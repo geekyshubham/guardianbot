@@ -45,6 +45,10 @@ image:
   readinessPath: /ready
   sbomFormat: cyclonedx-json
   dependentServices: [postgres, redis]
+  runtimeEnvironment:
+    PORT: "8080"
+  # Runner-generated startup-only values; no secret value is stored here.
+  ephemeralEnvironment: [APPLICATION_SMOKE_SECRET]
 ```
 
 DAST example:

@@ -86,6 +86,11 @@
           "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
           "additionalProperties": { "type": "string" }
         },
+        "ephemeralEnvironment": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }
+        },
         "migrationCommand": { "type": "string" },
         "testCommand": { "type": "string" }
       }

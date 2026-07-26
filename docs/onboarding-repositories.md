@@ -30,7 +30,10 @@ guardianctl inventory
 guardianctl offboard OWNER/REPOSITORY
 ```
 
-`doctor` validates configuration, workflow pin, and latest expected run.
+`doctor` validates configuration, the immutable workflow pin, the complete generated
+caller against the declarative configuration, and the latest expected run. A manual
+caller edit or a configuration change that was not regenerated is reported as drift;
+`guardianctl upgrade OWNER/REPOSITORY` regenerates the caller.
 `enforce` refuses to act until diagnostics are healthy and then creates the
 required-check ruleset using operator authorization. `upgrade` opens a pin update
 PR. `offboard` opens a deletion PR and deliberately retains central audit evidence.

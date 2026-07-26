@@ -26,6 +26,7 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
       readiness-path: ${JSON.stringify(image.readinessPath ?? "")}
       container-port: ${image.containerPort ?? 8000}
       dependent-services: ${JSON.stringify((image.dependentServices ?? []).join(","))}
+      ephemeral-env-keys: ${JSON.stringify((image.ephemeralEnvironment ?? []).join(","))}
       runtime-env: |
 ${runtimeEnvironment || "          # No runtime environment values configured."}
       migration-command: ${JSON.stringify(image.migrationCommand ?? "")}

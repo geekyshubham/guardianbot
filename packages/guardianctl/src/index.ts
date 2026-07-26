@@ -155,6 +155,14 @@ export interface DoctorResult {
   checks: Array<{ name: string; ok: boolean; detail: string }>;
 }
 
+export function callerWorkflowMatches(
+  actual: string,
+  expected: string
+): boolean {
+  const normalize = (value: string) => value.replace(/\r\n/g, "\n").trimEnd();
+  return normalize(actual) === normalize(expected);
+}
+
 export async function doctor(
   context: CommandContext,
   repository: string
@@ -164,12 +172,13 @@ export async function doctor(
   const configFile = await context.github.getFile(owner, repo, ".guardianbot/config.yml", metadata.default_branch);
   const workflow = await context.github.getFile(owner, repo, ".github/workflows/guardianbot.yml", metadata.default_branch);
   const checks: DoctorResult["checks"] = [];
+  let parsedConfig: ReturnType<typeof parseGuardianConfig> | undefined;
   if (!configFile) {
     checks.push({ name: "configuration", ok: false, detail: "not configured" });
   } else {
     try {
-      const config = parseGuardianConfig(configFile.content);
-      checks.push({ name: "configuration", ok: true, detail: `schema ${config.schemaVersion}` });
+      parsedConfig = parseGuardianConfig(configFile.content);
+      checks.push({ name: "configuration", ok: true, detail: `schema ${parsedConfig.schemaVersion}` });
     } catch (error) {
       checks.push({ name: "configuration", ok: false, detail: String(error) });
     }
@@ -179,6 +188,20 @@ export async function doctor(
     ok: Boolean(workflow?.content.includes(`@${context.workflowSha}`)),
     detail: workflow ? (workflow.content.includes(`@${context.workflowSha}`) ? "pin current" : "pin differs") : "not configured"
   });
+  if (workflow && parsedConfig) {
+    const expectedWorkflow = generateCallerWorkflow({
+      guardianRepository: context.guardianRepository,
+      workflowSha: context.workflowSha,
+      defaultBranch: metadata.default_branch,
+      image: parsedConfig.image
+    });
+    const matches = callerWorkflowMatches(workflow.content, expectedWorkflow);
+    checks.push({
+      name: "generated caller",
+      ok: matches,
+      detail: matches ? "matches configuration" : "drift detected; run guardianctl upgrade"
+    });
+  }
   if (workflow) {
     try {
       const runs = await context.github.listWorkflowRuns(owner, repo, "guardianbot.yml");

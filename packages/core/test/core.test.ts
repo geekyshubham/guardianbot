@@ -56,6 +56,25 @@ test("generates an immutable reusable workflow caller", () => {
   assert.match(workflow, /reusable-security\.yml/);
 });
 
+test("generates ephemeral runtime key references without repository-side values", () => {
+  const workflow = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    image: {
+      dockerfile: "Dockerfile",
+      context: ".",
+      platform: "linux/amd64",
+      registry: "ghcr.io/geekyshubham/service",
+      healthPath: "/health",
+      sbomFormat: "cyclonedx-json",
+      ephemeralEnvironment: ["APPLICATION_SMOKE_SECRET"]
+    }
+  });
+  assert.match(workflow, /ephemeral-env-keys: "APPLICATION_SMOKE_SECRET"/);
+  assert.doesNotMatch(workflow, /APPLICATION_SMOKE_SECRET=/);
+});
+
 test("normalizes and gates deterministic findings", () => {
   const semgrep = normalizeSemgrep({
     results: [

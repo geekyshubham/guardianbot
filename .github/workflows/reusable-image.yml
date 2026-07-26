@@ -13,6 +13,7 @@ on:
       migration-command: { required: false, type: string, default: "" }
       dependent-services: { required: false, type: string, default: "" }
       runtime-env: { required: false, type: string, default: "" }
+      ephemeral-env-keys: { required: false, type: string, default: "" }
       push: { required: false, type: boolean, default: false }
 
 permissions:
@@ -69,6 +70,19 @@ jobs:
           done <<'GUARDIANBOT_ENV'
           ${{ inputs.runtime-env }}
           GUARDIANBOT_ENV
+          IFS=',' read -ra ephemeral_keys <<< "${{ inputs.ephemeral-env-keys }}"
+          for key in "${ephemeral_keys[@]}"; do
+            [ -z "$key" ] && continue
+            [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || {
+              echo "Invalid ephemeral environment key"
+              exit 1
+            }
+            grep -q "^${key}=" guardianbot-runtime.env && {
+              echo "Ephemeral environment key also has a static value"
+              exit 1
+            }
+            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)" >> guardianbot-runtime.env
+          done
       - name: Apply migrations using exact image
         if: inputs.migration-command != ''
         run: |

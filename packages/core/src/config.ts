@@ -46,6 +46,7 @@ export interface GuardianConfig {
     sbomFormat: "cyclonedx-json";
     dependentServices?: Array<"postgres" | "redis">;
     runtimeEnvironment?: Record<string, string>;
+    ephemeralEnvironment?: string[];
     migrationCommand?: string;
     testCommand?: string;
   };
@@ -82,6 +83,14 @@ export function validateGuardianConfig(config: GuardianConfig): string[] {
     }
     if (url && url.protocol !== "https:") {
       errors.push("dast.allowedOrigin must use HTTPS");
+    }
+  }
+  for (const key of config.image?.ephemeralEnvironment ?? []) {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+      errors.push(`image.ephemeralEnvironment contains invalid key ${key}`);
+    }
+    if (config.image?.runtimeEnvironment?.[key] !== undefined) {
+      errors.push(`image ephemeral key ${key} must not also have a static value`);
     }
   }
   for (const suppression of config.scanners.suppressions ?? []) {
