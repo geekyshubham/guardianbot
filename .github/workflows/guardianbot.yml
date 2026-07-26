@@ -18,6 +18,6 @@ permissions:
 jobs:
   guardianbot-security-gate:
     name: guardianbot/security-gate
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@a1a5640b4aa30bf393777e420b3c9049739af7e7
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@441ca48d5ca1574826c7738bd3c18bc50a60e58b
     with:
       config-path: .guardianbot/config.yml
