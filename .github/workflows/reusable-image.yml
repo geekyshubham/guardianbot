@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Build exact linux/amd64 image
         run: |
           mkdir -p guardianbot-image-evidence
@@ -71,7 +71,7 @@ jobs:
         run: docker push "${{ inputs.image-name }}:${GITHUB_SHA}"
       - name: Install Cosign
         if: inputs.push
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
       - name: Keyless sign and attest
         if: inputs.push
         run: |
