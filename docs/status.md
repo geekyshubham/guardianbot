@@ -18,6 +18,7 @@ Last verified: 2026-07-27
 | Local semantic index | Partial | Text/symbol fallback | core tests | Tree-sitter and pgvector persistence planned |
 | Continuous monitoring | Partial | Nightly caller schedule | generated workflow | Digest rescans/15-minute smoke scheduler planned |
 | DigitalOcean deployment definitions | Beta | Single droplet | Compose/config validation | HA, restore drill not verified |
+| Signed release container | Beta | GuardianBot control plane | `release.yml` | First tagged build must pass before Working |
 | RouteLens/AstraNull full digest promotion | Planned | Those repositories | None yet | Must not claim until live workflows pass |
 | Cross-provider model fallback | Not applicable | Disabled by default | Protocol design | Requires explicit approval |
 

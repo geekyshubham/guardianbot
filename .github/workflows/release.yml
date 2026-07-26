@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Test source release
+        run: |
+          npm ci
+          npm run check
+      - name: Build control-plane image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot"
+          docker build --platform linux/amd64 -t "${image}:${GITHUB_REF_NAME}" -t "${image}:sha-${GITHUB_SHA}" .
+      - name: Scan release and create CycloneDX SBOM
+        run: |
+          mkdir -p release-evidence
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot:${GITHUB_REF_NAME}"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/release-evidence:/evidence" aquasec/trivy:0.64.1 \
+            image --severity CRITICAL --exit-code 1 --format json \
+            --output /evidence/trivy-image.json "$image"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/release-evidence:/evidence" aquasec/trivy:0.64.1 \
+            image --format cyclonedx --output /evidence/sbom.cdx.json "$image"
+      - name: Push immutable release image
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot"
+          docker push "${image}:${GITHUB_REF_NAME}"
+          docker push "${image}:sha-${GITHUB_SHA}"
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+      - name: Sign digest and attest SBOM
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot:${GITHUB_REF_NAME}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image")"
+          test -n "$digest"
+          cosign sign --yes "$digest"
+          cosign attest --yes --type cyclonedx --predicate release-evidence/sbom.cdx.json "$digest"
+          cosign verify "$digest" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            > release-evidence/cosign-verification.json
+          printf '%s\n' "$digest" > release-evidence/digest.txt
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-release-evidence-${{ github.ref_name }}
+          path: release-evidence/
+          if-no-files-found: error

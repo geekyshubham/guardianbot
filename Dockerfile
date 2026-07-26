@@ -5,7 +5,7 @@ COPY packages/protocol/package.json packages/protocol/package.json
 COPY packages/core/package.json packages/core/package.json
 COPY packages/guardianctl/package.json packages/guardianctl/package.json
 COPY apps/control-plane/package.json apps/control-plane/package.json
-RUN npm install
+RUN npm ci
 COPY tsconfig.base.json ./
 COPY packages packages
 COPY apps apps

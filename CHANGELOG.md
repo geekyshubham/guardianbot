@@ -14,6 +14,8 @@ reusable workflow commits remain immutable.
 - Reusable onboarding/admin CLI and versioned repository configuration.
 - Semgrep/Trivy, image/SBOM/Cosign, and allowlisted ZAP workflows.
 - DigitalOcean Compose deployment and release-controlled documentation.
+- Tagged GHCR control-plane image release with Trivy, CycloneDX, keyless signing,
+  and verification evidence.
 
 ### Known limitations
 
