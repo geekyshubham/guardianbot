@@ -75,11 +75,19 @@
         "registry": { "type": "string" },
         "healthPath": { "type": "string" },
         "readinessPath": { "type": "string" },
+        "containerPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "sbomFormat": { "const": "cyclonedx-json" },
         "dependentServices": {
           "type": "array",
           "items": { "enum": ["postgres", "redis"] }
-        }
+        },
+        "runtimeEnvironment": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
+          "additionalProperties": { "type": "string" }
+        },
+        "migrationCommand": { "type": "string" },
+        "testCommand": { "type": "string" }
       }
     },
     "dast": {

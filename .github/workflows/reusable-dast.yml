@@ -34,6 +34,7 @@ jobs:
           docker run --rm -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py \
             -t "${{ inputs.openapi-url }}" -f openapi \
+            -O "${{ inputs.target-origin }}" \
             -J zap.json -r zap.html -m "${{ inputs.minutes }}"
       - name: Upload DAST evidence
         if: always()

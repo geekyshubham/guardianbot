@@ -10,6 +10,9 @@ on:
       readiness-path: { required: false, type: string, default: "" }
       container-port: { required: false, type: number, default: 8000 }
       smoke-command: { required: false, type: string, default: "" }
+      migration-command: { required: false, type: string, default: "" }
+      dependent-services: { required: false, type: string, default: "" }
+      runtime-env: { required: false, type: string, default: "" }
       push: { required: false, type: boolean, default: false }
 
 permissions:
@@ -36,9 +39,45 @@ jobs:
       - name: Repository-specific application tests
         if: inputs.smoke-command != ''
         run: ${{ inputs.smoke-command }}
+      - name: Start disposable dependencies
+        shell: bash
+        run: |
+          docker network create guardianbot-smoke
+          if [[ ",${{ inputs.dependent-services }}," == *,postgres,* ]]; then
+            docker run -d --rm --name guardianbot-postgres --network guardianbot-smoke \
+              -e POSTGRES_USER=guardianbot -e POSTGRES_PASSWORD=guardianbot \
+              -e POSTGRES_DB=guardianbot postgres:16-alpine
+            for attempt in $(seq 1 30); do
+              docker exec guardianbot-postgres pg_isready -U guardianbot && break
+              sleep 2
+            done
+            docker exec guardianbot-postgres pg_isready -U guardianbot
+          fi
+          if [[ ",${{ inputs.dependent-services }}," == *,redis,* ]]; then
+            docker run -d --rm --name guardianbot-redis --network guardianbot-smoke redis:7-alpine
+            for attempt in $(seq 1 30); do
+              docker exec guardianbot-redis redis-cli ping | grep -qx PONG && break
+              sleep 2
+            done
+            docker exec guardianbot-redis redis-cli ping | grep -qx PONG
+          fi
+          install -m 600 /dev/null guardianbot-runtime.env
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            [[ "$line" =~ ^[A-Z_][A-Z0-9_]*=.*$ ]] || { echo "Invalid runtime environment key"; exit 1; }
+            printf '%s\n' "$line" >> guardianbot-runtime.env
+          done <<'GUARDIANBOT_ENV'
+          ${{ inputs.runtime-env }}
+          GUARDIANBOT_ENV
+      - name: Apply migrations using exact image
+        if: inputs.migration-command != ''
+        run: |
+          docker run --rm --network guardianbot-smoke --env-file guardianbot-runtime.env \
+            "${{ inputs.image-name }}:${GITHUB_SHA}" sh -lc "${{ inputs.migration-command }}"
       - name: Boot and verify exact image
         run: |
           docker run -d --rm --name guardianbot-smoke \
+            --network guardianbot-smoke --env-file guardianbot-runtime.env \
             -p 127.0.0.1:${{ inputs.container-port }}:${{ inputs.container-port }} \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
           trap 'docker logs guardianbot-smoke; docker stop guardianbot-smoke' EXIT
@@ -91,3 +130,8 @@ jobs:
           name: guardianbot-image-evidence-${{ github.run_id }}
           path: guardianbot-image-evidence/
           if-no-files-found: error
+      - name: Remove disposable dependencies
+        if: always()
+        run: |
+          docker rm -f guardianbot-smoke guardianbot-postgres guardianbot-redis 2>/dev/null || true
+          docker network rm guardianbot-smoke 2>/dev/null || true

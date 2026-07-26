@@ -108,7 +108,8 @@ export async function generateOnboarding(
     workflow: generateCallerWorkflow({
       guardianRepository: context.guardianRepository,
       workflowSha: context.workflowSha,
-      defaultBranch: snapshot.defaultBranch
+      defaultBranch: snapshot.defaultBranch,
+      image: configObject.image
     }),
     report: renderOnboardingReport(repository, detection)
   };
@@ -232,7 +233,8 @@ export async function upgrade(
   const workflow = generateCallerWorkflow({
     guardianRepository: context.guardianRepository,
     workflowSha: context.workflowSha,
-    defaultBranch: metadata.default_branch
+    defaultBranch: metadata.default_branch,
+    image: config.image
   });
   if (context.dryRun) return { changed: true };
   const branch = branchName("upgrade");

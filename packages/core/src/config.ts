@@ -42,8 +42,12 @@ export interface GuardianConfig {
     registry: string;
     healthPath: string;
     readinessPath?: string;
+    containerPort?: number;
     sbomFormat: "cyclonedx-json";
     dependentServices?: Array<"postgres" | "redis">;
+    runtimeEnvironment?: Record<string, string>;
+    migrationCommand?: string;
+    testCommand?: string;
   };
   dast?: null | {
     allowedOrigin: string;

@@ -215,6 +215,7 @@ export function generateGuardianConfig(
           registry: `ghcr.io/${snapshot.owner.toLowerCase()}/${snapshot.name.toLowerCase()}`,
           healthPath,
           readinessPath: detection.healthPaths.includes("/ready") ? "/ready" : undefined,
+          containerPort: 8000,
           sbomFormat: "cyclonedx-json",
           dependentServices: detection.dependentServices
         }

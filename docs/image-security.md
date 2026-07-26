@@ -6,6 +6,10 @@ readiness, scans vulnerability/misconfiguration/secret evidence, and creates a
 CycloneDX SBOM. Qualifying Critical findings, smoke failure, missing scan, or
 missing SBOM fail the job.
 
+The reusable job can create disposable PostgreSQL and Redis containers on an
+isolated Docker network, validate a non-secret runtime environment file, and run a
+declarative migration command inside the exact candidate image before smoke tests.
+
 When promotion is enabled, GitHub OIDC keylessly signs the pushed GHCR digest and
 attaches the SBOM attestation. Verification pins the repository workflow identity
 and issuer. DigitalOcean staging must deploy this exact digest, never rebuild or
