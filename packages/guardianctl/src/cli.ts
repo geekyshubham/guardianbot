@@ -26,6 +26,13 @@ Commands:
 Options:
   --dry-run     Inspect or render without writing to GitHub
   --json        Emit JSON
+  --dockerfile PATH
+  --health-path PATH
+  --readiness-path PATH
+  --dast-origin HTTPS_ORIGIN
+  --openapi PATH_OR_URL
+  --auth-profile CONTROL_PLANE_REFERENCE
+  --session-path PROTECTED_PATH
   --help        Show this help
 
 Authentication uses GH_TOKEN or the active gh CLI account. No repository secrets are created.`);
@@ -41,6 +48,14 @@ function token(): string {
   }
 }
 
+function option(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${name} requires a value`);
+  return value;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes("--help") || args.includes("-h")) help();
@@ -50,7 +65,16 @@ async function main() {
     github: new GitHubClient(token()),
     guardianRepository: process.env.GUARDIANBOT_REPOSITORY ?? "Geekyshubham/guardianbot",
     workflowSha: process.env.GUARDIANBOT_WORKFLOW_SHA ?? "0000000000000000000000000000000000000000",
-    dryRun: args.includes("--dry-run")
+    dryRun: args.includes("--dry-run"),
+    overrides: {
+      dockerfile: option(args, "--dockerfile"),
+      healthPath: option(args, "--health-path"),
+      readinessPath: option(args, "--readiness-path"),
+      dastOrigin: option(args, "--dast-origin"),
+      openapi: option(args, "--openapi"),
+      authenticationProfile: option(args, "--auth-profile"),
+      sessionAssertionPath: option(args, "--session-path")
+    }
   };
   if (context.workflowSha === "0000000000000000000000000000000000000000" && command !== "inventory") {
     throw new Error("Set GUARDIANBOT_WORKFLOW_SHA to the published immutable GuardianBot commit");

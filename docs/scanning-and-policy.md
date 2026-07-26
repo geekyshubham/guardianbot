@@ -4,6 +4,9 @@ Semgrep scans code and Trivy scans dependencies, configuration, licenses, and
 secrets. PRs use changed context; nightly runs establish full coverage.
 
 Initial onboarding is report-only. Existing fingerprints form the baseline.
+Qualifying findings are emitted as warnings in this mode; they fail the check only
+after the configuration changes to `enforce`. Scanner execution or missing-evidence
+failures remain visible failures in every mode.
 Enforcement may block:
 
 - new mapped High/Critical Semgrep findings;

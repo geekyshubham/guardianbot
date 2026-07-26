@@ -1,6 +1,6 @@
 # Capability status
 
-Release: `0.1.0-poc`  
+Release: `0.1.1-poc`  
 Last verified: 2026-07-27
 
 | Capability | Status | Scope | Evidence | Known limitation / failure behavior |
@@ -18,7 +18,7 @@ Last verified: 2026-07-27
 | Local semantic index | Partial | Text/symbol fallback | core tests | Tree-sitter and pgvector persistence planned |
 | Continuous monitoring | Partial | Nightly caller schedule | generated workflow | Digest rescans/15-minute smoke scheduler planned |
 | DigitalOcean deployment definitions | Beta | Single droplet | Compose/config validation | HA, restore drill not verified |
-| Signed release container | Beta | GuardianBot control plane | `release.yml` | First tagged build must pass before Working |
+| Signed release container | Working | GuardianBot control plane | [release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Digest `sha256:340fefd23012d84a6f07d82b87b22f27c0d52d1cdd2a9e7f2b00f283a17b87b0` |
 | RouteLens/AstraNull full digest promotion | Planned | Those repositories | None yet | Must not claim until live workflows pass |
 | Cross-provider model fallback | Not applicable | Disabled by default | Protocol design | Requires explicit approval |
 

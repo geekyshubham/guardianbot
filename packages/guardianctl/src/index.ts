@@ -15,6 +15,15 @@ export interface CommandContext {
   guardianRepository: string;
   workflowSha: string;
   dryRun?: boolean;
+  overrides?: {
+    dockerfile?: string;
+    healthPath?: string;
+    readinessPath?: string;
+    dastOrigin?: string;
+    openapi?: string;
+    authenticationProfile?: string;
+    sessionAssertionPath?: string;
+  };
 }
 
 export interface GeneratedOnboarding {
@@ -39,9 +48,11 @@ export async function inspectRepository(
   const metadata = await github.getRepository(owner, repo);
   const files = await github.getTree(owner, repo, metadata.default_branch);
   const languages = await github.getLanguages(owner, repo);
-  const candidates = files.filter((path) =>
-    /(^|\/)(package\.json|pyproject\.toml|Gemfile|Package\.swift|docker-compose[^/]*\.ya?ml|Dockerfile|.*\.ya?ml|.*\.json|.*\.py|.*\.ts|.*\.js)$/.test(path)
-  ).slice(0, 80);
+  const contextual = files.filter((path) =>
+    /(^|\/)(package\.json|pyproject\.toml|Gemfile|Package\.swift|docker-compose[^/]*\.ya?ml|Dockerfile(?:\.[^/]*)?|.*(?:url|route|health|ready|schema|openapi|swagger|deploy|workflow).*\.(?:ya?ml|json|py|ts|js))$/i.test(path)
+  );
+  const source = files.filter((path) => /\.(ya?ml|json|py|ts|js)$/i.test(path));
+  const candidates = [...new Set([...contextual, ...source])].slice(0, 140);
   const fileContents: Record<string, string> = {};
   await Promise.all(
     candidates.map(async (path) => {
@@ -67,6 +78,29 @@ export async function generateOnboarding(
   const snapshot = await inspectRepository(context.github, repository);
   const detection = detectRepository(snapshot);
   const configObject = generateGuardianConfig(snapshot, detection, context.workflowSha);
+  const override = context.overrides;
+  if (override?.dockerfile && configObject.image) {
+    if (!detection.dockerfiles.includes(override.dockerfile)) {
+      throw new Error(`Requested Dockerfile was not detected: ${override.dockerfile}`);
+    }
+    configObject.image.dockerfile = override.dockerfile;
+  }
+  if (override?.healthPath && configObject.image) configObject.image.healthPath = override.healthPath;
+  if (override?.readinessPath && configObject.image) configObject.image.readinessPath = override.readinessPath;
+  if (override?.dastOrigin || override?.openapi || override?.authenticationProfile ||
+      override?.sessionAssertionPath) {
+    if (!override.dastOrigin || !override.openapi || !override.authenticationProfile ||
+        !override.sessionAssertionPath) {
+      throw new Error("DAST overrides require origin, OpenAPI, auth profile, and session assertion");
+    }
+    configObject.dast = {
+      allowedOrigin: override.dastOrigin,
+      openapi: override.openapi,
+      authenticationProfile: override.authenticationProfile,
+      sessionAssertionPath: override.sessionAssertionPath,
+      excludedRoutes: []
+    };
+  }
   return {
     snapshot,
     detection,

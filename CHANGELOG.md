@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-27
+
 ### Security
 
 - Minimized the release runtime image and removed development dependencies and the

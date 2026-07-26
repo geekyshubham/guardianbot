@@ -17,6 +17,7 @@ export interface DetectionResult {
   testCommands: string[];
   buildCommands: string[];
   dockerfiles: string[];
+  preferredDockerfile?: string;
   openapi: string[];
   codeowners?: string;
   healthPaths: string[];
@@ -81,16 +82,37 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
   }
 
   const dockerfiles = has(snapshot, /(^|\/)Dockerfile(?:\.[^/]+)?$/i);
-  const openapi = has(snapshot, /(^|\/)(openapi|swagger)[^/]*\.(json|ya?ml)$/i);
+  const openapi = has(snapshot, /(^|\/)[^/]*(openapi|swagger)[^/]*\.(json|ya?ml)$/i);
+  const dockerfileReferences = new Map<string, number>();
+  for (const [path, content] of Object.entries(snapshot.fileContents ?? {})) {
+    if (!/\.github\/workflows\/|deploy|digitalocean|compose/i.test(path)) continue;
+    const weight = 1 + (/deploy/i.test(path) ? 2 : 0) + (/digitalocean/i.test(path) ? 4 : 0);
+    for (const dockerfile of dockerfiles) {
+      if (content.includes(dockerfile)) {
+        dockerfileReferences.set(
+          dockerfile,
+          (dockerfileReferences.get(dockerfile) ?? 0) + weight
+        );
+      }
+    }
+  }
+  const preferredDockerfile = [...dockerfileReferences.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0];
   const codeowners = snapshot.files.find((path) =>
     /(^|\/)(CODEOWNERS)$/.test(path)
   );
   const joined = Object.values(snapshot.fileContents ?? {}).join("\n");
-  const healthPaths = [
-    ...new Set(
-      ["/health", "/ready", "/api/v1/health/"].filter((path) => joined.includes(path))
-    )
-  ];
+  const extractedHealthPaths = [...joined.matchAll(
+    /["'`](\/?[A-Za-z0-9_./-]*(?:health|ready)[A-Za-z0-9_./-]*\/?)["'`]/gi
+  )].map((match) => match[1]!.startsWith("/") ? match[1]! : `/${match[1]}`);
+  const healthPaths = [...new Set([
+    ...extractedHealthPaths,
+    ...["/health", "/ready", "/api/v1/health/"].filter((path) => joined.includes(path))
+  ])].sort((left, right) => {
+    const score = (path: string) => path === "/api/v1/health/" ? 3 :
+      path === "/health" ? 2 : path === "/ready" ? 1 : 0;
+    return score(right) - score(left);
+  });
   const dependentServices: Array<"postgres" | "redis"> = [];
   if (/postgres|DATABASE_URL/i.test(joined)) dependentServices.push("postgres");
   if (/redis|REDIS_URL/i.test(joined)) dependentServices.push("redis");
@@ -112,6 +134,7 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     testCommands: [...new Set(testCommands)],
     buildCommands: [...new Set(buildCommands)],
     dockerfiles,
+    preferredDockerfile,
     openapi,
     codeowners,
     healthPaths,
@@ -127,6 +150,7 @@ export function generateGuardianConfig(
   workflowSha: string
 ): GuardianConfig {
   const primaryDockerfile =
+    detection.preferredDockerfile ??
     detection.dockerfiles.find((path) => path === "Dockerfile") ??
     detection.dockerfiles[0];
   const healthPath = detection.healthPaths[0] ?? "/health";
@@ -198,4 +222,3 @@ export function generateGuardianConfig(
     dast: null
   };
 }
-
