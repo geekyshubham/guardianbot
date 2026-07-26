@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardianbot.dev/schemas/repository-config.v1.schema.json",
+  "title": "GuardianBot Repository Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowVersion", "repository", "review", "scanners"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "workflowVersion": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["defaultBranch", "releaseBranches", "languages"],
+      "properties": {
+        "defaultBranch": { "type": "string", "minLength": 1 },
+        "releaseBranches": { "type": "array", "items": { "type": "string" } },
+        "languages": { "type": "array", "items": { "type": "string" } },
+        "relatedRepositories": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automatic", "drafts", "incremental", "maxInlineComments", "categories", "highRiskPaths"],
+      "properties": {
+        "automatic": { "type": "boolean" },
+        "drafts": { "enum": ["skip", "manual", "automatic"] },
+        "incremental": { "type": "boolean" },
+        "maxInlineComments": { "type": "integer", "minimum": 0, "maximum": 50 },
+        "categories": {
+          "type": "array",
+          "items": {
+            "enum": ["security", "logic", "reliability", "concurrency", "performance", "contract", "testing", "maintainability"]
+          }
+        },
+        "highRiskPaths": { "type": "array", "items": { "type": "string" } },
+        "contextDocuments": { "type": "array", "items": { "type": "string" } },
+        "excludedPaths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "scanners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "semgrep", "trivy"],
+      "properties": {
+        "mode": { "enum": ["advisory", "report-only", "enforce"] },
+        "semgrep": { "type": "boolean" },
+        "trivy": { "type": "boolean" },
+        "suppressions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fingerprint", "owner", "reason", "ticket", "expiresAt"],
+            "properties": {
+              "fingerprint": { "type": "string" },
+              "owner": { "type": "string" },
+              "reason": { "type": "string" },
+              "ticket": { "type": "string" },
+              "expiresAt": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    },
+    "image": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["dockerfile", "context", "platform", "registry", "healthPath", "sbomFormat"],
+      "properties": {
+        "dockerfile": { "type": "string" },
+        "context": { "type": "string" },
+        "platform": { "type": "string" },
+        "registry": { "type": "string" },
+        "healthPath": { "type": "string" },
+        "readinessPath": { "type": "string" },
+        "sbomFormat": { "const": "cyclonedx-json" },
+        "dependentServices": {
+          "type": "array",
+          "items": { "enum": ["postgres", "redis"] }
+        }
+      }
+    },
+    "dast": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["allowedOrigin", "openapi", "authenticationProfile", "sessionAssertionPath"],
+      "properties": {
+        "allowedOrigin": { "type": "string", "format": "uri" },
+        "openapi": { "type": "string" },
+        "authenticationProfile": { "type": "string" },
+        "sessionAssertionPath": { "type": "string" },
+        "excludedRoutes": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

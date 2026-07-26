@@ -1,0 +1,90 @@
+name: GuardianBot reusable security
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        description: Versioned repository configuration
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  scanners:
+    name: deterministic scanners
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out reviewed repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Validate GuardianBot configuration
+        shell: bash
+        run: |
+          test -f "${{ inputs.config-path }}"
+          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6 \
+            '.schemaVersion == "1.0.0" and (.workflowVersion | test("^[a-f0-9]{40}$"))' \
+            "/work/${{ inputs.config-path }}" | grep -qx true
+
+      - name: Semgrep
+        shell: bash
+        run: |
+          mkdir -p guardianbot-evidence
+          docker run --rm -v "$PWD:/src" semgrep/semgrep:1.130.0 \
+            semgrep scan --config auto --json --output /src/guardianbot-evidence/semgrep.json \
+            /src || printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/semgrep.json
+
+      - name: Trivy filesystem, dependencies, configuration, licenses, and secrets
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/workspace" aquasec/trivy:0.64.1 \
+            fs --format json --scanners vuln,misconfig,secret,license \
+            --output /workspace/guardianbot-evidence/trivy.json /workspace \
+            || printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/trivy.json
+
+      - name: Evaluate new-finding policy
+        id: gate
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const semgrep = JSON.parse(fs.readFileSync("guardianbot-evidence/semgrep.json", "utf8"));
+          const trivy = JSON.parse(fs.readFileSync("guardianbot-evidence/trivy.json", "utf8"));
+          const failures = [];
+          if (semgrep.scanner_error) failures.push("Semgrep failed or evidence is missing");
+          if (trivy.scanner_error) failures.push("Trivy failed or evidence is missing");
+          for (const finding of semgrep.results || []) {
+            const severity = String(finding.extra?.severity || "").toUpperCase();
+            if (severity === "ERROR" || severity === "CRITICAL" || severity === "HIGH") {
+              failures.push(`Semgrep ${finding.check_id} at ${finding.path}:${finding.start?.line}`);
+            }
+          }
+          for (const result of trivy.Results || []) {
+            for (const finding of result.Vulnerabilities || []) {
+              if (["CRITICAL", "HIGH"].includes(finding.Severity) && finding.FixedVersion) {
+                failures.push(`Trivy ${finding.VulnerabilityID} in ${finding.PkgName}; fixed by ${finding.FixedVersion}`);
+              }
+            }
+          }
+          fs.writeFileSync("guardianbot-evidence/gate.json", JSON.stringify({
+            schemaVersion: "1.0.0", passed: failures.length === 0, failures
+          }, null, 2));
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            `## GuardianBot security gate\n\n${failures.length ? failures.map(x => `- ❌ ${x}`).join("\n") : "- ✅ No qualifying new findings"}\n`);
+          if (failures.length) process.exitCode = 1;
+          NODE
+
+      - name: Upload immutable evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-evidence/
+          if-no-files-found: error
+          retention-days: 30

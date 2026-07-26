@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GuardianBot Backend Capabilities",
+  "$id": "https://guardianbot.dev/schemas/backend-capabilities.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "backendId",
+    "structuredOutput",
+    "maxInputCharacters",
+    "supportedProfiles",
+    "supportedDataClassifications",
+    "retention",
+    "usageReporting"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "const": "guardian.review.v1"
+    },
+    "backendId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "structuredOutput": {
+      "type": "boolean"
+    },
+    "maxInputCharacters": {
+      "type": "integer",
+      "minimum": 1000
+    },
+    "supportedProfiles": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "routine-review",
+          "high-risk-review",
+          "benchmark-review",
+          "fallback-review"
+        ]
+      }
+    },
+    "supportedDataClassifications": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "public",
+          "private",
+          "restricted"
+        ]
+      }
+    },
+    "retention": {
+      "enum": [
+        "none",
+        "bounded",
+        "unknown"
+      ]
+    },
+    "usageReporting": {
+      "type": "boolean"
+    }
+  }
+}

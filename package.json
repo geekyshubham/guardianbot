@@ -1,0 +1,32 @@
+{
+  "name": "guardianbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Provider-neutral, reusable GitHub security review platform",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/core",
+    "packages/guardianctl",
+    "apps/control-plane"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build --workspace @guardianbot/protocol && npm run build --workspace @guardianbot/core && npm run typecheck --workspaces --if-present",
+    "lint": "npm run typecheck && npm run docs:check",
+    "docs:check": "node scripts/check-docs.mjs",
+    "schemas:generate": "npm run build --workspace @guardianbot/protocol && node scripts/export-protocol-schemas.mjs",
+    "schemas:check": "npm run build --workspace @guardianbot/protocol && node scripts/export-protocol-schemas.mjs --check && node scripts/check-schemas.mjs",
+    "check": "npm run schemas:check && npm run lint && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  },
+  "license": "Apache-2.0"
+}

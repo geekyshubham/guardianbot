@@ -1,0 +1,44 @@
+name: GuardianBot reusable DAST
+
+on:
+  workflow_call:
+    inputs:
+      target-origin: { required: true, type: string }
+      openapi-url: { required: true, type: string }
+      expected-origin: { required: true, type: string }
+      minutes: { required: false, type: number, default: 45 }
+
+permissions:
+  contents: read
+
+jobs:
+  zap:
+    name: authenticated staging DAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Enforce exact staging allowlist
+        shell: bash
+        run: |
+          test "${{ inputs.target-origin }}" = "${{ inputs.expected-origin }}"
+          case "${{ inputs.target-origin }}" in
+            https://*) ;;
+            *) echo "Only HTTPS staging targets are permitted"; exit 1 ;;
+          esac
+          case "${{ inputs.target-origin }}" in
+            *localhost*|*127.0.0.1*|*0.0.0.0*) echo "Invalid remote target"; exit 1 ;;
+          esac
+      - name: Run ZAP API scan
+        run: |
+          mkdir -p guardianbot-dast-evidence
+          docker run --rm -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py \
+            -t "${{ inputs.openapi-url }}" -f openapi \
+            -J zap.json -r zap.html -m "${{ inputs.minutes }}"
+      - name: Upload DAST evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-dast-evidence-${{ github.run_id }}
+          path: guardianbot-dast-evidence/
+          if-no-files-found: error
