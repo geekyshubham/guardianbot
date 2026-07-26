@@ -159,7 +159,15 @@ export function callerWorkflowMatches(
   actual: string,
   expected: string
 ): boolean {
-  const normalize = (value: string) => value.replace(/\r\n/g, "\n").trimEnd();
+  const normalize = (value: string) =>
+    value
+      .replace(/\r\n/g, "\n")
+      .replace(
+        /^(\s*uses:\s+)([^/\s]+\/[^/\s]+)(\/\.github\/workflows\/)/gim,
+        (_match, prefix: string, repository: string, suffix: string) =>
+          `${prefix}${repository.toLowerCase()}${suffix}`
+      )
+      .trimEnd();
   return normalize(actual) === normalize(expected);
 }
 

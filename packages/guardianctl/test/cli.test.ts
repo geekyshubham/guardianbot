@@ -19,4 +19,11 @@ test("caller drift comparison tolerates only line-ending and final-newline diffe
     ),
     false
   );
+  assert.equal(
+    callerWorkflowMatches(
+      "    uses: geekyshubham/guardianbot/.github/workflows/reusable-security.yml@abc\n",
+      "    uses: Geekyshubham/GuardianBot/.github/workflows/reusable-security.yml@abc\n"
+    ),
+    true
+  );
 });
