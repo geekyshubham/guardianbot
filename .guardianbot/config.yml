@@ -1,0 +1,60 @@
+schemaVersion: 1.0.0
+workflowVersion: a1a5640b4aa30bf393777e420b3c9049739af7e7
+repository:
+  defaultBranch: main
+  releaseBranches:
+    - main
+  languages:
+    - dockerfile
+    - javascript
+    - typescript
+  relatedRepositories: []
+review:
+  automatic: true
+  drafts: manual
+  incremental: true
+  maxInlineComments: 8
+  categories:
+    - security
+    - logic
+    - reliability
+    - concurrency
+    - performance
+    - contract
+    - testing
+  highRiskPaths:
+    - "**/auth/**"
+    - "**/security/**"
+    - "**/migrations/**"
+    - .github/workflows/**
+    - "**/Dockerfile*"
+    - "**/*secret*"
+    - "**/*tenant*"
+  contextDocuments:
+    - README.md
+    - CONTRIBUTING.md
+    - SECURITY.md
+    - .github/CODEOWNERS
+  excludedPaths:
+    - "**/node_modules/**"
+    - "**/vendor/**"
+    - "**/dist/**"
+    - "**/build/**"
+    - "**/*.min.js"
+scanners:
+  mode: report-only
+  semgrep: true
+  trivy: true
+  suppressions: []
+image:
+  dockerfile: Dockerfile
+  context: .
+  platform: linux/amd64
+  registry: ghcr.io/geekyshubham/guardianbot
+  healthPath: /api/v1/health/
+  readinessPath: /ready
+  sbomFormat: cyclonedx-json
+  dependentServices:
+    - postgres
+    - redis
+dast: null
