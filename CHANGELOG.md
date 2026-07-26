@@ -5,6 +5,12 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Security
+
+- Minimized the release runtime image and removed development dependencies and the
+  bundled package manager after the v0.1.0 PoC image gate detected Critical
+  operating-system and `tar` findings.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added
