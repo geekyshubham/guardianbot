@@ -5,6 +5,21 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Exact generated-caller drift detection in `guardianctl doctor`.
+- Runner-generated ephemeral image-smoke environment values, referenced by key
+  without storing their values in consumer repositories.
+- Image evidence ordering that generates and uploads the CycloneDX SBOM before
+  applying the blocking Critical-finding policy.
+
+### Verified
+
+- AstraNull and RouteLens canonical images build, start with disposable
+  dependencies, pass their configured health probes, complete Trivy scanning,
+  and produce CycloneDX SBOMs. Both promotion paths correctly remain blocked by
+  Critical image findings; see `docs/status.md`.
+
 ## [0.1.1] - 2026-07-27
 
 ### Security
