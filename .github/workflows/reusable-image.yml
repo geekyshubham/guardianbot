@@ -108,7 +108,8 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1 \
             image --format json --output /evidence/trivy-image.json \
-            --severity CRITICAL --exit-code 1 "${{ inputs.image-name }}:${GITHUB_SHA}"
+            --scanners vuln,misconfig,secret --severity CRITICAL --exit-code 0 \
+            "${{ inputs.image-name }}:${GITHUB_SHA}"
       - name: CycloneDX SBOM from exact image
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -116,6 +117,20 @@ jobs:
             image --format cyclonedx --output /evidence/sbom.cdx.json \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
+      - name: Enforce Critical image policy
+        run: |
+          critical_count="$(
+            jq '[.Results[]? |
+              ((.Vulnerabilities // []) + (.Misconfigurations // []) + (.Secrets // []))[]? |
+              select(.Severity == "CRITICAL")] | length' \
+              guardianbot-image-evidence/trivy-image.json
+          )"
+          printf '{"criticalFindings":%s}\n' "$critical_count" \
+            > guardianbot-image-evidence/policy.json
+          if [ "$critical_count" -ne 0 ]; then
+            echo "Image policy blocked ${critical_count} Critical finding(s)."
+            exit 1
+          fi
       - name: Authenticate GHCR
         if: inputs.push
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
