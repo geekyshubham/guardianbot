@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const SEMVER_TAG =
   /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*))*))?$/;
@@ -211,6 +212,79 @@ function validateVerificationArray(document, label) {
   }
 }
 
+function decodeDsseStatement(envelope, label) {
+  if (
+    typeof envelope !== "object" ||
+    envelope === null ||
+    Array.isArray(envelope) ||
+    envelope.payloadType !== "application/vnd.in-toto+json" ||
+    typeof envelope.payload !== "string" ||
+    envelope.payload.length === 0 ||
+    !Array.isArray(envelope.signatures) ||
+    envelope.signatures.length === 0 ||
+    envelope.signatures.some(
+      (signature) =>
+        typeof signature !== "object" ||
+        signature === null ||
+        typeof signature.sig !== "string" ||
+        signature.sig.length === 0
+    )
+  ) {
+    throw new Error(`${label} is not a signed DSSE envelope`);
+  }
+
+  const decoded = Buffer.from(envelope.payload, "base64");
+  const normalizedInput = envelope.payload.replace(/=+$/u, "");
+  const normalizedDecoded = decoded.toString("base64").replace(/=+$/u, "");
+  if (
+    decoded.length === 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/u.test(envelope.payload) ||
+    normalizedDecoded !== normalizedInput
+  ) {
+    throw new Error(`${label} payload is not canonical base64`);
+  }
+
+  try {
+    return JSON.parse(decoded.toString("utf8"));
+  } catch {
+    throw new Error(`${label} payload is not valid JSON`);
+  }
+}
+
+function validateCosignSbomVerification(
+  document,
+  { image, digest, sbomDocument }
+) {
+  const envelopes = Array.isArray(document) ? document : [document];
+  if (envelopes.length === 0) {
+    throw new Error(
+      "Cosign SBOM verification must contain at least one verified statement"
+    );
+  }
+
+  for (const envelope of envelopes) {
+    const statement = decodeDsseStatement(
+      envelope,
+      "Cosign SBOM verification"
+    );
+    if (
+      !/^https:\/\/in-toto\.io\/Statement\/v(?:0\.1|1)$/u.test(
+        statement?._type ?? ""
+      ) ||
+      statement.predicateType !== "https://cyclonedx.org/bom" ||
+      !Array.isArray(statement.subject) ||
+      statement.subject.length !== 1 ||
+      statement.subject[0]?.name !== image ||
+      statement.subject[0]?.digest?.sha256 !== digest.slice("sha256:".length) ||
+      !isDeepStrictEqual(statement.predicate, sbomDocument)
+    ) {
+      throw new Error(
+        "Cosign SBOM verification does not bind the exact image, digest, and SBOM"
+      );
+    }
+  }
+}
+
 export async function createReleaseManifest({
   directory,
   tag,
@@ -302,14 +376,14 @@ export async function createReleaseManifest({
     ),
     "Cosign signature verification"
   );
-  validateVerificationArray(
+  validateCosignSbomVerification(
     JSON.parse(
       await readFile(
         path.join(directory, EVIDENCE_FILES.cosignSbomVerification),
         "utf8"
       )
     ),
-    "Cosign SBOM verification"
+    { image, digest, sbomDocument }
   );
 
   const evidence = {};

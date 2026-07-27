@@ -65,7 +65,43 @@ function validationPaths(directory) {
   };
 }
 
-async function evidenceFixture(directory) {
+function cosignSbomEnvelope({
+  image = "ghcr.io/geekyshubham/guardianbot",
+  digest = DIGEST,
+  sbom
+}) {
+  return {
+    payload: Buffer.from(
+      JSON.stringify({
+        _type: "https://in-toto.io/Statement/v0.1",
+        subject: [
+          {
+            name: image,
+            digest: { sha256: digest.slice("sha256:".length) }
+          }
+        ],
+        predicateType: "https://cyclonedx.org/bom",
+        predicate: sbom
+      })
+    ).toString("base64"),
+    payloadType: "application/vnd.in-toto+json",
+    signatures: [{ sig: "verified-by-cosign" }]
+  };
+}
+
+async function evidenceFixture(
+  directory,
+  {
+    attestedImage = "ghcr.io/geekyshubham/guardianbot",
+    attestedDigest = DIGEST,
+    attestedSbom
+  } = {}
+) {
+  const sbom = {
+    bomFormat: "CycloneDX",
+    specVersion: "1.6",
+    components: []
+  };
   const documents = {
     "trivy-image.json": {
       SchemaVersion: 2,
@@ -74,16 +110,16 @@ async function evidenceFixture(directory) {
       Results: [{ Target: "guardianbot", Vulnerabilities: null }]
     },
     "trivy-version.json": { Version: "0.70.0" },
-    "sbom.cdx.json": {
-      bomFormat: "CycloneDX",
-      specVersion: "1.6",
-      components: []
-    },
+    "sbom.cdx.json": sbom,
     "github-provenance.sigstore.json": { mediaType: "application/json" },
     "github-provenance-verification.json": [{ verificationResult: {} }],
     "github-provenance-oci-verification.json": [{ verificationResult: {} }],
     "cosign-signature-verification.json": [{ critical: {} }],
-    "cosign-sbom-verification.json": [{ payload: "verified" }]
+    "cosign-sbom-verification.json": cosignSbomEnvelope({
+      image: attestedImage,
+      digest: attestedDigest,
+      sbom: attestedSbom ?? sbom
+    })
   };
   for (const [name, document] of Object.entries(documents)) {
     await writeFile(path.join(directory, name), `${JSON.stringify(document)}\n`);
@@ -251,6 +287,52 @@ test("manifest binds the exact digest to hashed release evidence", async () => {
     expectedDigest: DIGEST
   });
   assert.equal(verified.evidence.sbom.path, "sbom.cdx.json");
+});
+
+test("manifest rejects an SBOM attestation for another image digest", async () => {
+  const directory = await temporaryDirectory();
+  await evidenceFixture(directory, {
+    attestedDigest: `sha256:${"c".repeat(64)}`
+  });
+  await assert.rejects(
+    createReleaseManifest({
+      directory,
+      tag: TAG,
+      sha: SHA,
+      ref: REF,
+      repository: REPOSITORY,
+      image: "ghcr.io/geekyshubham/guardianbot",
+      digest: DIGEST,
+      platform: "linux/amd64",
+      workflowIdentity: IDENTITY
+    }),
+    /does not bind the exact image, digest, and SBOM/
+  );
+});
+
+test("manifest rejects an attested SBOM different from the release SBOM", async () => {
+  const directory = await temporaryDirectory();
+  await evidenceFixture(directory, {
+    attestedSbom: {
+      bomFormat: "CycloneDX",
+      specVersion: "1.6",
+      components: [{ name: "different" }]
+    }
+  });
+  await assert.rejects(
+    createReleaseManifest({
+      directory,
+      tag: TAG,
+      sha: SHA,
+      ref: REF,
+      repository: REPOSITORY,
+      image: "ghcr.io/geekyshubham/guardianbot",
+      digest: DIGEST,
+      platform: "linux/amd64",
+      workflowIdentity: IDENTITY
+    }),
+    /does not bind the exact image, digest, and SBOM/
+  );
 });
 
 test("manifest verification rejects evidence changed after publication", async () => {

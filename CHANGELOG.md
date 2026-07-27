@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-27
+
+### Fixed
+
+- Release evidence now accepts Cosign's current single DSSE-envelope
+  verification output and validates that its in-toto subject, image digest, and
+  CycloneDX predicate exactly match the release image and generated SBOM.
+
 ## [0.2.6] - 2026-07-27
 
 ### Fixed
