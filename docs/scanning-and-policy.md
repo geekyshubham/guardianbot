@@ -3,6 +3,12 @@
 Semgrep scans code and Trivy scans dependencies, configuration, licenses, and
 secrets. PRs use changed context; nightly runs establish full coverage.
 
+Semgrep uses the local `guardianbot-engine/rules/semgrep.yml` checked out from the
+called reusable workflow's repository at `job.workflow_sha`. The job verifies
+that the caller's full immutable revision, the resolved checkout, and
+`job.workflow_sha` are identical before scanning, then records that revision with
+the evidence. It never selects a moving remote rule pack.
+
 Initial onboarding is report-only. Qualifying findings are emitted as warnings in
 this mode; they fail the check only after the configuration changes to `enforce`
 and the repository contains a reviewed `.guardianbot/baseline.json` fingerprint

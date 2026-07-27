@@ -29,6 +29,14 @@ reusable workflow commits remain immutable.
   runtime, avoids pull requests, and scrubs session material.
 - Pull-request scanning reads configuration and baselines from the base commit,
   and expired suppressions no longer weaken deterministic findings.
+- Semgrep resolves its local rule pack from the immutable called-workflow
+  `job.workflow_sha` and records the verified revision with scanner evidence.
+- Managed PostgreSQL supports CA-pinned TLS through
+  `GUARDIANBOT_DATABASE_CA_CERT`, overriding weaker URL TLS modes.
+- Metrics are closed by default and require a bearer token unless the deployment
+  explicitly trusts the internal private Compose network.
+- Evidence reconciliation now documents the GitHub App's Actions: read permission
+  and `workflow_run` event subscription as required inputs.
 
 ### Verified
 

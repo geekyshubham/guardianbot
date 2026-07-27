@@ -4,10 +4,13 @@
 
 Create an App owned by the intended GitHub account. Set the webhook URL to
 `https://YOUR_HOST/webhooks/github`, subscribe to installation repositories,
-repository, pull request, and issue comment events, and grant:
+repository, pull request, issue comment, and workflow run events, and grant:
 
 - Repository metadata: read
-- Contents, pull requests, issues, checks, and actions: read/write only where used
+- Actions: read, so `workflow_run` deliveries can be reconciled with immutable
+  scanner evidence
+- Contents: read
+- Pull requests, issues, and checks: read/write only where used
 - Administration: not required by the App; `guardianctl enforce` uses the
   operator's normal GitHub authorization
 

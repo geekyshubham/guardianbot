@@ -14,6 +14,10 @@ optional Valkey profile remains disabled until the worker path exists.
   PostgreSQL, Caddy, and Prometheus.
 - Store `.env` on the droplet with `0600` permissions. Consumer repositories
   never receive these values.
+- For managed PostgreSQL, set `GUARDIANBOT_DATABASE_CA_CERT` to the provider CA
+  PEM (literal or `\n`-escaped). GuardianBot removes weaker TLS query parameters
+  from `DATABASE_URL` and verifies the server against that CA. Local private
+  Compose PostgreSQL does not set this override.
 - Mount all persistent state under `GUARDIANBOT_STATE_DIR` on the encrypted
   DigitalOcean volume.
 
@@ -43,13 +47,17 @@ Monitor at minimum:
 
 - `https://HOST/healthz`
 - container health for `postgres`, `control-plane`, and `prometheus`
-- `https://HOST/metrics` via Prometheus scrape of the control plane
+- the internal `http://control-plane:3000/metrics` Prometheus target on the
+  explicitly trusted private Compose network
 - GitHub webhook 4xx/5xx rates
 - review latency and AI-backend availability
 - scanner evidence freshness, imports, suppression expiry, and missing evidence
 
-Current limitations still apply: `/readyz` and `/metrics` are not yet deep
-dependency checks, so container health and deploy verification remain required.
+Public Caddy requests to `/metrics` return `404`. Outside the trusted private
+Compose network, configure `GUARDIANBOT_METRICS_BEARER_TOKEN`; metrics stay closed
+when neither that token nor the explicit private-network trust flag is present.
+Current limitations still apply: `/readyz` and `/metrics` are not deep dependency
+checks, so container health and deploy verification remain required.
 
 ## Backup and restore
 
