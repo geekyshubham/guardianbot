@@ -1,114 +1,73 @@
-import { createHash } from "node:crypto";
+import {
+  buildRepositoryIndex,
+  buildRepositoryIndexFallback,
+  type RepositoryIndexBuildOptions
+} from "./index/builder.js";
+import {
+  cosineSimilarity,
+  lexicalFeatureVector,
+  lexicalOverlapScore,
+  LexicalHashEmbeddingProvider
+} from "./index/lexical.js";
+import type {
+  IndexedSymbol,
+  LocalEmbeddingProvider,
+  RepositoryIndex,
+  RepositoryIndexInput,
+  RepositorySourceParser
+} from "./index/types.js";
 
-export interface IndexedSymbol {
-  id: string;
-  repository: string;
-  commitSha: string;
-  path: string;
-  name: string;
-  kind: "function" | "class" | "type" | "module" | "text";
-  line: number;
-  content: string;
-  vector: number[];
+export * from "./index/types.js";
+export * from "./index/lexical.js";
+export * from "./index/parsers.js";
+export * from "./index/storage.js";
+export * from "./index/retrieval.js";
+export {
+  buildRepositoryIndex,
+  buildRepositoryIndexFallback,
+  type RepositoryIndexBuildOptions
+} from "./index/builder.js";
+
+export interface SyntaxAwareIndexOptions {
+  parser?: RepositorySourceParser;
+  embeddingProvider?: LocalEmbeddingProvider;
 }
 
-export interface RepositoryIndex {
-  repository: string;
-  commitSha: string;
-  symbols: IndexedSymbol[];
-  createdAt: string;
+/**
+ * Compatibility API for callers that need synchronous indexing. It uses the
+ * explicitly labeled deterministic text/regex and lexical fallback path.
+ *
+ * New production callers should use `indexRepositorySyntaxAware`.
+ */
+export function indexRepository(input: RepositoryIndexInput): RepositoryIndex {
+  return buildRepositoryIndexFallback(input, new LexicalHashEmbeddingProvider());
 }
 
-const symbolPatterns: Array<{
-  kind: IndexedSymbol["kind"];
-  pattern: RegExp;
-}> = [
-  { kind: "function", pattern: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/ },
-  { kind: "function", pattern: /^\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/ },
-  { kind: "function", pattern: /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/ },
-  { kind: "function", pattern: /^\s*func\s+([A-Za-z_]\w*)/ },
-  { kind: "class", pattern: /^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/ },
-  { kind: "class", pattern: /^\s*class\s+([A-Za-z_]\w*)/ },
-  { kind: "type", pattern: /^\s*(?:export\s+)?(?:interface|type|enum|struct)\s+([A-Za-z_$][\w$]*)/ },
-  { kind: "module", pattern: /^\s*module\s+([A-Za-z_:]\w*)/ }
-];
-
-export function localFeatureEmbedding(content: string, dimensions = 96): number[] {
-  const vector = new Array<number>(dimensions).fill(0);
-  for (const token of content.toLowerCase().match(/[a-z_][a-z0-9_]{2,}/g) ?? []) {
-    const digest = createHash("sha256").update(token).digest();
-    const index = digest.readUInt32BE(0) % dimensions;
-    const sign = digest[4]! % 2 === 0 ? 1 : -1;
-    vector[index] = (vector[index] ?? 0) + sign;
-  }
-  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
-  return norm ? vector.map((value) => value / norm) : vector;
-}
-
-export function indexRepository(input: {
-  repository: string;
-  commitSha: string;
-  files: Record<string, string>;
-}): RepositoryIndex {
-  const symbols: IndexedSymbol[] = [];
-  for (const [path, content] of Object.entries(input.files)) {
-    const lines = content.split(/\r?\n/);
-    let found = false;
-    lines.forEach((line, index) => {
-      for (const candidate of symbolPatterns) {
-        const match = line.match(candidate.pattern);
-        if (!match?.[1]) continue;
-        const start = Math.max(0, index - 2);
-        const end = Math.min(lines.length, index + 12);
-        const chunk = lines.slice(start, end).join("\n");
-        symbols.push({
-          id: createHash("sha256")
-            .update(`${input.repository}:${input.commitSha}:${path}:${match[1]}:${index + 1}`)
-            .digest("hex"),
-          repository: input.repository,
-          commitSha: input.commitSha,
-          path,
-          name: match[1],
-          kind: candidate.kind,
-          line: index + 1,
-          content: chunk,
-          vector: localFeatureEmbedding(chunk)
-        });
-        found = true;
-        break;
-      }
-    });
-    if (!found && content.trim()) {
-      const chunk = content.slice(0, 4000);
-      symbols.push({
-        id: createHash("sha256")
-          .update(`${input.repository}:${input.commitSha}:${path}:text`)
-          .digest("hex"),
-        repository: input.repository,
-        commitSha: input.commitSha,
-        path,
-        name: path,
-        kind: "text",
-        line: 1,
-        content: chunk,
-        vector: localFeatureEmbedding(chunk)
-      });
-    }
-  }
-  return {
-    repository: input.repository,
-    commitSha: input.commitSha,
-    symbols,
-    createdAt: new Date().toISOString()
+/**
+ * Parses Python, JavaScript/TypeScript, Swift, and Ruby with Tree-sitter WASM.
+ * Any unsupported, oversized, or unparsable file fails closed to text indexing
+ * without aborting the repository snapshot.
+ */
+export async function indexRepositorySyntaxAware(
+  input: RepositoryIndexInput,
+  options: SyntaxAwareIndexOptions = {}
+): Promise<RepositoryIndex> {
+  const buildOptions: RepositoryIndexBuildOptions = {
+    embeddingProvider:
+      options.embeddingProvider ?? new LexicalHashEmbeddingProvider(),
+    parser: options.parser
   };
+  return buildRepositoryIndex(input, buildOptions);
 }
 
-function cosine(a: number[], b: number[]): number {
-  let sum = 0;
-  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
-    sum += (a[index] ?? 0) * (b[index] ?? 0);
-  }
-  return sum;
+export const indexRepositoryWithParsers = indexRepositorySyntaxAware;
+
+/**
+ * Backwards-compatible name. This remains a lexical feature hash and must not
+ * be described as a semantic embedding.
+ */
+export function localFeatureEmbedding(content: string, dimensions = 96): number[] {
+  return lexicalFeatureVector(content, dimensions);
 }
 
 export function retrieveContext(
@@ -116,11 +75,28 @@ export function retrieveContext(
   query: string,
   limit = 20
 ): IndexedSymbol[] {
-  const queryVector = localFeatureEmbedding(query);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+    throw new RangeError("retrieval limit must be between 1 and 1000");
+  }
+  const queryVector =
+    index.embedding.kind === "lexical-fallback"
+      ? lexicalFeatureVector(query, index.embedding.dimensions)
+      : undefined;
   return [...index.symbols]
-    .map((symbol) => ({ symbol, score: cosine(queryVector, symbol.vector) }))
-    .sort((a, b) => b.score - a.score)
+    .map((symbol) => ({
+      symbol,
+      score: queryVector
+        ? cosineSimilarity(queryVector, symbol.vector)
+        : lexicalOverlapScore(query, symbol.content)
+    }))
+    .sort((left, right) => {
+      if (left.score !== right.score) return right.score - left.score;
+      return left.symbol.id < right.symbol.id
+        ? -1
+        : left.symbol.id > right.symbol.id
+          ? 1
+          : 0;
+    })
     .slice(0, limit)
     .map(({ symbol }) => symbol);
 }
-

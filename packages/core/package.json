@@ -17,8 +17,10 @@
   },
   "dependencies": {
     "@guardianbot/protocol": "*",
+    "@repomix/tree-sitter-wasms": "0.1.17",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
+    "web-tree-sitter": "0.26.11",
     "yaml": "^2.7.1"
   }
 }
