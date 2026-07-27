@@ -22,7 +22,7 @@ jobs:
       security-events: write
       actions: read
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@24167b17e2a7f25f3edb252ab389e178b4392cfe
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@359ee52824beead882330767f838a48e24766857
     with:
       config-path: .guardianbot/config.yml
 
@@ -33,7 +33,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@24167b17e2a7f25f3edb252ab389e178b4392cfe
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@359ee52824beead882330767f838a48e24766857
     with:
       dockerfile: "Dockerfile"
       context: "."
