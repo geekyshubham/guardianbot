@@ -2,63 +2,565 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  RELEASE_SHA: ${{ github.sha }}
+  RELEASE_REF: ${{ github.ref }}
+  RELEASE_REPOSITORY: ${{ github.repository }}
 
 jobs:
-  release:
+  verify_source:
+    name: Verify release source
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Test source release
+      - name: Validate immutable release inputs
+        shell: bash
         run: |
-          npm ci
-          npm run check
-      - name: Build control-plane image
+          set -euo pipefail
+          node scripts/release-evidence.mjs validate
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+          test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
+          git merge-base --is-ancestor "${RELEASE_SHA}" refs/remotes/origin/main
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Test release policy
+        run: node --test scripts/release-evidence.test.mjs
+      - name: Run schema, contract, documentation, and package checks
+        run: npm run check
+
+  publish_image:
+    name: Publish signed linux/amd64 image
+    needs: verify_source
+    outputs:
+      digest: ${{ steps.candidate.outputs.digest }}
+      workflow_identity: ${{ steps.metadata.outputs.workflow_identity }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_PLATFORM: linux/amd64
+      TRIVY_IMAGE: >-
+        aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - name: Check out the verified tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and validate release metadata
+        id: metadata
+        shell: bash
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot"
-          docker build --platform linux/amd64 -t "${image}:${GITHUB_REF_NAME}" -t "${image}:sha-${GITHUB_SHA}" .
-      - name: Scan release and create CycloneDX SBOM
-        run: |
+          set -euo pipefail
           mkdir -p release-evidence
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot:${GITHUB_REF_NAME}"
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/release-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
-            image --severity CRITICAL --exit-code 1 --format json \
-            --output /evidence/trivy-image.json "$image"
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/release-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
-            image --format cyclonedx --output /evidence/sbom.cdx.json "$image"
-      - name: Push immutable release image
-        run: |
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot"
-          docker push "${image}:${GITHUB_REF_NAME}"
-          docker push "${image}:sha-${GITHUB_SHA}"
+          node scripts/release-evidence.mjs validate \
+            > release-evidence/release-input.json
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+          test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
+          git merge-base --is-ancestor "${RELEASE_SHA}" refs/remotes/origin/main
+          image="ghcr.io/${RELEASE_REPOSITORY,,}"
+          version="${RELEASE_TAG#v}"
+          candidate_tag="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          workflow_identity="https://github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml@${RELEASE_REF}"
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "candidate_tag=${candidate_tag}"
+            echo "workflow_identity=${workflow_identity}"
+          } >> "${GITHUB_OUTPUT}"
+          printf '%s\n' "${image}:${candidate_tag}" \
+            > release-evidence/candidate.txt
+      - name: Set up pinned Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver: docker
       - name: Install Cosign
-        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
-      - name: Sign digest and attest SBOM
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        shell: bash
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/guardianbot:${GITHUB_REF_NAME}"
-          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image")"
-          test -n "$digest"
-          cosign sign --yes "$digest"
-          cosign attest --yes --type cyclonedx --predicate release-evidence/sbom.cdx.json "$digest"
-          cosign verify "$digest" \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            > release-evidence/cosign-verification.json
-          printf '%s\n' "$digest" > release-evidence/digest.txt
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" |
+            docker login ghcr.io --username "${GHCR_USER}" --password-stdin
+      - name: Resolve new or strictly resumable publication
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          WORKFLOW_IDENTITY: ${{ steps.metadata.outputs.workflow_identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolve_optional_digest() {
+            local reference="$1"
+            local manifest diagnostic
+            if manifest="$(docker manifest inspect --verbose "${reference}" 2>&1)"; then
+              jq -er '
+                if type == "object" and
+                   .Descriptor.platform.os == "linux" and
+                   .Descriptor.platform.architecture == "amd64"
+                then .Descriptor.digest
+                else error("expected a single linux/amd64 manifest")
+                end
+              ' <<<"${manifest}"
+              return
+            fi
+            diagnostic="${manifest}"
+            if grep -Eqi 'manifest unknown|not found' <<<"${diagnostic}"; then
+              printf '%s\n' "absent"
+              return
+            fi
+            echo "Could not resolve registry state for ${reference}" >&2
+            printf '%s\n' "${diagnostic}" >&2
+            return 1
+          }
+          version_digest="$(resolve_optional_digest \
+            "${RELEASE_IMAGE}:${RELEASE_TAG}")"
+          commit_digest="$(resolve_optional_digest \
+            "${RELEASE_IMAGE}:sha-${RELEASE_SHA}")"
+          if [[ "${version_digest}" == "absent" &&
+                "${commit_digest}" == "absent" ]]; then
+            echo "resume=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${version_digest}" != "absent" &&
+                "${commit_digest}" != "absent" &&
+                "${version_digest}" != "${commit_digest}" ]]; then
+            echo "Existing stable release tags resolve to different digests" >&2
+            exit 1
+          fi
+          digest="${version_digest}"
+          if [[ "${digest}" == "absent" ]]; then
+            digest="${commit_digest}"
+          fi
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          canonical="${RELEASE_IMAGE}@${digest}"
+          gh attestation verify "oci://${canonical}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --bundle-from-oci \
+            --cert-identity "${WORKFLOW_IDENTITY}" \
+            --cert-oidc-issuer "${OIDC_ISSUER}" \
+            --signer-workflow \
+              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
+            --source-digest "${RELEASE_SHA}" \
+            --source-ref "${RELEASE_REF}" \
+            --deny-self-hosted-runners \
+            --format json \
+            > release-evidence/resume-provenance-verification.json
+          cosign verify "${canonical}" \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            > release-evidence/resume-cosign-verification.json
+          cosign verify-attestation "${canonical}" \
+            --type cyclonedx \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            > release-evidence/resume-sbom-verification.json
+          {
+            echo "resume=true"
+            echo "digest=${digest}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Build or recover the exact candidate image
+        env:
+          CANDIDATE_TAG: ${{ steps.metadata.outputs.candidate_tag }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          RESUME: ${{ steps.state.outputs.resume }}
+          RESUME_DIGEST: ${{ steps.state.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="${RELEASE_IMAGE}:${CANDIDATE_TAG}"
+          if [[ "${RESUME}" == "true" ]]; then
+            docker pull --platform "${RELEASE_PLATFORM}" \
+              "${RELEASE_IMAGE}@${RESUME_DIGEST}"
+            docker tag "${RELEASE_IMAGE}@${RESUME_DIGEST}" "${candidate}"
+          else
+            docker build \
+              --pull \
+              --platform "${RELEASE_PLATFORM}" \
+              --label "org.opencontainers.image.revision=${RELEASE_SHA}" \
+              --label "org.opencontainers.image.source=https://github.com/${RELEASE_REPOSITORY}" \
+              --label "org.opencontainers.image.version=${RELEASE_VERSION}" \
+              --tag "${candidate}" \
+              .
+          fi
+          test "$(docker image inspect \
+            --format '{{.Os}}/{{.Architecture}}' "${candidate}")" \
+            = "${RELEASE_PLATFORM}"
+          test "$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            "${candidate}")" = "${RELEASE_SHA}"
+          test "$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+            "${candidate}")" = "${RELEASE_VERSION}"
+      - name: Scan candidate and create CycloneDX SBOM
+        env:
+          CANDIDATE_TAG: ${{ steps.metadata.outputs.candidate_tag }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+          candidate="${RELEASE_IMAGE}:${CANDIDATE_TAG}"
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            "${TRIVY_IMAGE}" version --format json \
+            > release-evidence/trivy-version.json
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            --volume "${GITHUB_WORKSPACE}/release-evidence:/evidence" \
+            "${TRIVY_IMAGE}" image \
+            --scanners vuln,misconfig,secret \
+            --image-config-scanners misconfig \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --timeout 15m \
+            --format json \
+            --output /evidence/trivy-image.json \
+            "${candidate}"
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            --volume "${GITHUB_WORKSPACE}/release-evidence:/evidence" \
+            "${TRIVY_IMAGE}" image \
+            --timeout 15m \
+            --format cyclonedx \
+            --output /evidence/sbom.cdx.json \
+            "${candidate}"
+      - name: Push run-scoped candidate and resolve its digest
+        id: candidate
+        env:
+          CANDIDATE_TAG: ${{ steps.metadata.outputs.candidate_tag }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          RESUME: ${{ steps.state.outputs.resume }}
+          RESUME_DIGEST: ${{ steps.state.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="${RELEASE_IMAGE}:${CANDIDATE_TAG}"
+          diagnostic=""
+          if diagnostic="$(docker manifest inspect "${candidate}" 2>&1)"; then
+            echo "Run-scoped candidate unexpectedly already exists" >&2
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|not found' <<<"${diagnostic}"; then
+            echo "Could not prove run-scoped candidate is absent" >&2
+            printf '%s\n' "${diagnostic}" >&2
+            exit 1
+          fi
+          docker push "${candidate}" |
+            tee release-evidence/push-candidate.log
+          digest="$(docker manifest inspect --verbose "${candidate}" |
+            jq -er '
+              if type == "object" and
+                 .Descriptor.platform.os == "linux" and
+                 .Descriptor.platform.architecture == "amd64"
+              then .Descriptor.digest
+              else error("expected a single linux/amd64 manifest")
+              end
+            ')"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "${RESUME}" == "true" ]]; then
+            test "${digest}" = "${RESUME_DIGEST}"
+          fi
+          printf '%s\n' "${RELEASE_IMAGE}@${digest}" \
+            > release-evidence/digest.txt
+          {
+            echo "digest=${digest}"
+            echo "pushed=true"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Generate GitHub build provenance
+        id: provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ${{ steps.metadata.outputs.image }}
+          subject-digest: ${{ steps.candidate.outputs.digest }}
+          push-to-registry: true
+      - name: Preserve and verify GitHub provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          RELEASE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          WORKFLOW_IDENTITY: ${{ steps.metadata.outputs.workflow_identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${PROVENANCE_BUNDLE}" \
+            release-evidence/github-provenance.sigstore.json
+          gh attestation verify "oci://${RELEASE_IMAGE}@${RELEASE_DIGEST}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --bundle-from-oci \
+            --cert-identity "${WORKFLOW_IDENTITY}" \
+            --cert-oidc-issuer "${OIDC_ISSUER}" \
+            --signer-workflow \
+              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
+            --source-digest "${RELEASE_SHA}" \
+            --source-ref "${RELEASE_REF}" \
+            --deny-self-hosted-runners \
+            --format json \
+            > release-evidence/github-provenance-verification.json
+      - name: Sign digest, attest SBOM, and verify exact identity
+        env:
+          RELEASE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          WORKFLOW_IDENTITY: ${{ steps.metadata.outputs.workflow_identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          canonical="${RELEASE_IMAGE}@${RELEASE_DIGEST}"
+          cosign sign --yes "${canonical}"
+          cosign verify "${canonical}" \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            > release-evidence/cosign-signature-verification.json
+          cosign attest --yes \
+            --type cyclonedx \
+            --predicate release-evidence/sbom.cdx.json \
+            "${canonical}"
+          cosign verify-attestation "${canonical}" \
+            --type cyclonedx \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}" \
+            > release-evidence/cosign-sbom-verification.json
+      - name: Create and sign deployable release manifest
+        env:
+          RELEASE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+          RELEASE_WORKFLOW_IDENTITY: ${{ steps.metadata.outputs.workflow_identity }}
+          WORKFLOW_IDENTITY: ${{ steps.metadata.outputs.workflow_identity }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-evidence.mjs create-manifest
+          cosign sign-blob --yes \
+            --bundle release-evidence/release-manifest.sigstore.json \
+            release-evidence/release-manifest.json
+          cosign verify-blob release-evidence/release-manifest.json \
+            --bundle release-evidence/release-manifest.sigstore.json \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}"
+          node scripts/release-evidence.mjs verify-manifest
+      - name: Attach stable tags without overwriting
+        env:
+          RELEASE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          canonical="${RELEASE_IMAGE}@${RELEASE_DIGEST}"
+          resolve_optional_digest() {
+            local reference="$1"
+            local manifest diagnostic
+            if manifest="$(docker manifest inspect --verbose "${reference}" 2>&1)"; then
+              jq -er '.Descriptor.digest' <<<"${manifest}"
+              return
+            fi
+            diagnostic="${manifest}"
+            if grep -Eqi 'manifest unknown|not found' <<<"${diagnostic}"; then
+              printf '%s\n' "absent"
+              return
+            fi
+            echo "Could not resolve registry state for ${reference}" >&2
+            printf '%s\n' "${diagnostic}" >&2
+            return 1
+          }
+          attach_or_verify() {
+            local target="$1"
+            local current
+            current="$(resolve_optional_digest "${target}")"
+            if [[ "${current}" == "absent" ]]; then
+              docker buildx imagetools create \
+                --prefer-index=false \
+                --tag "${target}" \
+                "${canonical}"
+              current="$(resolve_optional_digest "${target}")"
+            fi
+            test "${current}" = "${RELEASE_DIGEST}"
+          }
+          attach_or_verify "${RELEASE_IMAGE}:${RELEASE_TAG}"
+          attach_or_verify "${RELEASE_IMAGE}:sha-${RELEASE_SHA}"
+          printf '%s\n' "stable" > release-evidence/publication-state.txt
+          (
+            cd release-evidence
+            find . -maxdepth 1 -type f ! -name checksums.sha256 -print0 |
+              sort -z |
+              xargs -0 sha256sum > checksums.sha256
+          )
+      - name: Clean failed candidate when it has no stable aliases
+        if: failure() && steps.candidate.outputs.pushed == 'true'
+        continue-on-error: true
+        env:
+          CANDIDATE_TAG: ${{ steps.metadata.outputs.candidate_tag }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_IMAGE: ${{ steps.metadata.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${RELEASE_REPOSITORY%%/*}"
+          package="${RELEASE_IMAGE##*/}"
+          versions=""
+          api_base=""
+          if versions="$(gh api \
+            "/users/${owner}/packages/container/${package}/versions?per_page=100" \
+            2>/dev/null)"; then
+            api_base="/users/${owner}/packages/container/${package}/versions"
+          elif versions="$(gh api \
+            "/orgs/${owner}/packages/container/${package}/versions?per_page=100" \
+            2>/dev/null)"; then
+            api_base="/orgs/${owner}/packages/container/${package}/versions"
+          else
+            echo "candidate cleanup: package inventory unavailable" |
+              tee release-evidence/candidate-cleanup.txt
+            exit 0
+          fi
+          matches="$(jq --arg candidate "${CANDIDATE_TAG}" \
+            '[.[] | select(.metadata.container.tags | index($candidate))]' \
+            <<<"${versions}")"
+          if [[ "$(jq 'length' <<<"${matches}")" != "1" ]]; then
+            echo "candidate cleanup: exact package version not found" |
+              tee release-evidence/candidate-cleanup.txt
+            exit 0
+          fi
+          tags="$(jq -c '.[0].metadata.container.tags | sort' <<<"${matches}")"
+          if [[ "${tags}" != "[\"${CANDIDATE_TAG}\"]" ]]; then
+            echo "candidate cleanup: retained because stable aliases exist" |
+              tee release-evidence/candidate-cleanup.txt
+            exit 0
+          fi
+          version_id="$(jq -er '.[0].id' <<<"${matches}")"
+          gh api --method DELETE "${api_base}/${version_id}"
+          echo "candidate cleanup: deleted isolated failed candidate" |
+            tee release-evidence/candidate-cleanup.txt
       - name: Upload release evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: guardianbot-release-evidence-${{ github.ref_name }}
           path: release-evidence/
           if-no-files-found: error
+          retention-days: 90
+
+  publish_release:
+    name: Publish verified GitHub release
+    needs: publish_image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      OIDC_ISSUER: https://token.actions.githubusercontent.com
+      RELEASE_DIGEST: ${{ needs.publish_image.outputs.digest }}
+      WORKFLOW_IDENTITY: ${{ needs.publish_image.outputs.workflow_identity }}
+    steps:
+      - name: Check out release verification code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download signed release evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: guardianbot-release-evidence-${{ github.ref_name }}
+          path: release-evidence
+      - name: Install Cosign for offline manifest verification
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify evidence before release publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-evidence
+            sha256sum --check checksums.sha256
+          )
+          node scripts/release-evidence.mjs verify-manifest
+          cosign verify-blob release-evidence/release-manifest.json \
+            --bundle release-evidence/release-manifest.sigstore.json \
+            --certificate-identity "${WORKFLOW_IDENTITY}" \
+            --certificate-oidc-issuer "${OIDC_ISSUER}"
+      - name: Create or strictly resume GitHub release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" \
+            --repo "${RELEASE_REPOSITORY}" >/dev/null 2>&1; then
+            release_state="$(gh release view "${RELEASE_TAG}" \
+              --repo "${RELEASE_REPOSITORY}" \
+              --json tagName,isDraft \
+              --jq '[.tagName, .isDraft] | @tsv')"
+            if [[ "${release_state}" == "${RELEASE_TAG}"$'\tfalse' ]]; then
+              published_dir="${RUNNER_TEMP}/published-release-assets"
+              mkdir -p "${published_dir}"
+              gh release download "${RELEASE_TAG}" \
+                --repo "${RELEASE_REPOSITORY}" \
+                --dir "${published_dir}"
+              (
+                cd "${published_dir}"
+                sha256sum --check checksums.sha256
+              )
+              RELEASE_MANIFEST_PATH="${published_dir}/release-manifest.json" \
+                node scripts/release-evidence.mjs verify-manifest
+              cosign verify-blob \
+                "${published_dir}/release-manifest.json" \
+                --bundle \
+                  "${published_dir}/release-manifest.sigstore.json" \
+                --certificate-identity "${WORKFLOW_IDENTITY}" \
+                --certificate-oidc-issuer "${OIDC_ISSUER}"
+              exit 0
+            fi
+            test "${release_state}" = "${RELEASE_TAG}"$'\ttrue'
+            gh release upload "${RELEASE_TAG}" \
+              --repo "${RELEASE_REPOSITORY}" \
+              --clobber \
+              release-evidence/*
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${RELEASE_REPOSITORY}" \
+              --verify-tag \
+              --title "GuardianBot ${RELEASE_TAG}" \
+              --generate-notes \
+              --draft \
+              release-evidence/*
+          fi
+          uploaded_dir="${RUNNER_TEMP}/uploaded-release-assets"
+          mkdir -p "${uploaded_dir}"
+          gh release download "${RELEASE_TAG}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --dir "${uploaded_dir}"
+          for asset in release-evidence/*; do
+            cmp "${asset}" "${uploaded_dir}/$(basename "${asset}")"
+          done
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --draft=false

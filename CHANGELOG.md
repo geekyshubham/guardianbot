@@ -24,6 +24,20 @@ reusable workflow commits remain immutable.
 
 ### Security
 
+- The release pipeline now validates annotated SemVer tags and synchronized
+  workspace versions, scans a run-scoped candidate before stable publication,
+  resolves both GHCR tags to one `linux/amd64` digest, and verifies exact OIDC
+  identities instead of a permissive certificate regular expression.
+- Interrupted releases now resume only after existing tags pass digest,
+  provenance, signature, SBOM, source-ref, and source-commit verification.
+  Candidate cleanup deletes only isolated failed versions; GitHub Release assets
+  are replaceable only while the release is an unpublished draft.
+- Release images now carry GitHub SLSA provenance, a Cosign signature, and a
+  CycloneDX attestation bound to the exact registry digest. A validated,
+  keylessly signed deployment manifest hashes every verification artifact.
+- Release publication permissions are isolated from source verification, every
+  action remains full-SHA pinned, and the pinned Trivy v0.70.0 image replaces
+  the older release scanner following upstream supply-chain hardening.
 - DAST now requires the protected `guardianbot-dast` environment, proves the
   assertion is unauthorized before applying an ephemeral session cookie, caps
   runtime, avoids pull requests, and scrubs session material.
