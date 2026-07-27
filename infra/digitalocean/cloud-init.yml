@@ -1,10 +1,55 @@
 #cloud-config
 package_update: true
+package_upgrade: true
 packages:
+  - apt-listchanges
   - ca-certificates
   - curl
+  - fail2ban
   - git
+  - jq
+  - unattended-upgrades
   - ufw
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-guardianbot-hardening.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PermitRootLogin no
+      MaxAuthTries 3
+      X11Forwarding no
+      AllowAgentForwarding yes
+      AllowTcpForwarding yes
+  - path: /etc/apt/apt.conf.d/52guardianbot-unattended-upgrades
+    permissions: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      Unattended-Upgrade::Automatic-Reboot "false";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    content: |
+      {
+        "live-restore": true,
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "5"
+        }
+      }
+  - path: /etc/fail2ban/jail.d/guardianbot.local
+    permissions: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      banaction = ufw
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
 runcmd:
   - install -m 0755 -d /etc/apt/keyrings
   - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -12,11 +57,24 @@ runcmd:
   - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME}) stable" > /etc/apt/sources.list.d/docker.list
   - apt-get update
   - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  - ufw allow OpenSSH
+  - systemctl enable --now unattended-upgrades
+  - systemctl restart ssh
+  - systemctl restart docker
+  - systemctl enable --now fail2ban
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw limit OpenSSH
   - ufw allow 80/tcp
   - ufw allow 443/tcp
   - ufw --force enable
   - install -d -m 0700 /opt/guardianbot
+  - install -d -m 0700 /var/lib/guardianbot
+  - install -d -m 0700 /var/lib/guardianbot/backups
+  - install -d -m 0700 /var/lib/guardianbot/prometheus
+  - install -d -m 0700 /var/lib/guardianbot/postgres
+  - install -d -m 0700 /var/lib/guardianbot/caddy/data
+  - install -d -m 0700 /var/lib/guardianbot/caddy/config
+  - install -d -m 0700 /var/lib/guardianbot/valkey
 
 # Clone and secrets are intentionally operator steps. Cloud-init never embeds GitHub,
 # model-backend, DefectDojo, or DigitalOcean credentials.

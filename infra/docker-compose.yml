@@ -1,71 +1,166 @@
 name: guardianbot
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   control-plane:
-    build:
-      context: ..
+    image: ${GUARDIANBOT_IMAGE:?Set GUARDIANBOT_IMAGE to a signed ghcr.io digest}
+    pull_policy: always
     restart: unless-stopped
+    init: true
     env_file:
       - path: ../.env
-        required: false
+        required: true
     environment:
       DATABASE_URL: postgresql://guardianbot:${POSTGRES_PASSWORD}@postgres:5432/guardianbot
+      PORT: 3000
     depends_on:
       postgres:
         condition: service_healthy
     networks: [private, edge]
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 768m
+    cpus: 1.0
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    logging: *default-logging
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    pull_policy: always
     restart: unless-stopped
+    init: true
+    shm_size: 256m
     environment:
       POSTGRES_DB: guardianbot
       POSTGRES_USER: guardianbot
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes: [postgres-data:/var/lib/postgresql/data]
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - wal_compression=on
+    volumes:
+      - type: bind
+        source: ${GUARDIANBOT_STATE_DIR:?Set GUARDIANBOT_STATE_DIR to an encrypted DO volume}/postgres
+        target: /var/lib/postgresql/data
     networks: [private]
     healthcheck:
       test: [CMD-SHELL, pg_isready -U guardianbot]
-      interval: 5s
+      interval: 10s
       timeout: 3s
       retries: 20
+    stop_grace_period: 60s
+    mem_limit: 1g
+    cpus: 1.5
+    security_opt: [no-new-privileges:true]
+    logging: *default-logging
 
   valkey:
-    image: valkey/valkey:8.1-alpine
+    profiles: ["queue"]
+    image: valkey/valkey@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec
+    pull_policy: always
     restart: unless-stopped
+    init: true
     command: ["valkey-server", "--save", "60", "1", "--appendonly", "yes"]
-    volumes: [valkey-data:/data]
+    volumes:
+      - type: bind
+        source: ${GUARDIANBOT_STATE_DIR:?Set GUARDIANBOT_STATE_DIR to an encrypted DO volume}/valkey
+        target: /data
     networks: [private]
     security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    cpus: 0.50
+    logging: *default-logging
 
   caddy:
-    image: caddy:2.10-alpine
+    image: caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    pull_policy: always
     restart: unless-stopped
+    init: true
     environment:
       GUARDIANBOT_HOSTNAME: ${GUARDIANBOT_HOSTNAME}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
+      - type: bind
+        source: ${GUARDIANBOT_STATE_DIR:?Set GUARDIANBOT_STATE_DIR to an encrypted DO volume}/caddy/data
+        target: /data
+      - type: bind
+        source: ${GUARDIANBOT_STATE_DIR:?Set GUARDIANBOT_STATE_DIR to an encrypted DO volume}/caddy/config
+        target: /config
     ports: ["80:80", "443:443"]
     networks: [edge]
-    depends_on: [control-plane]
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.50
+    stop_grace_period: 30s
+    logging: *default-logging
 
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    pull_policy: always
     restart: unless-stopped
-    command: ["--config.file=/etc/prometheus/prometheus.yml"]
-    volumes: [./prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - type: bind
+        source: ${GUARDIANBOT_STATE_DIR:?Set GUARDIANBOT_STATE_DIR to an encrypted DO volume}/prometheus
+        target: /prometheus
     networks: [private]
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:9090/-/ready >/dev/null 2>&1 || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    mem_limit: 512m
+    cpus: 0.75
+    logging: *default-logging
 
 networks:
   private:
     internal: true
   edge:
-
-volumes:
-  postgres-data:
-  valkey-data:
-  caddy-data:

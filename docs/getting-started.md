@@ -16,19 +16,35 @@ Store the App ID, PEM private key, and webhook secret only on the control plane.
 ## 2. Deploy one DigitalOcean droplet
 
 Create an Ubuntu droplet using `infra/digitalocean/cloud-init.yml`, point a DNS
-record at it, then on the droplet:
+record at it, attach and mount an encrypted volume at `/var/lib/guardianbot`,
+then on the droplet:
 
 ```sh
 git clone https://github.com/Geekyshubham/guardianbot.git /opt/guardianbot
 cd /opt/guardianbot
 cp .env.example .env
 chmod 600 .env
-docker compose -f infra/docker-compose.yml up -d --build
-curl --fail https://YOUR_HOST/healthz
+cat >> .env <<'EOF'
+GUARDIANBOT_HOSTNAME=guardianbot.example.com
+GUARDIANBOT_STATE_DIR=/var/lib/guardianbot
+EOF
+
+./scripts/deploy-digitalocean.sh deploy \
+  ghcr.io/geekyshubham/guardianbot@sha256:340fefd23012d84a6f07d82b87b22f27c0d52d1cdd2a9e7f2b00f283a17b87b0
+./scripts/deploy-digitalocean.sh verify
 ```
 
-The bundled PostgreSQL and Valkey services are self-hosted on the droplet. No
-managed database or non-DigitalOcean cloud is required.
+The control plane now deploys only from the signed GHCR digest. PostgreSQL,
+Caddy, and Prometheus are pinned by digest, and their state lives under
+`GUARDIANBOT_STATE_DIR` on the encrypted DigitalOcean volume. The optional
+`valkey` service is kept behind the `queue` profile until the production worker
+path exists:
+
+```sh
+docker compose -f infra/docker-compose.yml --profile queue up -d valkey
+```
+
+No managed database or non-DigitalOcean cloud is required.
 
 ## 3. Connect a model bridge
 
@@ -58,3 +74,27 @@ guardianctl enforce OWNER/REPOSITORY
 ```
 
 See [repository onboarding](onboarding-repositories.md) for lifecycle details.
+
+## 5. Backups, restore, and rollback
+
+Take an application-consistent PostgreSQL backup to the encrypted DigitalOcean
+volume before each deploy and at least daily:
+
+```sh
+./scripts/backup-postgres.sh
+```
+
+Restore requires an explicit file path and confirmation flag:
+
+```sh
+./scripts/restore-postgres.sh --input /var/lib/guardianbot/backups/guardianbot-postgres-YYYYMMDDTHHMMSSZ.dump --yes
+```
+
+Roll back the control plane to the previously recorded digest:
+
+```sh
+./scripts/deploy-digitalocean.sh rollback
+```
+
+The rollback path changes the control-plane image only. Restore PostgreSQL from
+backup separately when a release or migration requires data rollback.

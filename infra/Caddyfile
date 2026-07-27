@@ -1,8 +1,22 @@
 {$GUARDIANBOT_HOSTNAME} {
   encode zstd gzip
-  reverse_proxy control-plane:3000
-  header {
-    X-Content-Type-Options "nosniff"
-    Referrer-Policy "no-referrer"
+  log {
+    output stdout
+    format json
   }
+
+  request_body {
+    max_size 3MB
+  }
+
+  header {
+    -Server
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "no-referrer"
+    Permissions-Policy "accelerometer=(), autoplay=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+  }
+
+  reverse_proxy control-plane:3000
 }
