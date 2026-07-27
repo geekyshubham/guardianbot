@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly GuardianBot DefectDojo backup schedule
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+Persistent=true
+RandomizedDelaySec=30m
+Unit=guardianbot-defectdojo-backup.service
+
+[Install]
+WantedBy=timers.target

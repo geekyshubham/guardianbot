@@ -22,6 +22,14 @@ normalized failures suitable for control-plane handling.
   repository/run metadata for tagging and audit trails.
 - Dry-run mode returns planned API mutations without contacting DefectDojo, which
   makes onboarding and contract tests safe.
+- A production-oriented DefectDojo OSS 3.1.200 deployment definition now lives
+  under [`infra/defectdojo`](../infra/defectdojo/README.md). It is limited to an
+  x86_64 DigitalOcean Droplet plus a dedicated DigitalOcean Managed PostgreSQL
+  18 cluster and pins every container to an immutable platform manifest.
+- The deployment includes root-only secret generation, managed PostgreSQL
+  `verify-full` TLS, Caddy TLS ingress, resource/security bounds, one-shot
+  migrations, nightly consistent backups, release-bound safe restore, systemd
+  units, and live diagnostics.
 
 ## Mapping model
 
@@ -63,8 +71,17 @@ history.
   the AI advisory review path.
 - Raw immutable workflow artifacts remain the replay source of truth.
 
-## Current limitation
+## Verification status
 
-This package is implemented and covered with mocked HTTP tests, but the control
-plane still needs to wire it into workflow-report ingestion and scheduled
-reconciliation before `docs/status.md` can claim full production coverage.
+The client package and deployment definition are implemented and locally
+validated. They are not evidence of a live production deployment. Full
+DefectDojo coverage remains unverified until the DigitalOcean deployment passes
+its live doctor, backup/restore drill, and an authenticated GuardianBot
+import/reimport fixture. The control plane must also complete workflow-report
+ingestion and scheduled reconciliation before `docs/status.md` can claim full
+production coverage.
+
+Deployment and operations details:
+
+- [DigitalOcean boundary](../infra/defectdojo/DIGITALOCEAN.md)
+- [Operator runbook](../infra/defectdojo/RUNBOOK.md)

@@ -1,0 +1,17 @@
+[Unit]
+Description=Consistent GuardianBot DefectDojo backup
+Documentation=https://github.com/geekyshubham/guardianbot/tree/main/infra/defectdojo
+Requires=guardianbot-defectdojo.service
+After=guardianbot-defectdojo.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/guardianbot-defectdojo/scripts/backup.sh --retention-days 14
+TimeoutStartSec=1800
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/guardianbot /opt/guardianbot-defectdojo
+ReadWritePaths=/run /var/backups/guardianbot/defectdojo

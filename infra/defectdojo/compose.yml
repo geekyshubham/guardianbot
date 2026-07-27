@@ -1,0 +1,463 @@
+name: guardianbot-defectdojo
+
+x-django-image: &django-image
+  image: defectdojo/defectdojo-django:3.1.200@sha256:b2b7b00ef0d53b6a7dd0b12ed2f645bef42263aeef674144bddead2d78cf65ad
+  platform: linux/amd64
+  pull_policy: always
+
+x-django-environment: &django-environment
+  DD_ALLOWED_HOSTS: "${DEFECTDOJO_DOMAIN:?DEFECTDOJO_DOMAIN is required}"
+  DD_API_TOKEN_AUTH_ENDPOINT_ENABLED: "False"
+  DD_API_TOKENS_ENABLED: "True"
+  DD_CELERY_BROKER_URL: "redis://valkey:6379/0"
+  DD_CELERY_LOG_LEVEL: "INFO"
+  DD_CREDENTIAL_AES_256_KEY: "${DD_CREDENTIAL_AES_256_KEY:?DD_CREDENTIAL_AES_256_KEY is required}"
+  DD_CSRF_COOKIE_SECURE: "True"
+  DD_CSRF_TRUSTED_ORIGINS: "https://${DEFECTDOJO_DOMAIN:?DEFECTDOJO_DOMAIN is required}"
+  DD_DATABASE_ENGINE: "django.db.backends.postgresql"
+  DD_DATABASE_HOST: "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}"
+  DD_DATABASE_NAME: "${DD_DATABASE_NAME:?DD_DATABASE_NAME is required}"
+  DD_DATABASE_PASSWORD: "${DD_DATABASE_PASSWORD:?DD_DATABASE_PASSWORD is required}"
+  DD_DATABASE_PORT: "${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+  DD_DATABASE_READINESS_TIMEOUT: "120"
+  DD_DATABASE_USER: "${DD_DATABASE_USER:?DD_DATABASE_USER is required}"
+  DD_DEBUG: "False"
+  DD_DJANGO_ADMIN_ENABLED: "False"
+  DD_DJANGO_METRICS_ENABLED: "False"
+  DD_ENABLE_AUDITLOG: "True"
+  DD_FORGOT_PASSWORD: "False"
+  DD_FORGOT_USERNAME: "False"
+  DD_INITIALIZE: "True"
+  DD_LOGGING_HANDLER: "json_console"
+  DD_RATE_LIMITER_ACCOUNT_LOCKOUT: "True"
+  DD_RATE_LIMITER_BLOCK: "True"
+  DD_RATE_LIMITER_ENABLED: "True"
+  DD_RATE_LIMITER_RATE: "5/m"
+  DD_REQUESTS_TIMEOUT: "30"
+  DD_SCAN_FILE_MAX_SIZE: "100"
+  DD_SECRET_KEY: "${DD_SECRET_KEY:?DD_SECRET_KEY is required}"
+  DD_SECURE_HSTS_INCLUDE_SUBDOMAINS: "True"
+  DD_SECURE_HSTS_SECONDS: "31536000"
+  DD_SECURE_PROXY_SSL_HEADER: "True"
+  DD_SECURE_SSL_REDIRECT: "True"
+  DD_SESSION_COOKIE_SECURE: "True"
+  DD_SITE_URL: "https://${DEFECTDOJO_DOMAIN:?DEFECTDOJO_DOMAIN is required}"
+  DD_TRACK_IMPORT_HISTORY: "True"
+  DD_UWSGI_NUM_OF_PROCESSES: "4"
+  DD_UWSGI_NUM_OF_THREADS: "2"
+  DD_WATSON_SEARCH_ENABLED: "False"
+  PGSSLMODE: "verify-full"
+  PGSSLROOTCERT: "/run/secrets/do-postgres-ca.crt"
+
+x-django-runtime: &django-runtime
+  <<: *django-image
+  environment: *django-environment
+  init: true
+  read_only: true
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - type: bind
+      source: /etc/guardianbot/do-postgres-ca.crt
+      target: /run/secrets/do-postgres-ca.crt
+      read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+    - /var/run/defectdojo:size=32m,uid=1001,gid=1337,mode=0770
+  logging: &bounded-logs
+    driver: json-file
+    options:
+      max-file: "5"
+      max-size: "25m"
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+
+services:
+  caddy:
+    image: caddy:2.11.4-alpine@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a
+    platform: linux/amd64
+    pull_policy: always
+    environment:
+      CADDY_ACME_EMAIL: "${CADDY_ACME_EMAIL:?CADDY_ACME_EMAIL is required}"
+      DEFECTDOJO_DOMAIN: "${DEFECTDOJO_DOMAIN:?DEFECTDOJO_DOMAIN is required}"
+    depends_on:
+      nginx:
+        condition: service_healthy
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+      - egress
+    init: true
+    read_only: true
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    cpus: "0.25"
+    mem_limit: 192m
+    pids_limit: 128
+    logging: *bounded-logs
+
+  nginx:
+    image: defectdojo/defectdojo-nginx:3.1.200@sha256:322fc39b1dfcdb78a3bcbdc9b3b413e4e74b8853ff8ca484922289f58d3e1468
+    platform: linux/amd64
+    pull_policy: always
+    environment:
+      DD_UWSGI_HOST: "uwsgi"
+      DD_UWSGI_PORT: "3031"
+      NGINX_METRICS_ENABLED: "false"
+      USE_TLS: "false"
+    depends_on:
+      uwsgi:
+        condition: service_healthy
+    expose:
+      - "8080"
+    volumes:
+      - defectdojo_media:/usr/share/nginx/html/media:ro
+    networks:
+      - edge
+      - app
+    init: true
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/uwsgi_health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    cpus: "0.50"
+    mem_limit: 256m
+    pids_limit: 256
+    logging: *bounded-logs
+
+  uwsgi:
+    <<: *django-runtime
+    entrypoint:
+      - /wait-for-it.sh
+      - "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}:${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      - -t
+      - "120"
+      - --
+      - /entrypoint-uwsgi.sh
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    expose:
+      - "3031"
+      - "8081"
+    volumes:
+      - type: bind
+        source: /etc/guardianbot/do-postgres-ca.crt
+        target: /run/secrets/do-postgres-ca.crt
+        read_only: true
+      - defectdojo_media:/app/media
+    networks:
+      - app
+      - egress
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/login?force_login_form', timeout=8).read(1)"
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    cpus: "2.00"
+    mem_limit: 2g
+    pids_limit: 512
+    stop_grace_period: 45s
+
+  celeryworker:
+    <<: *django-runtime
+    entrypoint:
+      - /wait-for-it.sh
+      - "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}:${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      - -t
+      - "120"
+      - --
+      - /entrypoint-celery-worker.sh
+    environment:
+      <<: *django-environment
+      DD_CELERY_WORKER_CONCURRENCY: "2"
+      DD_CELERY_WORKER_POOL_TYPE: "prefork"
+      DD_CELERY_WORKER_AUTOSCALE_MIN: "1"
+      DD_CELERY_WORKER_AUTOSCALE_MAX: "4"
+      DD_CELERY_WORKER_PREFETCH_MULTIPLIER: "4"
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: /etc/guardianbot/do-postgres-ca.crt
+        target: /run/secrets/do-postgres-ca.crt
+        read_only: true
+      - defectdojo_media:/app/media
+    networks:
+      - app
+      - egress
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'celery --app=dojo inspect ping --destination "celery@$${HOSTNAME}" --timeout=10 | grep -q pong'
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+    cpus: "2.00"
+    mem_limit: 2g
+    pids_limit: 512
+    stop_grace_period: 90s
+
+  celerybeat:
+    <<: *django-runtime
+    entrypoint:
+      - /wait-for-it.sh
+      - "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}:${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      - -t
+      - "120"
+      - --
+      - /entrypoint-celery-beat.sh
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    networks:
+      - app
+      - egress
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'test -s /var/run/defectdojo/celerybeat-schedule && celery --app=dojo inspect ping --timeout=10 | grep -q pong'
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+    cpus: "0.50"
+    mem_limit: 512m
+    pids_limit: 256
+    stop_grace_period: 45s
+
+  initializer:
+    <<: *django-image
+    entrypoint:
+      - /wait-for-it.sh
+      - "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}:${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      - -t
+      - "120"
+      - --
+      - /entrypoint-initializer.sh
+    environment:
+      <<: *django-environment
+      DD_ADMIN_FIRST_NAME: "${DD_ADMIN_FIRST_NAME:?DD_ADMIN_FIRST_NAME is required}"
+      DD_ADMIN_LAST_NAME: "${DD_ADMIN_LAST_NAME:?DD_ADMIN_LAST_NAME is required}"
+      DD_ADMIN_MAIL: "${DD_ADMIN_MAIL:?DD_ADMIN_MAIL is required}"
+      DD_ADMIN_PASSWORD: "${DD_ADMIN_PASSWORD:?DD_ADMIN_PASSWORD is required}"
+      DD_ADMIN_USER: "${DD_ADMIN_USER:?DD_ADMIN_USER is required}"
+      DD_JIRA_WEBHOOK_SECRET: "${DD_JIRA_WEBHOOK_SECRET:?DD_JIRA_WEBHOOK_SECRET is required}"
+    volumes:
+      - type: bind
+        source: /etc/guardianbot/do-postgres-ca.crt
+        target: /run/secrets/do-postgres-ca.crt
+        read_only: true
+    networks:
+      - egress
+    init: true
+    read_only: true
+    restart: "no"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /var/run/defectdojo:size=32m,uid=1001,gid=1337,mode=0770
+    cpus: "2.00"
+    mem_limit: 2g
+    pids_limit: 512
+    logging: *bounded-logs
+
+  valkey:
+    image: valkey/valkey:9.1.0-alpine@sha256:a35428eba9043cc0b79dbe54100f0c92784f2de00ad09b01182bfb1c5c83d1bd
+    platform: linux/amd64
+    pull_policy: always
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1000"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    expose:
+      - "6379"
+    volumes:
+      - defectdojo_valkey:/data
+    networks:
+      - app
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    cpus: "0.50"
+    mem_limit: 768m
+    pids_limit: 256
+    logging: *bounded-logs
+
+  operator:
+    <<: *django-image
+    profiles:
+      - operator
+    entrypoint:
+      - /bin/bash
+    environment:
+      DD_DATABASE_HOST: "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}"
+      DD_DATABASE_NAME: "${DD_DATABASE_NAME:?DD_DATABASE_NAME is required}"
+      DD_DATABASE_PASSWORD: "${DD_DATABASE_PASSWORD:?DD_DATABASE_PASSWORD is required}"
+      DD_DATABASE_PORT: "${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      DD_DATABASE_USER: "${DD_DATABASE_USER:?DD_DATABASE_USER is required}"
+      PGSSLMODE: "verify-full"
+      PGSSLROOTCERT: "/run/secrets/do-postgres-ca.crt"
+    user: "0:0"
+    volumes:
+      - type: bind
+        source: /etc/guardianbot/do-postgres-ca.crt
+        target: /run/secrets/do-postgres-ca.crt
+        read_only: true
+      - type: bind
+        source: /var/backups/guardianbot/defectdojo
+        target: /backup
+      - type: bind
+        source: ./scripts
+        target: /operator
+        read_only: true
+      - defectdojo_media:/restore/media
+      - defectdojo_valkey:/restore/valkey
+      - caddy_data:/restore/caddy-data
+      - caddy_config:/restore/caddy-config
+    networks:
+      - app
+      - egress
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cpus: "1.00"
+    mem_limit: 1g
+    pids_limit: 256
+    logging: *bounded-logs
+
+  postgres-tools:
+    image: postgres:18.4-alpine@sha256:1b1689b20d16a014a3d195653381cf2caa75a41a92d93b255a9d6ea29fd353aa
+    platform: linux/amd64
+    pull_policy: always
+    profiles:
+      - operator
+    entrypoint:
+      - /bin/sh
+    environment:
+      PGDATABASE: "${DD_DATABASE_NAME:?DD_DATABASE_NAME is required}"
+      PGHOST: "${DD_DATABASE_HOST:?DD_DATABASE_HOST is required}"
+      PGPASSWORD: "${DD_DATABASE_PASSWORD:?DD_DATABASE_PASSWORD is required}"
+      PGPORT: "${DD_DATABASE_PORT:?DD_DATABASE_PORT is required}"
+      PGSSLMODE: "verify-full"
+      PGSSLROOTCERT: "/run/secrets/do-postgres-ca.crt"
+      PGUSER: "${DD_DATABASE_USER:?DD_DATABASE_USER is required}"
+    user: "0:0"
+    volumes:
+      - type: bind
+        source: /etc/guardianbot/do-postgres-ca.crt
+        target: /run/secrets/do-postgres-ca.crt
+        read_only: true
+      - type: bind
+        source: /var/backups/guardianbot/defectdojo
+        target: /backup
+    networks:
+      - egress
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cpus: "1.00"
+    mem_limit: 1g
+    pids_limit: 256
+    logging: *bounded-logs
+
+networks:
+  edge:
+    name: guardianbot_defectdojo_edge
+  app:
+    name: guardianbot_defectdojo_app
+    internal: true
+  egress:
+    name: guardianbot_defectdojo_egress
+
+volumes:
+  defectdojo_media:
+    name: guardianbot_defectdojo_media
+  defectdojo_valkey:
+    name: guardianbot_defectdojo_valkey
+  caddy_data:
+    name: guardianbot_defectdojo_caddy_data
+  caddy_config:
+    name: guardianbot_defectdojo_caddy_config

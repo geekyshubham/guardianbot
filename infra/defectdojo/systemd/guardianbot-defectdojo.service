@@ -1,0 +1,28 @@
+[Unit]
+Description=GuardianBot DefectDojo OSS stack
+Documentation=https://github.com/geekyshubham/guardianbot/tree/main/infra/defectdojo
+Wants=network-online.target
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/guardianbot-defectdojo
+ExecStartPre=/opt/guardianbot-defectdojo/scripts/preflight.sh
+ExecStartPre=/opt/guardianbot-defectdojo/scripts/pull-and-verify-images.sh
+ExecStart=/usr/bin/docker compose --project-directory /opt/guardianbot-defectdojo --env-file /etc/guardianbot/defectdojo.env --file /opt/guardianbot-defectdojo/compose.yml up --detach --remove-orphans
+ExecStartPost=/opt/guardianbot-defectdojo/scripts/wait-ready.sh 900
+ExecStop=/usr/bin/docker compose --project-directory /opt/guardianbot-defectdojo --env-file /etc/guardianbot/defectdojo.env --file /opt/guardianbot-defectdojo/compose.yml stop --timeout 90
+TimeoutStartSec=1200
+TimeoutStopSec=180
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/guardianbot /opt/guardianbot-defectdojo
+ReadWritePaths=/run /var/backups/guardianbot/defectdojo
+
+[Install]
+WantedBy=multi-user.target

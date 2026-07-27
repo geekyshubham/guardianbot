@@ -1,0 +1,49 @@
+{
+	admin off
+	email {$CADDY_ACME_EMAIL}
+	grace_period 15s
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+{$DEFECTDOJO_DOMAIN} {
+	encode zstd gzip
+
+	request_body {
+		max_size 110MB
+	}
+
+	header {
+		-Server
+		Permissions-Policy "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+		Referrer-Policy "same-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+	}
+
+	handle /healthz {
+		rewrite * /nginx_health
+		reverse_proxy nginx:8080
+	}
+
+	@private_health path /django_metrics /nginx_health /nginx_status /uwsgi_health
+	respond @private_health 404
+
+	handle {
+		reverse_proxy nginx:8080 {
+			health_uri /uwsgi_health
+			health_interval 30s
+			health_timeout 10s
+			transport http {
+				dial_timeout 10s
+				response_header_timeout 30m
+			}
+		}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
