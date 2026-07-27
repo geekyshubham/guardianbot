@@ -933,8 +933,9 @@ export function isCapabilityFile(file) {
     /^schemas\/.*\.json$/.test(file) ||
     /^\.github\/(?:workflows|actions)\//.test(file) ||
     /^infra\//.test(file) ||
+    /^rules\//.test(file) ||
     /^Dockerfile$/.test(file) ||
-    /^scripts\/(?!check-docs\.mjs$|docs-check-|export-protocol-schemas\.mjs$|check-schemas\.mjs$).+/.test(file) ||
+    /^scripts\/(?!check-docs(?:\.test)?\.mjs$|docs-check-|export-protocol-schemas\.mjs$|check-schemas\.mjs$).+/.test(file) ||
     /^(?:apps|packages)\/[^/]+\/package\.json$/.test(file)
   );
 }

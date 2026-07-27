@@ -6,7 +6,7 @@ Last verified: 2026-07-27
 | Capability | Status | Scope | Evidence | Known limitation / failure behavior |
 | --- | --- | --- | --- | --- |
 | Strict `guardian.review.v1` validation | Working | Any conforming bridge | `packages/protocol/test/protocol.test.ts` | Invalid output is discarded |
-| Documentation quality gates | Working | Tracked repository documentation | `scripts/check-docs.test.mjs` | External reachability is opt-in; normal CI validates URL structure without live network calls |
+| Documentation quality gates | Working | Tracked repository documentation | [docs gate tests](../scripts/check-docs.test.mjs) | External reachability is opt-in; normal CI validates URL structure without live network calls |
 | Repository detection/config generation | Working | Python, Node, Swift, Ruby, Docker, docs | `packages/core/test/core.test.ts` | Heuristic detection, no command execution |
 | `guardianctl onboard` generation | Working | GitHub repositories | [12 generated onboarding PRs](https://github.com/search?q=is%3Apr+author%3Ageekyshubham+%22onboard+GuardianBot%22&type=pullrequests) | Ten merged normally; two held by pre-existing CI |
 | `guardianctl` lifecycle administration | Working | Authenticated owned repositories | `packages/guardianctl/test/cli.test.ts` | Live evidence and App/ruleset access must remain reachable; offboarding retains historical evidence |
@@ -17,8 +17,8 @@ Last verified: 2026-07-27
 | Semgrep/Trivy reusable gate | Beta | Code/dependency repositories | Ten default-branch runs passed within 35 seconds of merge | Enforce mode now requires a checked-in reviewed baseline; automatic historical reconciliation is still partial |
 | Image build/runtime/Trivy/SBOM | Beta | Docker repositories | [AstraNull run 30219565321](https://github.com/Geekyshubham/AstraNull/actions/runs/30219565321), RouteLens run 30219565657 (not publicly reachable) | Runtime and SBOM verified; both correctly blocked before promotion by Critical findings |
 | Cosign image promotion | Beta | Critical-clean default-branch images | [GuardianBot release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Verified for GuardianBot; RouteLens/AstraNull remain blocked |
-| DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Fails closed without an authenticated session cookie; DefectDojo import remains external to the reusable workflow |
-| DefectDojo reimport client | Beta | Self-hosted on DigitalOcean | core typecheck/tests | Full reconciliation scheduler planned |
+| DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Requires `guardianbot-dast` approval and an ephemeral session cookie; live verification and DefectDojo import remain |
+| DefectDojo import/reimport client | Beta | Self-hosted DefectDojo v2 | [client tests](../packages/defectdojo/test/client.test.ts) | Control-plane wiring, reconciliation scheduling, and live DigitalOcean verification remain |
 | Local semantic index | Partial | Text/symbol fallback | core tests | Tree-sitter and pgvector persistence planned |
 | Continuous monitoring | Partial | Ten onboarded repositories | generated nightly workflow | Digest rescans/15-minute smoke scheduler planned |
 | DigitalOcean deployment definitions | Beta | Single droplet | Compose/config validation | HA, restore drill not verified |

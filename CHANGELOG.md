@@ -13,11 +13,22 @@ reusable workflow commits remain immutable.
 - Hardened `guardianctl` lifecycle checks for App access, immutable pins and
   caller drift, evidence freshness, report-only observation windows, required
   checks, batch upgrades, and evidence-retaining offboarding.
+- Standalone DefectDojo v2 client with environment-reference configuration,
+  retry/idempotency controls, deterministic resource upserts, and
+  import-versus-reimport selection.
 - Exact generated-caller drift detection in `guardianctl doctor`.
 - Runner-generated ephemeral image-smoke environment values, referenced by key
   without storing their values in consumer repositories.
 - Image evidence ordering that generates and uploads the CycloneDX SBOM before
   applying the blocking Critical-finding policy.
+
+### Security
+
+- DAST now requires the protected `guardianbot-dast` environment, proves the
+  assertion is unauthorized before applying an ephemeral session cookie, caps
+  runtime, avoids pull requests, and scrubs session material.
+- Pull-request scanning reads configuration and baselines from the base commit,
+  and expired suppressions no longer weaken deterministic findings.
 
 ### Verified
 

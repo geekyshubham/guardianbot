@@ -9,6 +9,7 @@ import {
   collectTypeScriptConfigFields,
   compareCliContracts,
   compareConfigContracts,
+  isCapabilityFile,
   parseCliHelp,
   parseConfigReference,
   readMarkdownDocuments,
@@ -186,6 +187,9 @@ test("OpenAPI validation accepts a minimal internal document and rejects remote 
 });
 
 test("capability diffs require both status and changelog updates", () => {
+  assert.equal(isCapabilityFile("rules/semgrep.yml"), true);
+  assert.equal(isCapabilityFile("scripts/deploy-digitalocean.sh"), true);
+  assert.equal(isCapabilityFile("scripts/check-docs.test.mjs"), false);
   const missing = validateReleaseNotes({
     files: ["packages/core/src/config.ts"],
     unresolvedCiBase: false
