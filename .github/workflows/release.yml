@@ -320,7 +320,7 @@ jobs:
             release-evidence/github-provenance.sigstore.json
           gh attestation verify "oci://${RELEASE_IMAGE}@${RELEASE_DIGEST}" \
             --repo "${RELEASE_REPOSITORY}" \
-            --bundle-from-oci \
+            --bundle release-evidence/github-provenance.sigstore.json \
             --cert-identity "${WORKFLOW_IDENTITY}" \
             --cert-oidc-issuer "${OIDC_ISSUER}" \
             --signer-workflow \
@@ -330,6 +330,18 @@ jobs:
             --deny-self-hosted-runners \
             --format json \
             > release-evidence/github-provenance-verification.json
+          gh attestation verify "oci://${RELEASE_IMAGE}@${RELEASE_DIGEST}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --bundle-from-oci \
+            --cert-identity "${WORKFLOW_IDENTITY}" \
+            --cert-oidc-issuer "${OIDC_ISSUER}" \
+            --signer-workflow \
+              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
+            --source-digest "${RELEASE_SHA}" \
+            --source-ref "${RELEASE_REF}" \
+            --deny-self-hosted-runners \
+            --format json \
+            > release-evidence/github-provenance-oci-verification.json
       - name: Sign digest, attest SBOM, and verify exact identity
         env:
           RELEASE_DIGEST: ${{ steps.candidate.outputs.digest }}
@@ -411,12 +423,6 @@ jobs:
           attach_or_verify "${RELEASE_IMAGE}:${RELEASE_TAG}"
           attach_or_verify "${RELEASE_IMAGE}:sha-${RELEASE_SHA}"
           printf '%s\n' "stable" > release-evidence/publication-state.txt
-          (
-            cd release-evidence
-            find . -maxdepth 1 -type f ! -name checksums.sha256 -print0 |
-              sort -z |
-              xargs -0 sha256sum > checksums.sha256
-          )
       - name: Clean failed candidate when it has no stable aliases
         if: failure() && steps.candidate.outputs.pushed == 'true'
         continue-on-error: true
@@ -498,13 +504,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (
-            cd release-evidence
-            sha256sum --check checksums.sha256
-          )
-          node scripts/release-evidence.mjs verify-manifest
-          cosign verify-blob release-evidence/release-manifest.json \
-            --bundle release-evidence/release-manifest.sigstore.json \
+          node scripts/release-evidence.mjs stage-assets
+          node scripts/release-evidence.mjs verify-assets
+          RELEASE_MANIFEST_PATH="release-assets/release-manifest.json" \
+            node scripts/release-evidence.mjs verify-manifest
+          cosign verify-blob release-assets/release-manifest.json \
+            --bundle release-assets/release-manifest.sigstore.json \
             --certificate-identity "${WORKFLOW_IDENTITY}" \
             --certificate-oidc-issuer "${OIDC_ISSUER}"
       - name: Create or strictly resume GitHub release record
@@ -525,10 +530,8 @@ jobs:
               gh release download "${RELEASE_TAG}" \
                 --repo "${RELEASE_REPOSITORY}" \
                 --dir "${published_dir}"
-              (
-                cd "${published_dir}"
-                sha256sum --check checksums.sha256
-              )
+              RELEASE_ASSET_DIRECTORY="${published_dir}" \
+                node scripts/release-evidence.mjs verify-assets
               RELEASE_MANIFEST_PATH="${published_dir}/release-manifest.json" \
                 node scripts/release-evidence.mjs verify-manifest
               cosign verify-blob \
@@ -543,7 +546,7 @@ jobs:
             gh release upload "${RELEASE_TAG}" \
               --repo "${RELEASE_REPOSITORY}" \
               --clobber \
-              release-evidence/*
+              release-assets/*
           else
             gh release create "${RELEASE_TAG}" \
               --repo "${RELEASE_REPOSITORY}" \
@@ -551,14 +554,16 @@ jobs:
               --title "GuardianBot ${RELEASE_TAG}" \
               --generate-notes \
               --draft \
-              release-evidence/*
+              release-assets/*
           fi
           uploaded_dir="${RUNNER_TEMP}/uploaded-release-assets"
           mkdir -p "${uploaded_dir}"
           gh release download "${RELEASE_TAG}" \
             --repo "${RELEASE_REPOSITORY}" \
             --dir "${uploaded_dir}"
-          for asset in release-evidence/*; do
+          RELEASE_ASSET_DIRECTORY="${uploaded_dir}" \
+            node scripts/release-evidence.mjs verify-assets
+          for asset in release-assets/*; do
             cmp "${asset}" "${uploaded_dir}/$(basename "${asset}")"
           done
           gh release edit "${RELEASE_TAG}" \

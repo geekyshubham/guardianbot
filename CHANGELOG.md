@@ -34,7 +34,10 @@ reusable workflow commits remain immutable.
   are replaceable only while the release is an unpublished draft.
 - Release images now carry GitHub SLSA provenance, a Cosign signature, and a
   CycloneDX attestation bound to the exact registry digest. A validated,
-  keylessly signed deployment manifest hashes every verification artifact.
+  keylessly signed deployment manifest hashes every verification artifact; the
+  downloaded and OCI provenance bundles are verified independently.
+- GitHub Release publication now rejects any attachment outside its fixed,
+  checksummed asset allowlist before a draft can become public.
 - Release publication permissions are isolated from source verification, every
   action remains full-SHA pinned, and the pinned Trivy v0.70.0 image replaces
   the older release scanner following upstream supply-chain hardening.

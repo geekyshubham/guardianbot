@@ -49,7 +49,8 @@ The release workflow separates read-only verification from publication:
    is first pushed under `candidate-<run id>-<attempt>`, making failed attempts
    unambiguous and preventing a stable tag from exposing an unsigned image.
 6. GitHub creates SLSA build provenance for the digest and stores it in both the
-   repository attestation service and GHCR. The workflow verifies the exact
+   repository attestation service and GHCR. The workflow independently verifies
+   both the downloaded provenance bundle and the OCI copy against the exact
    certificate identity, source ref, source commit, repository, and
    GitHub-hosted runner claim.
 7. Cosign signs the exact digest and attaches the CycloneDX SBOM as an
@@ -64,11 +65,12 @@ The release workflow separates read-only verification from publication:
    already match that exact digest, which makes a partially completed two-tag
    publication safely resumable without overwriting either tag.
 10. The GitHub Release is created as a draft, every uploaded asset is compared
-    byte-for-byte, and only then is the release published. A resumed run may
-    replace assets only while the release is still a draft. An already published
-    release is accepted only after its checksums, manifest contents, and
-    manifest signature verify. The Actions evidence artifact is retained for
-    90 days.
+    byte-for-byte against a fixed canonical allowlist, and only then is the
+    release published. Unexpected draft or published assets fail the run. A
+    resumed run may replace canonical assets only while the release is still a
+    draft. An already published release is accepted only after its exact asset
+    set, checksums, manifest contents, and manifest signature verify. The
+    Actions evidence artifact is retained for 90 days.
 
 When a run fails before stable tag attachment, cleanup locates the GHCR package
 version by its run-scoped candidate tag and deletes it only if that candidate is

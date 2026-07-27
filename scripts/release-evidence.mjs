@@ -2,7 +2,14 @@
 
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,9 +31,20 @@ const EVIDENCE_FILES = Object.freeze({
   sbom: "sbom.cdx.json",
   githubProvenance: "github-provenance.sigstore.json",
   githubProvenanceVerification: "github-provenance-verification.json",
+  githubProvenanceOciVerification:
+    "github-provenance-oci-verification.json",
   cosignSignatureVerification: "cosign-signature-verification.json",
   cosignSbomVerification: "cosign-sbom-verification.json"
 });
+
+export const RELEASE_ASSET_FILES = Object.freeze(
+  [
+    ...Object.values(EVIDENCE_FILES),
+    "release-manifest.json",
+    "release-manifest.sigstore.json",
+    "checksums.sha256"
+  ].sort()
+);
 
 function required(value, label) {
   if (typeof value !== "string" || value.length === 0) {
@@ -269,6 +287,15 @@ export async function createReleaseManifest({
   validateVerificationArray(
     JSON.parse(
       await readFile(
+        path.join(directory, EVIDENCE_FILES.githubProvenanceOciVerification),
+        "utf8"
+      )
+    ),
+    "GitHub OCI provenance verification"
+  );
+  validateVerificationArray(
+    JSON.parse(
+      await readFile(
         path.join(directory, EVIDENCE_FILES.cosignSignatureVerification),
         "utf8"
       )
@@ -323,6 +350,77 @@ export async function createReleaseManifest({
     mode: 0o644
   });
   return manifest;
+}
+
+export async function writeReleaseChecksums(directory) {
+  const entries = [];
+  for (const name of RELEASE_ASSET_FILES) {
+    if (name === "checksums.sha256") {
+      continue;
+    }
+    const details = await stat(path.join(directory, name));
+    if (!details.isFile() || details.size === 0) {
+      throw new Error(`release asset ${name} must be a non-empty file`);
+    }
+    entries.push(`${await sha256File(path.join(directory, name))}  ${name}`);
+  }
+  await writeFile(
+    path.join(directory, "checksums.sha256"),
+    `${entries.join("\n")}\n`,
+    { mode: 0o644 }
+  );
+}
+
+export async function stageReleaseAssets(sourceDirectory, destinationDirectory) {
+  await writeReleaseChecksums(sourceDirectory);
+  await mkdir(destinationDirectory, { recursive: false });
+  for (const name of RELEASE_ASSET_FILES) {
+    await copyFile(
+      path.join(sourceDirectory, name),
+      path.join(destinationDirectory, name)
+    );
+  }
+  await verifyReleaseAssets(destinationDirectory);
+}
+
+export async function verifyReleaseAssets(directory) {
+  const actualNames = (
+    await readdir(directory, { withFileTypes: true })
+  )
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .sort();
+  const nonFiles = (
+    await readdir(directory, { withFileTypes: true })
+  ).filter((entry) => !entry.isFile());
+  if (
+    nonFiles.length > 0 ||
+    JSON.stringify(actualNames) !== JSON.stringify(RELEASE_ASSET_FILES)
+  ) {
+    throw new Error("release asset set is not exactly canonical");
+  }
+
+  const checksumLines = (
+    await readFile(path.join(directory, "checksums.sha256"), "utf8")
+  )
+    .trimEnd()
+    .split("\n");
+  const expectedNames = RELEASE_ASSET_FILES.filter(
+    (name) => name !== "checksums.sha256"
+  );
+  if (checksumLines.length !== expectedNames.length) {
+    throw new Error("release checksum set is incomplete");
+  }
+  for (let index = 0; index < checksumLines.length; index += 1) {
+    const expectedName = expectedNames[index];
+    const match = checksumLines[index].match(/^([0-9a-f]{64})  ([A-Za-z0-9._-]+)$/u);
+    if (!match || match[2] !== expectedName) {
+      throw new Error("release checksum set is not canonical");
+    }
+    if (match[1] !== (await sha256File(path.join(directory, expectedName)))) {
+      throw new Error(`release asset checksum does not match: ${expectedName}`);
+    }
+  }
 }
 
 export async function verifyReleaseManifest({
@@ -452,9 +550,24 @@ async function main() {
     process.stdout.write(`${manifest.image.reference}\n`);
     return;
   }
+  if (command === "stage-assets") {
+    await stageReleaseAssets(
+      process.env.RELEASE_EVIDENCE_DIRECTORY ?? "release-evidence",
+      process.env.RELEASE_ASSET_DIRECTORY ?? "release-assets"
+    );
+    process.stdout.write("release assets staged\n");
+    return;
+  }
+  if (command === "verify-assets") {
+    await verifyReleaseAssets(
+      process.env.RELEASE_ASSET_DIRECTORY ?? "release-assets"
+    );
+    process.stdout.write("release assets verified\n");
+    return;
+  }
   throw new Error(
     "usage: node scripts/release-evidence.mjs " +
-      "<validate|create-manifest|verify-manifest>"
+      "<validate|create-manifest|verify-manifest|stage-assets|verify-assets>"
   );
 }
 

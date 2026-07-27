@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,8 +14,11 @@ import YAML from "yaml";
 
 import {
   createReleaseManifest,
+  RELEASE_ASSET_FILES,
   RELEASE_SCHEMA,
+  stageReleaseAssets,
   validateReleaseInput,
+  verifyReleaseAssets,
   verifyReleaseManifest
 } from "./release-evidence.mjs";
 
@@ -71,6 +80,7 @@ async function evidenceFixture(directory) {
     },
     "github-provenance.sigstore.json": { mediaType: "application/json" },
     "github-provenance-verification.json": [{ verificationResult: {} }],
+    "github-provenance-oci-verification.json": [{ verificationResult: {} }],
     "cosign-signature-verification.json": [{ critical: {} }],
     "cosign-sbom-verification.json": [{ payload: "verified" }]
   };
@@ -246,6 +256,38 @@ test("manifest verification rejects evidence changed after publication", async (
   );
 });
 
+test("release assets use one exact checksummed allowlist", async () => {
+  const directory = await temporaryDirectory();
+  await evidenceFixture(directory);
+  await createReleaseManifest({
+    directory,
+    tag: TAG,
+    sha: SHA,
+    ref: REF,
+    repository: REPOSITORY,
+    image: "ghcr.io/geekyshubham/guardianbot",
+    digest: DIGEST,
+    platform: "linux/amd64",
+    workflowIdentity: IDENTITY
+  });
+  await writeFile(
+    path.join(directory, "release-manifest.sigstore.json"),
+    `${JSON.stringify({
+      mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json"
+    })}\n`
+  );
+  const assets = path.join(directory, "assets");
+  await stageReleaseAssets(directory, assets);
+  await verifyReleaseAssets(assets);
+  assert.deepEqual((await readdir(assets)).sort(), RELEASE_ASSET_FILES);
+
+  await writeFile(path.join(assets, "unexpected.txt"), "not signed\n");
+  await assert.rejects(
+    verifyReleaseAssets(assets),
+    /asset set is not exactly canonical/
+  );
+});
+
 test("release workflow pins every action and grants write permissions only to publish", async () => {
   const workflowPath = path.resolve(".github/workflows/release.yml");
   const source = await readFile(workflowPath, "utf8");
@@ -275,6 +317,14 @@ test("release workflow pins every action and grants write permissions only to pu
   assert.equal(workflow.jobs.publish_release["timeout-minutes"], 15);
   assert.deepEqual(workflow.on.push.tags, ["v*.*.*"]);
   assert.match(source, /--certificate-identity "\$\{WORKFLOW_IDENTITY\}"/);
+  assert.match(
+    source,
+    /--bundle release-evidence\/github-provenance\.sigstore\.json/
+  );
+  assert.match(
+    source,
+    /> release-evidence\/github-provenance-oci-verification\.json/
+  );
   assert.doesNotMatch(source, /certificate-identity-regexp/);
 });
 
@@ -311,6 +361,8 @@ test("stable tags are attached only after candidate trust evidence is verified",
   assert.match(source, /--deny-self-hosted-runners/);
   assert.match(source, /--draft(?:\s|$)/m);
   assert.match(source, /--draft=false/);
+  assert.match(source, /release-assets\/\*/);
+  assert.match(source, /release-evidence\.mjs verify-assets/);
   assert.match(source, /"\$\{tags\}" != "\[\\"\$\{CANDIDATE_TAG\}\\"\]"/);
 });
 
