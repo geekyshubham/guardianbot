@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-27
+
+### Fixed
+
+- Clean-checkout type checking now builds declaration output for the DefectDojo
+  and monitoring packages before checking the control plane, eliminating a
+  hidden dependency on locally cached `dist` directories.
+
 ## [0.2.2] - 2026-07-27
 
 ### Fixed

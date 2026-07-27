@@ -196,6 +196,32 @@ test("release input rejects mutable Dockerfile base images", async () => {
   );
 });
 
+test("clean type checking builds every declaration dependency first", async () => {
+  const packageDocument = JSON.parse(
+    await readFile(path.resolve("package.json"), "utf8")
+  );
+  const typecheck = packageDocument.scripts?.typecheck;
+  assert.equal(typeof typecheck, "string");
+  const workspaceTypecheck = typecheck.indexOf(
+    "npm run typecheck --workspaces --if-present"
+  );
+  assert.ok(workspaceTypecheck > 0);
+  for (const workspace of [
+    "@guardianbot/protocol",
+    "@guardianbot/core",
+    "@guardianbot/defectdojo",
+    "@guardianbot/monitoring"
+  ]) {
+    const dependencyBuild = typecheck.indexOf(
+      `npm run build --workspace ${workspace}`
+    );
+    assert.ok(
+      dependencyBuild >= 0 && dependencyBuild < workspaceTypecheck,
+      `${workspace} declarations must be built before workspace type checking`
+    );
+  }
+});
+
 test("manifest binds the exact digest to hashed release evidence", async () => {
   const directory = await temporaryDirectory();
   await evidenceFixture(directory);
