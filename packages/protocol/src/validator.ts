@@ -8,6 +8,7 @@ import addFormatsImport from "ajv-formats";
 import type {
   BackendCapabilities,
   ChangedLineRange,
+  ReviewFinding,
   ReviewRequest,
   ReviewResult
 } from "./types.js";
@@ -68,6 +69,62 @@ function locationAllowed(
   );
 }
 
+const EVIDENCE_TOKEN_PATTERN = /[A-Za-z_][A-Za-z0-9_:-]{3,}|\b\d{3,}\b/g;
+
+function evidenceTokens(value: string): Set<string> {
+  return new Set(
+    (value.match(EVIDENCE_TOKEN_PATTERN) ?? []).map((token) => token.toLowerCase())
+  );
+}
+
+function evidenceSupported(
+  finding: ReviewFinding,
+  request: ReviewRequest
+): boolean {
+  const evidence = finding.evidence.trim();
+  if (evidence.length < 12) return false;
+  const contexts = request.contexts.filter(
+    (context) => context.path === finding.path
+  );
+  if (!contexts.length) return false;
+
+  const normalizedEvidence = evidence
+    .replace(/[`"'“”‘’]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  for (const context of contexts) {
+    const normalizedContext = context.content
+      .split("\n")
+      .map((line) => line.replace(/^[ +\-]/, "").trim())
+      .join("\n")
+      .replace(/[`"'“”‘’]/g, "")
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+    if (
+      normalizedEvidence.length >= 12 &&
+      normalizedContext.includes(normalizedEvidence)
+    ) {
+      return true;
+    }
+  }
+
+  const findingTokens = evidenceTokens(evidence);
+  if (!findingTokens.size) return false;
+  for (const context of contexts) {
+    const contextTokens = evidenceTokens(context.content);
+    const overlap = [...findingTokens].filter((token) => contextTokens.has(token)).length;
+    const minimumOverlap = Math.min(2, findingTokens.size);
+    if (
+      overlap >= minimumOverlap &&
+      overlap / findingTokens.size >= 0.6
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function validateReviewResult(
   value: unknown,
   request?: ReviewRequest
@@ -95,6 +152,9 @@ export function validateReviewResult(
   }
 
   const fingerprints = new Set<string>();
+  const scannerFingerprints = new Set(
+    request.scannerEvidence.map((evidence) => evidence.fingerprint)
+  );
   for (const finding of value.findings) {
     if (
       !locationAllowed(
@@ -112,6 +172,18 @@ export function validateReviewResult(
       throw new ProtocolValidationError(
         `Duplicate finding fingerprint ${finding.fingerprint}`
       );
+    }
+    if (!evidenceSupported(finding, request)) {
+      throw new ProtocolValidationError(
+        `Finding ${finding.id} does not contain evidence grounded in its file context`
+      );
+    }
+    for (const scannerFingerprint of finding.scannerFingerprints ?? []) {
+      if (!scannerFingerprints.has(scannerFingerprint)) {
+        throw new ProtocolValidationError(
+          `Finding ${finding.id} references unknown scanner evidence ${scannerFingerprint}`
+        );
+      }
     }
     fingerprints.add(finding.fingerprint);
   }

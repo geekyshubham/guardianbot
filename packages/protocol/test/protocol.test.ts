@@ -31,7 +31,15 @@ const request: ReviewRequest = {
   promptVersion: "1",
   expectedContextIndexSha: "c".repeat(64),
   validChangedLines: [{ path: "src/auth.ts", start: 10, end: 20 }],
-  contexts: [],
+  contexts: [
+    {
+      id: "auth-diff",
+      path: "src/auth.ts",
+      kind: "diff",
+      content: "+if (!user.role) throw new Error('forbidden');",
+      sha256: "d".repeat(64)
+    }
+  ],
   scannerEvidence: [],
   rules: [],
   limits: { maxInlineComments: 8, maxInputCharacters: 100000, timeoutMs: 30000 }
@@ -62,7 +70,7 @@ const result: ReviewResult = {
       path: "src/auth.ts",
       startLine: 12,
       endLine: 12,
-      evidence: "The changed handler no longer checks the user role.",
+      evidence: "if (!user.role) throw new Error('forbidden');",
       impact: "A normal user could access an administrative operation.",
       remediation: "Restore the role check before performing the operation."
     }
@@ -94,5 +102,34 @@ test("rejects mismatched context bundle hashes when the request supplies one", (
   assert.throws(
     () => validateReviewResult(invalid, request),
     ProtocolValidationError
+  );
+});
+
+test("rejects findings whose evidence is not grounded in the matching file context", () => {
+  const invalid = structuredClone(result);
+  invalid.findings[0]!.evidence =
+    "A completely unrelated database transaction is unsafe.";
+  assert.throws(
+    () => validateReviewResult(invalid, request),
+    /does not contain evidence grounded/
+  );
+});
+
+test("rejects evidence with only one coincidental token overlap", () => {
+  const invalid = structuredClone(result);
+  invalid.findings[0]!.evidence =
+    "An unrelated unsafe database transaction could corrupt production.";
+  assert.throws(
+    () => validateReviewResult(invalid, request),
+    /does not contain evidence grounded/
+  );
+});
+
+test("rejects unknown scanner evidence references", () => {
+  const invalid = structuredClone(result);
+  invalid.findings[0]!.scannerFingerprints = ["missing-scanner-fingerprint"];
+  assert.throws(
+    () => validateReviewResult(invalid, request),
+    /references unknown scanner evidence/
   );
 });

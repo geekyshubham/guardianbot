@@ -59,7 +59,9 @@ export class GuardianReviewClient {
 
   async capabilities(): Promise<BackendCapabilities> {
     const response = await this.fetch("/v1/capabilities", { method: "GET" });
-    return validateBackendCapabilities(await response.json());
+    return validateBackendCapabilities(
+      await readJsonResponseLimited(response, 128 * 1024)
+    );
   }
 
   async review(request: ReviewRequest): Promise<ReviewResult> {
@@ -76,8 +78,9 @@ export class GuardianReviewClient {
 
     let body: unknown;
     try {
-      body = await response.json();
-    } catch {
+      body = await readJsonResponseLimited(response, 2 * 1024 * 1024);
+    } catch (error) {
+      if (error instanceof BackendError) throw error;
       throw new BackendError("invalid_output", "Backend returned invalid JSON", true);
     }
 
@@ -122,3 +125,44 @@ export class GuardianReviewClient {
   }
 }
 
+async function readJsonResponseLimited(
+  response: Response,
+  maxBytes: number
+): Promise<unknown> {
+  const declaredLength = response.headers.get("content-length");
+  if (
+    declaredLength !== null &&
+    (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxBytes)
+  ) {
+    throw new BackendError(
+      "invalid_output",
+      "Backend response exceeded the size limit",
+      false
+    );
+  }
+  if (!response.body) {
+    throw new BackendError("invalid_output", "Backend response body was missing", false);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    bytes += value.byteLength;
+    if (bytes > maxBytes) {
+      await reader.cancel();
+      throw new BackendError(
+        "invalid_output",
+        "Backend response exceeded the size limit",
+        false
+      );
+    }
+    chunks.push(value);
+  }
+
+  const body = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+  return JSON.parse(body);
+}

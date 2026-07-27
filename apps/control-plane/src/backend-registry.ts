@@ -18,6 +18,12 @@ export interface AdminBackendDefinition {
   tokenEnv?: string;
   allowedClassifications: DataClassification[];
   timeoutMs?: number;
+  /**
+   * Allows an authenticated cleartext hop only to a private-network address.
+   * This is an administrative deployment setting for platforms such as
+   * DigitalOcean App Platform; repository configuration cannot set it.
+   */
+  allowPrivateHttp?: boolean;
 }
 
 export interface AdminBackendRegistryConfig {
@@ -59,6 +65,36 @@ function parseClassification(value: unknown, label: string): DataClassification 
   throw new Error(`${label} contains an invalid data classification`);
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1"
+  );
+}
+
+function isPrivateNetworkHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (isLoopbackHost(normalized)) return true;
+  if (/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(normalized)) {
+    return true;
+  }
+  if (normalized.endsWith(".internal")) return true;
+  const octets = normalized.split(".").map(Number);
+  if (
+    octets.length === 4 &&
+    octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+  ) {
+    return (
+      octets[0] === 10 ||
+      (octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31) ||
+      (octets[0] === 192 && octets[1] === 168)
+    );
+  }
+  return /^f[cd][0-9a-f]:/i.test(normalized);
+}
+
 export function parseAdminBackendRegistry(
   input: string | AdminBackendRegistryConfig,
   environment: AdminEnvironment = process.env
@@ -87,7 +123,14 @@ export function parseAdminBackendRegistry(
     if (!isRecord(rawDefinition)) throw new Error(`backend ${alias} must be an object`);
     assertOnlyKeys(
       rawDefinition,
-      ["endpoint", "token", "tokenEnv", "allowedClassifications", "timeoutMs"],
+      [
+        "endpoint",
+        "token",
+        "tokenEnv",
+        "allowedClassifications",
+        "timeoutMs",
+        "allowPrivateHttp"
+      ],
       `backend ${alias}`
     );
     if (typeof rawDefinition.endpoint !== "string") {
@@ -107,15 +150,22 @@ export function parseAdminBackendRegistry(
         `backend ${alias} endpoint must not contain credentials or a fragment`
       );
     }
-    const loopback =
-      endpoint.hostname === "localhost" ||
-      endpoint.hostname === "127.0.0.1" ||
-      endpoint.hostname === "[::1]" ||
-      endpoint.hostname === "::1";
+    const loopback = isLoopbackHost(endpoint.hostname);
+    if (
+      rawDefinition.allowPrivateHttp !== undefined &&
+      typeof rawDefinition.allowPrivateHttp !== "boolean"
+    ) {
+      throw new Error(`backend ${alias} allowPrivateHttp must be a boolean`);
+    }
     if (endpoint.protocol !== "https:" && !loopback) {
-      throw new Error(
-        `backend ${alias} endpoint must use HTTPS outside explicit loopback development`
-      );
+      if (
+        rawDefinition.allowPrivateHttp !== true ||
+        !isPrivateNetworkHost(endpoint.hostname)
+      ) {
+        throw new Error(
+          `backend ${alias} endpoint must use HTTPS outside explicit authenticated private-network mode`
+        );
+      }
     }
     if (rawDefinition.token !== undefined && typeof rawDefinition.token !== "string") {
       throw new Error(`backend ${alias} token must be a string`);
@@ -162,11 +212,20 @@ export function parseAdminBackendRegistry(
     if (rawDefinition.tokenEnv && !token) {
       throw new Error(`backend ${alias} token environment variable is not set`);
     }
+    if (endpoint.protocol === "http:" && !loopback && !token) {
+      throw new Error(
+        `backend ${alias} private HTTP endpoint requires a bearer token`
+      );
+    }
     backends[alias] = {
       endpoint: endpoint.toString(),
       token,
       allowedClassifications,
-      timeoutMs
+      timeoutMs,
+      allowPrivateHttp:
+        endpoint.protocol === "http:" && !loopback
+          ? true
+          : undefined
     };
   }
 

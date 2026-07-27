@@ -1,0 +1,45 @@
+{
+  "protocolVersion": "guardian.review.v1",
+  "limits": {
+    "requestBodyBytes": 2097152,
+    "responseBodyBytes": 1048576,
+    "startupProbeTimeoutMs": 10000
+  },
+  "bindings": {
+    "openai-primary": {
+      "adapter": "openai-responses",
+      "baseUrl": "https://api.openai.com",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "allowedClassifications": [
+        "public",
+        "private"
+      ],
+      "retention": "bounded",
+      "usageReporting": true,
+      "timeoutMs": 90000,
+      "maxInputCharacters": 400000,
+      "maxOutputTokens": 12000,
+      "profileModels": {
+        "routine-review": "gpt-5.6-terra",
+        "high-risk-review": "gpt-5.6-sol",
+        "benchmark-review": "gpt-5.6-sol"
+      },
+      "profileReasoningEfforts": {
+        "routine-review": "medium",
+        "high-risk-review": "medium",
+        "benchmark-review": "medium"
+      }
+    }
+  },
+  "routes": {
+    "routine-review": {
+      "binding": "openai-primary"
+    },
+    "high-risk-review": {
+      "binding": "openai-primary"
+    },
+    "benchmark-review": {
+      "binding": "openai-primary"
+    }
+  }
+}

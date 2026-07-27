@@ -1,0 +1,15 @@
+{
+  "name": "@guardianbot/model-bridge",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "node ../../node_modules/tsx/dist/cli.mjs --test test/**/*.test.ts",
+    "typecheck": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@guardianbot/protocol": "0.1.1"
+  }
+}

@@ -286,7 +286,9 @@ function createResult(
         path,
         startLine,
         endLine: startLine,
-        evidence: "evidence",
+        evidence:
+          request.contexts.find((context) => context.path === path)?.content.slice(0, 500) ??
+          `Changed file ${path} contains an unsafe operation.`,
         impact: "impact",
         remediation: "fix it",
         ...(options.suggestion ? { suggestion: options.suggestion } : {})

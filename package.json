@@ -13,7 +13,8 @@
     "packages/defectdojo",
     "packages/monitoring",
     "packages/guardianctl",
-    "apps/control-plane"
+    "apps/control-plane",
+    "apps/model-bridge"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
