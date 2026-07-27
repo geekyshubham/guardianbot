@@ -6,14 +6,15 @@ Last verified: 2026-07-27
 | Capability | Status | Scope | Evidence | Known limitation / failure behavior |
 | --- | --- | --- | --- | --- |
 | Strict `guardian.review.v1` validation | Working | Any conforming bridge | `packages/protocol/test/protocol.test.ts` | Invalid output is discarded |
+| Documentation quality gates | Working | Tracked repository documentation | `scripts/check-docs.test.mjs` | External reachability is opt-in; normal CI validates URL structure without live network calls |
 | Repository detection/config generation | Working | Python, Node, Swift, Ruby, Docker, docs | `packages/core/test/core.test.ts` | Heuristic detection, no command execution |
-| `guardianctl onboard` generation | Working | GitHub repositories | [12 generated onboarding PRs](https://github.com/pulls?q=is%3Apr+author%3Ageekyshubham+%22onboard+GuardianBot%22) | Ten merged normally; two held by pre-existing CI |
+| `guardianctl onboard` generation | Working | GitHub repositories | [12 generated onboarding PRs](https://github.com/search?q=is%3Apr+author%3Ageekyshubham+%22onboard+GuardianBot%22&type=pullrequests) | Ten merged normally; two held by pre-existing CI |
 | Generated-caller drift detection | Working | Onboarded repositories | `packages/guardianctl/test/cli.test.ts` | `doctor` requires a reachable latest workflow run |
 | App repository discovery/onboarding issue | Beta | GitHub App installations | `apps/control-plane/src/service.ts` | Needs live App verification |
 | Advisory PR review placeholder/update | Beta | Ready PRs | `apps/control-plane/test/service.test.ts` | Inline review comments not yet posted |
 | Incremental stable-fingerprint lifecycle | Partial | PR review records | Store and protocol tests | Resolution/supersession UI planned |
 | Semgrep/Trivy reusable gate | Beta | Code/dependency repositories | Ten default-branch runs passed within 35 seconds of merge | Enforce mode now requires a checked-in reviewed baseline; automatic historical reconciliation is still partial |
-| Image build/runtime/Trivy/SBOM | Beta | Docker repositories | [AstraNull run 30219565321](https://github.com/Geekyshubham/AstraNull/actions/runs/30219565321), [RouteLens run 30219565657](https://github.com/Geekyshubham/RouteLens/actions/runs/30219565657) | Runtime and SBOM verified; both correctly blocked before promotion by Critical findings |
+| Image build/runtime/Trivy/SBOM | Beta | Docker repositories | [AstraNull run 30219565321](https://github.com/Geekyshubham/AstraNull/actions/runs/30219565321), RouteLens run 30219565657 (not publicly reachable) | Runtime and SBOM verified; both correctly blocked before promotion by Critical findings |
 | Cosign image promotion | Beta | Critical-clean default-branch images | [GuardianBot release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Verified for GuardianBot; RouteLens/AstraNull remain blocked |
 | DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Fails closed without an authenticated session cookie; DefectDojo import remains external to the reusable workflow |
 | DefectDojo reimport client | Beta | Self-hosted on DigitalOcean | core typecheck/tests | Full reconciliation scheduler planned |

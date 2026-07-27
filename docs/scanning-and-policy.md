@@ -16,10 +16,11 @@ Enforcement may block:
 
 Licenses, historical backlog, and AI findings stay report-only during the PoC.
 Suppressions require fingerprint, owner, reason, ticket, and expiry. Expired
-suppressions are invalid; risk acceptance never alters source scanner evidence.
+suppressions are ignored; risk acceptance never alters source scanner evidence.
 
 `guardianctl enforce` now refuses to create a required-check ruleset until
 `scanners.mode` is already `enforce`, `guardianctl doctor` is clean, and the
 baseline document is present and non-empty. The current reusable workflow still
-uses a checked-in baseline snapshot rather than full base/head historical
-reconciliation.
+omits full historical baseline reconciliation, but pull requests read their
+configuration and baseline from the base commit so they cannot weaken their own
+gate.

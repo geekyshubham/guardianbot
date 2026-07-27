@@ -7,6 +7,9 @@ reusable workflow commits remain immutable.
 
 ### Added
 
+- Documentation quality gates for local links and anchors, schema-backed config
+  examples and references, OpenAPI examples, Mermaid SVG rendering, CLI help
+  smoke tests, and release-note diff policy.
 - Exact generated-caller drift detection in `guardianctl doctor`.
 - Runner-generated ephemeral image-smoke environment values, referenced by key
   without storing their values in consumer repositories.

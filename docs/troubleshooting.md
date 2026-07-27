@@ -14,5 +14,9 @@
 - Import failure: preserve artifacts, repair DefectDojo reachability/token on the
   control plane, and reimport the same test to retain deduplication.
 - No image coverage: this is `not applicable` unless `image` is configured.
+- DAST stops before scanning: confirm the `guardianbot-dast` environment permits
+  the run, provides the ephemeral session cookie, returns 401/403 for the
+  unauthenticated assertion and 2xx after authentication, and uses a duration
+  between 5 and 45 minutes.
 
 See the focused [runbooks](runbooks/README.md).
