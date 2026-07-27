@@ -9,6 +9,10 @@ missing SBOM fail the job.
 The reusable job can create disposable PostgreSQL and Redis containers on an
 isolated Docker network, validate a non-secret runtime environment file, and run a
 declarative migration command inside the exact candidate image before smoke tests.
+For pull requests, the reusable workflow keeps validation in a read-only job with
+no package-publish or OIDC permissions. Default-branch promotion is a separate job
+that restores the exact validated image artifact before pushing, signing, and
+attesting it.
 
 When promotion is enabled, GitHub OIDC keylessly signs the pushed GHCR digest and
 attaches the SBOM attestation. Verification pins the repository workflow identity

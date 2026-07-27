@@ -5,8 +5,13 @@ on:
     inputs:
       target-origin: { required: true, type: string }
       openapi-url: { required: true, type: string }
+      openapi-allowlist: { required: false, type: string, default: "" }
       expected-origin: { required: true, type: string }
+      session-assertion-path: { required: true, type: string }
       minutes: { required: false, type: number, default: 45 }
+    secrets:
+      session_cookie:
+        required: false
 
 permissions:
   contents: read
@@ -16,30 +21,107 @@ jobs:
     name: authenticated staging DAST
     runs-on: ubuntu-24.04
     timeout-minutes: 55
+    permissions:
+      contents: read
     steps:
-      - name: Enforce exact staging allowlist
+      - name: Resolve and enforce exact staging contract
+        id: contract
+        env:
+          TARGET_ORIGIN: ${{ inputs.target-origin }}
+          EXPECTED_ORIGIN: ${{ inputs.expected-origin }}
+          OPENAPI_URL: ${{ inputs.openapi-url }}
+          OPENAPI_ALLOWLIST: ${{ inputs.openapi-allowlist }}
+          SESSION_ASSERTION_PATH: ${{ inputs.session-assertion-path }}
         shell: bash
         run: |
-          test "${{ inputs.target-origin }}" = "${{ inputs.expected-origin }}"
-          case "${{ inputs.target-origin }}" in
-            https://*) ;;
-            *) echo "Only HTTPS staging targets are permitted"; exit 1 ;;
-          esac
-          case "${{ inputs.target-origin }}" in
-            *localhost*|*127.0.0.1*|*0.0.0.0*) echo "Invalid remote target"; exit 1 ;;
-          esac
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const invalidRemoteHost = (hostname) =>
+            /(^localhost$)|(^127\.)|(^0\.0\.0\.0$)|(^169\.254\.)|(^::1$)/i.test(hostname);
+
+          const target = new URL(process.env.TARGET_ORIGIN);
+          const expected = new URL(process.env.EXPECTED_ORIGIN);
+          if (target.href !== expected.href) {
+            throw new Error("target-origin must match expected-origin exactly");
+          }
+          if (target.protocol !== "https:") {
+            throw new Error("Only HTTPS staging targets are permitted");
+          }
+          if (invalidRemoteHost(target.hostname)) {
+            throw new Error("Invalid remote target");
+          }
+
+          const sessionAssertionPath = process.env.SESSION_ASSERTION_PATH;
+          if (!sessionAssertionPath.startsWith("/")) {
+            throw new Error("session-assertion-path must begin with '/'");
+          }
+
+          const allowlist = new Set(
+            (process.env.OPENAPI_ALLOWLIST || "")
+              .split(/[\n,]/)
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+          );
+          const resolvedOpenapi = new URL(process.env.OPENAPI_URL, target);
+          if (resolvedOpenapi.protocol !== "https:") {
+            throw new Error("Resolved OpenAPI URL must use HTTPS");
+          }
+          if (invalidRemoteHost(resolvedOpenapi.hostname)) {
+            throw new Error("Resolved OpenAPI URL targets an invalid host");
+          }
+          const sameOrigin = resolvedOpenapi.origin === target.origin;
+          const allowlisted = allowlist.has(resolvedOpenapi.href);
+          if (!sameOrigin && !allowlisted) {
+            throw new Error("OpenAPI URL must be same-origin with the target or explicitly allowlisted");
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `resolved-openapi=${resolvedOpenapi.href}\n`);
+          NODE
+
+      - name: Require authenticated session assertion
+        env:
+          GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
+        shell: bash
+        run: |
+          [ -n "$GUARDIANBOT_SESSION_COOKIE" ] || {
+            echo "Authenticated DAST requires session_cookie."
+            exit 1
+          }
+          curl --fail --silent --show-error \
+            -H "Cookie: $GUARDIANBOT_SESSION_COOKIE" \
+            "${{ inputs.target-origin }}${{ inputs.session-assertion-path }}" >/dev/null
+
       - name: Run ZAP API scan
+        env:
+          GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
         run: |
           mkdir -p guardianbot-dast-evidence
+          python3 - <<'PY'
+          import os
+          import shlex
+          options = [
+            "-config", "replacer.full_list(0).description=guardianbot-session-cookie",
+            "-config", "replacer.full_list(0).enabled=true",
+            "-config", "replacer.full_list(0).matchtype=REQ_HEADER",
+            "-config", "replacer.full_list(0).matchstr=Cookie",
+            "-config", "replacer.full_list(0).regex=false",
+            "-config", f"replacer.full_list(0).replacement={os.environ['GUARDIANBOT_SESSION_COOKIE']}",
+          ]
+          with open("guardianbot-dast-evidence/zap-options.txt", "w", encoding="utf-8") as handle:
+            handle.write(" ".join(shlex.quote(option) for option in options))
+          PY
           docker run --rm -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
-            ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py \
-            -t "${{ inputs.openapi-url }}" -f openapi \
+            ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 zap-api-scan.py \
+            -t "${{ steps.contract.outputs.resolved-openapi }}" -f openapi \
             -O "${{ inputs.target-origin }}" \
-            -J zap.json -r zap.html -m "${{ inputs.minutes }}"
+            -J zap.json -r zap.html -m "${{ inputs.minutes }}" \
+            -z "$(cat guardianbot-dast-evidence/zap-options.txt)"
+
       - name: Upload DAST evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: guardianbot-dast-evidence-${{ github.run_id }}
+          name: guardianbot-dast-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: guardianbot-dast-evidence/
           if-no-files-found: error

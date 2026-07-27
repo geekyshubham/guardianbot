@@ -84,6 +84,20 @@ export function validateGuardianConfig(config: GuardianConfig): string[] {
     if (url && url.protocol !== "https:") {
       errors.push("dast.allowedOrigin must use HTTPS");
     }
+    if (!config.dast.sessionAssertionPath.startsWith("/")) {
+      errors.push("dast.sessionAssertionPath must begin with '/'");
+    }
+    try {
+      const openapiUrl = new URL(config.dast.openapi, url);
+      if (openapiUrl.protocol !== "https:") {
+        errors.push("dast.openapi must resolve to HTTPS");
+      }
+      if (url && new URL(config.dast.openapi, url).origin !== url.origin) {
+        errors.push("dast.openapi must resolve to the same origin as dast.allowedOrigin");
+      }
+    } catch {
+      errors.push("dast.openapi must be a relative path or absolute URL");
+    }
   }
   for (const key of config.image?.ephemeralEnvironment ?? []) {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {

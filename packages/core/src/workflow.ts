@@ -17,6 +17,11 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
   const imageJob = image ? `
   guardianbot-image:
     name: guardianbot/image-security
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     uses: ${imageReference}
     with:
       dockerfile: ${JSON.stringify(image.dockerfile)}
@@ -47,15 +52,14 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  actions: read
-  packages: write
-  id-token: write
-  attestations: write
 
 jobs:
   guardianbot-security-gate:
     name: guardianbot/security-gate
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     uses: ${reference}
     with:
       config-path: .guardianbot/config.yml

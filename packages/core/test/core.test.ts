@@ -55,6 +55,8 @@ test("generates an immutable reusable workflow caller", () => {
   });
   assert.match(workflow, new RegExp(`@${"b".repeat(40)}`));
   assert.match(workflow, /reusable-security\.yml/);
+  assert.doesNotMatch(workflow, /permissions:\n  contents: read\n  security-events: write\n  actions: read\n  packages: write/);
+  assert.match(workflow, /guardianbot-security-gate:[\s\S]*permissions:\n      contents: read\n      security-events: write\n      actions: read/);
 });
 
 test("generates ephemeral runtime key references without repository-side values", () => {
@@ -74,6 +76,36 @@ test("generates ephemeral runtime key references without repository-side values"
   });
   assert.match(workflow, /ephemeral-env-keys: "APPLICATION_SMOKE_SECRET"/);
   assert.doesNotMatch(workflow, /APPLICATION_SMOKE_SECRET=/);
+  assert.match(workflow, /guardianbot-image:[\s\S]*permissions:\n      contents: read\n      packages: write\n      id-token: write\n      attestations: write/);
+});
+
+test("rejects DAST configurations that escape the allowed origin", () => {
+  const errors = validateGuardianConfig({
+    schemaVersion: "1.0.0",
+    workflowVersion: "a".repeat(40),
+    repository: { defaultBranch: "main", releaseBranches: ["main"], languages: ["TypeScript"] },
+    review: {
+      automatic: true,
+      drafts: "manual",
+      incremental: true,
+      maxInlineComments: 8,
+      categories: ["security"],
+      highRiskPaths: [],
+      contextDocuments: [],
+      excludedPaths: []
+    },
+    scanners: { mode: "report-only", semgrep: true, trivy: true, suppressions: [] },
+    dast: {
+      allowedOrigin: "https://staging.example.com",
+      openapi: "https://schemas.example.net/openapi.json",
+      authenticationProfile: "staging",
+      sessionAssertionPath: "api/session"
+    }
+  });
+  assert.deepEqual(errors, [
+    "dast.sessionAssertionPath must begin with '/'",
+    "dast.openapi must resolve to the same origin as dast.allowedOrigin"
+  ]);
 });
 
 test("normalizes and gates deterministic findings", () => {

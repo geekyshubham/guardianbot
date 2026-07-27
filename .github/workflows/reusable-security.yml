@@ -7,6 +7,11 @@ on:
         description: Versioned repository configuration
         required: true
         type: string
+      baseline-path:
+        description: Baseline fingerprint document required before enforce mode
+        required: false
+        default: .guardianbot/baseline.json
+        type: string
 
 permissions:
   contents: read
@@ -18,37 +23,45 @@ jobs:
     name: deterministic scanners
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - name: Check out reviewed repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate GuardianBot configuration
         id: config
         shell: bash
         run: |
+          mkdir -p guardianbot-evidence
           test -f "${{ inputs.config-path }}"
-          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6 \
+          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '.schemaVersion == "1.0.0" and (.workflowVersion | test("^[a-f0-9]{40}$"))' \
             "/work/${{ inputs.config-path }}" | grep -qx true
-          mode="$(docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6 \
+          mode="$(docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '.scanners.mode' "/work/${{ inputs.config-path }}")"
           case "$mode" in advisory|report-only|enforce) ;; *) exit 1 ;; esac
+          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+            -o=json '.scanners.suppressions // [] | map(.fingerprint)' \
+            "/work/${{ inputs.config-path }}" > guardianbot-evidence/suppressions.json
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Semgrep
         shell: bash
         run: |
-          mkdir -p guardianbot-evidence
-          docker run --rm -v "$PWD:/src" semgrep/semgrep:1.130.0 \
+          docker run --rm -v "$PWD:/src" semgrep/semgrep:1.130.0@sha256:7674a72a8bd5beaa4591b728e5950c04c58b27b82803901f36e7f9d70b828906 \
             semgrep scan --config auto --json --output /src/guardianbot-evidence/semgrep.json \
             /src || printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/semgrep.json
 
       - name: Trivy filesystem, dependencies, configuration, licenses, and secrets
         shell: bash
         run: |
-          docker run --rm -v "$PWD:/workspace" aquasec/trivy:0.64.1 \
+          docker run --rm -v "$PWD:/workspace" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
             fs --format json --scanners vuln,misconfig,secret,license \
             --output /workspace/guardianbot-evidence/trivy.json /workspace \
             || printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/trivy.json
@@ -57,39 +70,175 @@ jobs:
         id: gate
         env:
           SCANNER_MODE: ${{ steps.config.outputs.mode }}
+          BASELINE_PATH: ${{ inputs.baseline-path }}
         shell: bash
         run: |
           node <<'NODE'
-          const fs = require("fs");
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const stableFingerprint = (parts) =>
+            crypto.createHash("sha256").update(parts.join("\u241f")).digest("hex");
+
+          const semgrepSeverity = {
+            ERROR: "high",
+            WARNING: "medium",
+            INFO: "info",
+            CRITICAL: "critical",
+            HIGH: "high",
+            MEDIUM: "medium",
+            LOW: "low"
+          };
+
+          const trivySeverity = {
+            CRITICAL: "critical",
+            HIGH: "high",
+            MEDIUM: "medium",
+            LOW: "low",
+            UNKNOWN: "info"
+          };
+
+          const normalizeSemgrep = (report) =>
+            (report.results || []).map((entry) => {
+              const extra = entry.extra || {};
+              const start = entry.start || {};
+              const ruleId = String(entry.check_id || "unknown");
+              const findingPath = String(entry.path || "");
+              const line = Number(start.line || 1);
+              const title = String(extra.message || ruleId);
+              return {
+                source: "semgrep",
+                fingerprint: stableFingerprint(["semgrep", ruleId, findingPath, line, title]),
+                severity: semgrepSeverity[String(extra.severity || "WARNING").toUpperCase()] || "medium",
+                ruleId,
+                path: findingPath,
+                line,
+                title
+              };
+            });
+
+          const normalizeTrivy = (report) => {
+            const findings = [];
+            for (const result of report.Results || []) {
+              const target = String(result.Target || "");
+              for (const vulnerability of result.Vulnerabilities || []) {
+                const ruleId = String(vulnerability.VulnerabilityID || "unknown");
+                const packageName = String(vulnerability.PkgName || "");
+                const installedVersion = String(vulnerability.InstalledVersion || "");
+                findings.push({
+                  source: "trivy",
+                  fingerprint: stableFingerprint([
+                    "trivy",
+                    ruleId,
+                    packageName,
+                    installedVersion,
+                    target
+                  ]),
+                  severity: trivySeverity[String(vulnerability.Severity || "UNKNOWN").toUpperCase()] || "info",
+                  ruleId,
+                  path: target,
+                  packageName,
+                  fixedVersion: String(vulnerability.FixedVersion || "")
+                });
+              }
+            }
+            return findings;
+          };
+
+          const baselineDocument = (raw) => {
+            if (Array.isArray(raw)) return raw;
+            if (raw && typeof raw === "object" && Array.isArray(raw.fingerprints)) return raw.fingerprints;
+            throw new Error("baseline must be an array or an object with a fingerprints array");
+          };
+
           const semgrep = JSON.parse(fs.readFileSync("guardianbot-evidence/semgrep.json", "utf8"));
           const trivy = JSON.parse(fs.readFileSync("guardianbot-evidence/trivy.json", "utf8"));
           const executionFailures = [];
-          const policyFindings = [];
           if (semgrep.scanner_error) executionFailures.push("Semgrep failed or evidence is missing");
           if (trivy.scanner_error) executionFailures.push("Trivy failed or evidence is missing");
-          for (const finding of semgrep.results || []) {
-            const severity = String(finding.extra?.severity || "").toUpperCase();
-            if (severity === "ERROR" || severity === "CRITICAL" || severity === "HIGH") {
-              policyFindings.push(`Semgrep ${finding.check_id} at ${finding.path}:${finding.start?.line}`);
-            }
-          }
-          for (const result of trivy.Results || []) {
-            for (const finding of result.Vulnerabilities || []) {
-              if (["CRITICAL", "HIGH"].includes(finding.Severity) && finding.FixedVersion) {
-                policyFindings.push(`Trivy ${finding.VulnerabilityID} in ${finding.PkgName}; fixed by ${finding.FixedVersion}`);
+
+          const suppressions = new Set(
+            JSON.parse(fs.readFileSync("guardianbot-evidence/suppressions.json", "utf8")).map(String)
+          );
+
+          let baselineFingerprints = new Set();
+          if (process.env.SCANNER_MODE === "enforce") {
+            const baselinePath = path.resolve(process.env.BASELINE_PATH);
+            if (!fs.existsSync(baselinePath)) {
+              executionFailures.push(`Baseline is required for enforce mode: ${process.env.BASELINE_PATH}`);
+            } else {
+              try {
+                baselineFingerprints = new Set(baselineDocument(JSON.parse(fs.readFileSync(baselinePath, "utf8"))).map(String));
+                if (baselineFingerprints.size === 0) {
+                  executionFailures.push(`Baseline is empty: ${process.env.BASELINE_PATH}`);
+                }
+              } catch (error) {
+                executionFailures.push(`Invalid baseline document at ${process.env.BASELINE_PATH}: ${error.message}`);
               }
             }
           }
+
+          const findings = [...normalizeSemgrep(semgrep), ...normalizeTrivy(trivy)];
+          const observed = findings.filter(
+            (finding) => !baselineFingerprints.has(finding.fingerprint) && !suppressions.has(finding.fingerprint)
+          );
+          const policyFindings = observed.filter((finding) => {
+            if (finding.source === "semgrep") {
+              return finding.severity === "critical" || finding.severity === "high";
+            }
+            if (finding.source === "trivy") {
+              return (
+                (finding.severity === "critical" || finding.severity === "high") &&
+                Boolean(finding.fixedVersion)
+              );
+            }
+            return false;
+          });
+
           const enforcedFindings = process.env.SCANNER_MODE === "enforce" ? policyFindings : [];
-          const failures = [...executionFailures, ...enforcedFindings];
+          const failures = [...executionFailures, ...enforcedFindings.map((finding) => {
+            if (finding.source === "semgrep") {
+              return `Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
+            }
+            return `Trivy ${finding.ruleId} in ${finding.packageName}; fixed by ${finding.fixedVersion}`;
+          })];
+
           fs.writeFileSync("guardianbot-evidence/gate.json", JSON.stringify({
-            schemaVersion: "1.0.0", mode: process.env.SCANNER_MODE,
-            passed: failures.length === 0, failures, policyFindings
+            schemaVersion: "1.0.0",
+            mode: process.env.SCANNER_MODE,
+            baselineRequired: process.env.SCANNER_MODE === "enforce",
+            baselineCount: baselineFingerprints.size,
+            passed: failures.length === 0,
+            failures,
+            policyFindings
           }, null, 2));
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-            `## GuardianBot security gate\n\nMode: **${process.env.SCANNER_MODE}**\n\n` +
-            `${executionFailures.map(x => `- ❌ ${x}`).join("\n")}\n` +
-            `${policyFindings.map(x => `- ${process.env.SCANNER_MODE === "enforce" ? "❌" : "⚠️"} ${x}`).join("\n") || "- ✅ No qualifying findings"}\n`);
+
+          const summaryLines = [
+            "## GuardianBot security gate",
+            "",
+            `Mode: **${process.env.SCANNER_MODE}**`,
+            "",
+            `Baseline fingerprints: **${baselineFingerprints.size}**`
+          ];
+          if (executionFailures.length) {
+            summaryLines.push("", ...executionFailures.map((item) => `- ❌ ${item}`));
+          }
+          if (policyFindings.length) {
+            summaryLines.push(
+              "",
+              ...policyFindings.map((finding) => {
+                const prefix = process.env.SCANNER_MODE === "enforce" ? "❌" : "⚠️";
+                if (finding.source === "semgrep") {
+                  return `- ${prefix} Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
+                }
+                return `- ${prefix} Trivy ${finding.ruleId} in ${finding.packageName}; fixed by ${finding.fixedVersion}`;
+              })
+            );
+          } else if (!executionFailures.length) {
+            summaryLines.push("", "- ✅ No qualifying findings");
+          }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summaryLines.join("\n")}\n`);
           if (failures.length) process.exitCode = 1;
           NODE
 

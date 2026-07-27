@@ -12,10 +12,10 @@ Last verified: 2026-07-27
 | App repository discovery/onboarding issue | Beta | GitHub App installations | `apps/control-plane/src/service.ts` | Needs live App verification |
 | Advisory PR review placeholder/update | Beta | Ready PRs | `apps/control-plane/test/service.test.ts` | Inline review comments not yet posted |
 | Incremental stable-fingerprint lifecycle | Partial | PR review records | Store and protocol tests | Resolution/supersession UI planned |
-| Semgrep/Trivy reusable gate | Beta | Code/dependency repositories | Ten default-branch runs passed within 35 seconds of merge | Baseline diff reconciliation is partial |
+| Semgrep/Trivy reusable gate | Beta | Code/dependency repositories | Ten default-branch runs passed within 35 seconds of merge | Enforce mode now requires a checked-in reviewed baseline; automatic historical reconciliation is still partial |
 | Image build/runtime/Trivy/SBOM | Beta | Docker repositories | [AstraNull run 30219565321](https://github.com/Geekyshubham/AstraNull/actions/runs/30219565321), [RouteLens run 30219565657](https://github.com/Geekyshubham/RouteLens/actions/runs/30219565657) | Runtime and SBOM verified; both correctly blocked before promotion by Critical findings |
 | Cosign image promotion | Beta | Critical-clean default-branch images | [GuardianBot release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Verified for GuardianBot; RouteLens/AstraNull remain blocked |
-| DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Authentication injection/import automation partial |
+| DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Fails closed without an authenticated session cookie; DefectDojo import remains external to the reusable workflow |
 | DefectDojo reimport client | Beta | Self-hosted on DigitalOcean | core typecheck/tests | Full reconciliation scheduler planned |
 | Local semantic index | Partial | Text/symbol fallback | core tests | Tree-sitter and pgvector persistence planned |
 | Continuous monitoring | Partial | Ten onboarded repositories | generated nightly workflow | Digest rescans/15-minute smoke scheduler planned |

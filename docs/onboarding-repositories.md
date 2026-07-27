@@ -31,10 +31,12 @@ guardianctl offboard OWNER/REPOSITORY
 ```
 
 `doctor` validates configuration, the immutable workflow pin, the complete generated
-caller against the declarative configuration, and the latest expected run. A manual
-caller edit or a configuration change that was not regenerated is reported as drift;
-`guardianctl upgrade OWNER/REPOSITORY` regenerates the caller.
-`enforce` refuses to act until diagnostics are healthy and then creates the
+caller against the declarative configuration, the latest expected run, and the
+baseline artifact required for `enforce` mode. A manual caller edit or a
+configuration change that was not regenerated is reported as drift;
+`guardianctl upgrade OWNER/REPOSITORY` regenerates the caller. `enforce` refuses
+to act until diagnostics are healthy, `scanners.mode` is already `enforce`, and a
+reviewed `.guardianbot/baseline.json` is present; only then does it create the
 required-check ruleset using operator authorization. `upgrade` opens a pin update
 PR. `offboard` opens a deletion PR and deliberately retains central audit evidence.
 

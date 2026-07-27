@@ -70,6 +70,8 @@ Merge the generated draft PR to start the report-only observation period. After 
 healthy baseline:
 
 ```sh
+edit .guardianbot/config.yml   # set scanners.mode: enforce
+edit .guardianbot/baseline.json
 guardianctl enforce OWNER/REPOSITORY
 ```
 

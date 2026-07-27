@@ -155,6 +155,23 @@ export interface DoctorResult {
   checks: Array<{ name: string; ok: boolean; detail: string }>;
 }
 
+function parseBaselineDocument(source: string): string[] {
+  const value = JSON.parse(source) as unknown;
+  const fingerprints = Array.isArray(value)
+    ? value
+    : value && typeof value === "object" && Array.isArray((value as { fingerprints?: unknown }).fingerprints)
+      ? (value as { fingerprints: unknown[] }).fingerprints
+      : null;
+  if (!fingerprints) {
+    throw new Error("baseline must be an array or an object with a fingerprints array");
+  }
+  const normalized = fingerprints.map((fingerprint) => String(fingerprint).trim()).filter(Boolean);
+  if (!normalized.length) {
+    throw new Error("baseline must contain at least one fingerprint");
+  }
+  return normalized;
+}
+
 export function callerWorkflowMatches(
   actual: string,
   expected: string
@@ -209,6 +226,39 @@ export async function doctor(
       ok: matches,
       detail: matches ? "matches configuration" : "drift detected; run guardianctl upgrade"
     });
+  }
+  if (parsedConfig) {
+    if (parsedConfig.scanners.mode !== "enforce") {
+      checks.push({
+        name: "baseline",
+        ok: true,
+        detail: "not required until scanners.mode is enforce"
+      });
+    } else {
+      const baselineFile = await context.github.getFile(owner, repo, ".guardianbot/baseline.json", metadata.default_branch);
+      if (!baselineFile) {
+        checks.push({
+          name: "baseline",
+          ok: false,
+          detail: "missing .guardianbot/baseline.json required for enforce mode"
+        });
+      } else {
+        try {
+          const fingerprints = parseBaselineDocument(baselineFile.content);
+          checks.push({
+            name: "baseline",
+            ok: true,
+            detail: `${fingerprints.length} fingerprints`
+          });
+        } catch (error) {
+          checks.push({
+            name: "baseline",
+            ok: false,
+            detail: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+    }
   }
   if (workflow) {
     try {
@@ -314,9 +364,16 @@ export async function enforce(
   context: CommandContext,
   repository: string
 ): Promise<{ dryRun: boolean; ruleset: unknown }> {
+  const { owner, repo } = parseRepository(repository);
+  const metadata = await context.github.getRepository(owner, repo);
+  const configFile = await context.github.getFile(owner, repo, ".guardianbot/config.yml", metadata.default_branch);
+  if (!configFile) throw new Error("Repository is not onboarded");
+  const config = parseGuardianConfig(configFile.content);
+  if (config.scanners.mode !== "enforce") {
+    throw new Error("Set scanners.mode to enforce and commit a reviewed baseline before enabling required checks");
+  }
   const diagnosis = await doctor(context, repository);
   if (diagnosis.status !== "ready") throw new Error("Cannot enforce until guardianctl doctor is ready");
-  const { owner, repo } = parseRepository(repository);
   const body = {
     name: "GuardianBot security gate",
     target: "branch",

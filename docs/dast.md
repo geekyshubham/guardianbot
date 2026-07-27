@@ -14,6 +14,8 @@ Before ZAP:
    cross-origin targets.
 
 Deploy-smoke profiles run for minutes; authenticated nightly profiles are capped at
-45 minutes. Evidence is imported/reimported into DefectDojo. The PoC reusable
-workflow enforces the exact origin and OpenAPI scan; session injection and import
-automation are Partial.
+45 minutes. The reusable workflow now fails closed unless an authenticated session
+cookie is provided, the protected session assertion succeeds, and the OpenAPI URL
+resolves to the exact target origin or an explicit allowlisted URL. DefectDojo
+import/reimport remains control-plane work; the PoC reusable workflow does not
+claim to perform it.

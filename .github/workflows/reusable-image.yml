@@ -18,17 +18,18 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
 
 jobs:
-  image:
-    name: image build, smoke, scan, SBOM, sign
+  validate-image:
+    name: image build, smoke, scan, SBOM
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Build exact linux/amd64 image
         run: |
           mkdir -p guardianbot-image-evidence
@@ -37,6 +38,9 @@ jobs:
             --tag "${{ inputs.image-name }}:${GITHUB_SHA}" "${{ inputs.context }}"
           docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" \
             --format '{{json .RepoDigests}}' > guardianbot-image-evidence/build-digests.json
+          if [ "${{ inputs.push }}" = "true" ]; then
+            docker save "${{ inputs.image-name }}:${GITHUB_SHA}" | gzip -1 > guardianbot-image-evidence/exact-image.tar.gz
+          fi
       - name: Repository-specific application tests
         if: inputs.smoke-command != ''
         run: ${{ inputs.smoke-command }}
@@ -47,7 +51,8 @@ jobs:
           if [[ ",${{ inputs.dependent-services }}," == *,postgres,* ]]; then
             docker run -d --rm --name guardianbot-postgres --network guardianbot-smoke \
               -e POSTGRES_USER=guardianbot -e POSTGRES_PASSWORD=guardianbot \
-              -e POSTGRES_DB=guardianbot postgres:16-alpine
+              -e POSTGRES_DB=guardianbot \
+              postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
             for attempt in $(seq 1 30); do
               docker exec guardianbot-postgres pg_isready -U guardianbot && break
               sleep 2
@@ -55,7 +60,8 @@ jobs:
             docker exec guardianbot-postgres pg_isready -U guardianbot
           fi
           if [[ ",${{ inputs.dependent-services }}," == *,redis,* ]]; then
-            docker run -d --rm --name guardianbot-redis --network guardianbot-smoke redis:7-alpine
+            docker run -d --rm --name guardianbot-redis --network guardianbot-smoke \
+              redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
             for attempt in $(seq 1 30); do
               docker exec guardianbot-redis redis-cli ping | grep -qx PONG && break
               sleep 2
@@ -106,14 +112,14 @@ jobs:
       - name: Trivy image scan
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1 \
+            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
             image --format json --output /evidence/trivy-image.json \
             --scanners vuln,misconfig,secret --severity CRITICAL --exit-code 0 \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
       - name: CycloneDX SBOM from exact image
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1 \
+            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
             image --format cyclonedx --output /evidence/sbom.cdx.json \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
@@ -131,17 +137,45 @@ jobs:
             echo "Image policy blocked ${critical_count} Critical finding(s)."
             exit 1
           fi
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-image-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-image-evidence/
+          if-no-files-found: error
+      - name: Remove disposable dependencies
+        if: always()
+        run: |
+          docker rm -f guardianbot-smoke guardianbot-postgres guardianbot-redis 2>/dev/null || true
+          docker network rm guardianbot-smoke 2>/dev/null || true
+
+  promote-image:
+    name: image push, sign, attest
+    if: inputs.push
+    needs: validate-image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: guardianbot-image-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-image-evidence
+      - name: Restore exact validated image
+        run: |
+          test -s guardianbot-image-evidence/exact-image.tar.gz
+          gzip -dc guardianbot-image-evidence/exact-image.tar.gz | docker load
       - name: Authenticate GHCR
-        if: inputs.push
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Push immutable content
-        if: inputs.push
         run: docker push "${{ inputs.image-name }}:${GITHUB_SHA}"
       - name: Install Cosign
-        if: inputs.push
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
       - name: Keyless sign and attest
-        if: inputs.push
         run: |
           digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${{ inputs.image-name }}:${GITHUB_SHA}")"
           test -n "$digest"
@@ -152,15 +186,10 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             > guardianbot-image-evidence/cosign-verification.json
-      - name: Upload evidence
+      - name: Upload promotion evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: guardianbot-image-evidence-${{ github.run_id }}
+          name: guardianbot-image-promotion-${{ github.run_id }}-${{ github.run_attempt }}
           path: guardianbot-image-evidence/
           if-no-files-found: error
-      - name: Remove disposable dependencies
-        if: always()
-        run: |
-          docker rm -f guardianbot-smoke guardianbot-postgres guardianbot-redis 2>/dev/null || true
-          docker network rm guardianbot-smoke 2>/dev/null || true
