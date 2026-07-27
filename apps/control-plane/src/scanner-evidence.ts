@@ -1,7 +1,7 @@
 import { once } from "node:events";
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { mkdtemp, open as openFile, readFile, rm } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, open as openFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, posix } from "node:path";
 import { inflateRawSync } from "node:zlib";
@@ -12,41 +12,56 @@ import {
   type NormalizedFinding
 } from "@guardianbot/core";
 import { createAppJwt } from "./app-auth.js";
+import {
+  computeEvidenceManifestDigest,
+  parseEvidenceManifest,
+  parseEvidenceTrustPolicy,
+  verifyEvidenceProvenanceToken,
+  type EvidenceArtifactType,
+  type EvidenceManifest,
+  type EvidenceTrustPolicy
+} from "./evidence-attestation.js";
 import type { GuardianScannerWorkflowRun } from "./service.js";
 import type {
   ScannerArtifactRecord,
   ScannerEvidenceRecord,
   ScannerReferencedWorkflow,
+  ScannerWorkflowEvent,
   ScannerWorkflowRunRecord,
   Store
 } from "./store.js";
 
 const DEFAULT_GITHUB_API_BASE = "https://api.github.com";
 const DEFAULT_GITHUB_TIMEOUT_MS = 30_000;
-const MAX_ARTIFACT_PAGES = 20;
-const MAX_ARTIFACTS_PER_RUN = 200;
-const MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
+const MAX_ARTIFACT_PAGES = 10;
+const MAX_ARTIFACTS_PER_RUN = 150;
+const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const MAX_JSON_BYTES = 8 * 1024 * 1024;
-const MAX_ENTRY_BYTES = 32 * 1024 * 1024;
-const MAX_ZIP_ENTRIES = 1_000;
+const MAX_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 64;
 const MAX_FINDINGS = 500;
 const ARTIFACT_NAME_TIMEOUT_MS = 60_000;
-const TRUSTED_WORKFLOW_PATHS = new Set([
-  ".github/workflows/reusable-security.yml",
-  ".github/workflows/reusable-image.yml",
-  ".github/workflows/reusable-dast.yml"
-]);
-const DEFAULT_TRUSTED_REPOSITORY = "geekyshubham/guardianbot";
-
-const SECURITY_FILES = new Set(["semgrep.json", "trivy.json", "gate.json"]);
-const IMAGE_FILES = new Set([
-  "trivy-image.json",
-  "sbom.cdx.json",
-  "policy.json",
+const PROVENANCE_FILES = ["provenance-manifest.json", "provenance-token.txt"] as const;
+const SECURITY_REPORT_FILES = ["gate.json", "semgrep.json", "trivy.json"] as const;
+const SECURITY_FILES = new Set([...SECURITY_REPORT_FILES, ...PROVENANCE_FILES]);
+const IMAGE_VALIDATION_REPORT_FILES = [
   "build-digests.json",
-  "cosign-verification.json"
+  "policy.json",
+  "sbom.cdx.json",
+  "trivy-image.json"
+] as const;
+const IMAGE_PROMOTION_REPORT_FILES = [
+  ...IMAGE_VALIDATION_REPORT_FILES,
+  "cosign-verification.json",
+  "promotion.json",
+  "sbom-attestation-verification.json"
+] as const;
+const IMAGE_FILES = new Set([
+  ...IMAGE_PROMOTION_REPORT_FILES,
+  ...PROVENANCE_FILES
 ]);
-const DAST_FILES = new Set(["zap.json", "scan-status.json"]);
+const DAST_REPORT_FILES = ["scan-status.json", "zap.json"] as const;
+const DAST_FILES = new Set([...DAST_REPORT_FILES, ...PROVENANCE_FILES]);
 
 interface ScannerEvidenceHandlerOptions {
   appId: string;
@@ -63,13 +78,12 @@ interface ScannerEvidenceHandlerOptions {
   ) => Promise<GitHubApiClient>;
 }
 
-interface TrustedWorkflowConfig {
-  repository: string;
-}
-
 interface GitHubWorkflowRun {
   id: number;
   run_attempt: number;
+  event?: string;
+  run_started_at?: string | null;
+  updated_at?: string | null;
   status: string;
   conclusion: string | null;
   head_sha: string;
@@ -86,12 +100,29 @@ interface GitHubArtifact {
   expired: boolean;
   digest?: string;
   archive_download_url?: string;
-  workflow_run?: { id?: number; head_sha?: string };
+  workflow_run?: {
+    id?: number;
+    repository_id?: number;
+    head_repository_id?: number;
+    head_branch?: string | null;
+    head_sha?: string;
+  };
 }
 
 interface GitHubArtifactPage {
   total_count?: number;
   artifacts?: GitHubArtifact[];
+}
+
+interface GitHubWorkflowJob {
+  name?: string;
+  status?: string;
+  conclusion?: string | null;
+}
+
+interface GitHubWorkflowJobsPage {
+  total_count?: number;
+  jobs?: GitHubWorkflowJob[];
 }
 
 interface ParsedReferencedWorkflow {
@@ -112,6 +143,8 @@ interface ParsedArtifactArchive {
 }
 
 interface ZipEntry {
+  name: string;
+  generalPurposeBitFlag: number;
   compressionMethod: number;
   compressedSize: number;
   uncompressedSize: number;
@@ -119,11 +152,13 @@ interface ZipEntry {
 }
 
 interface SecurityGateReport {
-  conclusion: string;
-  reason?: string;
-  blockers?: unknown[];
-  observed?: unknown[];
-  executionFailures?: unknown[];
+  schemaVersion: "1.0.0";
+  mode: "advisory" | "report-only" | "enforce";
+  passed: boolean;
+  failures: string[];
+  policyFindings: Record<string, unknown>[];
+  activeSuppressions: number;
+  expiredSuppressions: string[];
 }
 
 interface DefectDojoSettings {
@@ -163,17 +198,6 @@ async function loadDefectDojoModule(): Promise<DefectDojoModuleShape> {
   return (await import(moduleUrl.href)) as DefectDojoModuleShape;
 }
 
-function parseTrustedWorkflowConfig(
-  env: Record<string, string | undefined>
-): TrustedWorkflowConfig {
-  const configuredRepository =
-    env.GUARDIANBOT_TRUSTED_WORKFLOW_REPOSITORY ?? DEFAULT_TRUSTED_REPOSITORY;
-  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(configuredRepository)) {
-    throw new Error("GUARDIANBOT_TRUSTED_WORKFLOW_REPOSITORY is invalid");
-  }
-  return { repository: configuredRepository.toLowerCase() };
-}
-
 function parseDefectDojoSettings(
   env: Record<string, string | undefined>
 ): DefectDojoSettings | undefined {
@@ -192,13 +216,12 @@ function normalizeRepository(fullName: string): string {
   return fullName.trim().toLowerCase();
 }
 
-function sha256Hex(buffer: Uint8Array): string {
-  return createHash("sha256").update(buffer).digest("hex");
-}
-
 function artifactDigestMatches(expected: string | undefined, actualHex: string): boolean {
-  if (!expected) return true;
-  return expected.trim().toLowerCase() === `sha256:${actualHex}`;
+  return (
+    typeof expected === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(expected.trim().toLowerCase()) &&
+    expected.trim().toLowerCase() === `sha256:${actualHex}`
+  );
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -214,6 +237,23 @@ function requireInteger(value: unknown, field: string): number {
   return Number(value);
 }
 
+function scannerWorkflowEvent(value: unknown): ScannerWorkflowEvent | undefined {
+  return value === "pull_request" ||
+    value === "push" ||
+    value === "schedule" ||
+    value === "workflow_dispatch"
+    ? value
+    : undefined;
+}
+
+function normalizedTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+    ? new Date(milliseconds).toISOString()
+    : undefined;
+}
+
 function parseWorkflowPath(pathValue: string): { workflowPath: string; workflowRef?: string } {
   const [workflowPath = "", workflowRef] = pathValue.split("@", 2);
   return { workflowPath, workflowRef };
@@ -221,7 +261,7 @@ function parseWorkflowPath(pathValue: string): { workflowPath: string; workflowR
 
 function parseReferencedWorkflow(
   value: unknown,
-  trustedRepository: string
+  trustPolicy: EvidenceTrustPolicy
 ): ParsedReferencedWorkflow | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
@@ -239,8 +279,11 @@ function parseReferencedWorkflow(
   if (!repositoryPart || !workflowPath || !pathShaPart) return undefined;
   const repository = normalizeRepository(repositoryPart);
   const pathSha = pathShaPart.toLowerCase();
-  if (repository !== trustedRepository) return undefined;
-  if (!TRUSTED_WORKFLOW_PATHS.has(workflowPath)) return undefined;
+  if (repository !== trustPolicy.repository) return undefined;
+  const trustedWorkflow = Object.values(trustPolicy.workflows).find(
+    (workflow) => workflow.workflowPath === workflowPath && workflow.sha === pathSha
+  );
+  if (!trustedWorkflow) return undefined;
   if (!/^[a-f0-9]{40}$/.test(sha) || sha !== pathSha) return undefined;
   return { path: pathValue, repository, workflowPath, sha, ref };
 }
@@ -277,28 +320,70 @@ function countCriticalImageFindings(report: unknown): number {
 
 function parseCycloneDxSummary(report: unknown): Record<string, unknown> {
   const root = asRecord(report);
-  if (!root || root.bomFormat !== "CycloneDX" || typeof root.specVersion !== "string") {
+  if (
+    !root ||
+    root.bomFormat !== "CycloneDX" ||
+    typeof root.specVersion !== "string" ||
+    !/^1\.[4-9]$/.test(root.specVersion) ||
+    !Number.isSafeInteger(root.version) ||
+    Number(root.version) < 1 ||
+    (root.serialNumber !== undefined &&
+      (typeof root.serialNumber !== "string" ||
+        !/^urn:uuid:[0-9a-f-]{36}$/i.test(root.serialNumber))) ||
+    (root.components !== undefined && !Array.isArray(root.components))
+  ) {
     throw new Error("sbom.cdx.json is not a valid CycloneDX document");
+  }
+  const components = Array.isArray(root.components) ? root.components : [];
+  for (const componentValue of components) {
+    const component = asRecord(componentValue);
+    if (
+      !component ||
+      typeof component.type !== "string" ||
+      !component.type ||
+      typeof component.name !== "string" ||
+      !component.name
+    ) {
+      throw new Error("sbom.cdx.json contains an invalid CycloneDX component");
+    }
   }
   return {
     bomFormat: root.bomFormat,
     specVersion: root.specVersion,
+    version: root.version,
     serialNumber: typeof root.serialNumber === "string" ? root.serialNumber : undefined,
-    componentCount: Array.isArray(root.components) ? root.components.length : 0
+    componentCount: components.length
   };
 }
 
 function parseSecurityGate(report: unknown): SecurityGateReport {
   const root = asRecord(report);
-  if (!root || typeof root.conclusion !== "string") {
+  if (
+    !root ||
+    root.schemaVersion !== "1.0.0" ||
+    (root.mode !== "advisory" &&
+      root.mode !== "report-only" &&
+      root.mode !== "enforce") ||
+    typeof root.passed !== "boolean" ||
+    !Array.isArray(root.failures) ||
+    root.failures.some((failure) => typeof failure !== "string") ||
+    !Array.isArray(root.policyFindings) ||
+    root.policyFindings.some((finding) => !asRecord(finding)) ||
+    !Number.isSafeInteger(root.activeSuppressions) ||
+    Number(root.activeSuppressions) < 0 ||
+    !Array.isArray(root.expiredSuppressions) ||
+    root.expiredSuppressions.some((fingerprint) => typeof fingerprint !== "string")
+  ) {
     throw new Error("gate.json is invalid");
   }
   return {
-    conclusion: root.conclusion,
-    reason: typeof root.reason === "string" ? root.reason : undefined,
-    blockers: Array.isArray(root.blockers) ? root.blockers : undefined,
-    observed: Array.isArray(root.observed) ? root.observed : undefined,
-    executionFailures: Array.isArray(root.executionFailures) ? root.executionFailures : undefined
+    schemaVersion: "1.0.0",
+    mode: root.mode,
+    passed: root.passed,
+    failures: root.failures as string[],
+    policyFindings: root.policyFindings as Record<string, unknown>[],
+    activeSuppressions: Number(root.activeSuppressions),
+    expiredSuppressions: root.expiredSuppressions as string[]
   };
 }
 
@@ -487,6 +572,42 @@ async function listWorkflowArtifacts(
   return artifacts;
 }
 
+async function listWorkflowJobs(
+  client: GitHubApiClient,
+  owner: string,
+  repo: string,
+  runId: number
+): Promise<GitHubWorkflowJob[]> {
+  const jobs: GitHubWorkflowJob[] = [];
+  for (let page = 1; page <= MAX_ARTIFACT_PAGES; page += 1) {
+    const batch = await client.requestJson<GitHubWorkflowJobsPage>(
+      "GET",
+      `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=all&per_page=100&page=${page}`
+    );
+    const pageJobs = Array.isArray(batch.jobs) ? batch.jobs : [];
+    jobs.push(...pageJobs);
+    if (jobs.length > MAX_ARTIFACTS_PER_RUN) {
+      throw new RetryableScannerEvidenceError("workflow run returned too many jobs");
+    }
+    if (pageJobs.length < 100) break;
+  }
+  return jobs;
+}
+
+async function sha256File(zipPath: string): Promise<{ digest: string; size: number }> {
+  const hash = createHash("sha256");
+  let size = 0;
+  for await (const chunk of createReadStream(zipPath)) {
+    const buffer = Buffer.from(chunk);
+    size += buffer.length;
+    if (size > MAX_ARTIFACT_BYTES) {
+      throw new Error("artifact exceeded the configured size limit");
+    }
+    hash.update(buffer);
+  }
+  return { digest: hash.digest("hex"), size };
+}
+
 async function parseArtifactArchive(
   zipPath: string,
   allowedFiles: Set<string>
@@ -510,17 +631,47 @@ async function parseArtifactArchive(
     if (eocdOffset === -1) {
       throw new Error("artifact ZIP EOCD record was not found");
     }
+    const absoluteEocdOffset = stat.size - tailLength + eocdOffset;
+    const diskNumber = tail.readUInt16LE(eocdOffset + 4);
+    const centralDirectoryDisk = tail.readUInt16LE(eocdOffset + 6);
+    const entriesOnDisk = tail.readUInt16LE(eocdOffset + 8);
     const entryCount = tail.readUInt16LE(eocdOffset + 10);
     const centralDirectorySize = tail.readUInt32LE(eocdOffset + 12);
     const centralDirectoryOffset = tail.readUInt32LE(eocdOffset + 16);
+    const commentLength = tail.readUInt16LE(eocdOffset + 20);
+    if (
+      diskNumber !== 0 ||
+      centralDirectoryDisk !== 0 ||
+      entriesOnDisk !== entryCount ||
+      entryCount === 0xffff ||
+      centralDirectorySize === 0xffffffff ||
+      centralDirectoryOffset === 0xffffffff
+    ) {
+      throw new Error("artifact ZIP uses unsupported multi-disk or ZIP64 metadata");
+    }
+    if (absoluteEocdOffset + 22 + commentLength !== stat.size) {
+      throw new Error("artifact ZIP EOCD bounds are invalid");
+    }
     if (entryCount > MAX_ZIP_ENTRIES) {
       throw new Error("artifact ZIP has too many entries");
     }
-    if (centralDirectoryOffset + centralDirectorySize > stat.size) {
+    if (
+      centralDirectoryOffset + centralDirectorySize !== absoluteEocdOffset ||
+      centralDirectoryOffset > stat.size ||
+      centralDirectorySize > stat.size
+    ) {
       throw new Error("artifact ZIP central directory exceeds archive bounds");
     }
     const centralDirectory = Buffer.alloc(centralDirectorySize);
-    await handle.read(centralDirectory, 0, centralDirectory.length, centralDirectoryOffset);
+    const centralRead = await handle.read(
+      centralDirectory,
+      0,
+      centralDirectory.length,
+      centralDirectoryOffset
+    );
+    if (centralRead.bytesRead !== centralDirectory.length) {
+      throw new Error("artifact ZIP central directory is truncated");
+    }
     const entries = new Map<string, ZipEntry>();
     let cursor = 0;
     for (let index = 0; index < entryCount; index += 1) {
@@ -538,12 +689,22 @@ async function parseArtifactArchive(
       const extraLength = centralDirectory.readUInt16LE(cursor + 30);
       const commentLength = centralDirectory.readUInt16LE(cursor + 32);
       const localHeaderOffset = centralDirectory.readUInt32LE(cursor + 42);
+      const variableLength = fileNameLength + extraLength + commentLength;
+      if (
+        fileNameLength === 0 ||
+        cursor + 46 + variableLength > centralDirectory.length ||
+        (generalPurposeBitFlag & ~0x0808) !== 0 ||
+        (generalPurposeBitFlag & 0x0001) !== 0
+      ) {
+        throw new Error("artifact ZIP central directory flags or bounds are invalid");
+      }
       const name = centralDirectory
         .subarray(cursor + 46, cursor + 46 + fileNameLength)
-        .toString(generalPurposeBitFlag & 0x0800 ? "utf8" : "utf8");
-      cursor += 46 + fileNameLength + extraLength + commentLength;
+        .toString("utf8");
+      cursor += 46 + variableLength;
       const normalized = posix.normalize(name.replace(/\\/g, "/"));
       if (
+        name.includes("\0") ||
         normalized.startsWith("../") ||
         normalized.includes("/../") ||
         normalized.startsWith("/") ||
@@ -557,11 +718,16 @@ async function parseArtifactArchive(
         throw new Error(`artifact ZIP contains duplicate trusted file ${leaf}`);
       }
       entries.set(leaf, {
+        name,
+        generalPurposeBitFlag,
         compressionMethod,
         compressedSize,
         uncompressedSize,
         localHeaderOffset
       });
+    }
+    if (cursor !== centralDirectory.length) {
+      throw new Error("artifact ZIP central directory length did not match");
     }
     const selectedFiles = new Map<string, Uint8Array>();
     for (const [leaf, entry] of entries) {
@@ -569,20 +735,65 @@ async function parseArtifactArchive(
         throw new Error(`artifact ZIP entry ${leaf} exceeds the configured size limit`);
       }
       const localHeader = Buffer.alloc(30);
-      await handle.read(localHeader, 0, localHeader.length, entry.localHeaderOffset);
-      if (localHeader.readUInt32LE(0) !== 0x04034b50) {
+      if (entry.localHeaderOffset + localHeader.length > centralDirectoryOffset) {
+        throw new Error(`artifact ZIP local header for ${leaf} exceeds archive bounds`);
+      }
+      const localRead = await handle.read(
+        localHeader,
+        0,
+        localHeader.length,
+        entry.localHeaderOffset
+      );
+      if (
+        localRead.bytesRead !== localHeader.length ||
+        localHeader.readUInt32LE(0) !== 0x04034b50
+      ) {
         throw new Error(`artifact ZIP local header for ${leaf} is invalid`);
       }
+      const localFlags = localHeader.readUInt16LE(6);
+      const localCompressionMethod = localHeader.readUInt16LE(8);
       const localNameLength = localHeader.readUInt16LE(26);
       const localExtraLength = localHeader.readUInt16LE(28);
       const dataOffset = entry.localHeaderOffset + 30 + localNameLength + localExtraLength;
+      if (
+        localFlags !== entry.generalPurposeBitFlag ||
+        localCompressionMethod !== entry.compressionMethod ||
+        localNameLength === 0 ||
+        dataOffset > centralDirectoryOffset ||
+        entry.compressedSize > centralDirectoryOffset - dataOffset
+      ) {
+        throw new Error(`artifact ZIP local header for ${leaf} did not match`);
+      }
+      const localName = Buffer.alloc(localNameLength);
+      const localNameRead = await handle.read(
+        localName,
+        0,
+        localName.length,
+        entry.localHeaderOffset + 30
+      );
+      if (
+        localNameRead.bytesRead !== localName.length ||
+        localName.toString("utf8") !== entry.name
+      ) {
+        throw new Error(`artifact ZIP local filename for ${leaf} did not match`);
+      }
       const compressed = Buffer.alloc(entry.compressedSize);
-      await handle.read(compressed, 0, compressed.length, dataOffset);
+      const compressedRead = await handle.read(
+        compressed,
+        0,
+        compressed.length,
+        dataOffset
+      );
+      if (compressedRead.bytesRead !== compressed.length) {
+        throw new Error(`artifact ZIP entry ${leaf} is truncated`);
+      }
       let content: Buffer;
       if (entry.compressionMethod === 0) {
         content = compressed;
       } else if (entry.compressionMethod === 8) {
-        content = inflateRawSync(compressed);
+        content = inflateRawSync(compressed, {
+          maxOutputLength: entry.uncompressedSize
+        });
       } else {
         throw new Error(`artifact ZIP entry ${leaf} uses unsupported compression`);
       }
@@ -602,6 +813,91 @@ function parseJsonFile(bytes: Uint8Array, fileName: string): unknown {
     throw new Error(`${fileName} exceeds the configured JSON size limit`);
   }
   return JSON.parse(Buffer.from(bytes).toString("utf8"));
+}
+
+function reportFilesForArtifact(
+  artifactType: EvidenceArtifactType
+): readonly string[] {
+  if (artifactType === "security") return SECURITY_REPORT_FILES;
+  if (artifactType === "dast") return DAST_REPORT_FILES;
+  if (artifactType === "image-promotion") return IMAGE_PROMOTION_REPORT_FILES;
+  return IMAGE_VALIDATION_REPORT_FILES;
+}
+
+function validateArtifactProvenance(
+  archive: ParsedArtifactArchive,
+  artifactType: EvidenceArtifactType,
+  expected: {
+    repository: string;
+    repositoryId: number;
+    runId: number;
+    runAttempt: number;
+    headSha: string;
+  },
+  trustPolicy: EvidenceTrustPolicy,
+  now: Date
+): EvidenceManifest {
+  const manifestBytes = archive.selectedFiles.get("provenance-manifest.json");
+  const tokenBytes = archive.selectedFiles.get("provenance-token.txt");
+  if (!manifestBytes || !tokenBytes) {
+    throw new Error("artifact is missing its provenance manifest or token");
+  }
+  const manifest = parseEvidenceManifest(
+    parseJsonFile(manifestBytes, "provenance-manifest.json")
+  );
+  const trustedWorkflow = trustPolicy.workflows[artifactType];
+  if (
+    manifest.artifactType !== artifactType ||
+    manifest.repository !== normalizeRepository(expected.repository) ||
+    manifest.repositoryId !== expected.repositoryId ||
+    manifest.runId !== expected.runId ||
+    manifest.runAttempt !== expected.runAttempt ||
+    manifest.headSha !== expected.headSha ||
+    manifest.workflowPath !== trustedWorkflow.workflowPath ||
+    manifest.workflowSha !== trustedWorkflow.sha
+  ) {
+    throw new Error("artifact provenance manifest identity does not match the workflow run");
+  }
+  const expectedFiles = [...reportFilesForArtifact(artifactType)].sort();
+  if (
+    manifest.files.length !== expectedFiles.length ||
+    manifest.files.some((file, index) => file.path !== expectedFiles[index])
+  ) {
+    throw new Error("artifact provenance manifest does not contain the exact report set");
+  }
+  for (const file of manifest.files) {
+    const content = archive.selectedFiles.get(file.path);
+    if (
+      !content ||
+      content.byteLength !== file.size ||
+      createHash("sha256").update(content).digest("hex") !== file.sha256
+    ) {
+      throw new Error(`artifact provenance manifest does not match ${file.path}`);
+    }
+  }
+  const manifestDigest = computeEvidenceManifestDigest(manifest);
+  const token = Buffer.from(tokenBytes).toString("utf8").trim();
+  const provenance = verifyEvidenceProvenanceToken(
+    token,
+    trustPolicy.signingSecret,
+    now
+  );
+  if (
+    provenance.artifactType !== artifactType ||
+    provenance.manifestDigest !== manifestDigest ||
+    provenance.repository !== manifest.repository ||
+    provenance.repositoryId !== manifest.repositoryId ||
+    provenance.runId !== manifest.runId ||
+    provenance.runAttempt !== manifest.runAttempt ||
+    provenance.headSha !== manifest.headSha ||
+    provenance.workflowPath !== manifest.workflowPath ||
+    provenance.workflowSha !== manifest.workflowSha ||
+    provenance.jobWorkflowRef !==
+      `${trustPolicy.repository}/${manifest.workflowPath}@${manifest.workflowSha}`
+  ) {
+    throw new Error("artifact provenance token does not match its manifest");
+  }
+  return manifest;
 }
 
 function summarizeFindings(findings: readonly NormalizedFinding[]): Record<string, number> {
@@ -647,6 +943,7 @@ async function maybeImportToDefectDojo(
     repositoryFullName: string;
     visibility: "public" | "private" | "internal";
     defaultBranch: string;
+    headBranch: string;
     artifactId: number;
     runId: number;
     runAttempt: number;
@@ -667,6 +964,8 @@ async function maybeImportToDefectDojo(
   });
   const client = new DefectDojoClient(config);
   const profile = input.artifactType === "dast" ? "dast" : input.artifactType.startsWith("image") ? "image" : "security";
+  const branch = input.headBranch;
+  const isDefaultBranch = branch === input.defaultBranch;
   const tags = buildDefectDojoTags({
     repositoryId: input.repositoryId,
     repositorySlug: input.repositoryFullName,
@@ -674,7 +973,7 @@ async function maybeImportToDefectDojo(
     commitSha: input.headSha,
     workflowRunId: String(input.runId),
     workflowAttempt: String(input.runAttempt),
-    branch: input.defaultBranch,
+    branch,
     profile,
     scanType: input.scanType
   });
@@ -687,8 +986,8 @@ async function maybeImportToDefectDojo(
         tags
       },
       engagement: {
-        name: `${input.defaultBranch}/${profile}`,
-        branchTag: input.defaultBranch,
+        name: `${branch}/${profile}`,
+        branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
         tags
@@ -696,8 +995,8 @@ async function maybeImportToDefectDojo(
       test: {
         engagementId: 0,
         scanType: input.scanType,
-        title: `${input.defaultBranch}/${profile}`,
-        branchTag: input.defaultBranch,
+        title: `${branch}/${profile}`,
+        branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
         tags
@@ -708,17 +1007,20 @@ async function maybeImportToDefectDojo(
     }
     const imported = (await client.importScan({
       scanType: input.scanType,
-      testTitle: `${input.defaultBranch}/${profile}`,
+      testTitle: `${branch}/${profile}`,
       fileName: input.fileName,
       contentType: input.contentType,
       report: input.report,
       engagementId: ensured.engagement.id,
       existingTestId: ensured.test?.id ?? undefined,
       metadata: {
-        branchTag: input.defaultBranch,
+        branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
-        closeOldFindings: true,
+        // DefectDojo reconciliation is operational health, not a mutation of the
+        // already-completed GitHub gate. PR imports are isolated by head branch
+        // and must never close findings from the default-branch engagement.
+        closeOldFindings: isDefaultBranch,
         doNotReactivate: false,
         active: true,
         verified: true,
@@ -777,7 +1079,7 @@ async function processSecurityArtifact(
   store: Store,
   archive: ParsedArtifactArchive,
   artifact: ScannerArtifactRecord,
-  run: Pick<ScannerWorkflowRunRecord, "headSha">,
+  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch">,
   repositoryFullName: string,
   repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
@@ -867,13 +1169,17 @@ async function processSecurityArtifact(
     evidenceKey: "gate",
     kind: "security-gate",
     source: "guardianbot",
-    status: gate.conclusion === "failure" ? "failure" : "success",
+    status: gate.passed ? "success" : "failure",
     observedAt: new Date().toISOString(),
-    details: gate.reason ?? gate.conclusion,
+    details: gate.passed
+      ? `${gate.mode} gate passed`
+      : `${gate.mode} gate failed: ${gate.failures.length} failure(s)`,
     payload: {
-      blockers: Array.isArray(gate.blockers) ? gate.blockers.length : 0,
-      observed: Array.isArray(gate.observed) ? gate.observed.length : 0,
-      executionFailures: Array.isArray(gate.executionFailures) ? gate.executionFailures.length : 0
+      passed: gate.passed,
+      failures: gate.failures.length,
+      policyFindings: gate.policyFindings.length,
+      activeSuppressions: gate.activeSuppressions,
+      expiredSuppressions: gate.expiredSuppressions.length
     }
   });
   if (!semgrepFailed) {
@@ -882,6 +1188,7 @@ async function processSecurityArtifact(
       repositoryFullName,
       visibility: repositoryVisibility,
       defaultBranch,
+      headBranch: run.headBranch ?? defaultBranch,
       artifactId: artifact.artifactId,
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
@@ -899,6 +1206,7 @@ async function processSecurityArtifact(
       repositoryFullName,
       visibility: repositoryVisibility,
       defaultBranch,
+      headBranch: run.headBranch ?? defaultBranch,
       artifactId: artifact.artifactId,
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
@@ -912,6 +1220,172 @@ async function processSecurityArtifact(
   }
 }
 
+function parseBuildDigestReport(report: unknown): Record<string, unknown> {
+  const root = asRecord(report);
+  if (
+    !root ||
+    root.schemaVersion !== "1.0.0" ||
+    typeof root.imageId !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(root.imageId) ||
+    !Array.isArray(root.repoTags) ||
+    root.repoTags.some((tag) => typeof tag !== "string")
+  ) {
+    throw new Error("build-digests.json is invalid");
+  }
+  return {
+    imageId: root.imageId,
+    repoTags: root.repoTags.length,
+    promotionExpected: root.promotionExpected === true
+  };
+}
+
+function parseCosignVerificationEntries(report: unknown): Record<string, unknown>[] {
+  const values = Array.isArray(report) ? report : [report];
+  const entries = values
+    .map((value) => asRecord(value))
+    .filter((value): value is Record<string, unknown> => Boolean(value));
+  if (!entries.length) throw new Error("cosign verification evidence is empty");
+  return entries;
+}
+
+function verifyCosignSignatureEvidence(
+  report: unknown,
+  imageDigest: string,
+  certificateIdentity: string
+): number {
+  const entries = parseCosignVerificationEntries(report);
+  const matching = entries.filter((entry) => {
+    const critical = asRecord(entry.critical);
+    const image = asRecord(critical?.image);
+    const optional = asRecord(entry.optional);
+    return (
+      image?.["docker-manifest-digest"] === imageDigest &&
+      optional?.Issuer === "https://token.actions.githubusercontent.com" &&
+      optional?.Subject === certificateIdentity
+    );
+  });
+  if (!matching.length) {
+    throw new Error(
+      "cosign verification is not bound to the expected image digest and certificate identity"
+    );
+  }
+  return matching.length;
+}
+
+function verifySbomAttestationEvidence(
+  report: unknown,
+  imageDigest: string
+): number {
+  const envelopes = Array.isArray(report) ? report : [report];
+  let verified = 0;
+  for (const envelopeValue of envelopes) {
+    const envelope = asRecord(envelopeValue);
+    if (!envelope || typeof envelope.payload !== "string" || !envelope.payload) continue;
+    let statement: Record<string, unknown> | undefined;
+    try {
+      statement = asRecord(
+        JSON.parse(Buffer.from(envelope.payload, "base64").toString("utf8"))
+      );
+    } catch {
+      statement = undefined;
+    }
+    const subjects = Array.isArray(statement?.subject) ? statement.subject : [];
+    const digestHex = imageDigest.slice("sha256:".length);
+    const subjectMatches = subjects.some((subjectValue) => {
+      const subject = asRecord(subjectValue);
+      const digest = asRecord(subject?.digest);
+      return digest?.sha256 === digestHex;
+    });
+    const predicate = asRecord(statement?.predicate);
+    if (
+      subjectMatches &&
+      typeof statement?.predicateType === "string" &&
+      statement.predicateType.toLowerCase().includes("cyclonedx") &&
+      predicate?.bomFormat === "CycloneDX"
+    ) {
+      verified += 1;
+    }
+  }
+  if (!verified) {
+    throw new Error("SBOM attestation verification is missing or bound to another digest");
+  }
+  return verified;
+}
+
+function validatePromotionEvidence(
+  archive: ParsedArtifactArchive,
+  repositoryFullName: string,
+  callerWorkflowPath: string,
+  callerWorkflowRef: string | undefined,
+  trustPolicy: EvidenceTrustPolicy
+): {
+  imageDigest: string;
+  imageReference: string;
+  certificateIdentity: string;
+  signatures: number;
+  sbomAttestations: number;
+} {
+  const promotionBytes = archive.selectedFiles.get("promotion.json");
+  const cosignBytes = archive.selectedFiles.get("cosign-verification.json");
+  const attestationBytes = archive.selectedFiles.get(
+    "sbom-attestation-verification.json"
+  );
+  const sbomBytes = archive.selectedFiles.get("sbom.cdx.json");
+  if (
+    !promotionBytes ||
+    !cosignBytes ||
+    !attestationBytes ||
+    !sbomBytes ||
+    !callerWorkflowRef
+  ) {
+    throw new Error("image promotion evidence is incomplete");
+  }
+  const promotion = asRecord(parseJsonFile(promotionBytes, "promotion.json"));
+  if (!promotion || promotion.schemaVersion !== "1.0.0") {
+    throw new Error("promotion.json is invalid");
+  }
+  const imageDigest = String(promotion.imageDigest ?? "").toLowerCase();
+  const imageReference = String(promotion.imageReference ?? "");
+  const certificateIdentity = String(promotion.certificateIdentity ?? "");
+  const expectedIdentity =
+    `https://github.com/${repositoryFullName}/${callerWorkflowPath}@${callerWorkflowRef}`;
+  const expectedJobWorkflowRef =
+    `${trustPolicy.repository}/.github/workflows/reusable-image.yml@` +
+    trustPolicy.workflows["image-promotion"].sha;
+  if (
+    !/^sha256:[a-f0-9]{64}$/.test(imageDigest) ||
+    !imageReference.endsWith(`@${imageDigest}`) ||
+    certificateIdentity !== expectedIdentity ||
+    String(promotion.jobWorkflowRef ?? "").toLowerCase() !==
+      expectedJobWorkflowRef.toLowerCase() ||
+    promotion.sbomSha256 !==
+      createHash("sha256").update(sbomBytes).digest("hex")
+  ) {
+    throw new Error(
+      "promotion evidence is not bound to the expected image, workflow, and SBOM"
+    );
+  }
+  const signatures = verifyCosignSignatureEvidence(
+    parseJsonFile(cosignBytes, "cosign-verification.json"),
+    imageDigest,
+    certificateIdentity
+  );
+  const sbomAttestations = verifySbomAttestationEvidence(
+    parseJsonFile(
+      attestationBytes,
+      "sbom-attestation-verification.json"
+    ),
+    imageDigest
+  );
+  return {
+    imageDigest,
+    imageReference,
+    certificateIdentity,
+    signatures,
+    sbomAttestations
+  };
+}
+
 async function processImageArtifact(
   store: Store,
   archive: ParsedArtifactArchive,
@@ -919,7 +1393,11 @@ async function processImageArtifact(
   repositoryFullName: string,
   repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
-  headSha: string,
+  run: Pick<
+    ScannerWorkflowRunRecord,
+    "headSha" | "headBranch" | "workflowPath" | "workflowRef"
+  >,
+  trustPolicy: EvidenceTrustPolicy,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
 ): Promise<void> {
@@ -932,16 +1410,31 @@ async function processImageArtifact(
   const trivyBytes = archive.selectedFiles.get("trivy-image.json");
   const sbomBytes = archive.selectedFiles.get("sbom.cdx.json");
   const policyBytes = archive.selectedFiles.get("policy.json");
-  if (!trivyBytes || !sbomBytes || !policyBytes) {
+  const buildBytes = archive.selectedFiles.get("build-digests.json");
+  if (!trivyBytes || !sbomBytes || !policyBytes || !buildBytes) {
     throw new Error("image evidence artifact is missing a required trusted report");
   }
   const trivyJson = parseJsonFile(trivyBytes, "trivy-image.json");
   const sbomJson = parseJsonFile(sbomBytes, "sbom.cdx.json");
   const policyJson = parseJsonFile(policyBytes, "policy.json");
   const trivyFailed = Boolean(asRecord(trivyJson)?.scanner_error);
-  const trivyFindings = trivyFailed ? [] : dedupeFindings(normalizeTrivy(trivyJson));
-  const criticalCount =
-    Number(asRecord(policyJson)?.criticalFindings ?? countCriticalImageFindings(trivyJson)) || 0;
+  if (trivyFailed) {
+    throw new Error("Trivy image scanner reported scanner_error");
+  }
+  const trivyFindings = dedupeFindings(normalizeTrivy(trivyJson));
+  const actualCriticalCount = countCriticalImageFindings(trivyJson);
+  const policyCriticalCount = asRecord(policyJson)?.criticalFindings;
+  if (
+    !Number.isSafeInteger(policyCriticalCount) ||
+    Number(policyCriticalCount) < 0 ||
+    Number(policyCriticalCount) !== actualCriticalCount
+  ) {
+    throw new Error("image policy critical count does not match the Trivy report");
+  }
+  const criticalCount = actualCriticalCount;
+  const buildSummary = parseBuildDigestReport(
+    parseJsonFile(buildBytes, "build-digests.json")
+  );
   await recordEvidence(store, base, {
     evidenceKey: "image-trivy-summary",
     kind: "trivy",
@@ -951,7 +1444,8 @@ async function processImageArtifact(
     details: `critical image findings: ${criticalCount}`,
     payload: {
       criticalFindings: criticalCount,
-      findings: trivyFindings.length
+      findings: trivyFindings.length,
+      ...buildSummary
     }
   });
   const sbomSummary = parseCycloneDxSummary(sbomJson);
@@ -964,29 +1458,36 @@ async function processImageArtifact(
     details: "CycloneDX SBOM generated",
     payload: sbomSummary
   });
-  const cosignBytes = archive.selectedFiles.get("cosign-verification.json");
-  if (cosignBytes) {
-    const cosignJson = parseJsonFile(cosignBytes, "cosign-verification.json");
+  if (artifact.artifactType === "image-promotion") {
+    const promotion = validatePromotionEvidence(
+      archive,
+      repositoryFullName,
+      run.workflowPath,
+      run.workflowRef,
+      trustPolicy
+    );
     await recordEvidence(store, base, {
       evidenceKey: "signature",
       kind: "signature",
       source: "cosign",
       status: "success",
       observedAt: new Date().toISOString(),
-      details: "Cosign verification present",
-      payload: asRecord(cosignJson) ?? { items: Array.isArray(cosignJson) ? cosignJson.length : 0 }
+      digest: promotion.imageDigest,
+      details: "Cosign signature and CycloneDX attestation verified",
+      payload: promotion
     });
   }
-  if (!trivyFailed) {
+  if (artifact.artifactType === "image-validation") {
     await maybeImportToDefectDojo(store, env, defectDojoSettings, {
       repositoryId: artifact.repositoryId,
       repositoryFullName,
       visibility: repositoryVisibility,
       defaultBranch,
+      headBranch: run.headBranch ?? defaultBranch,
       artifactId: artifact.artifactId,
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
-      headSha,
+      headSha: run.headSha,
       artifactType: artifact.artifactType,
       scanType: "Trivy Scan",
       fileName: "trivy-image.json",
@@ -1003,7 +1504,7 @@ async function processDastArtifact(
   repositoryFullName: string,
   repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
-  headSha: string,
+  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch">,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
 ): Promise<void> {
@@ -1058,10 +1559,11 @@ async function processDastArtifact(
       repositoryFullName,
       visibility: repositoryVisibility,
       defaultBranch,
+      headBranch: run.headBranch ?? defaultBranch,
       artifactId: artifact.artifactId,
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
-      headSha,
+      headSha: run.headSha,
       artifactType: artifact.artifactType,
       scanType: "ZAP Scan",
       fileName: "zap.json",
@@ -1071,7 +1573,7 @@ async function processDastArtifact(
   }
 }
 
-function artifactType(name: string): ScannerArtifactRecord["artifactType"] | undefined {
+function artifactType(name: string): EvidenceArtifactType | undefined {
   if (name.startsWith("guardianbot-evidence-")) return "security";
   if (name.startsWith("guardianbot-image-promotion-")) return "image-promotion";
   if (name.startsWith("guardianbot-image-evidence-")) return "image-validation";
@@ -1079,11 +1581,131 @@ function artifactType(name: string): ScannerArtifactRecord["artifactType"] | und
   return undefined;
 }
 
+function expectedArtifactName(
+  type: EvidenceArtifactType,
+  runId: number,
+  runAttempt: number
+): string {
+  const prefix =
+    type === "security"
+      ? "guardianbot-evidence-"
+      : type === "dast"
+        ? "guardianbot-dast-evidence-"
+        : type === "image-promotion"
+          ? "guardianbot-image-promotion-"
+          : "guardianbot-image-evidence-";
+  return `${prefix}${runId}-${runAttempt}`;
+}
+
+function workflowJob(
+  jobs: readonly GitHubWorkflowJob[],
+  expectedName: string
+): GitHubWorkflowJob | undefined {
+  return jobs.find((job) => {
+    const name = String(job.name ?? "");
+    return name === expectedName || name.endsWith(` / ${expectedName}`);
+  });
+}
+
+function expectedArtifactTypes(
+  referencedWorkflows: readonly ParsedReferencedWorkflow[],
+  jobs: readonly GitHubWorkflowJob[]
+): EvidenceArtifactType[] {
+  const types: EvidenceArtifactType[] = [];
+  const paths = new Set(referencedWorkflows.map((workflow) => workflow.workflowPath));
+  if (paths.has(".github/workflows/reusable-security.yml")) {
+    const scannerJob = workflowJob(jobs, "deterministic scanners");
+    if (!scannerJob) {
+      throw new RetryableScannerEvidenceError(
+        "trusted security reusable workflow job metadata is unavailable"
+      );
+    }
+    if (scannerJob.conclusion !== "skipped") types.push("security");
+  }
+  if (paths.has(".github/workflows/reusable-image.yml")) {
+    const validationJob = workflowJob(jobs, "image build, smoke, scan, SBOM");
+    const promotionJob = workflowJob(jobs, "image push, sign, attest");
+    if (!validationJob || !promotionJob) {
+      throw new RetryableScannerEvidenceError(
+        "trusted image reusable workflow job metadata is unavailable"
+      );
+    }
+    if (validationJob.conclusion !== "skipped") types.push("image-validation");
+    if (promotionJob.conclusion !== "skipped") types.push("image-promotion");
+  }
+  if (paths.has(".github/workflows/reusable-dast.yml")) {
+    const dastJob = workflowJob(jobs, "authenticated staging DAST");
+    if (!dastJob) {
+      throw new RetryableScannerEvidenceError(
+        "trusted DAST reusable workflow job metadata is unavailable"
+      );
+    }
+    if (dastJob.conclusion !== "skipped") types.push("dast");
+  }
+  return types;
+}
+
+function validateArtifactMetadata(
+  artifact: GitHubArtifact,
+  expectedName: string,
+  workflowRecord: ScannerWorkflowRunRecord,
+  repositoryId: number
+): string[] {
+  const errors: string[] = [];
+  const workflowMetadata = asRecord(artifact.workflow_run);
+  if (!Number.isSafeInteger(artifact.id) || artifact.id <= 0) {
+    errors.push("artifact id is invalid");
+  }
+  if (artifact.name !== expectedName) errors.push("artifact name mismatch");
+  if (
+    !Number.isSafeInteger(artifact.size_in_bytes) ||
+    artifact.size_in_bytes <= 0 ||
+    artifact.size_in_bytes > MAX_ARTIFACT_BYTES
+  ) {
+    errors.push("artifact size is invalid");
+  }
+  if (
+    typeof artifact.digest !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(artifact.digest.toLowerCase())
+  ) {
+    errors.push("artifact digest is missing or invalid");
+  }
+  if (
+    typeof artifact.archive_download_url !== "string" ||
+    !/^https:\/\//.test(artifact.archive_download_url)
+  ) {
+    errors.push("artifact download metadata is missing or invalid");
+  }
+  if (!workflowMetadata) {
+    errors.push("artifact workflow_run metadata is missing");
+    return errors;
+  }
+  if (workflowMetadata.id !== workflowRecord.runId) {
+    errors.push("artifact workflow run id mismatch");
+  }
+  if (workflowMetadata.repository_id !== repositoryId) {
+    errors.push("artifact repository id mismatch");
+  }
+  if (
+    !Number.isSafeInteger(workflowMetadata.head_repository_id) ||
+    Number(workflowMetadata.head_repository_id) <= 0
+  ) {
+    errors.push("artifact head repository metadata is invalid");
+  }
+  if (workflowMetadata.head_sha !== workflowRecord.headSha) {
+    errors.push("artifact head SHA mismatch");
+  }
+  if (workflowMetadata.head_branch !== workflowRecord.headBranch) {
+    errors.push("artifact head branch mismatch");
+  }
+  return errors;
+}
+
 export function createScannerWorkflowRunHandler(
   options: ScannerEvidenceHandlerOptions
 ): (run: GuardianScannerWorkflowRun) => Promise<void> {
   const env = options.environment ?? process.env;
-  const trustedWorkflow = parseTrustedWorkflowConfig(env);
+  const trustPolicy = parseEvidenceTrustPolicy(env);
   const defectDojoSettings = parseDefectDojoSettings(env);
   const now = options.now ?? (() => new Date());
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -1126,7 +1748,7 @@ export function createScannerWorkflowRunHandler(
       ? workflowRun.referenced_workflows
       : [];
     const referencedWorkflows = referencedWorkflowValues
-      .map((workflow) => parseReferencedWorkflow(workflow, trustedWorkflow.repository))
+      .map((workflow) => parseReferencedWorkflow(workflow, trustPolicy))
       .filter((workflow): workflow is ParsedReferencedWorkflow => Boolean(workflow));
     const workflowRecord: ScannerWorkflowRunRecord = {
       repositoryId: run.repositoryId,
@@ -1134,6 +1756,12 @@ export function createScannerWorkflowRunHandler(
       runAttempt: run.runAttempt,
       headSha: String(workflowRun.head_sha ?? ""),
       headBranch: workflowRun.head_branch ? String(workflowRun.head_branch) : undefined,
+      event: scannerWorkflowEvent(workflowRun.event),
+      startedAt: normalizedTimestamp(workflowRun.run_started_at),
+      completedAt:
+        workflowRun.status === "completed"
+          ? normalizedTimestamp(workflowRun.updated_at)
+          : undefined,
       workflowPath,
       workflowRef,
       workflowSha:
@@ -1155,12 +1783,31 @@ export function createScannerWorkflowRunHandler(
     if (workflowRun.run_attempt !== run.runAttempt) validationErrors.push("workflow run attempt mismatch");
     if (workflowPath !== run.workflowPath) validationErrors.push("workflow path is not trusted");
     if (String(workflowRun.head_sha ?? "") !== run.headSha) validationErrors.push("workflow head SHA mismatch");
+    if (!workflowRun.head_branch || typeof workflowRun.head_branch !== "string") {
+      validationErrors.push("workflow head branch metadata is missing");
+    }
+    if (
+      workflowRun.repository?.id !== repository.repositoryId ||
+      normalizeRepository(String(workflowRun.repository?.full_name ?? "")) !==
+        normalizeRepository(repository.fullName)
+    ) {
+      validationErrors.push("workflow repository metadata mismatch");
+    }
+    if (String(workflowRun.conclusion ?? "unknown") !== run.conclusion) {
+      validationErrors.push("workflow conclusion mismatch");
+    }
     if (String(workflowRun.status ?? "") !== "completed") validationErrors.push("workflow run is not completed");
     if (referencedWorkflows.length === 0) {
       validationErrors.push("workflow run did not reference any trusted GuardianBot reusable workflow");
     }
     if (referencedWorkflows.length !== referencedWorkflowValues.length) {
       validationErrors.push("workflow run referenced an untrusted reusable workflow or mutable ref");
+    }
+    if (
+      new Set(referencedWorkflows.map((workflow) => workflow.workflowPath)).size !==
+      referencedWorkflows.length
+    ) {
+      validationErrors.push("workflow run referenced a trusted reusable workflow more than once");
     }
     if (validationErrors.length) {
       await options.store.upsertScannerWorkflowRun({
@@ -1172,22 +1819,49 @@ export function createScannerWorkflowRunHandler(
       return;
     }
     await options.store.upsertScannerWorkflowRun(workflowRecord);
-    const artifacts = await listWorkflowArtifacts(api, owner, repo, run.runId);
+    const [artifacts, jobs] = await Promise.all([
+      listWorkflowArtifacts(api, owner, repo, run.runId),
+      listWorkflowJobs(api, owner, repo, run.runId)
+    ]);
+    const expectedTypes = expectedArtifactTypes(referencedWorkflows, jobs);
     const expectedNames = new Set(
-      [...run.artifactNamePrefixes, "guardianbot-image-promotion-"].map(
-        (prefix) => `${prefix}${run.runId}-${run.runAttempt}`
+      expectedTypes.map((type) =>
+        expectedArtifactName(type, run.runId, run.runAttempt)
       )
     );
-    const trustedArtifacts = artifacts.filter((artifact) => expectedNames.has(artifact.name));
-    if (!trustedArtifacts.length) {
-      throw new RetryableScannerEvidenceError(
-        `workflow run ${run.runId}/${run.runAttempt} has no trusted GuardianBot artifact yet`
-      );
+    const namedTrustedArtifacts = artifacts.filter((artifact) =>
+      artifactType(artifact.name)
+    );
+    const unexpectedNames = namedTrustedArtifacts
+      .map((artifact) => artifact.name)
+      .filter((name) => !expectedNames.has(name));
+    const missingOrDuplicate = [...expectedNames].filter(
+      (name) => artifacts.filter((artifact) => artifact.name === name).length !== 1
+    );
+    if (unexpectedNames.length || missingOrDuplicate.length) {
+      const validationError = [
+        unexpectedNames.length
+          ? `unexpected trusted artifacts: ${unexpectedNames.join(", ")}`
+          : "",
+        missingOrDuplicate.length
+          ? `missing or duplicate expected artifacts: ${missingOrDuplicate.join(", ")}`
+          : ""
+      ]
+        .filter(Boolean)
+        .join("; ");
+      await options.store.upsertScannerWorkflowRun({
+        ...workflowRecord,
+        validationStatus: "failed",
+        validationError
+      });
+      throw new RetryableScannerEvidenceError(validationError);
     }
     let acceptedArtifacts = 0;
-    for (const artifact of trustedArtifacts) {
-      const type = artifactType(artifact.name);
-      if (!type) continue;
+    const reconciliationErrors: string[] = [];
+    for (const type of expectedTypes) {
+      const expectedName = expectedArtifactName(type, run.runId, run.runAttempt);
+      const artifact = artifacts.find((candidate) => candidate.name === expectedName);
+      if (!artifact) continue;
       const artifactRecord: ScannerArtifactRecord = {
         repositoryId: run.repositoryId,
         runId: run.runId,
@@ -1200,35 +1874,48 @@ export function createScannerWorkflowRunHandler(
         digest: artifact.digest ? String(artifact.digest).toLowerCase() : undefined,
         validationStatus: "accepted"
       };
-      if (artifact.expired) {
+      const metadataErrors = validateArtifactMetadata(
+        artifact,
+        expectedName,
+        workflowRecord,
+        repository.repositoryId
+      );
+      if (artifact.expired) metadataErrors.push("artifact has expired");
+      if (metadataErrors.length) {
         await options.store.upsertScannerArtifact({
           ...artifactRecord,
           validationStatus: "rejected",
-          validationError: "artifact has expired",
+          validationError: metadataErrors.join("; "),
           processedAt: now().toISOString()
         });
+        reconciliationErrors.push(`${expectedName}: ${metadataErrors.join("; ")}`);
         continue;
       }
       const zipPath = await api.downloadArtifact(owner, repo, artifact.id);
       try {
-        const zipBytes = await readFile(zipPath);
-        const actualDigest = sha256Hex(zipBytes);
-        if (!artifactDigestMatches(artifactRecord.digest, actualDigest)) {
-          await options.store.upsertScannerArtifact({
-            ...artifactRecord,
-            validationStatus: "rejected",
-            validationError: "artifact digest mismatch",
-            processedAt: now().toISOString()
-          });
-          continue;
+        const downloaded = await sha256File(zipPath);
+        if (
+          downloaded.size !== artifactRecord.sizeBytes ||
+          !artifactDigestMatches(artifactRecord.digest, downloaded.digest)
+        ) {
+          throw new Error("artifact size or digest mismatch");
         }
         const allowedFiles =
           type === "security" ? SECURITY_FILES : type === "dast" ? DAST_FILES : IMAGE_FILES;
         const archive = await parseArtifactArchive(zipPath, allowedFiles);
-        await options.store.upsertScannerArtifact({
-          ...artifactRecord,
-          processedAt: now().toISOString()
-        });
+        validateArtifactProvenance(
+          archive,
+          type,
+          {
+            repository: repository.fullName,
+            repositoryId: repository.repositoryId,
+            runId: run.runId,
+            runAttempt: run.runAttempt,
+            headSha: workflowRecord.headSha
+          },
+          trustPolicy,
+          now()
+        );
         if (type === "security") {
           await processSecurityArtifact(
             options.store,
@@ -1249,7 +1936,7 @@ export function createScannerWorkflowRunHandler(
             repository.fullName,
             repository.visibility as "public" | "private" | "internal",
             repository.defaultBranch,
-            workflowRecord.headSha,
+            workflowRecord,
             env,
             defectDojoSettings
           );
@@ -1261,16 +1948,28 @@ export function createScannerWorkflowRunHandler(
             repository.fullName,
             repository.visibility as "public" | "private" | "internal",
             repository.defaultBranch,
-            workflowRecord.headSha,
+            workflowRecord,
+            trustPolicy,
             env,
             defectDojoSettings
           );
         }
+        await options.store.upsertScannerArtifact({
+          ...artifactRecord,
+          processedAt: now().toISOString()
+        });
         acceptedArtifacts += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof RetryableScannerEvidenceError) {
-          throw error;
+          await options.store.upsertScannerArtifact({
+            ...artifactRecord,
+            validationStatus: "failed",
+            validationError:
+              `evidence validation completed, but reconciliation health failed: ${message}`
+          });
+          reconciliationErrors.push(`${expectedName}: ${message}`);
+          continue;
         }
         await options.store.upsertScannerArtifact({
           ...artifactRecord,
@@ -1278,14 +1977,25 @@ export function createScannerWorkflowRunHandler(
           validationError: message,
           processedAt: now().toISOString()
         });
+        reconciliationErrors.push(`${expectedName}: ${message}`);
       } finally {
         await rm(join(zipPath, ".."), { recursive: true, force: true }).catch(() => undefined);
       }
     }
+    if (acceptedArtifacts !== expectedTypes.length || reconciliationErrors.length) {
+      const validationError =
+        reconciliationErrors.join("; ") ||
+        "not every expected trusted artifact passed validation";
+      await options.store.upsertScannerWorkflowRun({
+        ...workflowRecord,
+        validationStatus: "failed",
+        validationError
+      });
+      throw new RetryableScannerEvidenceError(validationError);
+    }
     await options.store.upsertScannerWorkflowRun({
       ...workflowRecord,
-      validationStatus: acceptedArtifacts > 0 ? "accepted" : "failed",
-      validationError: acceptedArtifacts > 0 ? undefined : "no trusted artifact passed validation",
+      validationStatus: "accepted",
       processedAt: now().toISOString()
     });
   };

@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  createEvidenceAttestationService,
+  EvidenceAttestationError
+} from "./evidence-attestation.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
+import {
+  MonitoringService,
+  monitoringOptionsFromEnvironment
+} from "./monitoring-service.js";
 import { RepositoryIndexService } from "./repository-index-service.js";
 import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
 import { GuardianService } from "./service.js";
@@ -34,7 +42,21 @@ async function createStore(): Promise<Store> {
 async function start() {
   const metrics = new GuardianMetrics();
   const store = await createStore();
+  const monitoring = new MonitoringService(
+    store,
+    monitoringOptionsFromEnvironment(process.env)
+  );
   const privateKey = required("GITHUB_APP_PRIVATE_KEY").replace(/\\n/g, "\n");
+  const evidenceAttestation = createEvidenceAttestationService({
+    environment: process.env,
+    authorizeRepository: async (repositoryName, repositoryId) => {
+      const repository = await store.getRepository(repositoryId);
+      return (
+        repository?.repositoryState === "active" &&
+        repository.fullName.toLowerCase() === repositoryName.toLowerCase()
+      );
+    }
+  });
   const repositoryIndexService = new RepositoryIndexService(store);
   const service = new GuardianService(
     {
@@ -54,6 +76,7 @@ async function start() {
     },
     store
   );
+  monitoring.start();
   const workerId = `${process.pid}-${randomUUID()}`;
   let shuttingDown = false;
   let lastWorkerPollAt = Date.now();
@@ -81,6 +104,7 @@ async function start() {
       const ready =
         !shuttingDown &&
         Date.now() - lastWorkerPollAt < 30_000 &&
+        monitoring.ready() &&
         (await service.ready());
       response
         .writeHead(ready ? 200 : 503, { "content-type": "application/json" })
@@ -100,7 +124,59 @@ async function start() {
       }
       response
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
-        .end(metrics.render());
+        .end(`${metrics.render()}${monitoring.renderMetrics()}`);
+      return;
+    }
+    if (request.method === "POST" && request.url === "/evidence/attest") {
+      const mediaType = String(request.headers["content-type"] ?? "")
+        .split(";", 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (mediaType !== "application/json") {
+        response.writeHead(415).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      try {
+        for await (const chunk of request) {
+          const buffer = Buffer.from(chunk);
+          received += buffer.length;
+          if (received > 16 * 1024) {
+            response.writeHead(413).end();
+            request.destroy();
+            return;
+          }
+          chunks.push(buffer);
+        }
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const attestation = await evidenceAttestation.attest(
+          request.headers.authorization,
+          payload
+        );
+        response
+          .writeHead(200, {
+            "cache-control": "no-store",
+            "content-type": "application/json"
+          })
+          .end(JSON.stringify(attestation));
+      } catch (error) {
+        const status =
+          error instanceof EvidenceAttestationError ? error.statusCode : 400;
+        response
+          .writeHead(status, {
+            "cache-control": "no-store",
+            "content-type": "application/json"
+          })
+          .end(
+            JSON.stringify({
+              error:
+                error instanceof EvidenceAttestationError
+                  ? error.message
+                  : "invalid attestation request"
+            })
+          );
+      }
       return;
     }
     if (request.method !== "POST" || request.url !== "/webhooks/github") {
@@ -149,7 +225,10 @@ async function start() {
     if (shuttingDown) return;
     shuttingDown = true;
     server.close();
-    await Promise.race([workerPromise, delay(15_000)]);
+    await Promise.race([
+      Promise.all([workerPromise, monitoring.stop()]),
+      delay(15_000)
+    ]);
     await store.close();
     if (signal) process.exitCode = process.exitCode ?? 0;
   }

@@ -26,20 +26,37 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      id-token: write
+    outputs:
+      image-tar-sha256: ${{ steps.build.outputs.image-tar-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Build exact linux/amd64 image
+        id: build
         run: |
-          mkdir -p guardianbot-image-evidence
+          mkdir -p guardianbot-image-evidence guardianbot-image-transfer
           docker build --platform linux/amd64 \
             --file "${{ inputs.dockerfile }}" \
             --tag "${{ inputs.image-name }}:${GITHUB_SHA}" "${{ inputs.context }}"
-          docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" \
-            --format '{{json .RepoDigests}}' > guardianbot-image-evidence/build-digests.json
+          image_id="$(docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" --format '{{.Id}}')"
+          repo_tags="$(docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" --format '{{json .RepoTags}}')"
+          jq -n \
+            --arg imageId "$image_id" \
+            --argjson repoTags "$repo_tags" \
+            --argjson promotionExpected '${{ inputs.push }}' \
+            '{
+              schemaVersion: "1.0.0",
+              imageId: $imageId,
+              repoTags: $repoTags,
+              promotionExpected: $promotionExpected
+            }' > guardianbot-image-evidence/build-digests.json
           if [ "${{ inputs.push }}" = "true" ]; then
-            docker save "${{ inputs.image-name }}:${GITHUB_SHA}" | gzip -1 > guardianbot-image-evidence/exact-image.tar.gz
+            docker save "${{ inputs.image-name }}:${GITHUB_SHA}" |
+              gzip -1 > guardianbot-image-transfer/exact-image.tar.gz
+            tar_sha="$(sha256sum guardianbot-image-transfer/exact-image.tar.gz | cut -d' ' -f1)"
+            echo "image-tar-sha256=$tar_sha" >> "$GITHUB_OUTPUT"
           fi
       - name: Repository-specific application tests
         if: inputs.smoke-command != ''
@@ -87,7 +104,10 @@ jobs:
               echo "Ephemeral environment key also has a static value"
               exit 1
             }
-            printf '%s=%s\n' "$key" "$(openssl rand -hex 32)" >> guardianbot-runtime.env
+            generated_value="$(openssl rand -hex 32)"
+            echo "::add-mask::${generated_value}"
+            printf '%s=%s\n' "$key" "$generated_value" >> guardianbot-runtime.env
+            unset generated_value
           done
       - name: Apply migrations using exact image
         if: inputs.migration-command != ''
@@ -100,7 +120,7 @@ jobs:
             --network guardianbot-smoke --env-file guardianbot-runtime.env \
             -p 127.0.0.1:${{ inputs.container-port }}:${{ inputs.container-port }} \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
-          trap 'docker logs guardianbot-smoke; docker stop guardianbot-smoke' EXIT
+          trap 'docker stop guardianbot-smoke >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 60); do
             curl --fail --silent "http://127.0.0.1:${{ inputs.container-port }}${{ inputs.health-path }}" && break
             sleep 2
@@ -111,15 +131,24 @@ jobs:
           fi
       - name: Trivy image scan
         run: |
+          set +e
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
+            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
             image --format json --output /evidence/trivy-image.json \
             --scanners vuln,misconfig,secret --severity CRITICAL --exit-code 0 \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
+          trivy_exit="$?"
+          set -e
+          if [ "$trivy_exit" -ne 0 ] ||
+             ! jq -e 'type == "object"' guardianbot-image-evidence/trivy-image.json >/dev/null 2>&1; then
+            jq -n --argjson exitCode "$trivy_exit" \
+              '{scanner_error: true, exitCode: $exitCode}' \
+              > guardianbot-image-evidence/trivy-image.json
+          fi
       - name: CycloneDX SBOM from exact image
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.64.1@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e \
+            -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
             image --format cyclonedx --output /evidence/sbom.cdx.json \
             "${{ inputs.image-name }}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
@@ -131,12 +160,170 @@ jobs:
               select(.Severity == "CRITICAL")] | length' \
               guardianbot-image-evidence/trivy-image.json
           )"
-          printf '{"criticalFindings":%s}\n' "$critical_count" \
+          scanner_error="$(jq -r '.scanner_error == true' guardianbot-image-evidence/trivy-image.json)"
+          jq -n \
+            --argjson criticalFindings "$critical_count" \
+            --argjson scannerError "$scanner_error" \
+            '{criticalFindings: $criticalFindings, scannerError: $scannerError}' \
             > guardianbot-image-evidence/policy.json
+          if [ "$scanner_error" = "true" ]; then
+            echo "Image policy blocked because Trivy failed operationally."
+            exit 1
+          fi
           if [ "$critical_count" -ne 0 ]; then
             echo "Image policy blocked ${critical_count} Critical finding(s)."
             exit 1
           fi
+      - name: Upload exact image transfer
+        if: inputs.push
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-image-transfer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-image-transfer/exact-image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Check out immutable GuardianBot deployment manifest
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: guardianbot-engine
+          persist-credentials: false
+      - name: Attest validation evidence provenance
+        if: always()
+        env:
+          EVIDENCE_ARTIFACT_TYPE: image-validation
+          EVIDENCE_DIRECTORY: guardianbot-image-evidence
+          EVIDENCE_FILES: build-digests.json,policy.json,sbom.cdx.json,trivy-image.json
+          GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          (async () => {
+          const crypto = require("node:crypto");
+          const childProcess = require("node:child_process");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const canonical = (value) => {
+            if (value === null || typeof value === "boolean" ||
+                typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+            return `{${Object.keys(value).sort().map((key) =>
+              `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+          };
+          const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+          const workflowMatch = process.env.JOB_WORKFLOW_REF.match(
+            /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)@([a-f0-9]{40})$/i
+          );
+          if (!workflowMatch || workflowMatch[3].toLowerCase() !== process.env.JOB_WORKFLOW_SHA) {
+            throw new Error("Reusable workflow identity is not pinned to its exact SHA");
+          }
+          const workflowCheckout = fs.realpathSync(process.env.GUARDIANBOT_WORKFLOW_CHECKOUT);
+          const checkedOutSha = childProcess.execFileSync(
+            "git", ["-C", workflowCheckout, "rev-parse", "HEAD"],
+            { encoding: "utf8" }
+          ).trim().toLowerCase();
+          if (checkedOutSha !== process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+            throw new Error("Deployment manifest checkout does not match the reusable workflow SHA");
+          }
+          const deploymentPath = path.join(workflowCheckout, "deployments", "production.json");
+          const deploymentStat = fs.lstatSync(deploymentPath);
+          if (!deploymentStat.isFile() || deploymentStat.isSymbolicLink() ||
+              path.dirname(path.dirname(fs.realpathSync(deploymentPath))) !== workflowCheckout) {
+            throw new Error("Deployment manifest must be a direct regular file in the trusted checkout");
+          }
+          const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+          if (!deployment || deployment.schemaVersion !== "1.0.0" ||
+              deployment.environment !== "production" ||
+              typeof deployment.evidenceAttestationUrl !== "string" ||
+              Object.keys(deployment).sort().join(",") !==
+                "environment,evidenceAttestationUrl,schemaVersion") {
+            throw new Error("GuardianBot production deployment manifest is invalid");
+          }
+          const directoryStat = fs.lstatSync(process.env.EVIDENCE_DIRECTORY);
+          if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+            throw new Error("Evidence directory must be a real directory");
+          }
+          const evidenceDirectory = fs.realpathSync(process.env.EVIDENCE_DIRECTORY);
+          const writeEvidenceOutput = (name, contents) => {
+            const target = path.join(evidenceDirectory, name);
+            try {
+              const existing = fs.lstatSync(target);
+              if (!existing.isFile() || existing.isSymbolicLink() ||
+                  path.dirname(fs.realpathSync(target)) !== evidenceDirectory) {
+                throw new Error(`Refusing to replace unsafe evidence output: ${name}`);
+              }
+              fs.unlinkSync(target);
+            } catch (error) {
+              if (!error || error.code !== "ENOENT") throw error;
+            }
+            fs.writeFileSync(target, contents, { mode: 0o600, flag: "wx" });
+          };
+          const files = process.env.EVIDENCE_FILES.split(",").filter(Boolean).sort().map((name) => {
+            if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error("Invalid evidence filename");
+            const filePath = path.join(evidenceDirectory, name);
+            const stat = fs.lstatSync(filePath);
+            if (!stat.isFile() || stat.isSymbolicLink() ||
+                path.dirname(fs.realpathSync(filePath)) !== evidenceDirectory) {
+              throw new Error(`Evidence file must be a direct regular file: ${name}`);
+            }
+            const bytes = fs.readFileSync(filePath);
+            if (!bytes.length) throw new Error(`Evidence file is empty: ${name}`);
+            return { path: name, sha256: sha256(bytes), size: bytes.length };
+          });
+          const manifest = {
+            schemaVersion: "1.0.0",
+            artifactType: process.env.EVIDENCE_ARTIFACT_TYPE,
+            repository: process.env.GITHUB_REPOSITORY.toLowerCase(),
+            repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
+            runId: Number(process.env.GITHUB_RUN_ID),
+            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            headSha: process.env.GITHUB_SHA.toLowerCase(),
+            workflowPath: workflowMatch[2],
+            workflowSha: process.env.JOB_WORKFLOW_SHA.toLowerCase(),
+            files
+          };
+          const manifestDigest = `sha256:${sha256(Buffer.from(canonical(manifest)))}`;
+          writeEvidenceOutput("provenance-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          const endpoint = new URL(deployment.evidenceAttestationUrl);
+          if (endpoint.protocol !== "https:" || endpoint.pathname !== "/evidence/attest" ||
+              endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+            throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
+          }
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set("audience", "guardianbot-evidence");
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+            redirect: "error"
+          });
+          if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
+          const oidcToken = String((await oidcResponse.json()).value || "");
+          if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
+          const attestationResponse = await fetch(endpoint, {
+            method: "POST",
+            headers: { authorization: `Bearer ${oidcToken}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              schemaVersion: "1.0.0", artifactType: manifest.artifactType, manifestDigest,
+              repository: manifest.repository, repositoryId: manifest.repositoryId,
+              runId: manifest.runId, runAttempt: manifest.runAttempt, headSha: manifest.headSha
+            }),
+            redirect: "error"
+          });
+          if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
+          const provenance = await attestationResponse.json();
+          if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
+            throw new Error("Evidence attestation response is invalid");
+          }
+          writeEvidenceOutput("provenance-token.txt", `${provenance.token}\n`);
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+          });
+          NODE
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -147,6 +334,7 @@ jobs:
       - name: Remove disposable dependencies
         if: always()
         run: |
+          shred -u guardianbot-runtime.env 2>/dev/null || rm -f guardianbot-runtime.env
           docker rm -f guardianbot-smoke guardianbot-postgres guardianbot-redis 2>/dev/null || true
           docker network rm guardianbot-smoke 2>/dev/null || true
 
@@ -160,21 +348,35 @@ jobs:
       github.event_name == 'push' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: validate-image
+    environment: guardianbot-image-promotion
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
       id-token: write
-      attestations: write
     steps:
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: guardianbot-image-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: guardianbot-image-evidence
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: guardianbot-image-transfer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-image-transfer
+      - name: Check out immutable GuardianBot deployment manifest
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: guardianbot-engine
+          persist-credentials: false
       - name: Restore exact validated image
         run: |
-          test -s guardianbot-image-evidence/exact-image.tar.gz
-          gzip -dc guardianbot-image-evidence/exact-image.tar.gz | docker load
+          test -s guardianbot-image-transfer/exact-image.tar.gz
+          actual_tar_sha="$(sha256sum guardianbot-image-transfer/exact-image.tar.gz | cut -d' ' -f1)"
+          test "$actual_tar_sha" = "${{ needs.validate-image.outputs.image-tar-sha256 }}"
+          gzip -dc guardianbot-image-transfer/exact-image.tar.gz | docker load
       - name: Authenticate GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Push immutable content
@@ -182,16 +384,172 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
       - name: Keyless sign and attest
+        env:
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
           digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${{ inputs.image-name }}:${GITHUB_SHA}")"
           test -n "$digest"
+          image_digest="${digest##*@}"
+          certificate_identity="https://github.com/${GITHUB_WORKFLOW_REF}"
           cosign sign --yes "$digest"
           cosign attest --yes --type cyclonedx \
             --predicate guardianbot-image-evidence/sbom.cdx.json "$digest"
-          cosign verify "$digest" \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/" \
+          cosign verify --output json "$digest" \
+            --certificate-identity "$certificate_identity" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            | jq -s '[.[] | if type == "array" then .[] else . end]' \
             > guardianbot-image-evidence/cosign-verification.json
+          cosign verify-attestation --output json --type cyclonedx "$digest" \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            | jq -s '[.[] | if type == "array" then .[] else . end]' \
+            > guardianbot-image-evidence/sbom-attestation-verification.json
+          sbom_sha="$(sha256sum guardianbot-image-evidence/sbom.cdx.json | cut -d' ' -f1)"
+          jq -n \
+            --arg imageReference "$digest" \
+            --arg imageDigest "$image_digest" \
+            --arg certificateIdentity "$certificate_identity" \
+            --arg jobWorkflowRef "$JOB_WORKFLOW_REF" \
+            --arg sbomSha256 "$sbom_sha" \
+            '{
+              schemaVersion: "1.0.0",
+              imageReference: $imageReference,
+              imageDigest: $imageDigest,
+              certificateIdentity: $certificateIdentity,
+              jobWorkflowRef: $jobWorkflowRef,
+              sbomSha256: $sbomSha256
+            }' > guardianbot-image-evidence/promotion.json
+      - name: Attest promotion evidence provenance
+        if: always()
+        env:
+          EVIDENCE_ARTIFACT_TYPE: image-promotion
+          EVIDENCE_DIRECTORY: guardianbot-image-evidence
+          EVIDENCE_FILES: build-digests.json,cosign-verification.json,policy.json,promotion.json,sbom-attestation-verification.json,sbom.cdx.json,trivy-image.json
+          GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          (async () => {
+          const crypto = require("node:crypto");
+          const childProcess = require("node:child_process");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const canonical = (value) => {
+            if (value === null || typeof value === "boolean" ||
+                typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+            return `{${Object.keys(value).sort().map((key) =>
+              `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+          };
+          const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+          const workflowMatch = process.env.JOB_WORKFLOW_REF.match(
+            /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)@([a-f0-9]{40})$/i
+          );
+          if (!workflowMatch || workflowMatch[3].toLowerCase() !== process.env.JOB_WORKFLOW_SHA) {
+            throw new Error("Reusable workflow identity is not pinned to its exact SHA");
+          }
+          const workflowCheckout = fs.realpathSync(process.env.GUARDIANBOT_WORKFLOW_CHECKOUT);
+          const checkedOutSha = childProcess.execFileSync(
+            "git", ["-C", workflowCheckout, "rev-parse", "HEAD"],
+            { encoding: "utf8" }
+          ).trim().toLowerCase();
+          if (checkedOutSha !== process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+            throw new Error("Deployment manifest checkout does not match the reusable workflow SHA");
+          }
+          const deploymentPath = path.join(workflowCheckout, "deployments", "production.json");
+          const deploymentStat = fs.lstatSync(deploymentPath);
+          if (!deploymentStat.isFile() || deploymentStat.isSymbolicLink() ||
+              path.dirname(path.dirname(fs.realpathSync(deploymentPath))) !== workflowCheckout) {
+            throw new Error("Deployment manifest must be a direct regular file in the trusted checkout");
+          }
+          const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+          if (!deployment || deployment.schemaVersion !== "1.0.0" ||
+              deployment.environment !== "production" ||
+              typeof deployment.evidenceAttestationUrl !== "string" ||
+              Object.keys(deployment).sort().join(",") !==
+                "environment,evidenceAttestationUrl,schemaVersion") {
+            throw new Error("GuardianBot production deployment manifest is invalid");
+          }
+          const directoryStat = fs.lstatSync(process.env.EVIDENCE_DIRECTORY);
+          if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+            throw new Error("Evidence directory must be a real directory");
+          }
+          const evidenceDirectory = fs.realpathSync(process.env.EVIDENCE_DIRECTORY);
+          const writeEvidenceOutput = (name, contents) => {
+            const target = path.join(evidenceDirectory, name);
+            try {
+              const existing = fs.lstatSync(target);
+              if (!existing.isFile() || existing.isSymbolicLink() ||
+                  path.dirname(fs.realpathSync(target)) !== evidenceDirectory) {
+                throw new Error(`Refusing to replace unsafe evidence output: ${name}`);
+              }
+              fs.unlinkSync(target);
+            } catch (error) {
+              if (!error || error.code !== "ENOENT") throw error;
+            }
+            fs.writeFileSync(target, contents, { mode: 0o600, flag: "wx" });
+          };
+          const files = process.env.EVIDENCE_FILES.split(",").filter(Boolean).sort().map((name) => {
+            if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error("Invalid evidence filename");
+            const filePath = path.join(evidenceDirectory, name);
+            const stat = fs.lstatSync(filePath);
+            if (!stat.isFile() || stat.isSymbolicLink() ||
+                path.dirname(fs.realpathSync(filePath)) !== evidenceDirectory) {
+              throw new Error(`Evidence file must be a direct regular file: ${name}`);
+            }
+            const bytes = fs.readFileSync(filePath);
+            if (!bytes.length) throw new Error(`Evidence file is empty: ${name}`);
+            return { path: name, sha256: sha256(bytes), size: bytes.length };
+          });
+          const manifest = {
+            schemaVersion: "1.0.0", artifactType: process.env.EVIDENCE_ARTIFACT_TYPE,
+            repository: process.env.GITHUB_REPOSITORY.toLowerCase(),
+            repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
+            runId: Number(process.env.GITHUB_RUN_ID),
+            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            headSha: process.env.GITHUB_SHA.toLowerCase(),
+            workflowPath: workflowMatch[2],
+            workflowSha: process.env.JOB_WORKFLOW_SHA.toLowerCase(), files
+          };
+          const manifestDigest = `sha256:${sha256(Buffer.from(canonical(manifest)))}`;
+          writeEvidenceOutput("provenance-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          const endpoint = new URL(deployment.evidenceAttestationUrl);
+          if (endpoint.protocol !== "https:" || endpoint.pathname !== "/evidence/attest" ||
+              endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+            throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
+          }
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set("audience", "guardianbot-evidence");
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+            redirect: "error"
+          });
+          if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
+          const oidcToken = String((await oidcResponse.json()).value || "");
+          if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
+          const attestationResponse = await fetch(endpoint, {
+            method: "POST",
+            headers: { authorization: `Bearer ${oidcToken}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              schemaVersion: "1.0.0", artifactType: manifest.artifactType, manifestDigest,
+              repository: manifest.repository, repositoryId: manifest.repositoryId,
+              runId: manifest.runId, runAttempt: manifest.runAttempt, headSha: manifest.headSha
+            }),
+            redirect: "error"
+          });
+          if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
+          const provenance = await attestationResponse.json();
+          if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
+            throw new Error("Evidence attestation response is invalid");
+          }
+          writeEvidenceOutput("provenance-token.txt", `${provenance.token}\n`);
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+          });
+          NODE
       - name: Upload promotion evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

@@ -56,7 +56,9 @@ test("generates an immutable reusable workflow caller", () => {
   assert.match(workflow, new RegExp(`@${"b".repeat(40)}`));
   assert.match(workflow, /reusable-security\.yml/);
   assert.doesNotMatch(workflow, /permissions:\n  contents: read\n  security-events: write\n  actions: read\n  packages: write/);
-  assert.match(workflow, /guardianbot-security-gate:[\s\S]*permissions:\n      contents: read\n      security-events: write\n      actions: read/);
+  assert.match(workflow, /guardianbot-security-gate:[\s\S]*permissions:\n      contents: read\n      security-events: write\n      actions: read\n      id-token: write/);
+  assert.doesNotMatch(workflow, /evidence-attestation-url/);
+  assert.doesNotMatch(workflow, /GUARDIANBOT_EVIDENCE_ATTESTATION_URL/);
 });
 
 test("generates ephemeral runtime key references without repository-side values", () => {
@@ -76,7 +78,9 @@ test("generates ephemeral runtime key references without repository-side values"
   });
   assert.match(workflow, /ephemeral-env-keys: "APPLICATION_SMOKE_SECRET"/);
   assert.doesNotMatch(workflow, /APPLICATION_SMOKE_SECRET=/);
-  assert.match(workflow, /guardianbot-image:[\s\S]*permissions:\n      contents: read\n      packages: write\n      id-token: write\n      attestations: write/);
+  assert.match(workflow, /guardianbot-image:[\s\S]*permissions:\n      contents: read\n      packages: write\n      id-token: write/);
+  assert.doesNotMatch(workflow, /attestations: write/);
+  assert.doesNotMatch(workflow, /evidence-attestation-url/);
 });
 
 test("rejects DAST configurations that escape the allowed origin", () => {

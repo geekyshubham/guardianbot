@@ -32,6 +32,7 @@ jobs:
     timeout-minutes: 55
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Resolve and enforce exact staging contract
         id: contract
@@ -180,6 +181,147 @@ jobs:
             echo "ZAP failed operationally with exit code ${zap_exit}."
             exit "$zap_exit"
           fi
+
+      - name: Check out immutable GuardianBot deployment manifest
+        if: always()
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: guardianbot-engine
+          persist-credentials: false
+
+      - name: Attest DAST evidence provenance
+        if: always()
+        env:
+          EVIDENCE_ARTIFACT_TYPE: dast
+          EVIDENCE_DIRECTORY: guardianbot-dast-evidence
+          EVIDENCE_FILES: scan-status.json,zap.json
+          GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          (async () => {
+          const crypto = require("node:crypto");
+          const childProcess = require("node:child_process");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const canonical = (value) => {
+            if (value === null || typeof value === "boolean" ||
+                typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+            return `{${Object.keys(value).sort().map((key) =>
+              `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+          };
+          const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+          const workflowMatch = process.env.JOB_WORKFLOW_REF.match(
+            /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)@([a-f0-9]{40})$/i
+          );
+          if (!workflowMatch || workflowMatch[3].toLowerCase() !== process.env.JOB_WORKFLOW_SHA) {
+            throw new Error("Reusable workflow identity is not pinned to its exact SHA");
+          }
+          const workflowCheckout = fs.realpathSync(process.env.GUARDIANBOT_WORKFLOW_CHECKOUT);
+          const checkedOutSha = childProcess.execFileSync(
+            "git", ["-C", workflowCheckout, "rev-parse", "HEAD"],
+            { encoding: "utf8" }
+          ).trim().toLowerCase();
+          if (checkedOutSha !== process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+            throw new Error("Deployment manifest checkout does not match the reusable workflow SHA");
+          }
+          const deploymentPath = path.join(workflowCheckout, "deployments", "production.json");
+          const deploymentStat = fs.lstatSync(deploymentPath);
+          if (!deploymentStat.isFile() || deploymentStat.isSymbolicLink() ||
+              path.dirname(path.dirname(fs.realpathSync(deploymentPath))) !== workflowCheckout) {
+            throw new Error("Deployment manifest must be a direct regular file in the trusted checkout");
+          }
+          const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+          if (!deployment || deployment.schemaVersion !== "1.0.0" ||
+              deployment.environment !== "production" ||
+              typeof deployment.evidenceAttestationUrl !== "string" ||
+              Object.keys(deployment).sort().join(",") !==
+                "environment,evidenceAttestationUrl,schemaVersion") {
+            throw new Error("GuardianBot production deployment manifest is invalid");
+          }
+          const directoryStat = fs.lstatSync(process.env.EVIDENCE_DIRECTORY);
+          if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+            throw new Error("Evidence directory must be a real directory");
+          }
+          const evidenceDirectory = fs.realpathSync(process.env.EVIDENCE_DIRECTORY);
+          const writeEvidenceOutput = (name, contents) => {
+            const target = path.join(evidenceDirectory, name);
+            try {
+              const existing = fs.lstatSync(target);
+              if (!existing.isFile() || existing.isSymbolicLink() ||
+                  path.dirname(fs.realpathSync(target)) !== evidenceDirectory) {
+                throw new Error(`Refusing to replace unsafe evidence output: ${name}`);
+              }
+              fs.unlinkSync(target);
+            } catch (error) {
+              if (!error || error.code !== "ENOENT") throw error;
+            }
+            fs.writeFileSync(target, contents, { mode: 0o600, flag: "wx" });
+          };
+          const files = process.env.EVIDENCE_FILES.split(",").filter(Boolean).sort().map((name) => {
+            if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error("Invalid evidence filename");
+            const filePath = path.join(evidenceDirectory, name);
+            const stat = fs.lstatSync(filePath);
+            if (!stat.isFile() || stat.isSymbolicLink() ||
+                path.dirname(fs.realpathSync(filePath)) !== evidenceDirectory) {
+              throw new Error(`Evidence file must be a direct regular file: ${name}`);
+            }
+            const bytes = fs.readFileSync(filePath);
+            if (!bytes.length) throw new Error(`Evidence file is empty: ${name}`);
+            return { path: name, sha256: sha256(bytes), size: bytes.length };
+          });
+          const manifest = {
+            schemaVersion: "1.0.0", artifactType: process.env.EVIDENCE_ARTIFACT_TYPE,
+            repository: process.env.GITHUB_REPOSITORY.toLowerCase(),
+            repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
+            runId: Number(process.env.GITHUB_RUN_ID),
+            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            headSha: process.env.GITHUB_SHA.toLowerCase(),
+            workflowPath: workflowMatch[2],
+            workflowSha: process.env.JOB_WORKFLOW_SHA.toLowerCase(), files
+          };
+          const manifestDigest = `sha256:${sha256(Buffer.from(canonical(manifest)))}`;
+          writeEvidenceOutput("provenance-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          const endpoint = new URL(deployment.evidenceAttestationUrl);
+          if (endpoint.protocol !== "https:" || endpoint.pathname !== "/evidence/attest" ||
+              endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+            throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
+          }
+          const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+          oidcUrl.searchParams.set("audience", "guardianbot-evidence");
+          const oidcResponse = await fetch(oidcUrl, {
+            headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+            redirect: "error"
+          });
+          if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
+          const oidcToken = String((await oidcResponse.json()).value || "");
+          if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
+          const attestationResponse = await fetch(endpoint, {
+            method: "POST",
+            headers: { authorization: `Bearer ${oidcToken}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              schemaVersion: "1.0.0", artifactType: manifest.artifactType, manifestDigest,
+              repository: manifest.repository, repositoryId: manifest.repositoryId,
+              runId: manifest.runId, runAttempt: manifest.runAttempt, headSha: manifest.headSha
+            }),
+            redirect: "error"
+          });
+          if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
+          const provenance = await attestationResponse.json();
+          if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
+            throw new Error("Evidence attestation response is invalid");
+          }
+          writeEvidenceOutput("provenance-token.txt", `${provenance.token}\n`);
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+          });
+          NODE
 
       - name: Upload DAST evidence
         if: always()

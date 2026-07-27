@@ -7,6 +7,7 @@ COPY packages/defectdojo/package.json packages/defectdojo/package.json
 COPY packages/monitoring/package.json packages/monitoring/package.json
 COPY packages/guardianctl/package.json packages/guardianctl/package.json
 COPY apps/control-plane/package.json apps/control-plane/package.json
+COPY apps/model-bridge/package.json apps/model-bridge/package.json
 RUN npm ci
 COPY tsconfig.base.json ./
 COPY packages packages
@@ -22,11 +23,17 @@ COPY --from=build /app/packages/protocol/package.json ./packages/protocol/packag
 COPY --from=build /app/packages/protocol/dist ./packages/protocol/dist
 COPY --from=build /app/packages/core/package.json ./packages/core/package.json
 COPY --from=build /app/packages/core/dist ./packages/core/dist
+COPY --from=build /app/packages/defectdojo/package.json ./packages/defectdojo/package.json
+COPY --from=build /app/packages/defectdojo/dist ./packages/defectdojo/dist
+COPY --from=build /app/packages/monitoring/package.json ./packages/monitoring/package.json
+COPY --from=build /app/packages/monitoring/dist ./packages/monitoring/dist
 COPY --from=build /app/apps/control-plane/package.json ./apps/control-plane/package.json
 COPY --from=build /app/apps/control-plane/dist ./apps/control-plane/dist
+COPY --from=build /app/apps/model-bridge/package.json ./apps/model-bridge/package.json
+COPY --from=build /app/apps/model-bridge/dist ./apps/model-bridge/dist
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 USER node
-EXPOSE 3000
+EXPOSE 3000 3001
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/healthz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"]
+  CMD ["node", "-e", "const port=process.env.HEALTHCHECK_PORT||process.env.PORT||'3000';fetch(`http://127.0.0.1:${port}/healthz`).then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"]
 CMD ["node", "apps/control-plane/dist/server.js"]

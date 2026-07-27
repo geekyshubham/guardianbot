@@ -21,7 +21,6 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
       contents: read
       packages: write
       id-token: write
-      attestations: write
     uses: ${imageReference}
     with:
       dockerfile: ${JSON.stringify(image.dockerfile)}
@@ -60,6 +59,7 @@ jobs:
       contents: read
       security-events: write
       actions: read
+      id-token: write
     uses: ${reference}
     with:
       config-path: .guardianbot/config.yml

@@ -2,8 +2,29 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { deflateRawSync } from "node:zlib";
 import test from "node:test";
+import {
+  computeEvidenceManifestDigest,
+  createEvidenceProvenanceToken,
+  type EvidenceArtifactType,
+  type EvidenceManifest,
+  type EvidenceProvenanceClaims
+} from "../src/evidence-attestation.js";
 import { createScannerWorkflowRunHandler } from "../src/scanner-evidence.js";
 import { MemoryStore, type RepositoryRecord } from "../src/store.js";
+
+const SECURITY_SHA = "b".repeat(40);
+const IMAGE_SHA = "c".repeat(40);
+const DAST_SHA = "d".repeat(40);
+const HEAD_SHA = "a".repeat(40);
+const SIGNING_SECRET = "guardianbot-test-evidence-secret-".repeat(2);
+const TEST_NOW = new Date("2026-07-27T12:00:00.000Z");
+const TEST_ENV = {
+  GUARDIANBOT_TRUSTED_WORKFLOW_REPOSITORY: "Geekyshubham/guardianbot",
+  GUARDIANBOT_TRUSTED_SECURITY_WORKFLOW_SHA: SECURITY_SHA,
+  GUARDIANBOT_TRUSTED_IMAGE_WORKFLOW_SHA: IMAGE_SHA,
+  GUARDIANBOT_TRUSTED_DAST_WORKFLOW_SHA: DAST_SHA,
+  GUARDIANBOT_EVIDENCE_SIGNING_SECRET: SIGNING_SECRET
+};
 
 interface ZipEntryInput {
   name: string;
@@ -11,6 +32,17 @@ interface ZipEntryInput {
   compress?: boolean;
   declaredCompressedSize?: number;
   declaredUncompressedSize?: number;
+  centralFlags?: number;
+  localFlags?: number;
+  localName?: string;
+}
+
+interface FetchStubOptions {
+  workflowRun?: Record<string, unknown>;
+  jobs?: Array<Record<string, unknown>>;
+  artifactPages?: Array<Array<Record<string, unknown>>>;
+  zipByArtifactId?: Record<number, Buffer>;
+  dojoFailure?: boolean;
 }
 
 function createRepository(): RepositoryRecord {
@@ -26,38 +58,201 @@ function createRepository(): RepositoryRecord {
   };
 }
 
-function buildSecurityZip(overrides: Partial<Record<"semgrep" | "trivy" | "gate", unknown>> = {}) {
+function workflowForArtifactType(type: EvidenceArtifactType): {
+  path: string;
+  sha: string;
+} {
+  if (type === "security") {
+    return { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA };
+  }
+  if (type === "dast") {
+    return { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA };
+  }
+  return { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA };
+}
+
+function buildProvenanceZip(
+  artifactType: EvidenceArtifactType,
+  reports: Record<string, unknown | Uint8Array>,
+  options: {
+    manifestOverrides?: Partial<EvidenceManifest>;
+    tokenOverrides?: Partial<EvidenceProvenanceClaims>;
+    extraEntries?: ZipEntryInput[];
+  } = {}
+): Buffer {
+  const workflow = workflowForArtifactType(artifactType);
+  const reportEntries = Object.entries(reports)
+    .map(([name, value]) => ({
+      name,
+      content:
+        value instanceof Uint8Array
+          ? value
+          : Buffer.from(JSON.stringify(value), "utf8")
+    }))
+    .sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    );
+  const manifest: EvidenceManifest = {
+    schemaVersion: "1.0.0",
+    artifactType,
+    repository: "geekyshubham/guardianbot-consumer",
+    repositoryId: 99,
+    runId: 500,
+    runAttempt: 2,
+    headSha: HEAD_SHA,
+    workflowPath: workflow.path,
+    workflowSha: workflow.sha,
+    files: reportEntries.map((entry) => ({
+      path: entry.name,
+      sha256: createHash("sha256").update(entry.content).digest("hex"),
+      size: entry.content.length
+    })),
+    ...options.manifestOverrides
+  };
+  const issuedAt = Math.floor(TEST_NOW.getTime() / 1_000) - 60;
+  const claims: EvidenceProvenanceClaims = {
+    version: 1,
+    artifactType,
+    manifestDigest: computeEvidenceManifestDigest(manifest),
+    repository: manifest.repository,
+    repositoryId: manifest.repositoryId,
+    runId: manifest.runId,
+    runAttempt: manifest.runAttempt,
+    headSha: manifest.headSha,
+    jobWorkflowRef:
+      `geekyshubham/guardianbot/${workflow.path}@${workflow.sha}`,
+    workflowPath: workflow.path,
+    workflowSha: workflow.sha,
+    issuedAt,
+    expiresAt: issuedAt + 24 * 60 * 60,
+    ...options.tokenOverrides
+  };
+  const prefix =
+    artifactType === "security"
+      ? "guardianbot-evidence"
+      : artifactType === "dast"
+        ? "guardianbot-dast-evidence"
+        : "guardianbot-image-evidence";
   return createZip([
+    ...reportEntries.map((entry) => ({
+      name: `${prefix}/${entry.name}`,
+      content: entry.content
+    })),
     {
-      name: "guardianbot-evidence/semgrep.json",
+      name: `${prefix}/provenance-manifest.json`,
+      content: Buffer.from(JSON.stringify(manifest), "utf8")
+    },
+    {
+      name: `${prefix}/provenance-token.txt`,
       content: Buffer.from(
-        JSON.stringify(overrides.semgrep ?? { results: [] }),
+        createEvidenceProvenanceToken(claims, SIGNING_SECRET),
         "utf8"
       )
     },
-    {
-      name: "guardianbot-evidence/trivy.json",
-      content: Buffer.from(
-        JSON.stringify(overrides.trivy ?? { Results: [] }),
-        "utf8"
-      )
-    },
-    {
-      name: "guardianbot-evidence/gate.json",
-      content: Buffer.from(
-        JSON.stringify(
-          overrides.gate ?? {
-            conclusion: "success",
-            reason: "ok",
-            blockers: [],
-            observed: [],
-            executionFailures: []
-          }
-        ),
-        "utf8"
-      )
-    }
+    ...(options.extraEntries ?? [])
   ]);
+}
+
+function actualGateFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: "1.0.0",
+    mode: "report-only",
+    baselineRequired: false,
+    baselineCount: 0,
+    passed: true,
+    failures: [],
+    policyFindings: [],
+    activeSuppressions: 0,
+    expiredSuppressions: [],
+    ...overrides
+  };
+}
+
+function buildSecurityZip(
+  overrides: Partial<Record<"semgrep" | "trivy" | "gate", unknown>> = {},
+  options: Parameters<typeof buildProvenanceZip>[2] = {}
+): Buffer {
+  return buildProvenanceZip(
+    "security",
+    {
+      "gate.json": overrides.gate ?? actualGateFixture(),
+      "semgrep.json": overrides.semgrep ?? { results: [] },
+      "trivy.json": overrides.trivy ?? { Results: [] }
+    },
+    options
+  );
+}
+
+function validImageReports(
+  overrides: Partial<Record<string, unknown>> = {}
+): Record<string, unknown> {
+  return {
+    "build-digests.json": {
+      schemaVersion: "1.0.0",
+      imageId: `sha256:${"1".repeat(64)}`,
+      repoTags: [`ghcr.io/example/service:${HEAD_SHA}`],
+      promotionExpected: false
+    },
+    "policy.json": { criticalFindings: 0 },
+    "sbom.cdx.json": {
+      bomFormat: "CycloneDX",
+      specVersion: "1.6",
+      version: 1,
+      components: []
+    },
+    "trivy-image.json": { Results: [] },
+    ...overrides
+  };
+}
+
+function validPromotionReports(): Record<string, unknown> {
+  const validation = validImageReports({
+    "build-digests.json": {
+      schemaVersion: "1.0.0",
+      imageId: `sha256:${"1".repeat(64)}`,
+      repoTags: [`ghcr.io/example/service:${HEAD_SHA}`],
+      promotionExpected: true
+    }
+  });
+  const digestHex = "2".repeat(64);
+  const digest = `sha256:${digestHex}`;
+  const identity =
+    "https://github.com/Geekyshubham/guardianbot-consumer/" +
+    ".github/workflows/guardianbot.yml@refs/heads/main";
+  const statement = {
+    _type: "https://in-toto.io/Statement/v0.1",
+    predicateType: "https://cyclonedx.org/bom",
+    subject: [{ name: "ghcr.io/example/service", digest: { sha256: digestHex } }],
+    predicate: validation["sbom.cdx.json"]
+  };
+  const sbomBytes = Buffer.from(
+    JSON.stringify(validation["sbom.cdx.json"]),
+    "utf8"
+  );
+  return {
+    ...validation,
+    "cosign-verification.json": [
+      {
+        critical: { image: { "docker-manifest-digest": digest } },
+        optional: {
+          Issuer: "https://token.actions.githubusercontent.com",
+          Subject: identity
+        }
+      }
+    ],
+    "promotion.json": {
+      schemaVersion: "1.0.0",
+      imageReference: `ghcr.io/example/service@${digest}`,
+      imageDigest: digest,
+      certificateIdentity: identity,
+      jobWorkflowRef:
+        `Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@${IMAGE_SHA}`,
+      sbomSha256: createHash("sha256").update(sbomBytes).digest("hex")
+    },
+    "sbom-attestation-verification.json": [
+      { payload: Buffer.from(JSON.stringify(statement), "utf8").toString("base64") }
+    ]
+  };
 }
 
 function createZip(entries: ZipEntryInput[]): Buffer {
@@ -65,44 +260,49 @@ function createZip(entries: ZipEntryInput[]): Buffer {
   const centrals: Buffer[] = [];
   let offset = 0;
   for (const entry of entries) {
-    const fileName = Buffer.from(entry.name, "utf8");
-    const compressed = entry.compress === false ? Buffer.from(entry.content) : deflateRawSync(entry.content);
+    const centralName = Buffer.from(entry.name, "utf8");
+    const localName = Buffer.from(entry.localName ?? entry.name, "utf8");
+    const compressed =
+      entry.compress === false
+        ? Buffer.from(entry.content)
+        : deflateRawSync(entry.content);
     const compressedSize = entry.declaredCompressedSize ?? compressed.length;
     const uncompressedSize = entry.declaredUncompressedSize ?? entry.content.length;
-    const local = Buffer.alloc(30 + fileName.length);
+    const localFlags = entry.localFlags ?? entry.centralFlags ?? 0x0800;
+    const centralFlags = entry.centralFlags ?? 0x0800;
+    const local = Buffer.alloc(30 + localName.length);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
-    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(localFlags, 6);
     local.writeUInt16LE(entry.compress === false ? 0 : 8, 8);
     local.writeUInt32LE(0, 10);
     local.writeUInt32LE(0, 14);
     local.writeUInt32LE(compressedSize, 18);
     local.writeUInt32LE(uncompressedSize, 22);
-    local.writeUInt16LE(fileName.length, 26);
+    local.writeUInt16LE(localName.length, 26);
     local.writeUInt16LE(0, 28);
-    fileName.copy(local, 30);
+    localName.copy(local, 30);
     locals.push(local, compressed);
 
-    const central = Buffer.alloc(46 + fileName.length);
+    const central = Buffer.alloc(46 + centralName.length);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
-    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(centralFlags, 8);
     central.writeUInt16LE(entry.compress === false ? 0 : 8, 10);
     central.writeUInt32LE(0, 12);
     central.writeUInt32LE(0, 16);
     central.writeUInt32LE(compressedSize, 20);
     central.writeUInt32LE(uncompressedSize, 24);
-    central.writeUInt16LE(fileName.length, 28);
+    central.writeUInt16LE(centralName.length, 28);
     central.writeUInt16LE(0, 30);
     central.writeUInt16LE(0, 32);
     central.writeUInt16LE(0, 34);
     central.writeUInt16LE(0, 36);
     central.writeUInt32LE(0, 38);
     central.writeUInt32LE(offset, 42);
-    fileName.copy(central, 46);
+    centralName.copy(central, 46);
     centrals.push(central);
-
     offset += local.length + compressed.length;
   }
   const centralDirectory = Buffer.concat(centrals);
@@ -118,22 +318,93 @@ function createZip(entries: ZipEntryInput[]): Buffer {
   return Buffer.concat([...locals, centralDirectory, eocd]);
 }
 
-function createFetchStub(options: {
-  workflowRun?: Record<string, unknown>;
-  artifactPages?: Array<Array<Record<string, unknown>>>;
-  zipByArtifactId?: Record<number, Buffer>;
-  dojoFailure?: boolean;
-}) {
+function trustedWorkflowRun(
+  overrides: Partial<Record<string, unknown>> = {},
+  workflows: Array<{ path: string; sha: string }> = [
+    { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA }
+  ]
+) {
+  return {
+    id: 500,
+    run_attempt: 2,
+    event: "push",
+    run_started_at: "2026-07-27T11:55:00.000Z",
+    updated_at: "2026-07-27T12:00:00.000Z",
+    status: "completed",
+    conclusion: "success",
+    head_sha: HEAD_SHA,
+    head_branch: "main",
+    path: ".github/workflows/guardianbot.yml@refs/heads/main",
+    repository: {
+      id: 99,
+      full_name: "Geekyshubham/guardianbot-consumer"
+    },
+    referenced_workflows: workflows.map((workflow) => ({
+      path:
+        `Geekyshubham/guardianbot/${workflow.path}@${workflow.sha}`,
+      sha: workflow.sha,
+      ref: "refs/heads/main"
+    })),
+    ...overrides
+  };
+}
+
+function defaultSecurityJobs(): Array<Record<string, unknown>> {
+  return [
+    {
+      name: "guardianbot-security-gate / deterministic scanners",
+      status: "completed",
+      conclusion: "success"
+    }
+  ];
+}
+
+function artifactRecord(
+  id: number,
+  name: string,
+  zip: Buffer,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    id,
+    name,
+    size_in_bytes: zip.length,
+    expired: false,
+    digest: `sha256:${createHash("sha256").update(zip).digest("hex")}`,
+    archive_download_url:
+      `https://api.github.com/repos/Geekyshubham/guardianbot-consumer/actions/artifacts/${id}/zip`,
+    workflow_run: {
+      id: 500,
+      repository_id: 99,
+      head_repository_id: 99,
+      head_branch: "main",
+      head_sha: HEAD_SHA
+    },
+    ...overrides
+  };
+}
+
+function createFetchStub(options: FetchStubOptions) {
   const calls: string[] = [];
+  const bodies: Array<{
+    url: string;
+    method: string;
+    body: BodyInit | null | undefined;
+  }> = [];
   const fetchStub: typeof fetch = (async (input, init) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
     const method = init?.method ?? "GET";
     calls.push(`${method} ${url}`);
+    bodies.push({ url, method, body: init?.body });
     if (url.endsWith("/app/installations/1/access_tokens")) {
-      return new Response(JSON.stringify({ token: "installation-token" }), { status: 201 });
-    }
-    if (url.includes("/actions/runs/500?") || url.endsWith("/actions/runs/500")) {
-      return new Response(JSON.stringify(options.workflowRun), { status: 200 });
+      return new Response(JSON.stringify({ token: "installation-token" }), {
+        status: 201
+      });
     }
     if (url.includes("/actions/runs/500/artifacts?")) {
       const page = Number(new URL(url).searchParams.get("page") ?? "1");
@@ -145,6 +416,15 @@ function createFetchStub(options: {
         { status: 200 }
       );
     }
+    if (url.includes("/actions/runs/500/jobs?")) {
+      return new Response(
+        JSON.stringify({ total_count: options.jobs?.length ?? 0, jobs: options.jobs ?? [] }),
+        { status: 200 }
+      );
+    }
+    if (url.endsWith("/actions/runs/500")) {
+      return new Response(JSON.stringify(options.workflowRun), { status: 200 });
+    }
     const artifactMatch = url.match(/\/actions\/artifacts\/(\d+)\/zip$/);
     if (artifactMatch) {
       const artifactId = Number(artifactMatch[1]);
@@ -153,34 +433,61 @@ function createFetchStub(options: {
       return new Response(body, { status: 200 });
     }
     if (url.startsWith("https://dojo.example/api/v2/product_types/")) {
-      if (method === "GET") return new Response(JSON.stringify({ results: [] }), { status: 200 });
-      return new Response(JSON.stringify({ id: 1, name: "GitHub Repositories" }), { status: 201 });
+      if (method === "GET") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ id: 1, name: "GitHub Repositories" }),
+        { status: 201 }
+      );
     }
     if (url.startsWith("https://dojo.example/api/v2/products/")) {
-      if (method === "GET") return new Response(JSON.stringify({ results: [] }), { status: 200 });
-      return new Response(JSON.stringify({ id: 2, name: "Geekyshubham/guardianbot-consumer", prod_type: 1 }), { status: 201 });
+      if (method === "GET") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({
+          id: 2,
+          name: "Geekyshubham/guardianbot-consumer",
+          prod_type: 1
+        }),
+        { status: 201 }
+      );
     }
     if (url.startsWith("https://dojo.example/api/v2/engagements/")) {
-      if (method === "GET") return new Response(JSON.stringify({ results: [] }), { status: 200 });
-      return new Response(JSON.stringify({ id: 3, name: "main/security", product: 2 }), { status: 201 });
+      if (method === "GET") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ id: 3, name: "feature/security", product: 2 }),
+        { status: 201 }
+      );
     }
     if (url.startsWith("https://dojo.example/api/v2/tests/")) {
-      if (method === "GET") return new Response(JSON.stringify({ results: [] }), { status: 200 });
-      return new Response(JSON.stringify({ id: 4, engagement: 3, scan_type: "Semgrep JSON Report", title: "main/security" }), { status: 201 });
+      if (method === "GET") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({
+          id: 4,
+          engagement: 3,
+          scan_type: "Semgrep JSON Report",
+          title: "feature/security"
+        }),
+        { status: 201 }
+      );
     }
-    if (url.startsWith("https://dojo.example/api/v2/import-scan/")) {
-      return options.dojoFailure
-        ? new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
-        : new Response(JSON.stringify({ test: 4 }), { status: 201 });
-    }
-    if (url.startsWith("https://dojo.example/api/v2/reimport-scan/")) {
+    if (
+      url.startsWith("https://dojo.example/api/v2/import-scan/") ||
+      url.startsWith("https://dojo.example/api/v2/reimport-scan/")
+    ) {
       return options.dojoFailure
         ? new Response(JSON.stringify({ detail: "boom" }), { status: 500 })
         : new Response(JSON.stringify({ test: 4 }), { status: 201 });
     }
     throw new Error(`Unhandled fetch ${method} ${url}`);
   }) as typeof fetch;
-  return { fetchStub, calls };
+  return { fetchStub, calls, bodies };
 }
 
 function createApiClient(fetchImpl: typeof fetch) {
@@ -190,18 +497,21 @@ function createApiClient(fetchImpl: typeof fetch) {
       if (!response.ok) throw new Error(`GitHub ${method} ${path} failed`);
       return (await response.json()) as T;
     },
-    async downloadArtifact(_owner: string, _repo: string, artifactId: number): Promise<string> {
+    async downloadArtifact(
+      _owner: string,
+      _repo: string,
+      artifactId: number
+    ): Promise<string> {
       const response = await fetchImpl(
         `https://api.github.com/repos/Geekyshubham/guardianbot-consumer/actions/artifacts/${artifactId}/zip`,
         { method: "GET" }
       );
       if (!response.ok) throw new Error(`download ${artifactId} failed`);
-      const tempFile = await import("node:fs/promises").then((fs) =>
-        fs.mkdtemp("/tmp/guardianbot-test-").then((dir) => `${dir}/${artifactId}.zip`)
-      );
-      const body = Buffer.from(await response.arrayBuffer());
-      await import("node:fs/promises").then((fs) => fs.writeFile(tempFile, body));
-      return tempFile;
+      const fs = await import("node:fs/promises");
+      const directory = await fs.mkdtemp("/tmp/guardianbot-test-");
+      const target = `${directory}/${artifactId}.zip`;
+      await fs.writeFile(target, Buffer.from(await response.arrayBuffer()));
+      return target;
     }
   });
 }
@@ -210,33 +520,13 @@ async function seedRepository(store: MemoryStore) {
   await store.upsertRepository(createRepository());
 }
 
-function trustedWorkflowRun(overrides: Partial<Record<string, unknown>> = {}) {
-  return {
-    id: 500,
-    run_attempt: 2,
-    status: "completed",
-    conclusion: "success",
-    head_sha: "a".repeat(40),
-    head_branch: "main",
-    path: ".github/workflows/guardianbot.yml@refs/heads/main",
-    referenced_workflows: [
-      {
-        path: `Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@${"b".repeat(40)}`,
-        sha: "b".repeat(40),
-        ref: `refs/heads/main`
-      }
-    ],
-    ...overrides
-  };
-}
-
 function handlerInput() {
   return {
     repositoryId: 99,
     repositoryFullName: "Geekyshubham/guardianbot-consumer",
     runId: 500,
     runAttempt: 2,
-    headSha: "a".repeat(40),
+    headSha: HEAD_SHA,
     conclusion: "success",
     workflowPath: ".github/workflows/guardianbot.yml",
     artifactNamePrefixes: [
@@ -247,7 +537,31 @@ function handlerInput() {
   };
 }
 
-test("rejects workflow runs with mutable or untrusted reusable workflow references", async () => {
+function createHandler(
+  store: MemoryStore,
+  fetchStub: typeof fetch,
+  environment: Record<string, string | undefined> = TEST_ENV
+) {
+  return createScannerWorkflowRunHandler({
+    appId: "1",
+    privateKey: "private",
+    store,
+    fetchImpl: fetchStub,
+    apiClientFactory: createApiClient(fetchStub),
+    environment,
+    now: () => TEST_NOW
+  });
+}
+
+function scannerArtifacts(store: MemoryStore): any[] {
+  return [...((store as any).scannerArtifacts as Map<string, any>).values()];
+}
+
+function scannerEvidence(store: MemoryStore): any[] {
+  return [...((store as any).scannerEvidence as Map<string, any>).values()];
+}
+
+test("rejects workflow runs with mutable or administratively unapproved reusable references", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
   const { fetchStub } = createFetchStub({
@@ -255,245 +569,413 @@ test("rejects workflow runs with mutable or untrusted reusable workflow referenc
       referenced_workflows: [
         {
           path: "Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@main",
-          sha: "b".repeat(40),
+          sha: SECURITY_SHA,
           ref: "refs/heads/main"
         }
       ]
     })
   });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
-  });
-
-  await handler(handlerInput());
-
+  await createHandler(store, fetchStub)(handlerInput());
   const run = await store.getScannerWorkflowRun(99, 500, 2);
   assert.equal(run?.validationStatus, "rejected");
-  assert.match(run?.validationError ?? "", /mutable ref|untrusted/i);
+  assert.match(run?.validationError ?? "", /untrusted|mutable/i);
 });
 
-test("paginates artifact listings and skips duplicate processing after acceptance", async () => {
+test("parses the reusable-security gate.json schema end to end", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
-  const trustedZip = buildSecurityZip();
-  const junkArtifacts = Array.from({ length: 100 }, (_, index) => ({
+  const zip = buildSecurityZip({
+    gate: actualGateFixture({
+      passed: false,
+      failures: ["Semgrep auth.rule at src/auth.ts:4"],
+      policyFindings: [{ source: "semgrep", ruleId: "auth.rule" }],
+      activeSuppressions: 2,
+      expiredSuppressions: ["old-fingerprint"]
+    })
+  });
+  const artifact = artifactRecord(501, "guardianbot-evidence-500-2", zip);
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun(),
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[artifact]],
+    zipByArtifactId: { 501: zip }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  const gate = scannerEvidence(store).find((entry) => entry.evidenceKey === "gate");
+  assert.equal(gate?.status, "failure");
+  assert.deepEqual(gate?.payload, {
+    passed: false,
+    failures: 1,
+    policyFindings: 1,
+    activeSuppressions: 2,
+    expiredSuppressions: 1
+  });
+  const run = await store.getScannerWorkflowRun(99, 500, 2);
+  assert.equal(run?.validationStatus, "accepted");
+  assert.equal(run?.event, "push");
+  assert.equal(run?.startedAt, "2026-07-27T11:55:00.000Z");
+  assert.equal(run?.completedAt, "2026-07-27T12:00:00.000Z");
+});
+
+test("paginates listings and skips downloads after every expected artifact is accepted", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const zip = buildSecurityZip();
+  const junk = Array.from({ length: 100 }, (_, index) => ({
     id: index + 1,
     name: `junk-${index + 1}`,
     size_in_bytes: 10,
     expired: false
   }));
-  const trustedArtifact = {
-    id: 501,
-    name: "guardianbot-evidence-500-2",
-    size_in_bytes: trustedZip.length,
-    expired: false,
-    digest: `sha256:${createHash("sha256").update(trustedZip).digest("hex")}`
-  };
+  const trusted = artifactRecord(501, "guardianbot-evidence-500-2", zip);
   const { fetchStub, calls } = createFetchStub({
     workflowRun: trustedWorkflowRun(),
-    artifactPages: [junkArtifacts, [trustedArtifact]],
-    zipByArtifactId: { 501: trustedZip }
+    jobs: defaultSecurityJobs(),
+    artifactPages: [junk, [trusted]],
+    zipByArtifactId: { 501: zip }
   });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
-  });
-
+  const handler = createHandler(store, fetchStub);
   await handler(handlerInput());
   await handler(handlerInput());
-
-  const run = await store.getScannerWorkflowRun(99, 500, 2);
-  assert.equal(run?.validationStatus, "accepted");
-  assert.equal(calls.filter((call) => call.includes("/actions/artifacts/501/zip")).length, 1);
   assert.equal(
-    calls.filter((call) => call.includes("/actions/runs/500/artifacts?per_page=100&page=")).length,
+    (await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus,
+    "accepted"
+  );
+  assert.equal(
+    calls.filter((call) => call.includes("/actions/artifacts/501/zip")).length,
+    1
+  );
+  assert.equal(
+    calls.filter((call) => call.includes("/artifacts?per_page=100&page=")).length,
     2
   );
 });
 
-test("rejects trusted artifacts when the GitHub digest does not match", async () => {
+test("requires GitHub artifact digest and workflow/repository/head metadata", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
-  const trustedZip = buildSecurityZip();
+  const zip = buildSecurityZip();
+  const artifact = artifactRecord(501, "guardianbot-evidence-500-2", zip, {
+    digest: undefined,
+    workflow_run: {
+      id: 500,
+      repository_id: 100,
+      head_repository_id: 99,
+      head_branch: "other",
+      head_sha: "0".repeat(40)
+    }
+  });
   const { fetchStub } = createFetchStub({
     workflowRun: trustedWorkflowRun(),
-    artifactPages: [[{
-      id: 501,
-      name: "guardianbot-evidence-500-2",
-      size_in_bytes: trustedZip.length,
-      expired: false,
-      digest: `sha256:${"0".repeat(64)}`
-    }]],
-    zipByArtifactId: { 501: trustedZip }
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[artifact]]
   });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
+  await assert.rejects(
+    () => createHandler(store, fetchStub)(handlerInput()),
+    /digest|repository|head/i
+  );
+  assert.equal(scannerArtifacts(store)[0]?.validationStatus, "rejected");
+  assert.equal(
+    (await store.getScannerWorkflowRun(99, 500, 2))?.processedAt,
+    undefined
+  );
+});
+
+test("rejects a provenance token whose manifest digest was forged", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const zip = buildSecurityZip(
+    {},
+    { tokenOverrides: { manifestDigest: `sha256:${"0".repeat(64)}` } }
+  );
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun(),
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[artifactRecord(501, "guardianbot-evidence-500-2", zip)]],
+    zipByArtifactId: { 501: zip }
   });
+  await assert.rejects(
+    () => createHandler(store, fetchStub)(handlerInput()),
+    /provenance token does not match/i
+  );
+});
 
-  await handler(handlerInput());
+test("rejects ZIP traversal, encrypted flags, local-name mismatches, and oversized entries", async (t) => {
+  const cases: Array<{ name: string; zip: Buffer; error: RegExp }> = [
+    {
+      name: "traversal",
+      zip: createZip([
+        { name: "../semgrep.json", content: Buffer.from("{}") }
+      ]),
+      error: /unsafe/
+    },
+    {
+      name: "encrypted flag",
+      zip: createZip([
+        {
+          name: "guardianbot-evidence/gate.json",
+          content: Buffer.from("{}"),
+          centralFlags: 0x0801,
+          localFlags: 0x0801
+        }
+      ]),
+      error: /flags/
+    },
+    {
+      name: "local filename",
+      zip: createZip([
+        {
+          name: "guardianbot-evidence/gate.json",
+          localName: "guardianbot-evidence/evil.json",
+          content: Buffer.from("{}")
+        }
+      ]),
+      error: /filename/
+    },
+    {
+      name: "oversized",
+      zip: createZip([
+        {
+          name: "guardianbot-evidence/gate.json",
+          content: Buffer.from("{}"),
+          declaredUncompressedSize: 20 * 1024 * 1024
+        }
+      ]),
+      error: /size limit/
+    }
+  ];
+  for (const [index, item] of cases.entries()) {
+    await t.test(item.name, async () => {
+      const store = new MemoryStore();
+      await seedRepository(store);
+      const { fetchStub } = createFetchStub({
+        workflowRun: trustedWorkflowRun(),
+        jobs: defaultSecurityJobs(),
+        artifactPages: [[
+          artifactRecord(600 + index, "guardianbot-evidence-500-2", item.zip)
+        ]],
+        zipByArtifactId: { [600 + index]: item.zip }
+      });
+      await assert.rejects(
+        () => createHandler(store, fetchStub)(handlerInput()),
+        item.error
+      );
+    });
+  }
+});
 
-  const artifacts = [...((store as any).scannerArtifacts as Map<string, any>).values()];
-  assert.equal(artifacts[0]?.validationStatus, "rejected");
-  assert.match(artifacts[0]?.validationError ?? "", /digest mismatch/);
+test("requires exactly the evidence artifact for every non-skipped trusted reusable job", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const securityZip = buildSecurityZip();
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA },
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      ...defaultSecurityJobs(),
+      {
+        name: "guardianbot-image / image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "guardianbot-image / image push, sign, attest",
+        status: "completed",
+        conclusion: "skipped"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(501, "guardianbot-evidence-500-2", securityZip)
+    ]],
+    zipByArtifactId: { 501: securityZip }
+  });
+  await assert.rejects(
+    () => createHandler(store, fetchStub)(handlerInput()),
+    /guardianbot-image-evidence/
+  );
   const run = await store.getScannerWorkflowRun(99, 500, 2);
   assert.equal(run?.validationStatus, "failed");
+  assert.equal(run?.processedAt, undefined);
 });
 
-test("rejects ZIP traversal entries in trusted artifacts", async () => {
+test("accepts validation evidence without promotion only when the promotion job was skipped", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
-  const traversalZip = createZip([
-    {
-      name: "../semgrep.json",
-      content: Buffer.from('{"results":[]}', "utf8")
-    },
-    {
-      name: "guardianbot-evidence/trivy.json",
-      content: Buffer.from('{"Results":[]}', "utf8")
-    },
-    {
-      name: "guardianbot-evidence/gate.json",
-      content: Buffer.from('{"conclusion":"success"}', "utf8")
-    }
-  ]);
+  const imageZip = buildProvenanceZip(
+    "image-validation",
+    validImageReports()
+  );
   const { fetchStub } = createFetchStub({
-    workflowRun: trustedWorkflowRun(),
-    artifactPages: [[{
-      id: 501,
-      name: "guardianbot-evidence-500-2",
-      size_in_bytes: traversalZip.length,
-      expired: false,
-      digest: `sha256:${createHash("sha256").update(traversalZip).digest("hex")}`
-    }]],
-    zipByArtifactId: { 501: traversalZip }
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      {
+        name: "guardianbot-image / image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "guardianbot-image / image push, sign, attest",
+        status: "completed",
+        conclusion: "skipped"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(510, "guardianbot-image-evidence-500-2", imageZip)
+    ]],
+    zipByArtifactId: { 510: imageZip }
   });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
-  });
-
-  await handler(handlerInput());
-
-  const artifacts = [...((store as any).scannerArtifacts as Map<string, any>).values()];
-  assert.equal(artifacts[0]?.validationStatus, "rejected");
-  assert.match(artifacts[0]?.validationError ?? "", /unsafe/);
+  await createHandler(store, fetchStub)(handlerInput());
+  assert.equal(
+    (await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus,
+    "accepted"
+  );
 });
 
-test("rejects oversized trusted entries before extraction", async () => {
-  const store = new MemoryStore();
-  await seedRepository(store);
-  const oversizedZip = createZip([
-    {
-      name: "guardianbot-evidence/semgrep.json",
-      content: Buffer.from("{}", "utf8"),
-      declaredUncompressedSize: 40 * 1024 * 1024
-    },
-    {
-      name: "guardianbot-evidence/trivy.json",
-      content: Buffer.from('{"Results":[]}', "utf8")
-    },
-    {
-      name: "guardianbot-evidence/gate.json",
-      content: Buffer.from('{"conclusion":"success"}', "utf8")
-    }
-  ]);
-  const { fetchStub } = createFetchStub({
-    workflowRun: trustedWorkflowRun(),
-    artifactPages: [[{
-      id: 501,
-      name: "guardianbot-evidence-500-2",
-      size_in_bytes: oversizedZip.length,
-      expired: false,
-      digest: `sha256:${createHash("sha256").update(oversizedZip).digest("hex")}`
-    }]],
-    zipByArtifactId: { 501: oversizedZip }
-  });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
-  });
-
-  await handler(handlerInput());
-
-  const artifacts = [...((store as any).scannerArtifacts as Map<string, any>).values()];
-  assert.equal(artifacts[0]?.validationStatus, "rejected");
-  assert.match(artifacts[0]?.validationError ?? "", /size limit/);
+test("fails image evidence on scanner_error or a policy count that disagrees with Trivy", async (t) => {
+  const cases = [
+    validImageReports({ "trivy-image.json": { scanner_error: true } }),
+    validImageReports({ "policy.json": { criticalFindings: 1 } })
+  ];
+  for (const [index, reports] of cases.entries()) {
+    await t.test(String(index), async () => {
+      const store = new MemoryStore();
+      await seedRepository(store);
+      const zip = buildProvenanceZip("image-validation", reports);
+      const { fetchStub } = createFetchStub({
+        workflowRun: trustedWorkflowRun({}, [
+          { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+        ]),
+        jobs: [
+          {
+            name: "image build, smoke, scan, SBOM",
+            status: "completed",
+            conclusion: "success"
+          },
+          {
+            name: "image push, sign, attest",
+            status: "completed",
+            conclusion: "skipped"
+          }
+        ],
+        artifactPages: [[
+          artifactRecord(520 + index, "guardianbot-image-evidence-500-2", zip)
+        ]],
+        zipByArtifactId: { [520 + index]: zip }
+      });
+      await assert.rejects(
+        () => createHandler(store, fetchStub)(handlerInput()),
+        /scanner_error|critical count/i
+      );
+    });
+  }
 });
 
-test("retries when a completed workflow run has no trusted GuardianBot artifact yet", async () => {
+test("requires structurally valid Cosign signature and CycloneDX attestation evidence for promotion", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
+  const validationZip = buildProvenanceZip(
+    "image-validation",
+    validImageReports()
+  );
+  const promotionZip = buildProvenanceZip(
+    "image-promotion",
+    validPromotionReports()
+  );
   const { fetchStub } = createFetchStub({
-    workflowRun: trustedWorkflowRun(),
-    artifactPages: [[{ id: 42, name: "junk", size_in_bytes: 1, expired: false }]]
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      {
+        name: "image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "image push, sign, attest",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(530, "guardianbot-image-evidence-500-2", validationZip),
+      artifactRecord(531, "guardianbot-image-promotion-500-2", promotionZip)
+    ]],
+    zipByArtifactId: { 530: validationZip, 531: promotionZip }
   });
-  const handler = createScannerWorkflowRunHandler({
-    appId: "1",
-    privateKey: "private",
-    store,
-    fetchImpl: fetchStub,
-    apiClientFactory: createApiClient(fetchStub)
-  });
-
-  await assert.rejects(() => handler(handlerInput()), /no trusted GuardianBot artifact yet/);
+  await createHandler(store, fetchStub)(handlerInput());
+  const signature = scannerEvidence(store).find(
+    (entry) => entry.evidenceKey === "signature"
+  );
+  assert.equal(signature?.status, "success");
+  assert.equal(signature?.payload?.signatures, 1);
+  assert.equal(signature?.payload?.sbomAttestations, 1);
 });
 
-test("persists DefectDojo import failures and raises a retryable error", async () => {
+test("persists DefectDojo reconciliation failure without mutating the completed GitHub gate", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
-  const trustedZip = buildSecurityZip();
-  const { fetchStub } = createFetchStub({
-    workflowRun: trustedWorkflowRun(),
-    artifactPages: [[{
-      id: 501,
-      name: "guardianbot-evidence-500-2",
-      size_in_bytes: trustedZip.length,
-      expired: false,
-      digest: `sha256:${createHash("sha256").update(trustedZip).digest("hex")}`
-    }]],
-    zipByArtifactId: { 501: trustedZip },
+  const zip = buildSecurityZip();
+  const { fetchStub, bodies } = createFetchStub({
+    workflowRun: trustedWorkflowRun({ head_branch: "feature" }),
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[
+      artifactRecord(501, "guardianbot-evidence-500-2", zip, {
+        workflow_run: {
+          id: 500,
+          repository_id: 99,
+          head_repository_id: 99,
+          head_branch: "feature",
+          head_sha: HEAD_SHA
+        }
+      })
+    ]],
+    zipByArtifactId: { 501: zip },
     dojoFailure: true
   });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = fetchStub;
   try {
-    const handler = createScannerWorkflowRunHandler({
-      appId: "1",
-      privateKey: "private",
-      store,
-      fetchImpl: fetchStub,
-      apiClientFactory: createApiClient(fetchStub),
-      environment: {
-        GUARDIANBOT_DEFECTDOJO_BASE_URL_REF: "GUARDIANBOT_DEFECTDOJO_BASE_URL",
-        GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF: "GUARDIANBOT_DEFECTDOJO_API_TOKEN",
-        GUARDIANBOT_DEFECTDOJO_BASE_URL: "https://dojo.example",
-        GUARDIANBOT_DEFECTDOJO_API_TOKEN: "token"
-      }
-    });
-    await assert.rejects(() => handler(handlerInput()), /DefectDojo import failed/);
+    await assert.rejects(
+      () =>
+        createHandler(store, fetchStub, {
+          ...TEST_ENV,
+          GUARDIANBOT_DEFECTDOJO_BASE_URL_REF:
+            "GUARDIANBOT_DEFECTDOJO_BASE_URL",
+          GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF:
+            "GUARDIANBOT_DEFECTDOJO_API_TOKEN",
+          GUARDIANBOT_DEFECTDOJO_BASE_URL: "https://dojo.example",
+          GUARDIANBOT_DEFECTDOJO_API_TOKEN: "token"
+        })(handlerInput()),
+      /DefectDojo import failed/
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
-
-  const evidence = [...((store as any).scannerEvidence as Map<string, any>).values()];
-  const dojoFailure = evidence.find((entry) => entry.kind === "defectdojo-import");
-  assert.equal(dojoFailure?.status, "failure");
-  assert.match(dojoFailure?.details ?? "", /500|boom|failed/i);
+  const evidence = scannerEvidence(store);
+  assert.equal(
+    evidence.find((entry) => entry.kind === "defectdojo-import")?.status,
+    "failure"
+  );
+  assert.equal(evidence.find((entry) => entry.evidenceKey === "gate")?.status, "success");
+  const artifact = scannerArtifacts(store)[0];
+  assert.equal(artifact?.validationStatus, "failed");
+  assert.match(artifact?.validationError ?? "", /reconciliation health/i);
+  const run = await store.getScannerWorkflowRun(99, 500, 2);
+  assert.equal(run?.conclusion, "success");
+  assert.equal(run?.validationStatus, "failed");
+  assert.equal(run?.processedAt, undefined);
+  const importRequest = bodies.find((entry) =>
+    entry.url.includes("import-scan/")
+  );
+  const form = importRequest?.body as
+    | { get(name: string): FormDataEntryValue | null }
+    | undefined;
+  assert.equal(typeof form?.get, "function");
+  assert.equal(form?.get("branch_tag"), "feature");
+  assert.equal(form?.get("close_old_findings"), "false");
 });
