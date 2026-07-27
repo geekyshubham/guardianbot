@@ -9,6 +9,7 @@ Last verified: 2026-07-27
 | Documentation quality gates | Working | Tracked repository documentation | `scripts/check-docs.test.mjs` | External reachability is opt-in; normal CI validates URL structure without live network calls |
 | Repository detection/config generation | Working | Python, Node, Swift, Ruby, Docker, docs | `packages/core/test/core.test.ts` | Heuristic detection, no command execution |
 | `guardianctl onboard` generation | Working | GitHub repositories | [12 generated onboarding PRs](https://github.com/search?q=is%3Apr+author%3Ageekyshubham+%22onboard+GuardianBot%22&type=pullrequests) | Ten merged normally; two held by pre-existing CI |
+| `guardianctl` lifecycle administration | Working | Authenticated owned repositories | `packages/guardianctl/test/cli.test.ts` | Live evidence and App/ruleset access must remain reachable; offboarding retains historical evidence |
 | Generated-caller drift detection | Working | Onboarded repositories | `packages/guardianctl/test/cli.test.ts` | `doctor` requires a reachable latest workflow run |
 | App repository discovery/onboarding issue | Beta | GitHub App installations | `apps/control-plane/src/service.ts` | Needs live App verification |
 | Advisory PR review placeholder/update | Beta | Ready PRs | `apps/control-plane/test/service.test.ts` | Inline review comments not yet posted |
