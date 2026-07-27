@@ -12,8 +12,30 @@ export interface GitHubRepository {
 export class GitHubClient {
   constructor(
     private readonly token: string,
-    private readonly apiBase = "https://api.github.com"
-  ) {}
+    private readonly apiBase = "https://api.github.com",
+    private readonly timeoutMs = 30_000,
+    private readonly fetchImpl: typeof fetch = fetch
+  ) {
+    const base = new URL(apiBase);
+    const loopback =
+      base.hostname === "localhost" ||
+      base.hostname === "127.0.0.1" ||
+      base.hostname === "[::1]";
+    if (base.protocol !== "https:" && !(loopback && base.protocol === "http:")) {
+      throw new Error("GitHub API base URL must use HTTPS outside loopback development");
+    }
+    if (
+      base.username ||
+      base.password ||
+      base.search ||
+      base.hash ||
+      !Number.isInteger(timeoutMs) ||
+      timeoutMs < 1_000 ||
+      timeoutMs > 120_000
+    ) {
+      throw new Error("GitHub client configuration is invalid");
+    }
+  }
 
   async request<T>(
     method: string,
@@ -21,21 +43,40 @@ export class GitHubClient {
     body?: unknown,
     extraHeaders?: Record<string, string>
   ): Promise<T> {
-    const response = await fetch(new URL(path, this.apiBase), {
-      method,
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${this.token}`,
-        "content-type": "application/json",
-        "user-agent": "guardianbot/0.1",
-        "x-github-api-version": "2022-11-28",
-        ...(extraHeaders ?? {})
-      },
-      body: body === undefined ? undefined : JSON.stringify(body)
-    });
+    const base = new URL(this.apiBase);
+    const url = new URL(path, base);
+    if (url.origin !== base.origin) {
+      throw new Error("GitHub API request cannot leave the configured origin");
+    }
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method,
+        headers: {
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+          "user-agent": "guardianbot/0.1",
+          "x-github-api-version": "2022-11-28",
+          ...(extraHeaders ?? {}),
+          authorization: `Bearer ${this.token}`
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs)
+      });
+    } catch (error) {
+      if (
+        (error instanceof DOMException && error.name === "TimeoutError") ||
+        (error instanceof Error && error.name === "AbortError")
+      ) {
+        throw new Error(`GitHub ${method} ${url.pathname} timed out`);
+      }
+      throw new Error(`GitHub ${method} ${url.pathname} failed`, { cause: error });
+    }
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`GitHub ${method} ${path} returned ${response.status}: ${text}`);
+      const text = (await response.text()).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 2_000);
+      throw new Error(
+        `GitHub ${method} ${url.pathname} returned ${response.status}: ${text}`
+      );
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
