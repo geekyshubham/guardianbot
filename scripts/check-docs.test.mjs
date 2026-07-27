@@ -12,6 +12,7 @@ import {
   parseCliHelp,
   parseConfigReference,
   readMarkdownDocuments,
+  validateExternalLinks,
   validateMarkdownLinks,
   validateMermaidDiagram,
   validateOpenApiDocument,
@@ -75,6 +76,22 @@ test("unclosed Markdown fences and invalid Mermaid sources are rejected", (conte
   assert.match(document.fenceErrors[0], /unclosed/);
   assert.deepEqual(validateMermaidDiagram("flowchart LR\nA --> B", "diagram.md:1"), []);
   assert.match(validateMermaidDiagram("not-a-diagram", "diagram.md:2")[0], /syntax\/rendering/);
+});
+
+test("live external checks reject insecure/private targets without fetching them", async () => {
+  const fetched = [];
+  const errors = await validateExternalLinks([
+    "http://example.com/docs",
+    "https://127.0.0.1/private",
+    "https://example.com/docs"
+  ], async (url, options) => {
+    fetched.push([url, options.method]);
+    return { status: 200 };
+  });
+  assert.equal(errors.length, 2);
+  assert.match(errors.join("\n"), /require HTTPS/);
+  assert.match(errors.join("\n"), /local or private/);
+  assert.deepEqual(fetched, [["https://example.com/docs", "HEAD"]]);
 });
 
 test("configuration contract compares source, schema, and the reference table", () => {
