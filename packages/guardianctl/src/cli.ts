@@ -17,15 +17,16 @@ function help(): never {
 
 Commands:
   onboard       Detect a repository and open one draft onboarding PR
-  doctor        Verify configuration, workflow pin, and latest expected run
-  enforce       Create the required guardianbot/security-gate ruleset
-  upgrade       Open a draft PR updating the immutable workflow pin; use --all for every onboarded repository
-  inventory     List owned repositories and GuardianBot state
-  offboard      Open a draft PR removing repository-side callers
+  doctor        Verify access, pins, drift, evidence, expected runs, and required checks
+  enforce       Require a reviewed baseline and seven report-only days before promotion
+  upgrade       Regenerate configuration pins and callers at an immutable workflow SHA
+  inventory     Classify owned repositories by effective GuardianBot lifecycle state
+  offboard      Plan and open a caller/config removal PR while retaining evidence
 
 Options:
   --dry-run     Inspect or render without writing to GitHub
   --json        Emit JSON
+  --all         Upgrade every onboarded, non-archived, non-fork repository
   --dockerfile PATH
   --health-path PATH
   --readiness-path PATH
@@ -56,15 +57,58 @@ function option(args: string[], name: string): string | undefined {
   return value;
 }
 
+const VALUE_OPTIONS = new Set([
+  "--dockerfile",
+  "--health-path",
+  "--readiness-path",
+  "--dast-origin",
+  "--openapi",
+  "--auth-profile",
+  "--session-path"
+]);
+
+function positionalRepository(args: string[]): string | undefined {
+  for (let index = 1; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (VALUE_OPTIONS.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (!value.startsWith("-")) return value;
+  }
+  return undefined;
+}
+
+function positiveNumber(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return parsed;
+}
+
+function numberAtLeast(name: string, minimum: number): number {
+  const value = positiveNumber(name, minimum);
+  if (value < minimum) {
+    throw new Error(`${name} must be at least ${minimum}`);
+  }
+  return value;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes("--help") || args.includes("-h")) help();
   const command = args[0]!;
-  const repository = args.find((arg, index) => index > 0 && !arg.startsWith("-"));
+  const repository = positionalRepository(args);
   const context: CommandContext = {
     github: new GitHubClient(token()),
     guardianRepository: process.env.GUARDIANBOT_REPOSITORY ?? "Geekyshubham/guardianbot",
     workflowSha: process.env.GUARDIANBOT_WORKFLOW_SHA ?? "0000000000000000000000000000000000000000",
+    guardianAppSlug: process.env.GUARDIANBOT_APP_SLUG,
+    expectedRunMaxAgeHours: positiveNumber("GUARDIANBOT_EXPECTED_RUN_MAX_AGE_HOURS", 36),
+    reportOnlyMinimumDays: numberAtLeast("GUARDIANBOT_REPORT_ONLY_MINIMUM_DAYS", 7),
     dryRun: args.includes("--dry-run"),
     overrides: {
       dockerfile: option(args, "--dockerfile"),
@@ -76,7 +120,10 @@ async function main() {
       sessionAssertionPath: option(args, "--session-path")
     }
   };
-  if (context.workflowSha === "0000000000000000000000000000000000000000" && command !== "inventory") {
+  if (
+    context.workflowSha === "0000000000000000000000000000000000000000" &&
+    !["inventory", "offboard"].includes(command)
+  ) {
     throw new Error("Set GUARDIANBOT_WORKFLOW_SHA to the published immutable GuardianBot commit");
   }
   let result: unknown;
