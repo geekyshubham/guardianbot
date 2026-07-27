@@ -84,6 +84,12 @@ export function validateReviewResult(
   if (value.reviewedHeadSha !== request.pullRequest.headSha) {
     throw new ProtocolValidationError("ReviewResult reviewedHeadSha does not match request");
   }
+  if (
+    request.expectedContextIndexSha &&
+    value.contextIndexSha !== request.expectedContextIndexSha
+  ) {
+    throw new ProtocolValidationError("ReviewResult contextIndexSha does not match request");
+  }
   if (value.findings.length > request.limits.maxInlineComments) {
     throw new ProtocolValidationError("ReviewResult exceeds maxInlineComments");
   }

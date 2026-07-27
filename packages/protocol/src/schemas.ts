@@ -64,6 +64,7 @@ export const reviewRequestSchema = {
       ]
     },
     promptVersion: { type: "string", minLength: 1 },
+    expectedContextIndexSha: { type: "string", pattern: "^[a-f0-9]{64}$" },
     validChangedLines: {
       type: "array",
       items: changedLineRangeSchema,
@@ -210,7 +211,7 @@ export const reviewResultSchema = {
     schemaVersion: { const: "1.0.0" },
     requestId: { type: "string", minLength: 1 },
     reviewedHeadSha: { type: "string", minLength: 7 },
-    contextIndexSha: { type: "string", minLength: 7 },
+    contextIndexSha: { type: "string", pattern: "^[a-f0-9]{64}$" },
     summary: {
       type: "object",
       additionalProperties: false,
@@ -314,4 +315,3 @@ export const backendCapabilitiesSchema = {
     usageReporting: { type: "boolean" }
   }
 } as const;
-

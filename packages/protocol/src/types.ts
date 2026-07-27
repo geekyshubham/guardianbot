@@ -60,6 +60,7 @@ export interface ReviewRequest {
   };
   profile: ReviewProfile;
   promptVersion: string;
+  expectedContextIndexSha?: string;
   validChangedLines: ChangedLineRange[];
   contexts: ReviewContextChunk[];
   scannerEvidence: ScannerEvidence[];
@@ -166,4 +167,3 @@ export interface ReviewProfileRoute {
   retryCount: 0 | 1;
   fallbackBackendId?: string;
 }
-

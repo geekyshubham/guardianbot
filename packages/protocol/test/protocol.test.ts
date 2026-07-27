@@ -29,6 +29,7 @@ const request: ReviewRequest = {
   },
   profile: "high-risk-review",
   promptVersion: "1",
+  expectedContextIndexSha: "c".repeat(64),
   validChangedLines: [{ path: "src/auth.ts", start: 10, end: 20 }],
   contexts: [],
   scannerEvidence: [],
@@ -41,7 +42,7 @@ const result: ReviewResult = {
   schemaVersion: "1.0.0",
   requestId: "req-1",
   reviewedHeadSha: "bbbbbbb",
-  contextIndexSha: "bbbbbbb",
+  contextIndexSha: "c".repeat(64),
   summary: {
     intent: "Fix authentication",
     changeGroups: [],
@@ -87,3 +88,11 @@ test("rejects findings outside changed lines", () => {
   );
 });
 
+test("rejects mismatched context bundle hashes when the request supplies one", () => {
+  const invalid = structuredClone(result);
+  invalid.contextIndexSha = "d".repeat(64);
+  assert.throws(
+    () => validateReviewResult(invalid, request),
+    ProtocolValidationError
+  );
+});
