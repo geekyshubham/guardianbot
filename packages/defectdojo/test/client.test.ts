@@ -50,6 +50,62 @@ test("missing env reference raises a config error without echoing token values",
   );
 });
 
+test("rejects insecure remote URLs and unsafe configuration bounds", () => {
+  assert.throws(
+    () =>
+      resolveDefectDojoConfig(
+        {
+          DEFECTDOJO_URL: "http://dojo.example.com",
+          DEFECTDOJO_API_TOKEN: "token"
+        },
+        { baseUrlRef: "DEFECTDOJO_URL", apiTokenRef: "DEFECTDOJO_API_TOKEN" }
+      ),
+    /HTTPS/
+  );
+  assert.throws(
+    () =>
+      resolveDefectDojoConfig(
+        {
+          DEFECTDOJO_URL: "https://dojo.example.com",
+          DEFECTDOJO_API_TOKEN: "token"
+        },
+        {
+          baseUrlRef: "DEFECTDOJO_URL",
+          apiTokenRef: "DEFECTDOJO_API_TOKEN",
+          maxAttempts: 0
+        }
+      ),
+    /maxAttempts/
+  );
+});
+
+test("refuses cross-origin pagination before forwarding the API token", async () => {
+  const calls: string[] = [];
+  const client = new DefectDojoClient(
+    resolveDefectDojoConfig(
+      {
+        DEFECTDOJO_URL: "https://dojo.example.com",
+        DEFECTDOJO_API_TOKEN: "token"
+      },
+      { baseUrlRef: "DEFECTDOJO_URL", apiTokenRef: "DEFECTDOJO_API_TOKEN" }
+    ),
+    {
+      fetch: async (input) => {
+        const url = String(input);
+        calls.push(url);
+        return createJsonResponse({
+          count: 1,
+          next: "https://attacker.example/steal",
+          results: [{ id: 1, name: "guardianbot" }]
+        });
+      }
+    }
+  );
+
+  await assert.rejects(() => client.listProducts(), /configured origin/);
+  assert.deepEqual(calls, ["https://dojo.example.com/api/v2/products/?limit=100"]);
+});
+
 test("retries on Retry-After and upserts product hierarchy before importing", async () => {
   const calls: Array<{ url: string; method: string; body?: unknown }> = [];
   const sleeps: number[] = [];

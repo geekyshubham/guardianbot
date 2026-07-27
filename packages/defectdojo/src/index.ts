@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_BACKOFF_MS = 250;
+const MAX_PAGINATION_PAGES = 1_000;
 const MAX_RESPONSE_BODY_PREVIEW = 1_024;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const ENVIRONMENT_REFERENCE_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 
 export interface DefectDojoConfigRefs {
   baseUrlRef: string;
@@ -254,7 +258,36 @@ function sortStrings(values: string[] | undefined): string[] | undefined {
 }
 
 function normalizeBaseUrl(value: string): string {
-  return value.endsWith("/") ? value : `${value}/`;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "baseUrl",
+      message: "DefectDojo base URL must be an absolute URL"
+    });
+  }
+  const loopback =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(loopback && url.protocol === "http:")) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "baseUrl",
+      message: "DefectDojo base URL must use HTTPS outside loopback development"
+    });
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "baseUrl",
+      message: "DefectDojo base URL cannot contain credentials, query parameters, or a fragment"
+    });
+  }
+  url.pathname = url.pathname.endsWith("/") ? url.pathname : `${url.pathname}/`;
+  return url.toString();
 }
 
 function normalizeDate(value: string | undefined): string | undefined {
@@ -326,6 +359,15 @@ export function resolveDefectDojoConfig(
   env: Record<string, string | undefined>,
   refs: DefectDojoConfigRefs
 ): DefectDojoResolvedConfig {
+  for (const reference of [refs.baseUrlRef, refs.apiTokenRef]) {
+    if (!ENVIRONMENT_REFERENCE_PATTERN.test(reference)) {
+      throw new DefectDojoError({
+        kind: "config",
+        path: reference,
+        message: "DefectDojo environment references must be uppercase variable names"
+      });
+    }
+  }
   const baseUrl = env[refs.baseUrlRef];
   const apiToken = env[refs.apiTokenRef];
   if (!baseUrl) {
@@ -342,14 +384,46 @@ export function resolveDefectDojoConfig(
       message: `missing required DefectDojo API token environment reference ${refs.apiTokenRef}`
     });
   }
+  const timeoutMs = refs.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const pageSize = refs.pageSize ?? DEFAULT_PAGE_SIZE;
+  const maxAttempts = refs.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const backoffMs = refs.backoffMs ?? DEFAULT_BACKOFF_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "timeoutMs",
+      message: "DefectDojo timeoutMs must be an integer between 1000 and 120000"
+    });
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 1_000) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "pageSize",
+      message: "DefectDojo pageSize must be an integer between 1 and 1000"
+    });
+  }
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "maxAttempts",
+      message: "DefectDojo maxAttempts must be an integer between 1 and 10"
+    });
+  }
+  if (!Number.isInteger(backoffMs) || backoffMs < 0 || backoffMs > 60_000) {
+    throw new DefectDojoError({
+      kind: "config",
+      path: "backoffMs",
+      message: "DefectDojo backoffMs must be an integer between 0 and 60000"
+    });
+  }
   return {
     baseUrl: normalizeBaseUrl(baseUrl),
     apiToken,
     userAgent: refs.userAgent ?? "@guardianbot/defectdojo",
-    timeoutMs: refs.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    pageSize: refs.pageSize ?? DEFAULT_PAGE_SIZE,
-    maxAttempts: refs.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
-    backoffMs: refs.backoffMs ?? DEFAULT_BACKOFF_MS,
+    timeoutMs,
+    pageSize,
+    maxAttempts,
+    backoffMs,
     dryRun: refs.dryRun ?? false,
     refs: {
       baseUrlRef: refs.baseUrlRef,
@@ -726,7 +800,19 @@ export class DefectDojoClient {
       ...query,
       limit: query.limit ?? this.config.pageSize
     };
+    const visited = new Set<string>();
+    let pages = 0;
     while (nextPath) {
+      const nextUrl = new URL(nextPath, this.config.baseUrl).toString();
+      if (visited.has(nextUrl) || pages >= MAX_PAGINATION_PAGES) {
+        throw new DefectDojoError({
+          kind: "validation",
+          path,
+          message: "DefectDojo pagination is cyclic or exceeds the maximum page count"
+        });
+      }
+      visited.add(nextUrl);
+      pages += 1;
       const pageResult: DefectDojoPage<T> | T[] | DefectDojoDryRunOperation = await this.request<
         DefectDojoPage<T> | T[]
       >({
@@ -786,6 +872,14 @@ export class DefectDojoClient {
     input: DefectDojoRequest<T>
   ): Promise<T | DefectDojoDryRunOperation> {
     const url = new URL(input.path, this.config.baseUrl);
+    const configuredUrl = new URL(this.config.baseUrl);
+    if (url.origin !== configuredUrl.origin) {
+      throw new DefectDojoError({
+        kind: "validation",
+        path: url.pathname,
+        message: "DefectDojo response attempted to redirect pagination outside its configured origin"
+      });
+    }
     if (input.query) {
       for (const [key, value] of Object.entries(input.query)) {
         if (value !== undefined) {
@@ -797,7 +891,10 @@ export class DefectDojoClient {
     headers.set("authorization", `Token ${this.config.apiToken}`);
     headers.set("user-agent", this.config.userAgent);
     if (input.idempotencyKey) {
-      headers.set("x-request-id", input.idempotencyKey);
+      headers.set(
+        "x-request-id",
+        createHash("sha256").update(input.idempotencyKey).digest("hex")
+      );
     }
     let body = input.body;
     if (input.json) {
