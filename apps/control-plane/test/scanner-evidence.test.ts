@@ -168,6 +168,27 @@ function actualGateFixture(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function emptyTrivyReport(artifactType = "filesystem") {
+  return {
+    SchemaVersion: 2,
+    ArtifactName: artifactType === "container_image"
+      ? "ghcr.io/example/service:test"
+      : "/workspace",
+    ArtifactType: artifactType,
+    Results: []
+  };
+}
+
+function scannerFingerprint(parts: Array<string | number | undefined>): string {
+  return createHash("sha256")
+    .update(
+      parts
+        .map((part) => String(part ?? "").trim().toLowerCase())
+        .join("\u001f")
+    )
+    .digest("hex");
+}
+
 function buildSecurityZip(
   overrides: Partial<Record<"semgrep" | "trivy" | "gate", unknown>> = {},
   options: Parameters<typeof buildProvenanceZip>[2] = {}
@@ -177,7 +198,7 @@ function buildSecurityZip(
     {
       "gate.json": overrides.gate ?? actualGateFixture(),
       "semgrep.json": overrides.semgrep ?? { results: [] },
-      "trivy.json": overrides.trivy ?? { Results: [] }
+      "trivy.json": overrides.trivy ?? emptyTrivyReport()
     },
     options
   );
@@ -200,7 +221,7 @@ function validImageReports(
       version: 1,
       components: []
     },
-    "trivy-image.json": { Results: [] },
+    "trivy-image.json": emptyTrivyReport("container_image"),
     ...overrides
   };
 }
@@ -584,11 +605,31 @@ test("rejects workflow runs with mutable or administratively unapproved reusable
 test("parses the reusable-security gate.json schema end to end", async () => {
   const store = new MemoryStore();
   await seedRepository(store);
+  const semgrepFinding = {
+    check_id: "auth.rule",
+    path: "src/auth.ts",
+    start: { line: 4 },
+    extra: {
+      severity: "ERROR",
+      message: "Authorization is bypassed",
+      metadata: { impact: "Privileged access can bypass authorization" }
+    }
+  };
+  const fingerprint = scannerFingerprint([
+    "semgrep",
+    semgrepFinding.check_id,
+    semgrepFinding.path,
+    semgrepFinding.start.line,
+    semgrepFinding.extra.message
+  ]);
   const zip = buildSecurityZip({
+    semgrep: { results: [semgrepFinding] },
     gate: actualGateFixture({
       passed: false,
       failures: ["Semgrep auth.rule at src/auth.ts:4"],
-      policyFindings: [{ source: "semgrep", ruleId: "auth.rule" }],
+      policyFindings: [
+        { source: "semgrep", ruleId: "auth.rule", fingerprint }
+      ],
       activeSuppressions: 2,
       expiredSuppressions: ["old-fingerprint"]
     })
@@ -615,6 +656,52 @@ test("parses the reusable-security gate.json schema end to end", async () => {
   assert.equal(run?.event, "push");
   assert.equal(run?.startedAt, "2026-07-27T11:55:00.000Z");
   assert.equal(run?.completedAt, "2026-07-27T12:00:00.000Z");
+});
+
+test("rejects incomplete scanner reports and gate fingerprints that disagree", async (t) => {
+  const cases = [
+    {
+      name: "incomplete Trivy report",
+      zip: buildSecurityZip({ trivy: { Results: [] } }),
+      error: /complete Trivy report/i
+    },
+    {
+      name: "unmatched gate fingerprint",
+      zip: buildSecurityZip({
+        gate: actualGateFixture({
+          passed: false,
+          failures: ["unmatched finding"],
+          policyFindings: [
+            { source: "semgrep", fingerprint: "0".repeat(64) }
+          ]
+        })
+      }),
+      error: /does not agree/i
+    }
+  ];
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.name, async () => {
+      const store = new MemoryStore();
+      await seedRepository(store);
+      const artifactId = 540 + index;
+      const { fetchStub } = createFetchStub({
+        workflowRun: trustedWorkflowRun(),
+        jobs: defaultSecurityJobs(),
+        artifactPages: [[
+          artifactRecord(
+            artifactId,
+            "guardianbot-evidence-500-2",
+            entry.zip
+          )
+        ]],
+        zipByArtifactId: { [artifactId]: entry.zip }
+      });
+      await assert.rejects(
+        () => createHandler(store, fetchStub)(handlerInput()),
+        entry.error
+      );
+    });
+  }
 });
 
 test("paginates listings and skips downloads after every expected artifact is accepted", async () => {
@@ -835,6 +922,66 @@ test("accepts validation evidence without promotion only when the promotion job 
   );
 });
 
+test("keeps DAST smoke and nightly evidence as distinct trusted profiles", async (t) => {
+  const cases = [
+    {
+      profile: "authenticated-baseline",
+      minutes: 15,
+      evidenceKey: "zap-smoke-summary",
+      kind: "zap-smoke"
+    },
+    {
+      profile: "authenticated-full",
+      minutes: 45,
+      evidenceKey: "zap-nightly-summary",
+      kind: "zap-nightly"
+    }
+  ] as const;
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.profile, async () => {
+      const store = new MemoryStore();
+      await seedRepository(store);
+      const zip = buildProvenanceZip("dast", {
+        "scan-status.json": {
+          schemaVersion: "1.0.0",
+          profile: entry.profile,
+          minutes: entry.minutes,
+          zapExitCode: 0
+        },
+        "zap.json": { site: [] }
+      });
+      const artifactId = 515 + index;
+      const { fetchStub } = createFetchStub({
+        workflowRun: trustedWorkflowRun({}, [
+          { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA }
+        ]),
+        jobs: [
+          {
+            name: "guardianbot-dast / authenticated staging DAST",
+            status: "completed",
+            conclusion: "success"
+          }
+        ],
+        artifactPages: [[
+          artifactRecord(
+            artifactId,
+            "guardianbot-dast-evidence-500-2",
+            zip
+          )
+        ]],
+        zipByArtifactId: { [artifactId]: zip }
+      });
+      await createHandler(store, fetchStub)(handlerInput());
+      const summary = scannerEvidence(store).find(
+        (record) => record.evidenceKey === entry.evidenceKey
+      );
+      assert.equal(summary?.kind, entry.kind);
+      assert.equal(summary?.payload?.profile, entry.profile);
+      assert.equal(summary?.payload?.minutes, entry.minutes);
+    });
+  }
+});
+
 test("fails image evidence on scanner_error or a policy count that disagrees with Trivy", async (t) => {
   const cases = [
     validImageReports({ "trivy-image.json": { scanner_error: true } }),
@@ -914,6 +1061,122 @@ test("requires structurally valid Cosign signature and CycloneDX attestation evi
   assert.equal(signature?.status, "success");
   assert.equal(signature?.payload?.signatures, 1);
   assert.equal(signature?.payload?.sbomAttestations, 1);
+});
+
+test("records exact DigitalOcean deployment evidence from a trusted promotion", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const validationZip = buildProvenanceZip(
+    "image-validation",
+    validImageReports()
+  );
+  const promotionZip = buildProvenanceZip(
+    "image-promotion",
+    validPromotionReports()
+  );
+  const github = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      {
+        name: "image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "image push, sign, attest",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(540, "guardianbot-image-evidence-500-2", validationZip),
+      artifactRecord(541, "guardianbot-image-promotion-500-2", promotionZip)
+    ]],
+    zipByArtifactId: { 540: validationZip, 541: promotionZip }
+  });
+  const digest = `sha256:${"2".repeat(64)}`;
+  const appId = "346b3b81-b8cf-4136-b706-0a7195bc9f00";
+  const deploymentId = "1304cb3c-f8c9-4135-8ad5-e21ed98b1aef";
+  const fetchStub: typeof fetch = (async (request, init) => {
+    const url =
+      request instanceof URL
+        ? request
+        : new URL(typeof request === "string" ? request : request.url);
+    if (url.origin === "https://api.digitalocean.com") {
+      return Response.json({
+        app: {
+          id: appId,
+          spec: {
+            name: "guardianbot-consumer-staging",
+            services: [
+              {
+                name: "web",
+                image: {
+                  registry_type: "GHCR",
+                  registry: "example",
+                  repository: "service",
+                  digest
+                }
+              }
+            ]
+          },
+          active_deployment: {
+            id: deploymentId,
+            phase: "ACTIVE",
+            spec: {
+              name: "guardianbot-consumer-staging",
+              services: [
+                {
+                  name: "web",
+                  image: {
+                    registry_type: "GHCR",
+                    registry: "example",
+                    repository: "service",
+                    digest
+                  }
+                }
+              ]
+            }
+          },
+          in_progress_deployment: null
+        }
+      });
+    }
+    if (url.href === "https://staging.example.com/healthz") {
+      return new Response("ok", { status: 200 });
+    }
+    return github.fetchStub(request, init);
+  }) as typeof fetch;
+  const environment = {
+    ...TEST_ENV,
+    DIGITALOCEAN_STAGING_TOKEN: "dop_v1_test-token-with-enough-entropy",
+    GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON: JSON.stringify({
+      consumer: {
+        repository: "Geekyshubham/guardianbot-consumer",
+        repositoryId: 99,
+        appId,
+        appName: "guardianbot-consumer-staging",
+        serviceNames: ["web"],
+        imageName: "ghcr.io/example/service",
+        environment: "staging",
+        origin: "https://staging.example.com",
+        healthPath: "/healthz",
+        apiTokenEnv: "DIGITALOCEAN_STAGING_TOKEN",
+        timeoutSeconds: 60
+      }
+    })
+  };
+
+  await createHandler(store, fetchStub, environment)(handlerInput());
+  const deployment = scannerEvidence(store).find(
+    (entry) => entry.evidenceKey === "deployment:staging"
+  );
+  assert.equal(deployment?.status, "success");
+  assert.equal(deployment?.digest, digest);
+  assert.equal(deployment?.environment, "staging");
+  assert.equal(deployment?.payload?.deploymentId, deploymentId);
 });
 
 test("persists DefectDojo reconciliation failure without mutating the completed GitHub gate", async () => {

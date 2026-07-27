@@ -107,6 +107,43 @@ test("reconcileEvidence validates digest-scoped evidence freshness", () => {
   assert.equal(result.status, "passing");
 });
 
+test("reconcileEvidence keeps evidence identity separate from the artifact digest", () => {
+  const result = reconcileEvidence(
+    [
+      {
+        key: "deployment",
+        kind: "deployment",
+        evidenceKey: "image-promotion:deployment:staging",
+        required: true,
+        maxAgeMs: 60 * 60_000,
+        digest: "sha256:expected",
+        environment: "staging"
+      }
+    ],
+    [
+      {
+        kind: "deployment",
+        evidenceKey: "image-promotion:deployment:other",
+        observedAt: "2026-07-27T09:40:00.000Z",
+        status: "success",
+        digest: "sha256:expected",
+        environment: "staging"
+      },
+      {
+        kind: "deployment",
+        evidenceKey: "image-promotion:deployment:staging",
+        observedAt: "2026-07-27T09:41:00.000Z",
+        status: "success",
+        digest: "sha256:wrong",
+        environment: "staging"
+      }
+    ],
+    clock
+  );
+  assert.equal(result.status, "failing");
+  assert.equal(result.missingCount, 1);
+});
+
 test("evaluateImageEvidence fails on deployed digest drift", () => {
   const result = evaluateImageEvidence(
     {

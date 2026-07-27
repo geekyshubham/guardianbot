@@ -153,8 +153,38 @@ export interface MonitoringWeeklyReportRecord {
     review: "unavailable";
     scanner: "latest-reconciliation";
     monitoring: "latest-reconciliation";
-    imageProtection: "unavailable";
+    imageProtection: "latest-reconciliation";
   };
+}
+
+export interface DastSessionIssuanceClaim {
+  issuanceKey: string;
+  leaseId: string;
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  profileId: string;
+  origin: string;
+  leasedAt: string;
+  leaseExpiresAt: string;
+}
+
+interface DastSessionIssuanceRecord extends DastSessionIssuanceClaim {
+  status: "leased" | "issued";
+  issuedAt?: string;
+  credentialExpiresAt?: string;
+}
+
+export interface DeploymentPromotionClaim {
+  deploymentKey: string;
+  leaseId: string;
+  repositoryId: number;
+  environment: string;
+  imageDigest: string;
+  runId: number;
+  runAttempt: number;
+  leasedAt: string;
+  leaseExpiresAt: string;
 }
 
 export interface StoreLock {
@@ -233,6 +263,24 @@ export interface Store {
   getMonitoringWeeklyReport(
     weekKey: string
   ): Promise<MonitoringWeeklyReportRecord | undefined>;
+  claimDastSessionIssuance(claim: DastSessionIssuanceClaim): Promise<boolean>;
+  completeDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string,
+    issuedAt: string,
+    credentialExpiresAt: string
+  ): Promise<boolean>;
+  releaseDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string
+  ): Promise<boolean>;
+  claimDeploymentPromotion(
+    claim: DeploymentPromotionClaim
+  ): Promise<boolean>;
+  releaseDeploymentPromotion(
+    deploymentKey: string,
+    leaseId: string
+  ): Promise<boolean>;
   listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]>;
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
@@ -305,6 +353,8 @@ export class MemoryStore implements Store {
   private monitoringSnapshots = new Map<string, MonitoringSnapshotRecord>();
   private monitoringAlerts = new Map<string, MonitoringAlertRecord>();
   private monitoringWeeklyReports = new Map<string, MonitoringWeeklyReportRecord>();
+  private dastSessionIssuances = new Map<string, DastSessionIssuanceRecord>();
+  private deploymentPromotions = new Map<string, DeploymentPromotionClaim>();
   private monitoringLockHeld = false;
 
   async ping(): Promise<void> {}
@@ -537,19 +587,15 @@ export class MemoryStore implements Store {
       .filter((repository) => repository.repositoryState === "active")
       .sort((left, right) => left.repositoryId - right.repositoryId)
       .map((repository) => {
-        const latestRunsByEvent = new Map<string, ScannerWorkflowRunRecord>();
-        for (const run of [...this.scannerRuns.values()]
+        const latestRuns = [...this.scannerRuns.values()]
           .filter(
             (run) =>
               run.repositoryId === repository.repositoryId &&
               run.headBranch === repository.defaultBranch
           )
-          .sort(compareScannerRunsNewestFirst)) {
-          const event = run.event ?? "unknown";
-          if (!latestRunsByEvent.has(event)) {
-            latestRunsByEvent.set(event, cloneScannerWorkflowRun(run));
-          }
-        }
+          .sort(compareScannerRunsNewestFirst)
+          .slice(0, 256)
+          .map(cloneScannerWorkflowRun);
         const evidenceByKey = new Map<string, ScannerEvidenceRecord>();
         for (const evidence of [...this.scannerEvidence.values()]
           .filter(
@@ -586,7 +632,7 @@ export class MemoryStore implements Store {
         return {
           repository: { ...repository },
           index: index ? structuredClone(index) : undefined,
-          latestScannerRuns: [...latestRunsByEvent.values()],
+          latestScannerRuns: latestRuns,
           latestScannerEvidence: [...evidenceByKey.values()]
         };
       });
@@ -649,6 +695,85 @@ export class MemoryStore implements Store {
   ): Promise<MonitoringWeeklyReportRecord | undefined> {
     const report = this.monitoringWeeklyReports.get(weekKey);
     return report ? cloneMonitoringWeeklyReport(report) : undefined;
+  }
+
+  async claimDastSessionIssuance(
+    claim: DastSessionIssuanceClaim
+  ): Promise<boolean> {
+    const existing = this.dastSessionIssuances.get(claim.issuanceKey);
+    if (
+      existing?.status === "issued" ||
+      (existing?.status === "leased" &&
+        Date.parse(existing.leaseExpiresAt) > Date.parse(claim.leasedAt))
+    ) {
+      return false;
+    }
+    this.dastSessionIssuances.set(claim.issuanceKey, {
+      ...claim,
+      status: "leased"
+    });
+    return true;
+  }
+
+  async completeDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string,
+    issuedAt: string,
+    credentialExpiresAt: string
+  ): Promise<boolean> {
+    const existing = this.dastSessionIssuances.get(issuanceKey);
+    if (
+      !existing ||
+      existing.status !== "leased" ||
+      existing.leaseId !== leaseId
+    ) {
+      return false;
+    }
+    this.dastSessionIssuances.set(issuanceKey, {
+      ...existing,
+      status: "issued",
+      issuedAt,
+      credentialExpiresAt
+    });
+    return true;
+  }
+
+  async releaseDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string
+  ): Promise<boolean> {
+    const existing = this.dastSessionIssuances.get(issuanceKey);
+    if (
+      !existing ||
+      existing.status !== "leased" ||
+      existing.leaseId !== leaseId
+    ) {
+      return false;
+    }
+    return this.dastSessionIssuances.delete(issuanceKey);
+  }
+
+  async claimDeploymentPromotion(
+    claim: DeploymentPromotionClaim
+  ): Promise<boolean> {
+    const existing = this.deploymentPromotions.get(claim.deploymentKey);
+    if (
+      existing &&
+      Date.parse(existing.leaseExpiresAt) > Date.parse(claim.leasedAt)
+    ) {
+      return false;
+    }
+    this.deploymentPromotions.set(claim.deploymentKey, { ...claim });
+    return true;
+  }
+
+  async releaseDeploymentPromotion(
+    deploymentKey: string,
+    leaseId: string
+  ): Promise<boolean> {
+    const existing = this.deploymentPromotions.get(deploymentKey);
+    if (!existing || existing.leaseId !== leaseId) return false;
+    return this.deploymentPromotions.delete(deploymentKey);
   }
 
   async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
@@ -1004,6 +1129,39 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS monitoring_weekly_reports_period_idx
         ON monitoring_weekly_reports (period_start DESC);
+
+      CREATE TABLE IF NOT EXISTS dast_session_issuances (
+        issuance_key TEXT PRIMARY KEY,
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        run_id BIGINT NOT NULL,
+        run_attempt INTEGER NOT NULL,
+        profile_id TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('leased', 'issued')),
+        lease_id TEXT NOT NULL,
+        leased_at TIMESTAMPTZ NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        issued_at TIMESTAMPTZ,
+        credential_expires_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS dast_session_issuances_repository_idx
+        ON dast_session_issuances (repository_id, run_id DESC, run_attempt DESC);
+
+      CREATE TABLE IF NOT EXISTS deployment_promotions (
+        deployment_key TEXT PRIMARY KEY,
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        environment TEXT NOT NULL,
+        image_digest TEXT NOT NULL,
+        run_id BIGINT NOT NULL,
+        run_attempt INTEGER NOT NULL,
+        lease_id TEXT NOT NULL,
+        leased_at TIMESTAMPTZ NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS deployment_promotions_repository_idx
+        ON deployment_promotions (repository_id, environment);
     `);
     if (this.repositoryIndexStorageMode === "pgvector") {
       await this.pool.query(
@@ -1449,23 +1607,29 @@ export class PostgresStore implements Store {
           AND repositories.index_sha=indexes.commit_sha`
       ),
       this.pool.query(
-        `SELECT DISTINCT ON (runs.repository_id, runs.event)
-           runs.*
-         FROM scanner_workflow_runs AS runs
-         JOIN repositories AS repositories
-           ON repositories.repository_id=runs.repository_id
-          AND repositories.repository_state='active'
-          AND runs.head_branch=repositories.default_branch
-         ORDER BY runs.repository_id,
-                  runs.event,
-                  COALESCE(
-                    runs.completed_at,
-                    runs.started_at,
-                    runs.processed_at,
-                    runs.updated_at
-                  ) DESC,
-                  runs.run_id DESC,
-                  runs.run_attempt DESC`
+        `WITH ranked_runs AS (
+           SELECT runs.*,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY runs.repository_id
+                    ORDER BY COALESCE(
+                               runs.completed_at,
+                               runs.started_at,
+                               runs.processed_at,
+                               runs.updated_at
+                             ) DESC,
+                             runs.run_id DESC,
+                             runs.run_attempt DESC
+                  ) AS monitoring_rank
+           FROM scanner_workflow_runs AS runs
+           JOIN repositories AS repositories
+             ON repositories.repository_id=runs.repository_id
+            AND repositories.repository_state='active'
+            AND runs.head_branch=repositories.default_branch
+         )
+         SELECT *
+         FROM ranked_runs
+         WHERE monitoring_rank <= 256
+         ORDER BY repository_id, monitoring_rank`
       ),
       this.pool.query(
         `SELECT DISTINCT ON (
@@ -1653,6 +1817,119 @@ export class PostgresStore implements Store {
       [weekKey]
     );
     return result.rows[0] ? this.toMonitoringWeeklyReport(result.rows[0]) : undefined;
+  }
+
+  async claimDastSessionIssuance(
+    claim: DastSessionIssuanceClaim
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO dast_session_issuances
+         (issuance_key, repository_id, run_id, run_attempt, profile_id, origin,
+          status, lease_id, leased_at, lease_expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'leased',$7,$8,$9)
+       ON CONFLICT (issuance_key) DO UPDATE SET
+         status='leased',
+         lease_id=excluded.lease_id,
+         leased_at=excluded.leased_at,
+         lease_expires_at=excluded.lease_expires_at,
+         updated_at=now()
+       WHERE dast_session_issuances.status='leased'
+         AND dast_session_issuances.lease_expires_at <= excluded.leased_at
+       RETURNING issuance_key`,
+      [
+        claim.issuanceKey,
+        claim.repositoryId,
+        claim.runId,
+        claim.runAttempt,
+        claim.profileId,
+        claim.origin,
+        claim.leaseId,
+        claim.leasedAt,
+        claim.leaseExpiresAt
+      ]
+    );
+    return result.rowCount === 1;
+  }
+
+  async completeDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string,
+    issuedAt: string,
+    credentialExpiresAt: string
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE dast_session_issuances
+       SET status='issued',
+           issued_at=$3,
+           credential_expires_at=$4,
+           updated_at=now()
+       WHERE issuance_key=$1
+         AND lease_id=$2
+         AND status='leased'`,
+      [issuanceKey, leaseId, issuedAt, credentialExpiresAt]
+    );
+    return result.rowCount === 1;
+  }
+
+  async releaseDastSessionIssuance(
+    issuanceKey: string,
+    leaseId: string
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `DELETE FROM dast_session_issuances
+       WHERE issuance_key=$1
+         AND lease_id=$2
+         AND status='leased'`,
+      [issuanceKey, leaseId]
+    );
+    return result.rowCount === 1;
+  }
+
+  async claimDeploymentPromotion(
+    claim: DeploymentPromotionClaim
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO deployment_promotions
+         (deployment_key, repository_id, environment, image_digest, run_id,
+          run_attempt, lease_id, leased_at, lease_expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (deployment_key) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         environment=excluded.environment,
+         image_digest=excluded.image_digest,
+         run_id=excluded.run_id,
+         run_attempt=excluded.run_attempt,
+         lease_id=excluded.lease_id,
+         leased_at=excluded.leased_at,
+         lease_expires_at=excluded.lease_expires_at,
+         updated_at=now()
+       WHERE deployment_promotions.lease_expires_at <= excluded.leased_at
+       RETURNING deployment_key`,
+      [
+        claim.deploymentKey,
+        claim.repositoryId,
+        claim.environment,
+        claim.imageDigest,
+        claim.runId,
+        claim.runAttempt,
+        claim.leaseId,
+        claim.leasedAt,
+        claim.leaseExpiresAt
+      ]
+    );
+    return result.rowCount === 1;
+  }
+
+  async releaseDeploymentPromotion(
+    deploymentKey: string,
+    leaseId: string
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `DELETE FROM deployment_promotions
+       WHERE deployment_key=$1 AND lease_id=$2`,
+      [deploymentKey, leaseId]
+    );
+    return result.rowCount === 1;
   }
 
   async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {

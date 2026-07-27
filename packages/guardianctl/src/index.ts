@@ -423,7 +423,8 @@ export async function generateOnboarding(
       guardianRepository: context.guardianRepository,
       workflowSha: context.workflowSha,
       defaultBranch: snapshot.defaultBranch,
-      image: configObject.image
+      image: configObject.image,
+      dast: configObject.dast
     }),
     report
   };
@@ -1718,7 +1719,8 @@ async function doctorInternal(
       guardianRepository: context.guardianRepository,
       workflowSha: effectiveWorkflowSha,
       defaultBranch: metadata.default_branch,
-      image: parsedConfig.image
+      image: parsedConfig.image,
+      dast: parsedConfig.dast
     });
     const matches = callerWorkflowMatches(workflow.content, expectedWorkflow);
     checks.push(
@@ -2139,7 +2141,8 @@ export async function upgrade(
     guardianRepository: context.guardianRepository,
     workflowSha: context.workflowSha,
     defaultBranch: metadata.default_branch,
-    image: config.image
+    image: config.image,
+    dast: config.dast
   });
   const workflowChanged = !callerWorkflowMatches(workflowFile.content, workflow);
   if (!configChanged && !workflowChanged) return { changed: false };

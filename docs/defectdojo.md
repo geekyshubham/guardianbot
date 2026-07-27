@@ -77,9 +77,10 @@ The client package and deployment definition are implemented and locally
 validated. They are not evidence of a live production deployment. Full
 DefectDojo coverage remains unverified until the DigitalOcean deployment passes
 its live doctor, backup/restore drill, and an authenticated GuardianBot
-import/reimport fixture. The control plane must also complete workflow-report
-ingestion and scheduled reconciliation before `docs/status.md` can claim full
-production coverage.
+import/reimport fixture. The control plane now ingests trusted workflow evidence
+and schedules reconciliation, including distinct ZAP smoke and nightly import
+identities, but that automated contract is not a substitute for the missing live
+DefectDojo evidence.
 
 Deployment and operations details:
 

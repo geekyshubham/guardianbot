@@ -7,6 +7,22 @@ reusable workflow commits remain immutable.
 
 ### Added
 
+- A one-time DAST session broker that binds an exact repository, workflow SHA,
+  GitHub-hosted runner, protected environment, target origin, run attempt, and
+  default-branch commit before exchanging an ephemeral staging credential.
+- Separate authenticated ZAP smoke and nightly evidence/import identities so a
+  frequent smoke run cannot satisfy the nightly full-scan requirement.
+- Full Trivy vulnerability, misconfiguration, secret, and license
+  normalization with class-specific policy decisions and secret-detail
+  redaction.
+- A central, repository-neutral DigitalOcean App Platform promotion reconciler
+  that updates only allowlisted GHCR services to the signed image digest and
+  records health-verified deployment evidence.
+- Signed-release deployment entry points for DigitalOcean droplets and App
+  Platform, with canonical asset, signature, attestation, provenance, source,
+  workflow-identity, and exact-running-digest verification.
+- Durable DAST issuance and deployment-promotion leases, exact signed/deployed
+  image reconciliation, and weekly image-protection coverage.
 - Documentation quality gates for local links and anchors, schema-backed config
   examples and references, OpenAPI examples, Mermaid SVG rendering, CLI help
   smoke tests, and release-note diff policy.
@@ -24,6 +40,27 @@ reusable workflow commits remain immutable.
 
 ### Security
 
+- DAST credentials no longer come from consumer-repository secrets. The
+  reusable workflow obtains a one-time credential from the control plane using
+  GitHub OIDC; target-side exchange is the normal mode and static credentials
+  require an explicit PoC-only control-plane switch.
+- Scanner and image workflows reject repository-controlled evidence paths,
+  symlinks, incomplete reports, invalid baseline hashes, and mismatched reusable
+  workflow identities. Temporary raw Trivy secret matches are scrubbed before
+  artifact publication.
+- Scanner fingerprints now use one canonical implementation in the workflow and
+  control plane; ingestion independently rejects incomplete Semgrep/Trivy
+  documents or gate fingerprints that do not exist in normalized evidence.
+  Existing PoC baselines and suppressions using the earlier workflow
+  fingerprint remain accepted during migration.
+- Reusable workflows bound GitHub OIDC and evidence-attestation JSON responses
+  before parsing instead of trusting an unbounded response body.
+- Monitoring now separates evidence identity from artifact digest, combines
+  trusted evidence for the same exact default-branch commit, and requires a
+  registry digest whose signing and deployment evidence agree.
+- DigitalOcean promotion is restricted to a hard-coded API origin, exact
+  centrally configured app/repository/service/image identities, bounded API
+  responses, immutable digests, and post-deployment health/readiness probes.
 - The release pipeline now validates annotated SemVer tags and synchronized
   workspace versions, scans a run-scoped candidate before stable publication,
   resolves both GHCR tags to one `linux/amd64` digest, and verifies exact OIDC

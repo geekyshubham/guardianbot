@@ -1,107 +1,162 @@
 # Operations
 
-Deploy the Compose stack on one dedicated DigitalOcean droplet in a private VPC,
-with an encrypted attached volume mounted at `GUARDIANBOT_STATE_DIR`
-(recommended: `/var/lib/guardianbot`). The runtime path is intentionally
-single-host today: Caddy terminates TLS, PostgreSQL stays private, and the
-optional Valkey profile remains disabled until the worker path exists.
+GuardianBot supports two DigitalOcean-only control-plane layouts:
 
-## Deployment boundary
+- an existing DigitalOcean App Platform app with managed PostgreSQL; or
+- one dedicated Ubuntu droplet in a private VPC, with an encrypted attached
+  volume mounted at `GUARDIANBOT_STATE_DIR`.
 
-- Deploy only the signed control-plane image digest published by the release
-  workflow. Do not build from source on the droplet.
-- Keep `infra/docker-compose.yml` pinned to immutable digests for GuardianBot,
-  PostgreSQL, Caddy, and Prometheus.
-- Store `.env` on the droplet with `0600` permissions. Consumer repositories
-  never receive these values.
-- For managed PostgreSQL, set `GUARDIANBOT_DATABASE_CA_CERT` to the provider CA
-  PEM (literal or `\n`-escaped). GuardianBot removes weaker TLS query parameters
-  from `DATABASE_URL` and verifies the server against that CA. Local private
-  Compose PostgreSQL does not set this override.
-- Mount all persistent state under `GUARDIANBOT_STATE_DIR` on the encrypted
-  DigitalOcean volume.
+Consumer repositories never receive control-plane, model, database,
+DefectDojo, DAST, or DigitalOcean credentials.
 
-## Standard deploy
+## Release boundary
+
+Deploy only a canonical GuardianBot GitHub Release asset set. A release
+directory contains the checksummed manifest, Sigstore bundle, provenance
+bundles, verification records, and SBOM needed to prove the exact GHCR digest.
+Do not deploy a raw digest copied from a log and do not build source on the
+DigitalOcean host.
+
+Install `cosign`, `gh`, `jq`, `node`, and `curl` on either deployment host. App
+Platform deployment also requires an authenticated `doctl`; droplet deployment
+requires Docker with Compose.
+
+Download a complete release to a new operator-controlled directory:
+
+```sh
+mkdir guardianbot-release-v0.2.0
+gh release download v0.2.0 \
+  --repo Geekyshubham/guardianbot \
+  --dir guardianbot-release-v0.2.0
+```
+
+The deployment scripts verify:
+
+- the fixed release-asset allowlist and checksums;
+- repository, tag, source ref, and source commit;
+- the keylessly signed release manifest;
+- the exact GHCR image signature and CycloneDX attestation;
+- GitHub artifact provenance from the canonical release workflow; and
+- the active DigitalOcean deployment's exact digest.
+
+## DigitalOcean App Platform
+
+For the existing `guardianbot-prod` app:
+
+```sh
+./scripts/deploy-digitalocean-app-platform.sh \
+  11111111-2222-4333-8444-555555555555 \
+  guardianbot-release-v0.2.0
+```
+
+The script refuses an unexpected app name or image source, updates only the
+`control-plane` and optional `model-bridge` service, removes mutable tags, waits
+for an active deployment, re-reads that deployment's spec, and probes
+`/healthz` and `/readyz`.
+
+App-level environment configuration must include:
+
+- GitHub App ID, private key, and webhook secret;
+- `GUARDIANBOT_EVIDENCE_SIGNING_SECRET`;
+- exact trusted security, image, and DAST reusable-workflow SHAs;
+- `DATABASE_URL` and
+  `GUARDIANBOT_DATABASE_CA_CERT=${guardianbot-db.CA_CERT}` for the managed
+  DigitalOcean database binding;
+- model bridge URL/token, when a bridge is enabled;
+- `GUARDIANBOT_DAST_PROFILES_JSON` and its referenced exchange-secret
+  environment variables; and
+- `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` and the centrally referenced
+  DigitalOcean API token.
+
+The profile JSON documents contain identifiers and environment-variable names,
+not secret values. Keep each actual secret in encrypted App Platform
+configuration.
+
+To roll back App Platform, run the same verified script with the retained asset
+directory for the previous release. Database rollback is a separate,
+explicitly approved restore operation.
+
+## Dedicated droplet
+
+The Compose topology uses Caddy for TLS, private PostgreSQL, and private
+Prometheus. Its optional Valkey profile remains disabled until a worker queue
+requires it. Keep `.env` at mode `0600` or `0400`, pin support containers by
+digest, and mount all persistent state below the encrypted
+`GUARDIANBOT_STATE_DIR`.
+
+Before a deployment:
 
 ```sh
 cd /opt/guardianbot
 ./scripts/backup-postgres.sh
-./scripts/deploy-digitalocean.sh deploy ghcr.io/geekyshubham/guardianbot@sha256:340fefd23012d84a6f07d82b87b22f27c0d52d1cdd2a9e7f2b00f283a17b87b0
+./scripts/deploy-digitalocean.sh deploy \
+  /opt/guardianbot/releases/guardianbot-release-v0.2.0
 ./scripts/deploy-digitalocean.sh verify
 ```
 
-The deploy script:
+The script retains canonical current and previous release assets in a
+non-symlink deployment-state directory, verifies the running container's exact
+image, waits for PostgreSQL and the control plane, and probes the external
+`/healthz` and `/readyz` routes.
 
-- refuses mutable image references
-- validates `.env` permissions and required secrets
-- records the previous image for rollback
-- waits for PostgreSQL and the control plane to become healthy
-- verifies the HTTPS `/healthz` route through Caddy on the configured hostname
+Droplet rollback re-verifies the retained previous release before deployment:
 
-`guardianctl upgrade` still delivers consumer-workflow pin updates through draft
-PRs. It does not change the control-plane deployment.
+```sh
+./scripts/deploy-digitalocean.sh rollback
+```
+
+## PostgreSQL, backup, and restore
+
+For DigitalOcean managed PostgreSQL, set
+`GUARDIANBOT_DATABASE_CA_CERT` to the DigitalOcean CA PEM. GuardianBot removes
+weaker TLS query parameters from `DATABASE_URL` and verifies the database
+server against that CA. Private Compose PostgreSQL does not use this override.
+
+Back up droplet PostgreSQL before each deployment and on a daily schedule:
+
+```sh
+cd /opt/guardianbot
+./scripts/backup-postgres.sh
+```
+
+Restore only after taking a new pre-restore backup:
+
+```sh
+./scripts/restore-postgres.sh \
+  --input /var/lib/guardianbot/backups/guardianbot-postgres-YYYYMMDDTHHMMSSZ.dump \
+  --yes
+```
+
+Run a restore drill in an isolated DigitalOcean environment before declaring
+the system ready for business-critical retention requirements.
 
 ## Monitoring
 
 Monitor at minimum:
 
-- `https://HOST/healthz`
-- container health for `postgres`, `control-plane`, and `prometheus`
-- the internal `http://control-plane:3000/metrics` Prometheus target on the
-  explicitly trusted private Compose network
-- GitHub webhook 4xx/5xx rates
-- review latency and AI-backend availability
-- scanner evidence freshness, imports, suppression expiry, and missing evidence
+- public `/healthz` and `/readyz`;
+- scheduler run, failure, duration, and last-success metrics;
+- GitHub webhook 4xx/5xx rates and replay rejections;
+- bridge availability and review latency;
+- expected workflow runs, repository-index freshness, and scanner evidence;
+- distinct DAST smoke/nightly freshness and DefectDojo imports;
+- exact scan/SBOM/signature/deployment digest agreement; and
+- suppression expiry and weekly coverage snapshots.
 
-Public Caddy requests to `/metrics` return `404`. Outside the trusted private
-Compose network, configure `GUARDIANBOT_METRICS_BEARER_TOKEN`; metrics stay closed
-when neither that token nor the explicit private-network trust flag is present.
-Current limitations still apply: `/readyz` and `/metrics` are not deep dependency
-checks, so container health and deploy verification remain required.
+Public Caddy requests to `/metrics` return `404`. Metrics access requires
+`GUARDIANBOT_METRICS_BEARER_TOKEN` unless the deployment explicitly enables
+`GUARDIANBOT_TRUST_PRIVATE_METRICS=1` on a genuinely private Compose network.
+Health/readiness endpoints are useful process signals, not substitutes for
+external probes and evidence reconciliation.
 
-## Backup and restore
+## Host and secret operations
 
-Back up PostgreSQL to the encrypted DigitalOcean volume before each deploy and on
-a scheduled cadence such as daily cron:
+The droplet cloud-init profile enables UFW default-deny inbound policy,
+unattended security upgrades, SSH password/root-login disablement, Docker
+live-restore/log rotation, and `fail2ban`.
 
-```sh
-cd /opt/guardianbot
-./scripts/backup-postgres.sh
-```
-
-Restore into the same droplet only after taking a fresh pre-restore backup:
-
-```sh
-./scripts/restore-postgres.sh --input /var/lib/guardianbot/backups/guardianbot-postgres-YYYYMMDDTHHMMSSZ.dump --yes
-```
-
-Test restore into an isolated DigitalOcean environment before calling the stack
-production-ready for regulated or business-critical workloads.
-
-## Rollback
-
-Application rollback is explicit and image-based:
-
-```sh
-cd /opt/guardianbot
-./scripts/deploy-digitalocean.sh rollback
-```
-
-This rolls the control plane back to the previously recorded digest and re-runs
-health verification. Data rollback is separate and must use
-`restore-postgres.sh` with a known-good backup.
-
-## Host hardening
-
-`infra/digitalocean/cloud-init.yml` now enables:
-
-- UFW default deny for inbound traffic, limited SSH, and ports 80/443 only
-- unattended security upgrades
-- SSH password and root-login disablement
-- Docker live-restore and log rotation
-- `fail2ban` for SSH
-
-Rotate the GitHub App PEM, webhook secret, model bridge token, DefectDojo token,
-and staging credentials independently. Emergency disablement removes App access
-or stops the control plane; repository security workflows continue at their
-pinned commit.
+Rotate the GitHub App private key, webhook secret, evidence signing secret,
+model bridge token, DAST exchange credentials, DigitalOcean token, DefectDojo
+token, and database credentials independently. Emergency disablement removes
+GitHub App access or stops the control plane; consumer security workflows
+continue at their immutable pinned commit.

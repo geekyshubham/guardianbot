@@ -288,7 +288,7 @@ test("reconciliation persists sanitized snapshots and idempotent alerts from sto
     review: "unavailable",
     scanner: "latest-reconciliation",
     monitoring: "latest-reconciliation",
-    imageProtection: "unavailable"
+    imageProtection: "latest-reconciliation"
   });
 });
 
@@ -371,6 +371,235 @@ test("immutable scanner toggles control which evidence is required", async () =>
     snapshot?.checks.some((check) => check.key.includes("semgrep")),
     false
   );
+});
+
+test("reconciliation combines security and DAST evidence from separate exact-head schedules", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store);
+  const configIndex = await store.getRepositoryIndex(
+    20,
+    "github:20",
+    "a".repeat(40)
+  );
+  assert.ok(configIndex);
+  const configSymbol = configIndex.symbols.find(
+    (symbol) => symbol.path === ".guardianbot/config.yml"
+  );
+  assert.ok(configSymbol);
+  const config = JSON.parse(configSymbol.content) as GuardianConfig;
+  config.dast = {
+    allowedOrigin: "https://staging.example.com",
+    openapi: "openapi.json",
+    openapiSource: "repository-file",
+    authenticationProfile: "control-plane://profiles/service-staging",
+    sessionAssertionPath: "/api/session"
+  };
+  const updatedIndex = await indexRepositorySyntaxAware({
+    repository: "acme/service",
+    repositoryId: 20,
+    repositoryScope: "github:20",
+    visibility: "private",
+    commitSha: "a".repeat(40),
+    files: { ".guardianbot/config.yml": JSON.stringify(config) }
+  });
+  await store.replaceRepositoryIndex(
+    20,
+    updatedIndex,
+    toPersistedVectorRows(updatedIndex),
+    new Date("2026-07-27T11:50:00.000Z")
+  );
+
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 500 }));
+  await store.upsertScannerWorkflowRun(
+    scannerRun({
+      runId: 501,
+      startedAt: "2026-07-27T11:41:00.000Z",
+      completedAt: "2026-07-27T11:46:00.000Z",
+      processedAt: "2026-07-27T11:46:00.000Z"
+    })
+  );
+  await store.upsertScannerWorkflowRun(
+    scannerRun({
+      runId: 502,
+      startedAt: "2026-07-27T11:47:00.000Z",
+      completedAt: "2026-07-27T11:55:00.000Z",
+      processedAt: "2026-07-27T11:55:00.000Z"
+    })
+  );
+  for (const record of [
+    evidence("semgrep-summary", "semgrep", "success", { runId: 500 }),
+    evidence("trivy-summary", "trivy", "success", { runId: 500 }),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import", "success", {
+      runId: 500
+    }),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import", "success", {
+      runId: 500
+    }),
+    evidence("zap-smoke-summary", "zap-smoke", "success", {
+      runId: 501,
+      artifactId: 701,
+      artifactType: "dast"
+    }),
+    evidence("defectdojo-import:ZAP Scan:smoke", "defectdojo-import", "success", {
+      runId: 501,
+      artifactId: 701,
+      artifactType: "dast"
+    }),
+    evidence("zap-nightly-summary", "zap-nightly", "success", {
+      runId: 502,
+      artifactId: 702,
+      artifactType: "dast"
+    }),
+    evidence("defectdojo-import:ZAP Scan:nightly", "defectdojo-import", "success", {
+      runId: 502,
+      artifactId: 702,
+      artifactType: "dast"
+    })
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.overallStatus, "passing");
+  assert.equal(snapshot?.checks.find((check) => check.key === "scanner-semgrep")?.status, "passing");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-smoke")?.status,
+    "passing"
+  );
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-nightly")?.status,
+    "passing"
+  );
+});
+
+test("image monitoring requires deployment evidence for the exact signed digest", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store);
+  const configIndex = await store.getRepositoryIndex(
+    20,
+    "github:20",
+    "a".repeat(40)
+  );
+  assert.ok(configIndex);
+  const configSymbol = configIndex.symbols.find(
+    (symbol) => symbol.path === ".guardianbot/config.yml"
+  );
+  assert.ok(configSymbol);
+  const config = JSON.parse(configSymbol.content) as GuardianConfig;
+  config.image = {
+    name: "acme/service",
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64",
+    registry: "ghcr.io/acme/service",
+    healthPath: "/healthz",
+    sbomFormat: "cyclonedx-json",
+    deployment: {
+      environment: "staging",
+      requireImmutableDigest: true,
+      requireSignature: true,
+      requireSbom: true
+    }
+  };
+  const updatedIndex = await indexRepositorySyntaxAware({
+    repository: "acme/service",
+    repositoryId: 20,
+    repositoryScope: "github:20",
+    visibility: "private",
+    commitSha: "a".repeat(40),
+    files: { ".guardianbot/config.yml": JSON.stringify(config) }
+  });
+  await store.replaceRepositoryIndex(
+    20,
+    updatedIndex,
+    toPersistedVectorRows(updatedIndex),
+    new Date("2026-07-27T11:50:00.000Z")
+  );
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 500 }));
+  await store.upsertScannerWorkflowRun(
+    scannerRun({
+      runId: 501,
+      event: "push",
+      startedAt: "2026-07-27T11:41:00.000Z",
+      completedAt: "2026-07-27T11:50:00.000Z",
+      processedAt: "2026-07-27T11:50:00.000Z"
+    })
+  );
+  const signedDigest = `sha256:${"d".repeat(64)}`;
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import"),
+    evidence("image-trivy-summary", "trivy", "success", {
+      artifactId: 701,
+      artifactType: "image-validation"
+    }),
+    evidence("sbom", "sbom", "success", {
+      artifactId: 701,
+      artifactType: "image-validation"
+    }),
+    evidence("signature", "signature", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest
+    }),
+    evidence("deployment:staging", "deployment", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: `sha256:${"e".repeat(64)}`,
+      environment: "staging"
+    })
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  await monitoring.reconcileOnce();
+  let snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "image-signature")?.status,
+    "passing"
+  );
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "image-deployment")?.status,
+    "failing"
+  );
+
+  await store.upsertScannerEvidence(
+    evidence("deployment:staging", "deployment", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest,
+      environment: "staging"
+    })
+  );
+  await monitoring.reconcileOnce();
+  snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "image-deployment")?.status,
+    "passing"
+  );
+  assert.equal(snapshot?.overallStatus, "passing");
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(weekly?.report.monitoring.protectedDigests, 1);
+  assert.equal(weekly?.report.monitoring.completeEvidenceDigests, 1);
+  assert.equal(weekly?.report.monitoring.missingEvidenceDigests, 0);
 });
 
 test("missing immutable configuration is explicit and cannot produce a healthy snapshot", async () => {

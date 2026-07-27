@@ -13,11 +13,17 @@ logic.
 - A vendor-neutral `guardian.review.v1` HTTP contract with strict JSON Schema and
   changed-line validation. Models get bounded text, no tools, credentials, or
   GitHub access.
+- An isolated Responses API bridge with strict Structured Outputs, mapping routine
+  reviews to `gpt-5.6-terra` and high-risk/benchmark reviews to
+  `gpt-5.6-sol`, plus capability-checked compatible and fixture adapters.
 - `guardianctl onboard`, `doctor`, `enforce`, `upgrade`, `inventory`, and
   `offboard`.
-- Reusable scanner, image, SBOM/signing, and allowlisted ZAP workflows.
-- Self-hosted control plane, PostgreSQL, queue, TLS, metrics, and optional
-  DefectDojo on DigitalOcean.
+- Reusable Semgrep/full-class Trivy, image, SBOM/signing, and exact-origin ZAP
+  workflows.
+- One-time OIDC-bound DAST sessions, exact signed/deployed digest
+  reconciliation, and continuous evidence monitoring.
+- A DigitalOcean-only control plane, PostgreSQL, TLS, private metrics, isolated
+  staging promotion, and optional DefectDojo.
 
 ```mermaid
 flowchart LR
@@ -25,9 +31,11 @@ flowchart LR
   CP --> IDX["Repository-isolated index"]
   CP --> BR["Approved model bridge"]
   BR --> CP
-  WF["Pinned reusable workflows"] --> SC["Semgrep / Trivy / ZAP"]
+  WF["Pinned reusable workflows"] --> SC["Semgrep / Trivy / image / ZAP"]
   SC --> GH
-  SC --> DD["DefectDojo on DigitalOcean"]
+  SC --> CP
+  CP --> DO["Allowlisted DigitalOcean staging"]
+  CP --> DD["DefectDojo on DigitalOcean"]
 ```
 
 ## Five-minute local quickstart
@@ -54,6 +62,8 @@ See [what is verified](docs/status.md), [how it works](docs/how-it-works.md),
 ## Repository layout
 
 - `apps/control-plane`: GitHub App HTTP service and repository-isolated state.
+- `apps/model-bridge`: optional provider-isolated `guardian.review.v1`
+  implementation.
 - `packages/protocol`: canonical provider-neutral request/result schemas and client.
 - `packages/core`: detection, configuration, indexing, policy, and GitHub primitives.
 - `packages/guardianctl`: reusable repository onboarding and administration.

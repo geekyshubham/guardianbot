@@ -1,32 +1,46 @@
 # Capability status
 
-Release: `0.1.1-poc`  
+Release baseline: `0.1.1` plus the unreleased changes in this repository
 Last verified: 2026-07-27
 
-| Capability | Status | Scope | Evidence | Known limitation / failure behavior |
-| --- | --- | --- | --- | --- |
-| Strict `guardian.review.v1` validation | Working | Any conforming bridge | `packages/protocol/test/protocol.test.ts` | Invalid output is discarded |
-| Documentation quality gates | Working | Tracked repository documentation | [docs gate tests](../scripts/check-docs.test.mjs) | External reachability is opt-in; normal CI validates URL structure without live network calls |
-| Repository detection/config generation | Working | Python, Node, Swift, Ruby, Docker, docs | `packages/core/test/core.test.ts` | Heuristic detection, no command execution |
-| `guardianctl onboard` generation | Working | GitHub repositories | [12 generated onboarding PRs](https://github.com/search?q=is%3Apr+author%3Ageekyshubham+%22onboard+GuardianBot%22&type=pullrequests) | Ten merged normally; two held by pre-existing CI |
-| `guardianctl` lifecycle administration | Working | Authenticated owned repositories | `packages/guardianctl/test/cli.test.ts` | Live evidence and App/ruleset access must remain reachable; offboarding retains historical evidence |
-| Generated-caller drift detection | Working | Onboarded repositories | `packages/guardianctl/test/cli.test.ts` | `doctor` requires a reachable latest workflow run |
-| App repository discovery/onboarding issue | Beta | GitHub App installations | `apps/control-plane/src/service.ts` | Evidence reconciliation requires Actions: read and `workflow_run` subscription; live App verification remains |
-| Advisory PR review placeholder/update | Beta | Ready PRs | `apps/control-plane/test/service.test.ts` | Inline review comments not yet posted |
-| Incremental stable-fingerprint lifecycle | Partial | PR review records | Store and protocol tests | Resolution/supersession UI planned |
-| Semgrep/Trivy reusable gate | Beta | Code/dependency repositories | [immutable local rule-pack checkout](../.github/workflows/reusable-security.yml) and ten default-branch runs | Enforce mode requires a reviewed baseline; automatic historical reconciliation is still partial |
-| Image build/runtime/Trivy/SBOM | Beta | Docker repositories | [AstraNull run 30219565321](https://github.com/Geekyshubham/AstraNull/actions/runs/30219565321), RouteLens run 30219565657 (not publicly reachable) | Runtime and SBOM verified; both correctly blocked before promotion by Critical findings |
-| Cosign image promotion | Beta | Critical-clean default-branch images | [GuardianBot release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Verified for GuardianBot; RouteLens/AstraNull remain blocked |
-| DAST exact-origin ZAP | Beta | Safe staging with OpenAPI | `reusable-dast.yml` | Requires `guardianbot-dast` approval and an ephemeral session cookie; live verification and DefectDojo import remain |
-| DefectDojo import/reimport client | Beta | Self-hosted DefectDojo v2 | [client tests](../packages/defectdojo/test/client.test.ts) | Control-plane wiring, reconciliation scheduling, and live DigitalOcean verification remain |
-| Local semantic index | Partial | Text/symbol fallback | core tests | Tree-sitter and pgvector persistence planned |
-| Continuous monitoring | Partial | Ten onboarded repositories | generated nightly workflow | Digest rescans/15-minute smoke scheduler planned |
-| Control-plane database/metrics transport | Working | Managed PostgreSQL and trusted private Compose | [database TLS tests](../apps/control-plane/test/store.test.ts), [metrics access tests](../apps/control-plane/test/http-security.test.ts) | Managed databases require their CA; private metrics trust must not be enabled outside the internal Compose network |
-| DigitalOcean deployment definitions | Beta | Single droplet | Compose/config validation | HA, restore drill not verified |
-| Signed release container | Working | GuardianBot control plane | [release run 30217789531](https://github.com/Geekyshubham/guardianbot/actions/runs/30217789531) | Digest `sha256:340fefd23012d84a6f07d82b87b22f27c0d52d1cdd2a9e7f2b00f283a17b87b0` |
-| RouteLens/AstraNull full digest promotion | Planned | Those repositories | Blocking evidence in runs 30219565321 and 30219565657 | Critical image findings, existing repository CI, application-test wiring, signing, deployment, and authenticated DAST remain |
-| Cross-provider model fallback | Not applicable | Disabled by default | Protocol design | Requires explicit approval |
+This matrix is the authoritative distinction between implemented behavior and
+roadmap intent. A local automated test is evidence that a contract works in the
+test environment; it is not evidence that the corresponding GitHub or
+DigitalOcean integration is live.
 
-Statuses mean: Working has automated local evidence; Beta is implemented but needs
-live environment verification; Partial omits material behavior; Planned is roadmap
-only; Not applicable is deliberately excluded.
+| Capability | Status | Supported scope | Last verified evidence | Required configuration | Known limitation / failure behavior |
+| --- | --- | --- | --- | --- | --- |
+| `guardian.review.v1` protocol and strict result validation | Working | Any conforming bridge | [protocol tests](../packages/protocol/test/protocol.test.ts) | Approved administrative backend profile | Invalid, ungrounded, stale, oversized, or malformed output is discarded |
+| Provider-neutral backend registry | Working | Administratively approved bridges | [control-plane bridge tests](../apps/control-plane/test/backend-registry-private-network.test.ts) | Backend URL/token only on the control plane | Cross-backend fallback is off unless explicitly approved |
+| Responses API strict adapter | Working | `gpt-5.6-terra` routine and `gpt-5.6-sol` high-risk/benchmark profiles | [bridge adapter tests](../apps/model-bridge/test/adapters.test.ts) | OpenAI credential only in the isolated bridge | Automated evidence only; no production bridge credential is configured yet |
+| OpenAI-compatible and fixture adapters | Working | Capability-checked compatible gateways and tests | [bridge service tests](../apps/model-bridge/test/service.test.ts) | Administrative adapter configuration | Unsupported strict-schema capabilities fail closed |
+| Documentation quality gates | Working | Tracked repository documentation | [documentation gate tests](../scripts/check-docs.test.mjs) | None | Normal CI validates external URL structure; live external reachability is opt-in |
+| Repository detection and configuration generation | Working | Python, Node, Swift, Ruby, Docker, OpenAPI, and documentation repositories | [detection tests](../packages/core/test/detection-contract.test.ts) | Repository read access | Detection is bounded and heuristic; it does not execute discovered commands |
+| `guardianctl onboard`, `doctor`, `enforce`, `upgrade`, `inventory`, and `offboard` | Working | Authenticated GitHub repositories | [CLI tests](../packages/guardianctl/test/cli.test.ts) | Operator GitHub authorization and immutable workflow SHA | Live App, ruleset, and workflow evidence must remain reachable |
+| GitHub App discovery and onboarding issue | Beta | Selected App installations | [control-plane service tests](../apps/control-plane/test/service.test.ts) | App permissions and subscribed events | The new Geekyshubham App has not yet been created and installed |
+| Advisory PR placeholder and grouped review | Beta | Ready pull requests | [control-plane service tests](../apps/control-plane/test/service.test.ts) | Active repository record and approved bridge | Inline finding publication and live end-to-end App evidence remain incomplete |
+| Incremental stable-fingerprint lifecycle | Partial | Persisted PR review records | [store tests](../apps/control-plane/test/store.test.ts) | Active repository | Resolved/superseded presentation and full feedback analytics remain planned |
+| Semgrep and full-class Trivy gate | Beta | Code, dependency, configuration, secret, and license evidence | [scanner tests](../packages/core/test/core.test.ts) and [workflow security tests](../packages/core/test/workflow-security.test.ts) | Generated caller; reviewed baseline for enforce mode | License findings stay report-only; live runs against the unreleased workflow SHA remain |
+| Trusted scanner evidence ingestion | Beta | Pinned reusable workflows on GitHub-hosted runners | [evidence tests](../apps/control-plane/test/scanner-evidence.test.ts) | Exact workflow SHA, App Actions read, and evidence attestation | Missing, mismatched, oversized, or untrusted evidence fails reconciliation |
+| Image build, runtime smoke, Trivy, and CycloneDX SBOM | Beta | Dockerized repositories | [workflow security tests](../packages/core/test/workflow-security.test.ts) | Declarative image profile | RouteLens and AstraNull still have blocking findings and have not completed promotion |
+| Cosign and provenance-bound image promotion | Beta | Critical-clean default-branch images | [release evidence tests](../scripts/release-evidence.test.mjs) | GitHub OIDC and immutable release identity | GuardianBot has earlier live release evidence; the unreleased image is not published yet |
+| One-time DAST session broker | Beta | Exact-origin staging with an approved authentication profile | [session broker tests](../apps/control-plane/test/dast-session.test.ts) | `GUARDIANBOT_DAST_PROFILES_JSON` and protected `guardianbot-dast` environment | Target exchange is preferred; static credentials require an explicit PoC-only switch |
+| Exact-origin ZAP smoke and nightly workflows | Beta | Safe OpenAPI routes on isolated staging | [workflow security tests](../packages/core/test/workflow-security.test.ts) | Onboarding DAST configuration and one-time broker profile | Live RouteLens/AstraNull authenticated runs and imports remain unverified |
+| DefectDojo import/reimport client | Beta | Self-hosted DefectDojo v2 | [client tests](../packages/defectdojo/test/client.test.ts) | Central URL/token | Dedicated DigitalOcean service and live import/reimport evidence remain |
+| Repository-isolated index | Partial | Python, JavaScript/TypeScript, Swift, Ruby, and text fallback | [indexer tests](../packages/core/test/indexer.test.ts) | Active repository and commit snapshot | Durable pgvector adapter and production-scale history retrieval remain planned |
+| Continuous reconciliation and weekly coverage | Beta | Installed repositories with expected workflows | [monitoring tests](../packages/monitoring/test/monitoring.test.ts) and [service tests](../apps/control-plane/test/monitoring-service.test.ts) | Scheduler, App Actions read, and durable store | Automated contracts pass; live multi-repository scheduler evidence remains |
+| Exact signed/deployed image evidence matching | Beta | Repositories with image promotion and deployment configuration | [monitoring tests](../packages/monitoring/test/monitoring.test.ts) | Matching signed digest and deployment environment | A local Docker image ID is never accepted as a registry digest |
+| DigitalOcean App Platform digest reconciler | Beta | Centrally allowlisted GHCR services | [deployment tests](../apps/control-plane/test/digitalocean-deployment.test.ts) | `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` and central token reference | Mocked API evidence passes; RouteLens/AstraNull live staging is not created or verified |
+| Signed GuardianBot DigitalOcean deployment scripts | Beta | Dedicated droplet or existing `guardianbot-prod` App Platform app | [deployment script tests](../scripts/deployment-security.test.mjs) | Canonical signed release asset directory | The unreleased build is not deployed; restore drills and HA are not verified |
+| Control-plane PostgreSQL and private metrics transport | Working | DigitalOcean managed PostgreSQL or private Compose PostgreSQL | [database tests](../apps/control-plane/test/store.test.ts) and [HTTP security tests](../apps/control-plane/test/http-security.test.ts) | CA pin for managed PostgreSQL; private metrics policy | Readiness is process/store oriented, not a substitute for external health monitoring |
+| RouteLens and AstraNull full digest promotion and DAST | Planned | Those two repositories through the generic onboarding flow | Earlier blocking workflow evidence only | Clean image gate, isolated staging, broker profile, and DefectDojo | No successful signed deployment or authenticated ZAP evidence exists yet |
+| Cross-provider model fallback | Not applicable | Disabled by default | [model protocol](model-protocol.md) | Explicit repository visibility/data-classification approval | Unavailable AI becomes advisory `AI review unavailable`; deterministic checks continue |
+
+Statuses mean:
+
+- **Working**: the described behavior has passing automated evidence.
+- **Beta**: implemented with automated evidence but still needs the stated live
+  environment verification.
+- **Partial**: material behavior is intentionally incomplete.
+- **Planned**: roadmap only; it must not be represented as implemented.
+- **Not applicable**: deliberately excluded or disabled.

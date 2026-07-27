@@ -39,7 +39,11 @@ jobs:
           PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         shell: bash
         run: |
-          mkdir -p guardianbot-evidence
+          if [ -e guardianbot-evidence ] || [ -L guardianbot-evidence ]; then
+            echo "guardianbot-evidence is a reserved workflow path."
+            exit 1
+          fi
+          install -d -m 700 guardianbot-evidence
           config_path="$INPUT_CONFIG_PATH"
           baseline_path="$INPUT_BASELINE_PATH"
           for candidate in "$config_path" "$baseline_path"; do
@@ -164,12 +168,178 @@ jobs:
       - name: Trivy filesystem, dependencies, configuration, licenses, and secrets
         shell: bash
         run: |
-          docker run --rm -v "$PWD:/workspace" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
+          trivy_raw="guardianbot-evidence/trivy-raw.json"
+          if docker run --rm -v "$PWD:/workspace" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
             fs --format json --scanners vuln,misconfig,secret,license \
             --skip-dirs /workspace/guardianbot-engine \
             --skip-dirs /workspace/guardianbot-evidence \
-            --output /workspace/guardianbot-evidence/trivy.json /workspace \
-            || printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/trivy.json
+            --output "/workspace/${trivy_raw}" /workspace; then
+            if ! node - "$trivy_raw" "guardianbot-evidence/trivy.json" <<'NODE'
+          const fs = require("node:fs");
+
+          const [, , inputPath, outputPath] = process.argv;
+          const MAX_SUMMARY_LENGTH = 500;
+
+          const asRecord = (value) =>
+            value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+
+          const boundedText = (value, fallback) => {
+            const normalized = String(value ?? fallback).replace(/\s+/g, " ").trim();
+            return (normalized || fallback).slice(0, MAX_SUMMARY_LENGTH);
+          };
+
+          const normalizedLine = (value) => {
+            const line = Number(value);
+            return Number.isInteger(line) && line > 0 ? line : undefined;
+          };
+
+          const compact = (value) =>
+            Object.fromEntries(
+              Object.entries(value).filter(([, entry]) => entry !== undefined)
+            );
+
+          const sanitizeVulnerabilities = (value) =>
+            Array.isArray(value)
+              ? value
+                  .map((entry) => asRecord(entry))
+                  .filter(Boolean)
+                  .map((entry) => {
+                    const ruleId = String(entry.VulnerabilityID ?? "unknown");
+                    return compact({
+                      VulnerabilityID: ruleId,
+                      Severity: String(entry.Severity ?? "UNKNOWN"),
+                      Title: boundedText(entry.Title, ruleId),
+                      Description: boundedText(entry.Description, boundedText(entry.Title, ruleId)),
+                      PkgName: String(entry.PkgName ?? ""),
+                      InstalledVersion: String(entry.InstalledVersion ?? ""),
+                      FixedVersion: String(entry.FixedVersion ?? "")
+                    });
+                  })
+              : [];
+
+          const sanitizeMisconfigurations = (value) =>
+            Array.isArray(value)
+              ? value
+                  .map((entry) => asRecord(entry))
+                  .filter(Boolean)
+                  .map((entry) => {
+                    const causeMetadata = asRecord(entry.CauseMetadata);
+                    const ruleId = String(entry.AVDID ?? entry.ID ?? entry.Type ?? "unknown");
+                    const title = boundedText(entry.Title ?? entry.Message, ruleId);
+                    return compact({
+                      ID: String(entry.ID ?? ""),
+                      AVDID: String(entry.AVDID ?? ""),
+                      Type: String(entry.Type ?? ""),
+                      Severity: String(entry.Severity ?? "UNKNOWN"),
+                      Title: title,
+                      Description: boundedText(
+                        entry.Description ?? entry.Message ?? entry.Resolution,
+                        title
+                      ),
+                      Message: boundedText(entry.Message, title),
+                      Resolution: boundedText(entry.Resolution, title),
+                      PrimaryURL: typeof entry.PrimaryURL === "string" ? entry.PrimaryURL : undefined,
+                      CauseMetadata: causeMetadata
+                        ? compact({
+                            Resource:
+                              typeof causeMetadata.Resource === "string"
+                                ? causeMetadata.Resource
+                                : undefined,
+                            Provider:
+                              typeof causeMetadata.Provider === "string"
+                                ? causeMetadata.Provider
+                                : undefined,
+                            Service:
+                              typeof causeMetadata.Service === "string"
+                                ? causeMetadata.Service
+                                : undefined,
+                            StartLine: normalizedLine(causeMetadata.StartLine),
+                            EndLine: normalizedLine(causeMetadata.EndLine)
+                          })
+                        : undefined
+                    });
+                  })
+              : [];
+
+          const sanitizeSecrets = (value) =>
+            Array.isArray(value)
+              ? value
+                  .map((entry) => asRecord(entry))
+                  .filter(Boolean)
+                  .map((entry) =>
+                    compact({
+                      RuleID: String(entry.RuleID ?? entry.Category ?? "secret"),
+                      Category: String(entry.Category ?? ""),
+                      Severity: String(entry.Severity ?? "UNKNOWN"),
+                      Title: boundedText(
+                        entry.Title,
+                        String(entry.Category ?? "Potential secret detected")
+                      ),
+                      StartLine: normalizedLine(entry.StartLine),
+                      EndLine: normalizedLine(entry.EndLine)
+                    })
+                  )
+              : [];
+
+          const sanitizeLicenses = (value) =>
+            Array.isArray(value)
+              ? value
+                  .map((entry) => asRecord(entry))
+                  .filter(Boolean)
+                  .map((entry) =>
+                    compact({
+                      Name: String(entry.Name ?? entry.Category ?? "unknown-license"),
+                      Severity: String(entry.Severity ?? "UNKNOWN"),
+                      Category: String(entry.Category ?? ""),
+                      PkgName: String(entry.PkgName ?? ""),
+                      InstalledVersion: String(entry.InstalledVersion ?? "")
+                    })
+                  )
+              : [];
+
+          const raw = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+          const report = asRecord(raw);
+          if (
+            !report ||
+            report.SchemaVersion !== 2 ||
+            typeof report.ArtifactName !== "string" ||
+            !report.ArtifactName ||
+            typeof report.ArtifactType !== "string" ||
+            !report.ArtifactType ||
+            !Array.isArray(report.Results)
+          ) {
+            throw new Error("Trivy report is incomplete");
+          }
+
+          const sanitized = {
+            SchemaVersion: 2,
+            ArtifactName: report.ArtifactName,
+            ArtifactType: report.ArtifactType,
+            Results: report.Results
+              .map((entry) => asRecord(entry))
+              .filter(Boolean)
+              .map((entry) =>
+                compact({
+                  Target: String(entry.Target ?? ""),
+                  Class: typeof entry.Class === "string" ? entry.Class : undefined,
+                  Type: typeof entry.Type === "string" ? entry.Type : undefined,
+                  Vulnerabilities: sanitizeVulnerabilities(entry.Vulnerabilities),
+                  Misconfigurations: sanitizeMisconfigurations(entry.Misconfigurations),
+                  Secrets: sanitizeSecrets(entry.Secrets),
+                  Licenses: sanitizeLicenses(entry.Licenses)
+                })
+              )
+          };
+
+          fs.writeFileSync(outputPath, JSON.stringify(sanitized, null, 2));
+          NODE
+            then
+              printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/trivy.json
+            fi
+          else
+            printf '%s\n' '{"scanner_error":true}' > guardianbot-evidence/trivy.json
+          fi
+          shred -u "$trivy_raw" 2>/dev/null || rm -f "$trivy_raw"
 
       - name: Evaluate new-finding policy
         id: gate
@@ -182,9 +352,39 @@ jobs:
           const crypto = require("node:crypto");
           const fs = require("node:fs");
           const path = require("node:path");
+          const MAX_SUMMARY_LENGTH = 500;
 
           const stableFingerprint = (parts) =>
-            crypto.createHash("sha256").update(parts.join("\u241f")).digest("hex");
+            crypto
+              .createHash("sha256")
+              .update(
+                parts
+                  .map((part) => String(part ?? "").trim().toLowerCase())
+                  .join("\u001f")
+              )
+              .digest("hex");
+          const legacyScannerFingerprint = (parts) =>
+            crypto
+              .createHash("sha256")
+              .update(parts.join("\u241f"))
+              .digest("hex");
+          const fingerprintFields = (parts) => ({
+            fingerprint: stableFingerprint(parts),
+            legacyFingerprint: legacyScannerFingerprint(parts)
+          });
+
+          const asRecord = (value) =>
+            value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+
+          const boundedText = (value, fallback) => {
+            const normalized = String(value ?? fallback).replace(/\s+/g, " ").trim();
+            return (normalized || fallback).slice(0, MAX_SUMMARY_LENGTH);
+          };
+
+          const normalizedLine = (value) => {
+            const line = Number(value);
+            return Number.isInteger(line) && line > 0 ? line : undefined;
+          };
 
           const semgrepSeverity = {
             ERROR: "high",
@@ -204,6 +404,28 @@ jobs:
             UNKNOWN: "info"
           };
 
+          const validateSemgrepReport = (report) => {
+            const root = asRecord(report);
+            if (!root || !Array.isArray(root.results)) {
+              throw new Error("Semgrep evidence is missing the results array");
+            }
+          };
+
+          const validateTrivyReport = (report) => {
+            const root = asRecord(report);
+            if (
+              !root ||
+              root.SchemaVersion !== 2 ||
+              typeof root.ArtifactName !== "string" ||
+              !root.ArtifactName ||
+              typeof root.ArtifactType !== "string" ||
+              !root.ArtifactType ||
+              !Array.isArray(root.Results)
+            ) {
+              throw new Error("Trivy evidence is incomplete");
+            }
+          };
+
           const normalizeSemgrep = (report) =>
             (report.results || []).map((entry) => {
               const extra = entry.extra || {};
@@ -214,7 +436,7 @@ jobs:
               const title = String(extra.message || ruleId);
               return {
                 source: "semgrep",
-                fingerprint: stableFingerprint(["semgrep", ruleId, findingPath, line, title]),
+                ...fingerprintFields(["semgrep", ruleId, findingPath, line, title]),
                 severity: semgrepSeverity[String(extra.severity || "WARNING").toUpperCase()] || "medium",
                 ruleId,
                 path: findingPath,
@@ -233,7 +455,8 @@ jobs:
                 const installedVersion = String(vulnerability.InstalledVersion || "");
                 findings.push({
                   source: "trivy",
-                  fingerprint: stableFingerprint([
+                  scannerClass: "vulnerability",
+                  ...fingerprintFields([
                     "trivy",
                     ruleId,
                     packageName,
@@ -244,7 +467,108 @@ jobs:
                   ruleId,
                   path: target,
                   packageName,
+                  installedVersion,
+                  title: boundedText(vulnerability.Title, ruleId),
+                  description: boundedText(vulnerability.Description, boundedText(vulnerability.Title, ruleId)),
                   fixedVersion: String(vulnerability.FixedVersion || "")
+                });
+              }
+              for (const misconfiguration of result.Misconfigurations || []) {
+                const causeMetadata = asRecord(misconfiguration.CauseMetadata);
+                const ruleId = String(
+                  misconfiguration.AVDID || misconfiguration.ID || misconfiguration.Type || "unknown"
+                );
+                const line = normalizedLine(causeMetadata?.StartLine);
+                const title = boundedText(
+                  misconfiguration.Title || misconfiguration.Message,
+                  ruleId
+                );
+                findings.push({
+                  source: "trivy",
+                  scannerClass: "misconfiguration",
+                  ...fingerprintFields([
+                    "trivy",
+                    "misconfiguration",
+                    ruleId,
+                    target,
+                    String(causeMetadata?.Resource || ""),
+                    line || "",
+                    normalizedLine(causeMetadata?.EndLine) || ""
+                  ]),
+                  severity:
+                    trivySeverity[String(misconfiguration.Severity || "UNKNOWN").toUpperCase()] || "info",
+                  ruleId,
+                  path: target,
+                  line,
+                  title,
+                  description: boundedText(
+                    misconfiguration.Description ||
+                      misconfiguration.Message ||
+                      misconfiguration.Resolution,
+                    title
+                  )
+                });
+              }
+              for (const secret of result.Secrets || []) {
+                const ruleId = String(secret.RuleID || secret.Category || "secret");
+                const line = normalizedLine(secret.StartLine);
+                const endLine = normalizedLine(secret.EndLine);
+                const category = String(secret.Category || "").trim();
+                const title = category
+                  ? `Potential ${category} secret`
+                  : `Potential secret: ${ruleId}`;
+                findings.push({
+                  source: "trivy",
+                  scannerClass: "secret",
+                  ...fingerprintFields([
+                    "trivy",
+                    "secret",
+                    ruleId,
+                    category,
+                    target,
+                    line || "",
+                    endLine || ""
+                  ]),
+                  severity: trivySeverity[String(secret.Severity || "UNKNOWN").toUpperCase()] || "info",
+                  ruleId,
+                  path: target,
+                  line,
+                  title,
+                  description: boundedText(
+                    category
+                      ? `Potential ${category} secret detected by Trivy`
+                      : `Potential secret detected by Trivy rule ${ruleId}`,
+                    title
+                  )
+                });
+              }
+              for (const license of result.Licenses || []) {
+                const packageName = String(license.PkgName || "");
+                const installedVersion = String(license.InstalledVersion || "");
+                const licenseName = String(license.Name || license.Category || "unknown-license");
+                findings.push({
+                  source: "trivy",
+                  scannerClass: "license",
+                  ...fingerprintFields([
+                    "trivy",
+                    "license",
+                    packageName,
+                    installedVersion,
+                    licenseName,
+                    target
+                  ]),
+                  severity: trivySeverity[String(license.Severity || "UNKNOWN").toUpperCase()] || "info",
+                  ruleId: licenseName,
+                  path: target,
+                  packageName,
+                  installedVersion,
+                  title: boundedText(licenseName, "unknown-license"),
+                  description: boundedText(
+                    license.Category
+                      ? `License classification ${license.Category}`
+                      : `Detected license ${licenseName}`,
+                    licenseName
+                  )
                 });
               }
             }
@@ -255,6 +579,20 @@ jobs:
             if (Array.isArray(raw)) return raw;
             if (raw && typeof raw === "object" && Array.isArray(raw.fingerprints)) return raw.fingerprints;
             throw new Error("baseline must be an array or an object with a fingerprints array");
+          };
+
+          const summarizeFinding = (finding) => {
+            if (finding.source === "semgrep") {
+              return `Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
+            }
+            const suffix = finding.line ? `:${finding.line}` : "";
+            if (finding.scannerClass === "misconfiguration") {
+              return `Trivy misconfiguration ${finding.ruleId} at ${finding.path}${suffix}`;
+            }
+            if (finding.scannerClass === "secret") {
+              return `Trivy secret ${finding.ruleId} at ${finding.path}${suffix}`;
+            }
+            return `Trivy vulnerability ${finding.ruleId} in ${finding.packageName}; fixed by ${finding.fixedVersion}`;
           };
 
           const semgrep = JSON.parse(fs.readFileSync("guardianbot-evidence/semgrep.json", "utf8"));
@@ -303,7 +641,21 @@ jobs:
               executionFailures.push(`Baseline is required for enforce mode: ${process.env.BASELINE_PATH}`);
             } else {
               try {
-                baselineFingerprints = new Set(baselineDocument(JSON.parse(fs.readFileSync(baselinePath, "utf8"))).map(String));
+                const baselineValues = baselineDocument(
+                  JSON.parse(fs.readFileSync(baselinePath, "utf8"))
+                ).map(String);
+                const invalidFingerprints = baselineValues.filter(
+                  (fingerprint) => !/^[a-f0-9]{64}$/.test(fingerprint)
+                );
+                if (invalidFingerprints.length) {
+                  throw new Error(
+                    `${invalidFingerprints.length} baseline fingerprint(s) are not lowercase SHA-256 values`
+                  );
+                }
+                if (new Set(baselineValues).size !== baselineValues.length) {
+                  throw new Error("baseline contains duplicate fingerprints");
+                }
+                baselineFingerprints = new Set(baselineValues);
                 if (baselineFingerprints.size === 0) {
                   executionFailures.push(`Baseline is empty: ${process.env.BASELINE_PATH}`);
                 }
@@ -313,15 +665,45 @@ jobs:
             }
           }
 
-          const findings = [...normalizeSemgrep(semgrep), ...normalizeTrivy(trivy)];
+          let semgrepFindings = [];
+          if (!semgrep.scanner_error) {
+            try {
+              validateSemgrepReport(semgrep);
+              semgrepFindings = normalizeSemgrep(semgrep);
+            } catch (error) {
+              executionFailures.push(`Semgrep evidence is invalid: ${error.message}`);
+            }
+          }
+
+          let trivyFindings = [];
+          if (!trivy.scanner_error) {
+            try {
+              validateTrivyReport(trivy);
+              trivyFindings = normalizeTrivy(trivy);
+            } catch (error) {
+              executionFailures.push(`Trivy evidence is invalid: ${error.message}`);
+            }
+          }
+
+          const findings = [...semgrepFindings, ...trivyFindings];
           const observed = findings.filter(
-            (finding) => !baselineFingerprints.has(finding.fingerprint) && !suppressions.has(finding.fingerprint)
+            (finding) =>
+              !baselineFingerprints.has(finding.fingerprint) &&
+              !baselineFingerprints.has(finding.legacyFingerprint) &&
+              !suppressions.has(finding.fingerprint) &&
+              !suppressions.has(finding.legacyFingerprint)
           );
           const policyFindings = observed.filter((finding) => {
             if (finding.source === "semgrep") {
               return finding.severity === "critical" || finding.severity === "high";
             }
             if (finding.source === "trivy") {
+              if (finding.scannerClass === "license") {
+                return false;
+              }
+              if (finding.scannerClass === "misconfiguration" || finding.scannerClass === "secret") {
+                return finding.severity === "critical" || finding.severity === "high";
+              }
               return (
                 (finding.severity === "critical" || finding.severity === "high") &&
                 Boolean(finding.fixedVersion)
@@ -331,12 +713,7 @@ jobs:
           });
 
           const enforcedFindings = process.env.SCANNER_MODE === "enforce" ? policyFindings : [];
-          const failures = [...executionFailures, ...enforcedFindings.map((finding) => {
-            if (finding.source === "semgrep") {
-              return `Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
-            }
-            return `Trivy ${finding.ruleId} in ${finding.packageName}; fixed by ${finding.fixedVersion}`;
-          })];
+          const failures = [...executionFailures, ...enforcedFindings.map(summarizeFinding)];
 
           fs.writeFileSync("guardianbot-evidence/gate.json", JSON.stringify({
             schemaVersion: "1.0.0",
@@ -375,10 +752,7 @@ jobs:
               "",
               ...policyFindings.map((finding) => {
                 const prefix = process.env.SCANNER_MODE === "enforce" ? "❌" : "⚠️";
-                if (finding.source === "semgrep") {
-                  return `- ${prefix} Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
-                }
-                return `- ${prefix} Trivy ${finding.ruleId} in ${finding.packageName}; fixed by ${finding.fixedVersion}`;
+                return `- ${prefix} ${summarizeFinding(finding)}`;
               })
             );
           } else if (!executionFailures.length) {
@@ -499,6 +873,28 @@ jobs:
               endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
             throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
           }
+          const readJsonLimited = async (response, maximum) => {
+            const declared = response.headers.get("content-length");
+            if (declared !== null &&
+                (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+              throw new Error("JSON response exceeded its size limit");
+            }
+            if (!response.body) throw new Error("JSON response body is missing");
+            const reader = response.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received += value.byteLength;
+              if (received > maximum) {
+                await reader.cancel();
+                throw new Error("JSON response exceeded its size limit");
+              }
+              chunks.push(Buffer.from(value));
+            }
+            return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          };
           const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           oidcUrl.searchParams.set("audience", "guardianbot-evidence");
           const oidcResponse = await fetch(oidcUrl, {
@@ -506,7 +902,9 @@ jobs:
             redirect: "error"
           });
           if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
-          const oidcToken = String((await oidcResponse.json()).value || "");
+          const oidcToken = String(
+            (await readJsonLimited(oidcResponse, 64 * 1024)).value || ""
+          );
           if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
           const attestationResponse = await fetch(endpoint, {
             method: "POST",
@@ -529,7 +927,10 @@ jobs:
           if (!attestationResponse.ok) {
             throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
           }
-          const provenance = await attestationResponse.json();
+          const provenance = await readJsonLimited(
+            attestationResponse,
+            16 * 1024
+          );
           if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
             throw new Error("Evidence attestation response is invalid");
           }

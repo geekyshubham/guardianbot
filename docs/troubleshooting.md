@@ -52,8 +52,22 @@
   control plane, and reimport the same test to retain deduplication.
 - No image coverage: this is `not applicable` unless `image` is configured.
 - DAST stops before scanning: confirm the `guardianbot-dast` environment permits
-  the run, provides the ephemeral session cookie, returns 401/403 for the
-  unauthenticated assertion and 2xx after authentication, and uses a duration
-  between 5 and 45 minutes.
+  run; the control plane trusts the exact DAST workflow SHA; the selected
+  `GUARDIANBOT_DAST_PROFILES_JSON` entry matches the repository ID, origin, and
+  assertion path; and the one-time OIDC request has not already been consumed.
+  The target must return 401/403 before authentication and 2xx afterward.
+  Exchange mode also requires a same-origin exchange endpoint to return a
+  credential whose expiry is within the approved TTL.
+- DAST smoke is fresh but nightly is missing: smoke and nightly evidence and
+  DefectDojo import identities are intentionally distinct. Confirm the nightly
+  `authenticated-full` schedule completed for at least 30 minutes.
+- Image is signed but staging is missing: verify the repository has one central
+  DigitalOcean deployment profile, its App ID/name/service/image identities are
+  exact, and the referenced API token is present only on the control plane.
+  Compare the signed registry digest with the active App Platform deployment
+  and inspect health/readiness failures.
+- DigitalOcean promotion says another run is active: wait for the durable
+  deployment lease to expire or for the current exact-digest promotion to
+  finish. Do not bypass the lease by editing PostgreSQL.
 
 See the focused [runbooks](runbooks/README.md).

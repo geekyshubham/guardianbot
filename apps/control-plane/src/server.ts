@@ -5,6 +5,10 @@ import {
   createEvidenceAttestationService,
   EvidenceAttestationError
 } from "./evidence-attestation.js";
+import {
+  createDastSessionService,
+  DastSessionError
+} from "./dast-session.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
 import {
@@ -55,6 +59,23 @@ async function start() {
         repository?.repositoryState === "active" &&
         repository.fullName.toLowerCase() === repositoryName.toLowerCase()
       );
+    }
+  });
+  const dastSession = createDastSessionService({
+    store,
+    environment: process.env,
+    authorizeRepository: async (repositoryName, repositoryId) => {
+      const repository = await store.getRepository(repositoryId);
+      if (
+        repository?.repositoryState !== "active" ||
+        repository.fullName.toLowerCase() !== repositoryName.toLowerCase()
+      ) {
+        return undefined;
+      }
+      return {
+        fullName: repository.fullName,
+        defaultBranch: repository.defaultBranch
+      };
     }
   });
   const repositoryIndexService = new RepositoryIndexService(store);
@@ -174,6 +195,60 @@ async function start() {
                 error instanceof EvidenceAttestationError
                   ? error.message
                   : "invalid attestation request"
+            })
+          );
+      }
+      return;
+    }
+    if (request.method === "POST" && request.url === "/dast/session") {
+      const mediaType = String(request.headers["content-type"] ?? "")
+        .split(";", 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (mediaType !== "application/json") {
+        response.writeHead(415).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      try {
+        for await (const chunk of request) {
+          const buffer = Buffer.from(chunk);
+          received += buffer.length;
+          if (received > 16 * 1024) {
+            response.writeHead(413).end();
+            request.destroy();
+            return;
+          }
+          chunks.push(buffer);
+        }
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const session = await dastSession.issue(
+          request.headers.authorization,
+          payload
+        );
+        response
+          .writeHead(200, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(JSON.stringify(session));
+      } catch (error) {
+        const status =
+          error instanceof DastSessionError ? error.statusCode : 400;
+        response
+          .writeHead(status, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(
+            JSON.stringify({
+              error:
+                error instanceof DastSessionError
+                  ? error.message
+                  : "invalid DAST session request"
             })
           );
       }

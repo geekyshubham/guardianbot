@@ -147,4 +147,13 @@ test("onboarding generates the complete reusable contract and explains coverage"
   assert.match(generated.report, /Commands are declarations|Detected commands are declarations/);
   assert.match(generated.report, /No model credentials.*backend URLs.*shared secrets/);
   assert.match(generated.workflow, new RegExp(`@${WORKFLOW_SHA}`));
+  assert.match(generated.workflow, /guardianbot-dast-smoke:/);
+  assert.match(generated.workflow, /guardianbot-dast-nightly:/);
+  assert.match(
+    generated.workflow,
+    /uses: acme\/guardianbot\/\.github\/workflows\/reusable-dast\.yml@a{40}/
+  );
+  assert.match(generated.workflow, /authentication-profile: "control-plane:\/\/profiles\/service-staging"/);
+  assert.match(generated.workflow, /cron: "\*\/15 \* \* \* \*"/);
+  assert.doesNotMatch(generated.workflow, /secrets:|session_cookie|GUARDIANBOT_DAST/);
 });

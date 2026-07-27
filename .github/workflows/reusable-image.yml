@@ -35,37 +35,49 @@ jobs:
           persist-credentials: false
       - name: Build exact linux/amd64 image
         id: build
+        env:
+          INPUT_CONTEXT: ${{ inputs.context }}
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_PUSH: ${{ inputs.push }}
         run: |
-          mkdir -p guardianbot-image-evidence guardianbot-image-transfer
+          for reserved_path in guardianbot-image-evidence guardianbot-image-transfer; do
+            if [ -e "$reserved_path" ] || [ -L "$reserved_path" ]; then
+              echo "${reserved_path} is a reserved workflow path."
+              exit 1
+            fi
+          done
+          install -d -m 700 guardianbot-image-evidence guardianbot-image-transfer
           docker build --platform linux/amd64 \
-            --file "${{ inputs.dockerfile }}" \
-            --tag "${{ inputs.image-name }}:${GITHUB_SHA}" "${{ inputs.context }}"
-          image_id="$(docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" --format '{{.Id}}')"
-          repo_tags="$(docker image inspect "${{ inputs.image-name }}:${GITHUB_SHA}" --format '{{json .RepoTags}}')"
+            --file "$INPUT_DOCKERFILE" \
+            --tag "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" "$INPUT_CONTEXT"
+          image_id="$(docker image inspect "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" --format '{{.Id}}')"
+          repo_tags="$(docker image inspect "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" --format '{{json .RepoTags}}')"
           jq -n \
             --arg imageId "$image_id" \
             --argjson repoTags "$repo_tags" \
-            --argjson promotionExpected '${{ inputs.push }}' \
+            --argjson promotionExpected "$INPUT_PUSH" \
             '{
               schemaVersion: "1.0.0",
               imageId: $imageId,
               repoTags: $repoTags,
               promotionExpected: $promotionExpected
             }' > guardianbot-image-evidence/build-digests.json
-          if [ "${{ inputs.push }}" = "true" ]; then
-            docker save "${{ inputs.image-name }}:${GITHUB_SHA}" |
+          if [ "$INPUT_PUSH" = "true" ]; then
+            docker save "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" |
               gzip -1 > guardianbot-image-transfer/exact-image.tar.gz
             tar_sha="$(sha256sum guardianbot-image-transfer/exact-image.tar.gz | cut -d' ' -f1)"
             echo "image-tar-sha256=$tar_sha" >> "$GITHUB_OUTPUT"
           fi
-      - name: Repository-specific application tests
-        if: inputs.smoke-command != ''
-        run: ${{ inputs.smoke-command }}
       - name: Start disposable dependencies
+        env:
+          INPUT_DEPENDENT_SERVICES: ${{ inputs.dependent-services }}
+          INPUT_EPHEMERAL_ENV_KEYS: ${{ inputs.ephemeral-env-keys }}
+          INPUT_RUNTIME_ENV: ${{ inputs.runtime-env }}
         shell: bash
         run: |
           docker network create guardianbot-smoke
-          if [[ ",${{ inputs.dependent-services }}," == *,postgres,* ]]; then
+          if [[ ",${INPUT_DEPENDENT_SERVICES}," == *,postgres,* ]]; then
             docker run -d --rm --name guardianbot-postgres --network guardianbot-smoke \
               -e POSTGRES_USER=guardianbot -e POSTGRES_PASSWORD=guardianbot \
               -e POSTGRES_DB=guardianbot \
@@ -76,7 +88,7 @@ jobs:
             done
             docker exec guardianbot-postgres pg_isready -U guardianbot
           fi
-          if [[ ",${{ inputs.dependent-services }}," == *,redis,* ]]; then
+          if [[ ",${INPUT_DEPENDENT_SERVICES}," == *,redis,* ]]; then
             docker run -d --rm --name guardianbot-redis --network guardianbot-smoke \
               redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
             for attempt in $(seq 1 30); do
@@ -90,10 +102,8 @@ jobs:
             [ -z "$line" ] && continue
             [[ "$line" =~ ^[A-Z_][A-Z0-9_]*=.*$ ]] || { echo "Invalid runtime environment key"; exit 1; }
             printf '%s\n' "$line" >> guardianbot-runtime.env
-          done <<'GUARDIANBOT_ENV'
-          ${{ inputs.runtime-env }}
-          GUARDIANBOT_ENV
-          IFS=',' read -ra ephemeral_keys <<< "${{ inputs.ephemeral-env-keys }}"
+          done <<< "$INPUT_RUNTIME_ENV"
+          IFS=',' read -ra ephemeral_keys <<< "$INPUT_EPHEMERAL_ENV_KEYS"
           for key in "${ephemeral_keys[@]}"; do
             [ -z "$key" ] && continue
             [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || {
@@ -109,34 +119,52 @@ jobs:
             printf '%s=%s\n' "$key" "$generated_value" >> guardianbot-runtime.env
             unset generated_value
           done
-      - name: Apply migrations using exact image
-        if: inputs.migration-command != ''
+      - name: Repository-specific application tests inside exact image
+        if: inputs.smoke-command != ''
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_SMOKE_COMMAND: ${{ inputs.smoke-command }}
         run: |
           docker run --rm --network guardianbot-smoke --env-file guardianbot-runtime.env \
-            "${{ inputs.image-name }}:${GITHUB_SHA}" sh -lc "${{ inputs.migration-command }}"
+            "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" sh -lc "$INPUT_SMOKE_COMMAND"
+      - name: Apply migrations using exact image
+        if: inputs.migration-command != ''
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_MIGRATION_COMMAND: ${{ inputs.migration-command }}
+        run: |
+          docker run --rm --network guardianbot-smoke --env-file guardianbot-runtime.env \
+            "${INPUT_IMAGE_NAME}:${GITHUB_SHA}" sh -lc "$INPUT_MIGRATION_COMMAND"
       - name: Boot and verify exact image
+        env:
+          INPUT_CONTAINER_PORT: ${{ inputs.container-port }}
+          INPUT_HEALTH_PATH: ${{ inputs.health-path }}
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_READINESS_PATH: ${{ inputs.readiness-path }}
         run: |
           docker run -d --rm --name guardianbot-smoke \
             --network guardianbot-smoke --env-file guardianbot-runtime.env \
-            -p 127.0.0.1:${{ inputs.container-port }}:${{ inputs.container-port }} \
-            "${{ inputs.image-name }}:${GITHUB_SHA}"
+            -p "127.0.0.1:${INPUT_CONTAINER_PORT}:${INPUT_CONTAINER_PORT}" \
+            "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
           trap 'docker stop guardianbot-smoke >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 60); do
-            curl --fail --silent "http://127.0.0.1:${{ inputs.container-port }}${{ inputs.health-path }}" && break
+            curl --fail --silent "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_HEALTH_PATH}" && break
             sleep 2
           done
-          curl --fail "http://127.0.0.1:${{ inputs.container-port }}${{ inputs.health-path }}"
-          if [ -n "${{ inputs.readiness-path }}" ]; then
-            curl --fail "http://127.0.0.1:${{ inputs.container-port }}${{ inputs.readiness-path }}"
+          curl --fail "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_HEALTH_PATH}"
+          if [ -n "$INPUT_READINESS_PATH" ]; then
+            curl --fail "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_READINESS_PATH}"
           fi
       - name: Trivy image scan
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
         run: |
           set +e
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
             image --format json --output /evidence/trivy-image.json \
             --scanners vuln,misconfig,secret --severity CRITICAL --exit-code 0 \
-            "${{ inputs.image-name }}:${GITHUB_SHA}"
+            "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
           trivy_exit="$?"
           set -e
           if [ "$trivy_exit" -ne 0 ] ||
@@ -146,11 +174,13 @@ jobs:
               > guardianbot-image-evidence/trivy-image.json
           fi
       - name: CycloneDX SBOM from exact image
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/guardianbot-image-evidence:/evidence" aquasec/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e \
             image --format cyclonedx --output /evidence/sbom.cdx.json \
-            "${{ inputs.image-name }}:${GITHUB_SHA}"
+            "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
       - name: Enforce Critical image policy
         run: |
@@ -294,6 +324,28 @@ jobs:
               endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
             throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
           }
+          const readJsonLimited = async (response, maximum) => {
+            const declared = response.headers.get("content-length");
+            if (declared !== null &&
+                (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+              throw new Error("JSON response exceeded its size limit");
+            }
+            if (!response.body) throw new Error("JSON response body is missing");
+            const reader = response.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received += value.byteLength;
+              if (received > maximum) {
+                await reader.cancel();
+                throw new Error("JSON response exceeded its size limit");
+              }
+              chunks.push(Buffer.from(value));
+            }
+            return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          };
           const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           oidcUrl.searchParams.set("audience", "guardianbot-evidence");
           const oidcResponse = await fetch(oidcUrl, {
@@ -301,7 +353,9 @@ jobs:
             redirect: "error"
           });
           if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
-          const oidcToken = String((await oidcResponse.json()).value || "");
+          const oidcToken = String(
+            (await readJsonLimited(oidcResponse, 64 * 1024)).value || ""
+          );
           if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
           const attestationResponse = await fetch(endpoint, {
             method: "POST",
@@ -314,7 +368,10 @@ jobs:
             redirect: "error"
           });
           if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
-          const provenance = await attestationResponse.json();
+          const provenance = await readJsonLimited(
+            attestationResponse,
+            16 * 1024
+          );
           if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
             throw new Error("Evidence attestation response is invalid");
           }
@@ -380,14 +437,17 @@ jobs:
       - name: Authenticate GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Push immutable content
-        run: docker push "${{ inputs.image-name }}:${GITHUB_SHA}"
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+        run: docker push "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
       - name: Install Cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
       - name: Keyless sign and attest
         env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
           JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
-          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${{ inputs.image-name }}:${GITHUB_SHA}")"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${INPUT_IMAGE_NAME}:${GITHUB_SHA}")"
           test -n "$digest"
           image_digest="${digest##*@}"
           certificate_identity="https://github.com/${GITHUB_WORKFLOW_REF}"
@@ -520,6 +580,28 @@ jobs:
               endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
             throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
           }
+          const readJsonLimited = async (response, maximum) => {
+            const declared = response.headers.get("content-length");
+            if (declared !== null &&
+                (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+              throw new Error("JSON response exceeded its size limit");
+            }
+            if (!response.body) throw new Error("JSON response body is missing");
+            const reader = response.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received += value.byteLength;
+              if (received > maximum) {
+                await reader.cancel();
+                throw new Error("JSON response exceeded its size limit");
+              }
+              chunks.push(Buffer.from(value));
+            }
+            return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          };
           const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           oidcUrl.searchParams.set("audience", "guardianbot-evidence");
           const oidcResponse = await fetch(oidcUrl, {
@@ -527,7 +609,9 @@ jobs:
             redirect: "error"
           });
           if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
-          const oidcToken = String((await oidcResponse.json()).value || "");
+          const oidcToken = String(
+            (await readJsonLimited(oidcResponse, 64 * 1024)).value || ""
+          );
           if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
           const attestationResponse = await fetch(endpoint, {
             method: "POST",
@@ -540,7 +624,10 @@ jobs:
             redirect: "error"
           });
           if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
-          const provenance = await attestationResponse.json();
+          const provenance = await readJsonLimited(
+            attestationResponse,
+            16 * 1024
+          );
           if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
             throw new Error("Evidence attestation response is invalid");
           }

@@ -48,11 +48,12 @@ and reports the omitted paths.
 flowchart LR
   PR["PR or nightly trigger"] --> CALL["Immutable caller SHA"]
   CALL --> SEM["Semgrep"]
-  CALL --> TRI["Trivy"]
+  CALL --> TRI["Trivy vulnerability, config, secret, and license scans"]
   SEM --> NORM["Normalized evidence"]
   TRI --> NORM
   NORM --> POL["New-finding policy"]
   POL --> ART["Immutable artifacts"]
+  ART --> ATT["Control-plane identity and attestation verification"]
   POL --> CHECK["guardianbot/security-gate"]
 ```
 
@@ -61,10 +62,48 @@ enforcement.
 
 ## Image and DAST
 
-The image workflow builds one `linux/amd64` image, runs smoke checks, scans it,
-creates CycloneDX, pushes by content, signs keylessly, and verifies workflow
-identity. The same digest is the only valid DigitalOcean staging promotion input.
-ZAP accepts only the configured exact HTTPS origin and safe OpenAPI artifact.
+```mermaid
+sequenceDiagram
+  participant W as "Pinned image workflow"
+  participant R as "GHCR"
+  participant C as "GuardianBot control plane"
+  participant D as "Allowlisted DigitalOcean app"
+  W->>W: "Build linux/amd64, test, boot, scan, create SBOM"
+  W->>R: "Push exact digest, sign, attach SBOM"
+  W->>C: "Attested image-promotion evidence"
+  C->>C: "Verify repository, run, SHA, workflow, digest"
+  C->>D: "Update approved services to exact digest"
+  D-->>C: "Active deployment with same digest"
+  C->>D: "Health and readiness probes"
+  C->>C: "Record deployment evidence"
+```
 
-Nightly callers provide full scans. The production roadmap adds reconciliation for
-deployed digest rescans, expected runs, imports, expiry, and weekly value reporting.
+The DigitalOcean API token and target allowlist exist only on the control
+plane. Monitoring reports an image protected only when its scan, SBOM,
+signature, and deployment evidence agree on the registry digest.
+
+```mermaid
+sequenceDiagram
+  participant W as "Pinned DAST workflow"
+  participant O as "GitHub OIDC"
+  participant C as "GuardianBot session broker"
+  participant S as "Exact staging origin"
+  participant Z as "ZAP"
+  W->>S: "Protected assertion without credential"
+  S-->>W: "401 or 403"
+  W->>O: "OIDC token for guardianbot-dast-session"
+  W->>C: "One-time session request"
+  C->>C: "Verify repo, run, commit, workflow SHA, runner, environment"
+  C->>S: "Exchange for short-lived credential"
+  S-->>C: "Credential and bounded expiry"
+  C-->>W: "Masked one-time header"
+  W->>S: "Protected assertion with credential"
+  S-->>W: "2xx"
+  W->>Z: "Safe same-origin OpenAPI and exact origin"
+  Z-->>W: "Scrubbed smoke or nightly report"
+```
+
+The 15-minute smoke and nightly authenticated scans use distinct evidence and
+DefectDojo import identities. Expected-run reconciliation, index freshness,
+evidence freshness, suppression expiry, exact signed/deployed digest matching,
+and weekly aggregate coverage are persisted by the monitoring scheduler.

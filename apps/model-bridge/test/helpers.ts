@@ -89,7 +89,7 @@ export function sampleResult(
         path: "src/auth.ts",
         startLine: 12,
         endLine: 12,
-        evidence: "The changed path returns true for all callers.",
+        evidence: "if (user.isAdmin) return true;",
         impact: "Unauthenticated callers could access privileged behavior.",
         remediation: "Restore the role gate before returning success."
       }

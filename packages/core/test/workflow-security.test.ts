@@ -28,6 +28,8 @@ test("reusable workflows resolve attestation only from the exact workflow releas
     );
     assert.match(workflow, /deployments", "production\.json"/);
     assert.match(workflow, /new URL\(deployment\.evidenceAttestationUrl\)/);
+    assert.match(workflow, /const readJsonLimited = async \(response, maximum\)/);
+    assert.doesNotMatch(workflow, /\.json\(\)/);
   }
 
   const deployment = JSON.parse(
@@ -63,4 +65,31 @@ test("image workflow masks generated runtime values and never dumps container lo
     workflow,
     /aquasec\/trivy:0\.70\.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e/
   );
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{ inputs."))) {
+    assert.match(
+      line,
+      /^\s+INPUT_[A-Z0-9_]+:\s+\$\{\{ inputs\.[A-Za-z0-9-]+ \}\}$/,
+      `workflow input must enter a shell step only through an environment assignment: ${line}`
+    );
+  }
+  assert.doesNotMatch(workflow, /^\s+run:\s+\$\{\{ inputs\./m);
+  assert.match(
+    workflow,
+    /docker run --rm --network guardianbot-smoke --env-file guardianbot-runtime\.env \\\n\s+"\$\{INPUT_IMAGE_NAME\}:\$\{GITHUB_SHA\}" sh -lc "\$INPUT_SMOKE_COMMAND"/
+  );
+  assert.match(
+    workflow,
+    /for reserved_path in guardianbot-image-evidence guardianbot-image-transfer/
+  );
+  assert.match(workflow, /install -d -m 700 guardianbot-image-evidence guardianbot-image-transfer/);
+});
+
+test("scanner and DAST workflows reject repository-controlled evidence paths", () => {
+  const security = repositoryFile(".github/workflows/reusable-security.yml");
+  const dast = repositoryFile(".github/workflows/reusable-dast.yml");
+  assert.match(security, /guardianbot-evidence is a reserved workflow path/);
+  assert.match(security, /install -d -m 700 guardianbot-evidence/);
+  assert.match(security, /trivy_raw="guardianbot-evidence\/trivy-raw\.json"/);
+  assert.match(dast, /guardianbot-dast-evidence is a reserved workflow path/);
+  assert.match(dast, /fs\.mkdirSync\("guardianbot-dast-evidence", \{ mode: 0o700 \}\)/);
 });

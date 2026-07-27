@@ -51,8 +51,14 @@ const TRIVY_IMPORT_EVIDENCE_KEY = "defectdojo-import:Trivy Scan";
 const IMAGE_TRIVY_EVIDENCE_KEY = "image-trivy-summary";
 const SBOM_EVIDENCE_KEY = "sbom";
 const SIGNATURE_EVIDENCE_KEY = "signature";
-const ZAP_EVIDENCE_KEY = "zap-summary";
-const ZAP_IMPORT_EVIDENCE_KEY = "defectdojo-import:ZAP Scan";
+const DEPLOYMENT_EVIDENCE_PREFIX = "deployment:";
+const ZAP_SMOKE_EVIDENCE_KEY = "zap-smoke-summary";
+const ZAP_NIGHTLY_EVIDENCE_KEY = "zap-nightly-summary";
+const ZAP_SMOKE_IMPORT_EVIDENCE_KEY =
+  "defectdojo-import:ZAP Scan:smoke";
+const ZAP_NIGHTLY_IMPORT_EVIDENCE_KEY =
+  "defectdojo-import:ZAP Scan:nightly";
+const DAST_SMOKE_MAX_AGE_MS = 45 * 60_000;
 const SUPPRESSION_NOTIFY_BEFORE_MS = 7 * 24 * 60 * 60_000;
 const BASELINE_FINGERPRINT = /^[a-f0-9]{64}$/;
 const BASELINE_PATH = ".guardianbot/baseline.json";
@@ -65,8 +71,10 @@ const MONITORED_EVIDENCE_KEYS = new Set([
   IMAGE_TRIVY_EVIDENCE_KEY,
   SBOM_EVIDENCE_KEY,
   SIGNATURE_EVIDENCE_KEY,
-  ZAP_EVIDENCE_KEY,
-  ZAP_IMPORT_EVIDENCE_KEY
+  ZAP_SMOKE_EVIDENCE_KEY,
+  ZAP_NIGHTLY_EVIDENCE_KEY,
+  ZAP_SMOKE_IMPORT_EVIDENCE_KEY,
+  ZAP_NIGHTLY_IMPORT_EVIDENCE_KEY
 ]);
 const SUPPORTED_EVIDENCE_KINDS = new Set<EvidenceKind>([
   "semgrep",
@@ -444,23 +452,46 @@ function evaluateInventoryItem(
 ): RepositoryMonitoringSnapshot {
   const configuration = readIndexedConfiguration(item);
   const config = configuration.config;
-  const scheduledRun = item.latestScannerRuns.find((run) => run.event === "schedule");
+  const exactHeadEvidenceRuns = item.latestScannerRuns
+    .filter(
+      (run) =>
+        (run.event === "schedule" || run.event === "push") &&
+        run.validationStatus === "accepted" &&
+        item.index?.commitSha === run.headSha
+    )
+    .sort(compareWorkflowRunsNewestFirst);
   const observedRuns = item.latestScannerRuns
     .map(toObservedWorkflowRun)
     .filter((run): run is ObservedWorkflowRun => Boolean(run));
   const newestObservableRun = [...item.latestScannerRuns]
     .filter((run) => run.startedAt || run.completedAt)
     .sort(compareWorkflowRunsNewestFirst)[0];
-  const relevantEvidence =
-    scheduledRun && item.index?.commitSha === scheduledRun.headSha
-    ? item.latestScannerEvidence.filter(
-        (evidence) =>
-          evidence.runId === scheduledRun.runId &&
-          evidence.runAttempt === scheduledRun.runAttempt
-      )
-    : [];
+  const evidenceRunKeys = new Set(
+    exactHeadEvidenceRuns.map((run) =>
+      workflowRunKey(run.runId, run.runAttempt)
+    )
+  );
+  const relevantEvidence = item.latestScannerEvidence.filter((evidence) =>
+    evidenceRunKeys.has(workflowRunKey(evidence.runId, evidence.runAttempt))
+  );
+  const signedImageDigest = relevantEvidence
+    .filter(
+      (evidence) =>
+        evidence.evidenceKey === SIGNATURE_EVIDENCE_KEY &&
+        evidence.kind === "signature"
+    )
+    .map((evidence) => evidence.digest)
+    .find(
+      (digest): digest is string =>
+        typeof digest === "string" &&
+        /^sha256:[a-f0-9]{64}$/.test(digest)
+    );
   const evidenceRequirements = config
-    ? buildEvidenceRequirements(config, thresholds.evidenceMaxAgeMs)
+    ? buildEvidenceRequirements(
+        config,
+        thresholds.evidenceMaxAgeMs,
+        signedImageDigest
+      )
     : [];
   const supplementaryChecks: MonitoringCheckResult[] = [configuration.check];
   let baselineReady: boolean | undefined;
@@ -470,21 +501,12 @@ function evaluateInventoryItem(
     supplementaryChecks.push(baseline.check);
   }
   if (config?.image) {
-    const imageSummary = relevantEvidence.find(
-      (evidence) => evidence.evidenceKey === IMAGE_TRIVY_EVIDENCE_KEY
-    );
-    const imageDigest = imageDigestFromEvidence(imageSummary);
     supplementaryChecks.push({
       key: "image-digest-observability",
-      status: imageDigest ? "passing" : "failing",
-      summary: imageDigest
-        ? "Immutable image build digest is observable for the scheduled run"
-        : "Immutable image build digest is not observable for the scheduled run"
-    });
-    supplementaryChecks.push({
-      key: "image-deployment-scope",
-      status: "warning",
-      summary: "Image deployment environment is not persisted; deployment drift is unobservable"
+      status: signedImageDigest ? "passing" : "failing",
+      summary: signedImageDigest
+        ? "Signed immutable registry digest is observable for the exact indexed commit"
+        : "Signed immutable registry digest is not observable for the exact indexed commit"
     });
   }
 
@@ -534,17 +556,18 @@ function evaluateInventoryItem(
             observed: relevantEvidence
               .filter(
                 (evidence) =>
-                  MONITORED_EVIDENCE_KEYS.has(evidence.evidenceKey) &&
+                  isMonitoredEvidenceKey(evidence.evidenceKey) &&
                   isEvidenceKind(evidence.kind)
               )
               .map((evidence) => ({
                 kind: evidence.kind as EvidenceKind,
-                observedAt: evidence.observedAt,
-                status: evidence.status,
-                digest: evidenceMatchKey(
+                evidenceKey: evidenceMatchKey(
                   evidence.artifactType ?? "unknown",
                   evidence.evidenceKey
                 ),
+                observedAt: evidence.observedAt,
+                status: evidence.status,
+                digest: evidence.digest,
                 environment: evidence.environment,
                 details: evidence.details
               }))
@@ -741,7 +764,8 @@ function readIndexedConfiguration(
 
 function buildEvidenceRequirements(
   config: GuardianConfig,
-  maxAgeMs: number
+  maxAgeMs: number,
+  signedImageDigest?: string
 ): EvidenceRequirement[] {
   const requirements: EvidenceRequirement[] = [];
   const add = (
@@ -749,14 +773,21 @@ function buildEvidenceRequirements(
     kind: EvidenceKind,
     artifactType: string,
     evidenceKey: string,
-    label: string
+    label: string,
+    options: {
+      maxAgeMs?: number;
+      digest?: string;
+      environment?: string;
+    } = {}
   ) => {
     requirements.push({
       key,
       kind,
       required: true,
-      maxAgeMs,
-      digest: evidenceMatchKey(artifactType, evidenceKey),
+      maxAgeMs: options.maxAgeMs ?? maxAgeMs,
+      evidenceKey: evidenceMatchKey(artifactType, evidenceKey),
+      digest: options.digest,
+      environment: options.environment,
       label
     });
   };
@@ -789,15 +820,58 @@ function buildEvidenceRequirements(
       "Image scan"
     );
     add("image-sbom", "sbom", "image-validation", SBOM_EVIDENCE_KEY, "Image SBOM");
+    add(
+      "image-signature",
+      "signature",
+      "image-promotion",
+      SIGNATURE_EVIDENCE_KEY,
+      "Image signature",
+      { digest: signedImageDigest }
+    );
+    if (config.image.deployment) {
+      add(
+        "image-deployment",
+        "deployment",
+        "image-promotion",
+        `${DEPLOYMENT_EVIDENCE_PREFIX}${config.image.deployment.environment}`,
+        "Immutable staging deployment",
+        {
+          digest: signedImageDigest,
+          environment: config.image.deployment.environment
+        }
+      );
+    }
   }
   if (config.dast) {
-    add("scanner-zap", "zap-nightly", "dast", ZAP_EVIDENCE_KEY, "ZAP");
     add(
-      "scanner-zap-import",
+      "scanner-zap-smoke",
+      "zap-smoke",
+      "dast",
+      ZAP_SMOKE_EVIDENCE_KEY,
+      "ZAP deploy smoke",
+      { maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS) }
+    );
+    add(
+      "scanner-zap-smoke-import",
       "defectdojo-import",
       "dast",
-      ZAP_IMPORT_EVIDENCE_KEY,
-      "ZAP DefectDojo import"
+      ZAP_SMOKE_IMPORT_EVIDENCE_KEY,
+      "ZAP deploy smoke DefectDojo import",
+      { maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS) }
+    );
+    add(
+      "scanner-zap-nightly",
+      "zap-nightly",
+      "dast",
+      ZAP_NIGHTLY_EVIDENCE_KEY,
+      "ZAP nightly"
+    );
+    add(
+      "scanner-zap-nightly-import",
+      "defectdojo-import",
+      "dast",
+      ZAP_NIGHTLY_IMPORT_EVIDENCE_KEY,
+      "ZAP nightly DefectDojo import"
     );
   }
   return requirements;
@@ -805,6 +879,17 @@ function buildEvidenceRequirements(
 
 function evidenceMatchKey(artifactType: string, evidenceKey: string): string {
   return `${artifactType}:${evidenceKey}`;
+}
+
+function isMonitoredEvidenceKey(evidenceKey: string): boolean {
+  return (
+    MONITORED_EVIDENCE_KEYS.has(evidenceKey) ||
+    evidenceKey.startsWith(DEPLOYMENT_EVIDENCE_PREFIX)
+  );
+}
+
+function workflowRunKey(runId: number, runAttempt: number): string {
+  return `${runId}:${runAttempt}`;
 }
 
 function compareWorkflowRunsNewestFirst(
@@ -819,17 +904,6 @@ function workflowRunTimestamp(run: ScannerWorkflowRunRecord): number {
   return Number.isNaN(parsed) ? -1 : parsed;
 }
 
-function imageDigestFromEvidence(
-  evidence: MonitoringRepositoryInventory["latestScannerEvidence"][number] | undefined
-): string | undefined {
-  const payloadDigest =
-    evidence?.payload && typeof evidence.payload.imageId === "string"
-      ? evidence.payload.imageId
-      : undefined;
-  const digest = evidence?.digest ?? payloadDigest;
-  return digest && /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : undefined;
-}
-
 function toWeeklyRepositoryMetrics(
   item: MonitoringRepositoryInventory,
   snapshot: RepositoryMonitoringSnapshot
@@ -837,6 +911,16 @@ function toWeeklyRepositoryMetrics(
   const checks = new Map(snapshot.checks.map((check) => [check.key, check]));
   const expectedRun = checks.get("scanner-run");
   const indexStatus = checks.get("index-freshness")?.status;
+  const imageCheckKeys = [
+    "image-trivy",
+    "image-sbom",
+    "image-signature",
+    ...(checks.has("image-deployment") ? ["image-deployment"] : [])
+  ];
+  const imageConfigured = imageCheckKeys.some((key) => checks.has(key));
+  const imageEvidenceComplete =
+    imageConfigured &&
+    imageCheckKeys.every((key) => checks.get(key)?.status === "passing");
 
   return {
     repository: item.repository.fullName,
@@ -869,9 +953,11 @@ function toWeeklyRepositoryMetrics(
       staleIndexes: indexStatus === "failing" ? 1 : 0,
       expiredSuppressions: snapshot.suppressions?.expired.length ?? 0,
       expiringSuppressions: snapshot.suppressions?.expiringSoon.length ?? 0,
-      protectedDigests: 0,
-      completeEvidenceDigests: 0,
-      missingEvidenceDigests: 0
+      protectedDigests:
+        checks.get("image-deployment")?.status === "passing" ? 1 : 0,
+      completeEvidenceDigests: imageEvidenceComplete ? 1 : 0,
+      missingEvidenceDigests:
+        imageConfigured && !imageEvidenceComplete ? 1 : 0
     }
   };
 }
@@ -900,7 +986,7 @@ function toMonitoringWeeklyReport(
       review: "unavailable",
       scanner: "latest-reconciliation",
       monitoring: "latest-reconciliation",
-      imageProtection: "unavailable"
+      imageProtection: "latest-reconciliation"
     }
   };
 }

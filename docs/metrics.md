@@ -9,6 +9,8 @@ Measure review usefulness rather than comment volume:
 - input/output units and cost by administrative profile;
 - PRs reviewed, repositories onboarded, enforced/report-only/advisory-only states;
 - image digests with scan/SBOM/signature/deployment/DAST evidence;
+- exact deployed digests that are protected, evidence-complete, or missing
+  required evidence;
 - expired suppressions, missing scheduled runs, and import reconciliation lag.
 
 Reports must separate AI advisory value from deterministic gate value and public
@@ -28,8 +30,17 @@ best-effort dashboards. Each snapshot evaluates:
   `missing-expected-runs`.
 
 Weekly value reporting aggregates those snapshots across at most seven days and
-keeps review-value metrics separate from deterministic coverage metrics. Missing
-samples stay zero-valued rather than extrapolated.
+keeps review-value metrics separate from deterministic coverage metrics.
+GuardianBot labels each source family with its completeness. The current
+control-plane report uses `latest-reconciliation` for scanner, monitoring, and
+image-protection values rather than pretending that current snapshots are an
+event-complete weekly history. Review metrics remain `unavailable` until
+bounded review-event aggregation is wired.
+
+Image protection is counted from the latest reconciliation only when the
+required scan, SBOM, signature, and deployment evidence agree on the exact
+registry digest and configured environment. Missing samples are never
+extrapolated; a zero has meaning only alongside its source-completeness label.
 
 Metrics transport stays private by default. Public Caddy exposure returns `404`
 for `/metrics`; successful access requires

@@ -1,8 +1,10 @@
 # Building a model bridge
 
 A bridge translates `guardian.review.v1` into any local or hosted model API. The
-GuardianBot repository contains no provider SDK, provider URL grammar, model name,
-or credential handling beyond opaque bridge bearer authentication.
+control plane, protocol, repository configuration, and reusable workflows contain
+no provider SDK, provider URL grammar, model name, or provider credential. Those
+details are isolated inside a separately deployable bridge; the included bridge is
+one conforming implementation, not a control-plane dependency.
 
 Implementation checklist:
 

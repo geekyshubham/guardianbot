@@ -1,105 +1,159 @@
 # Getting started
 
-## 1. Create the GitHub App
+This guide keeps every infrastructure component on GitHub or DigitalOcean. No
+consumer repository receives a GuardianBot infrastructure secret.
 
-Create an App owned by the intended GitHub account. Set the webhook URL to
-`https://YOUR_HOST/webhooks/github`, subscribe to installation repositories,
-repository, pull request, issue comment, and workflow run events, and grant:
+## 1. Create and install the GitHub App
 
-- Repository metadata: read
-- Actions: read, so `workflow_run` deliveries can be reconciled with immutable
-  scanner evidence
+Create the App under the intended GitHub account and set the webhook URL to:
+
+```text
+https://YOUR_GUARDIANBOT_HOST/webhooks/github
+```
+
+Subscribe to installation/repository selection, repository, pull request, issue
+comment, push, and workflow run events. Grant the minimum repository
+permissions:
+
+- Metadata: read
+- Actions: read
 - Contents: read
-- Pull requests, issues, and checks: read/write only where used
-- Administration: not required by the App; `guardianctl enforce` uses the
-  operator's normal GitHub authorization
+- Issues: read/write
+- Pull requests: read/write
 
-Store the App ID, PEM private key, and webhook secret only on the control plane.
+The App does not need Administration permission. `guardianctl enforce` uses the
+operator's normal GitHub authorization for rulesets.
 
-## 2. Deploy one DigitalOcean droplet
+Store the App ID, generated private key, and webhook secret only in encrypted
+DigitalOcean environment configuration. Select repositories explicitly during
+installation; newly selected repositories are discovered from App events.
 
-Create an Ubuntu droplet using `infra/digitalocean/cloud-init.yml`, point a DNS
-record at it, attach and mount an encrypted volume at `/var/lib/guardianbot`,
-then on the droplet:
+## 2. Deploy the control plane on DigitalOcean
+
+Download a canonical signed GuardianBot release and use one of the verified
+deployment scripts described in [operations](operations.md).
+
+For an existing DigitalOcean App Platform app:
 
 ```sh
-git clone https://github.com/Geekyshubham/guardianbot.git /opt/guardianbot
+mkdir guardianbot-release-v0.2.0
+gh release download v0.2.0 \
+  --repo Geekyshubham/guardianbot \
+  --dir guardianbot-release-v0.2.0
+./scripts/deploy-digitalocean-app-platform.sh \
+  11111111-2222-4333-8444-555555555555 \
+  guardianbot-release-v0.2.0
+```
+
+For a dedicated DigitalOcean droplet, create Ubuntu with
+`infra/digitalocean/cloud-init.yml`, attach an encrypted volume at
+`/var/lib/guardianbot`, place the release assets below an operator-owned
+directory, and run:
+
+```sh
 cd /opt/guardianbot
 cp .env.example .env
 chmod 600 .env
-cat >> .env <<'EOF'
-GUARDIANBOT_HOSTNAME=guardianbot.example.com
-GUARDIANBOT_STATE_DIR=/var/lib/guardianbot
-EOF
-
 ./scripts/deploy-digitalocean.sh deploy \
-  ghcr.io/geekyshubham/guardianbot@sha256:340fefd23012d84a6f07d82b87b22f27c0d52d1cdd2a9e7f2b00f283a17b87b0
+  /opt/guardianbot/releases/guardianbot-release-v0.2.0
 ./scripts/deploy-digitalocean.sh verify
 ```
 
-The control plane now deploys only from the signed GHCR digest. PostgreSQL,
-Caddy, and Prometheus are pinned by digest, and their state lives under
-`GUARDIANBOT_STATE_DIR` on the encrypted DigitalOcean volume. The optional
-`valkey` service is kept behind the `queue` profile until the production worker
-path exists:
+Both scripts reject a release unless its fixed asset set, manifest signature,
+GHCR signature, CycloneDX attestation, GitHub provenance, source commit, source
+ref, and workflow identity all verify.
 
-```sh
-docker compose -f infra/docker-compose.yml --profile queue up -d valkey
+Use DigitalOcean managed PostgreSQL with
+`GUARDIANBOT_DATABASE_CA_CERT` or private Compose PostgreSQL on the droplet.
+Do not connect GuardianBot to an external database provider.
+
+## 3. Connect a conforming model bridge
+
+The control plane communicates only through `guardian.review.v1`. Deploy
+`apps/model-bridge` as an isolated service or connect another conforming bridge,
+then configure only:
+
+```text
+GUARDIAN_MODEL_BACKEND_URL=https://INTERNAL_BRIDGE_ORIGIN
+GUARDIAN_MODEL_BACKEND_TOKEN=CONTROL_PLANE_TO_BRIDGE_TOKEN
 ```
 
-No managed database or non-DigitalOcean cloud is required.
+The included `openai-responses` adapter calls the Responses API with native
+strict Structured Outputs. Its default profile mapping is:
 
-## 3. Connect a model bridge
+- `routine-review` to `gpt-5.6-terra`;
+- `high-risk-review` to `gpt-5.6-sol`; and
+- `benchmark-review` to `gpt-5.6-sol`.
 
-Deploy any conforming bridge reachable from the control plane. Set
-`GUARDIAN_MODEL_BACKEND_URL` and, if required,
-`GUARDIAN_MODEL_BACKEND_TOKEN`. Verify `/healthz`, `/v1/capabilities`, and the
-conformance tests described in [building a bridge](building-a-model-bridge.md).
-Backend and profile routing is administrative configuration, never repository
-configuration.
+Put `OPENAI_API_KEY` only in the model-bridge service. The model receives
+bounded, explicitly delimited untrusted repository context, no tools, no GitHub
+client, and no credentials. Malformed output is discarded. `store: false` is
+used, but the bridge reports bounded retention unless Zero Data Retention is
+separately approved and administratively verified.
 
-## 4. Install and onboard
+An `openai-compatible` binding can target a local or hosted compatible gateway
+only after its strict-schema capability probe passes. The fixture adapter is
+for conformance tests, not a production model.
 
-Install the App on a selected repository. GuardianBot opens an inventory issue and
-provides advisory behavior. Then run:
+Verify the bridge endpoints and run the conformance tests from
+[building a model bridge](building-a-model-bridge.md). If the bridge is
+unavailable, GuardianBot reports AI review unavailable and deterministic
+scanner checks continue.
+
+## 4. Configure central staging services
+
+Before enabling image deployment or DAST for a repository, configure:
+
+- a DigitalOcean App Platform allowlist profile in
+  `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON`;
+- a one-time staging authentication profile in
+  `GUARDIANBOT_DAST_PROFILES_JSON`; and
+- the referenced DigitalOcean and target-exchange secrets only in the control
+  plane.
+
+See [image security](image-security.md) and [DAST](dast.md). Repositories
+without a Dockerfile report image coverage as not applicable. Repositories
+without a DAST profile do not receive a missing-DAST failure.
+
+## 5. Onboard a repository
+
+Install or extend App access to the repository. GuardianBot inventories it and
+opens an advisory onboarding issue. Then run:
 
 ```sh
-export GUARDIANBOT_WORKFLOW_SHA=<published-guardianbot-commit>
+export GUARDIANBOT_WORKFLOW_SHA=0123456789abcdef0123456789abcdef01234567
 guardianctl onboard OWNER/REPOSITORY
 guardianctl doctor OWNER/REPOSITORY
 ```
 
-Merge the generated draft PR to start the report-only observation period. After a
-healthy baseline:
+`onboard` creates one draft PR containing only
+`.guardianbot/config.yml`, a small immutable caller workflow, and an onboarding
+report. It copies no scanner implementation or infrastructure credential.
+
+Merge the PR to begin the seven-day report-only period. After a reviewed,
+healthy baseline, set `scanners.mode: enforce`, update the baseline document,
+and run:
 
 ```sh
-edit .guardianbot/config.yml   # set scanners.mode: enforce
-edit .guardianbot/baseline.json
 guardianctl enforce OWNER/REPOSITORY
 ```
 
-See [repository onboarding](onboarding-repositories.md) for lifecycle details.
+Use `guardianctl inventory` for fleet state and `guardianctl upgrade --all` to
+open immutable pin-update PRs. See
+[repository onboarding](onboarding-repositories.md) for the complete lifecycle.
 
-## 5. Backups, restore, and rollback
+## 6. Verify and operate
 
-Take an application-consistent PostgreSQL backup to the encrypted DigitalOcean
-volume before each deploy and at least daily:
+Check:
 
-```sh
-./scripts/backup-postgres.sh
-```
+- `/healthz` and `/readyz`;
+- receipt of a signed GitHub webhook;
+- creation of the repository inventory issue;
+- the first advisory PR review;
+- the first scanner artifact and evidence attestation; and
+- monitoring freshness after the onboarding PR merges.
 
-Restore requires an explicit file path and confirmation flag:
-
-```sh
-./scripts/restore-postgres.sh --input /var/lib/guardianbot/backups/guardianbot-postgres-YYYYMMDDTHHMMSSZ.dump --yes
-```
-
-Roll back the control plane to the previously recorded digest:
-
-```sh
-./scripts/deploy-digitalocean.sh rollback
-```
-
-The rollback path changes the control-plane image only. Restore PostgreSQL from
-backup separately when a release or migration requires data rollback.
+Back up before each control-plane deployment. A droplet rolls back with
+`./scripts/deploy-digitalocean.sh rollback`; App Platform rolls back by
+re-running the verified deployment script with the previous release asset
+directory. Database restore is a separate operation.

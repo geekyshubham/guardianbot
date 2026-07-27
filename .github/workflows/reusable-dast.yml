@@ -4,14 +4,13 @@ on:
   workflow_call:
     inputs:
       target-origin: { required: true, type: string }
-      openapi-url: { required: true, type: string }
-      openapi-allowlist: { required: false, type: string, default: "" }
-      expected-origin: { required: true, type: string }
+      openapi: { required: true, type: string }
+      openapi-source: { required: true, type: string }
+      authentication-profile: { required: true, type: string }
       session-assertion-path: { required: true, type: string }
+      excluded-routes: { required: false, type: string, default: "[]" }
+      scan-profile: { required: true, type: string }
       minutes: { required: false, type: number, default: 45 }
-    secrets:
-      session_cookie:
-        required: true
 
 permissions:
   contents: read
@@ -19,9 +18,8 @@ permissions:
 jobs:
   zap:
     name: authenticated staging DAST
-    # Repository secrets must never be released to pull-request-controlled
-    # workflow definitions. The fixed environment also lets operators apply
-    # protected-branch and reviewer rules in the consumer repository.
+    # Credentials are issued once by the control plane from an administrative
+    # profile. No repository or environment secret is copied into the caller.
     if: >-
       github.event_name != 'pull_request' &&
       github.event_name != 'pull_request_target' &&
@@ -34,91 +32,380 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Check out consumer repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out immutable GuardianBot deployment manifest
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: guardianbot-engine
+          persist-credentials: false
+
       - name: Resolve and enforce exact staging contract
         id: contract
         env:
+          AUTHENTICATION_PROFILE: ${{ inputs.authentication-profile }}
+          EXCLUDED_ROUTES: ${{ inputs.excluded-routes }}
+          OPENAPI: ${{ inputs.openapi }}
+          OPENAPI_SOURCE: ${{ inputs.openapi-source }}
+          SCAN_MINUTES: ${{ inputs.minutes }}
+          SCAN_PROFILE: ${{ inputs.scan-profile }}
           TARGET_ORIGIN: ${{ inputs.target-origin }}
-          EXPECTED_ORIGIN: ${{ inputs.expected-origin }}
-          OPENAPI_URL: ${{ inputs.openapi-url }}
-          OPENAPI_ALLOWLIST: ${{ inputs.openapi-allowlist }}
           SESSION_ASSERTION_PATH: ${{ inputs.session-assertion-path }}
         shell: bash
         run: |
           node <<'NODE'
           const fs = require("node:fs");
+          const path = require("node:path");
 
           const invalidRemoteHost = (hostname) =>
-            /(^localhost$)|(^127\.)|(^0\.0\.0\.0$)|(^169\.254\.)|(^::1$)/i.test(hostname);
+            /(^localhost$)|(\.localhost$)|(\.local$)|(\.internal$)|(^127\.)|(^0\.)|(^10\.)|(^169\.254\.)|(^192\.168\.)|(^172\.(1[6-9]|2[0-9]|3[01])\.)|(^::1$)|(^f[cd][0-9a-f]:)|(^fe[89ab][0-9a-f]:)/i.test(hostname);
 
           const target = new URL(process.env.TARGET_ORIGIN);
-          const expected = new URL(process.env.EXPECTED_ORIGIN);
-          const minutes = Number(${{ inputs.minutes }});
+          const minutes = Number(process.env.SCAN_MINUTES);
           if (!Number.isInteger(minutes) || minutes < 5 || minutes > 45) {
             throw new Error("DAST minutes must be an integer between 5 and 45");
           }
-          if (target.href !== expected.href) {
-            throw new Error("target-origin must match expected-origin exactly");
-          }
-          if (target.protocol !== "https:") {
-            throw new Error("Only HTTPS staging targets are permitted");
-          }
-          if (invalidRemoteHost(target.hostname)) {
+          if (target.protocol !== "https:" || target.username || target.password ||
+              target.pathname !== "/" || target.search || target.hash ||
+              invalidRemoteHost(target.hostname)) {
             throw new Error("Invalid remote target");
           }
 
           const sessionAssertionPath = process.env.SESSION_ASSERTION_PATH;
-          if (!sessionAssertionPath.startsWith("/")) {
-            throw new Error("session-assertion-path must begin with '/'");
+          if (!/^\/(?!\/)[^\s?#]*$/.test(sessionAssertionPath)) {
+            throw new Error("session-assertion-path must be an origin-relative path");
+          }
+          if (!/^control-plane:\/\/profiles\/[A-Za-z0-9._/-]+$/.test(
+                process.env.AUTHENTICATION_PROFILE) ||
+              process.env.AUTHENTICATION_PROFILE.includes("..")) {
+            throw new Error("authentication-profile must be an opaque control-plane profile");
+          }
+          if (!["authenticated-baseline", "authenticated-full"].includes(
+                process.env.SCAN_PROFILE)) {
+            throw new Error("scan-profile is invalid");
+          }
+          let excludedRoutes;
+          try {
+            excludedRoutes = JSON.parse(process.env.EXCLUDED_ROUTES);
+          } catch {
+            throw new Error("excluded-routes must be a JSON array");
+          }
+          if (!Array.isArray(excludedRoutes) || excludedRoutes.length > 100 ||
+              excludedRoutes.some((route) =>
+                typeof route !== "string" || !/^\/(?!\/)[^\s?#]*$/.test(route))) {
+            throw new Error("excluded-routes contains an invalid route");
           }
 
-          const allowlist = new Set(
-            (process.env.OPENAPI_ALLOWLIST || "")
-              .split(/[\n,]/)
-              .map((entry) => entry.trim())
-              .filter(Boolean)
-          );
-          const resolvedOpenapi = new URL(process.env.OPENAPI_URL, target);
-          if (resolvedOpenapi.protocol !== "https:") {
-            throw new Error("Resolved OpenAPI URL must use HTTPS");
-          }
-          if (invalidRemoteHost(resolvedOpenapi.hostname)) {
-            throw new Error("Resolved OpenAPI URL targets an invalid host");
-          }
-          const sameOrigin = resolvedOpenapi.origin === target.origin;
-          const allowlisted = allowlist.has(resolvedOpenapi.href);
-          if (!sameOrigin && !allowlisted) {
-            throw new Error("OpenAPI URL must be same-origin with the target or explicitly allowlisted");
+          let openapiLocation;
+          if (process.env.OPENAPI_SOURCE === "repository-file") {
+            const candidate = process.env.OPENAPI;
+            if (!/^[A-Za-z0-9._/-]+\.(?:json|ya?ml)$/i.test(candidate) ||
+                candidate.split("/").includes("..")) {
+              throw new Error("repository OpenAPI path is invalid");
+            }
+            const workspace = fs.realpathSync(process.env.GITHUB_WORKSPACE);
+            const absolute = path.resolve(workspace, candidate);
+            const stat = fs.lstatSync(absolute);
+            if (!stat.isFile() || stat.isSymbolicLink() ||
+                !fs.realpathSync(absolute).startsWith(`${workspace}${path.sep}`) ||
+                stat.size < 1 || stat.size > 2 * 1024 * 1024) {
+              throw new Error("repository OpenAPI file is unsafe or outside its size limit");
+            }
+            openapiLocation = absolute;
+          } else if (process.env.OPENAPI_SOURCE === "live-endpoint") {
+            const resolved = new URL(process.env.OPENAPI, target);
+            if (resolved.protocol !== "https:" || resolved.origin !== target.origin ||
+                resolved.username || resolved.password || resolved.hash) {
+              throw new Error("live OpenAPI endpoint must be same-origin HTTPS");
+            }
+            openapiLocation = resolved.href;
+          } else {
+            throw new Error("openapi-source is invalid");
           }
 
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `resolved-openapi=${resolvedOpenapi.href}\n`);
+          try {
+            fs.lstatSync("guardianbot-dast-evidence");
+            throw new Error("guardianbot-dast-evidence is a reserved workflow path");
+          } catch (error) {
+            if (!error || error.code !== "ENOENT") throw error;
+          }
+          fs.mkdirSync("guardianbot-dast-evidence", { mode: 0o700 });
+          const contractPath = path.join(process.env.RUNNER_TEMP, "guardianbot-dast-contract.json");
+          fs.writeFileSync(contractPath, JSON.stringify({
+            schemaVersion: "1.0.0",
+            origin: target.origin,
+            openapiSource: process.env.OPENAPI_SOURCE,
+            openapiLocation,
+            authenticationProfile: process.env.AUTHENTICATION_PROFILE,
+            sessionAssertionPath,
+            excludedRoutes,
+            scanProfile: process.env.SCAN_PROFILE,
+            minutes
+          }), { mode: 0o600, flag: "wx" });
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `contract-path=${contractPath}\n`);
           NODE
 
-      - name: Require authenticated session assertion
+      - name: Resolve one-time session from control plane
         env:
-          GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
-          TARGET_ORIGIN: ${{ inputs.target-origin }}
-          SESSION_ASSERTION_PATH: ${{ inputs.session-assertion-path }}
+          CONTRACT_PATH: ${{ steps.contract.outputs.contract-path }}
+          GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
         shell: bash
         run: |
-          [ -n "$GUARDIANBOT_SESSION_COOKIE" ] || {
-            echo "Authenticated DAST requires session_cookie."
-            exit 1
+          node <<'NODE'
+          (async () => {
+            const childProcess = require("node:child_process");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const readJsonLimited = async (response, maximum) => {
+              const declared = response.headers.get("content-length");
+              if (declared !== null &&
+                  (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+                throw new Error("JSON response exceeded its size limit");
+              }
+              if (!response.body) throw new Error("JSON response body is missing");
+              const reader = response.body.getReader();
+              const chunks = [];
+              let received = 0;
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                received += value.byteLength;
+                if (received > maximum) {
+                  await reader.cancel();
+                  throw new Error("JSON response exceeded its size limit");
+                }
+                chunks.push(Buffer.from(value));
+              }
+              return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            };
+            const contract = JSON.parse(fs.readFileSync(process.env.CONTRACT_PATH, "utf8"));
+            const workflowMatch = process.env.JOB_WORKFLOW_REF.match(
+              /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)@([a-f0-9]{40})$/i
+            );
+            if (!workflowMatch || workflowMatch[3].toLowerCase() !==
+                process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+              throw new Error("Reusable workflow identity is not pinned to its exact SHA");
+            }
+            const checkout = fs.realpathSync(process.env.GUARDIANBOT_WORKFLOW_CHECKOUT);
+            const checkedOutSha = childProcess.execFileSync(
+              "git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }
+            ).trim().toLowerCase();
+            if (checkedOutSha !== process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+              throw new Error("Deployment manifest checkout does not match the reusable workflow SHA");
+            }
+            const deploymentPath = path.join(checkout, "deployments", "production.json");
+            const deploymentStat = fs.lstatSync(deploymentPath);
+            if (!deploymentStat.isFile() || deploymentStat.isSymbolicLink() ||
+                path.dirname(path.dirname(fs.realpathSync(deploymentPath))) !== checkout) {
+              throw new Error("GuardianBot deployment manifest is unsafe");
+            }
+            const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+            if (!deployment || deployment.schemaVersion !== "1.0.0" ||
+                deployment.environment !== "production" ||
+                typeof deployment.evidenceAttestationUrl !== "string") {
+              throw new Error("GuardianBot deployment manifest is invalid");
+            }
+            const evidenceEndpoint = new URL(deployment.evidenceAttestationUrl);
+            if (evidenceEndpoint.protocol !== "https:" ||
+                evidenceEndpoint.pathname !== "/evidence/attest" ||
+                evidenceEndpoint.username || evidenceEndpoint.password ||
+                evidenceEndpoint.search || evidenceEndpoint.hash) {
+              throw new Error("GuardianBot evidence endpoint is invalid");
+            }
+            const sessionEndpoint = new URL("/dast/session", evidenceEndpoint);
+            const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+            oidcUrl.searchParams.set("audience", "guardianbot-dast-session");
+            const oidcResponse = await fetch(oidcUrl, {
+              headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+              redirect: "error"
+            });
+            if (!oidcResponse.ok) {
+              throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
+            }
+            const oidcToken = String((await readJsonLimited(oidcResponse, 64 * 1024)).value || "");
+            if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
+            const sessionResponse = await fetch(sessionEndpoint, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${oidcToken}`,
+                "content-type": "application/json"
+              },
+              body: JSON.stringify({
+                schemaVersion: "1.0.0",
+                profileRef: contract.authenticationProfile,
+                origin: contract.origin,
+                sessionAssertionPath: contract.sessionAssertionPath,
+                repository: process.env.GITHUB_REPOSITORY.toLowerCase(),
+                repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
+                runId: Number(process.env.GITHUB_RUN_ID),
+                runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+                headSha: process.env.GITHUB_SHA.toLowerCase()
+              }),
+              redirect: "error"
+            });
+            if (!sessionResponse.ok) {
+              throw new Error(`DAST session resolution failed: ${sessionResponse.status}`);
+            }
+            const session = await readJsonLimited(sessionResponse, 16 * 1024);
+            const allowedKeys = [
+              "schemaVersion", "origin", "sessionAssertionPath", "headerName",
+              "headerValue", "expiresAt", "assurance"
+            ];
+            if (!session || typeof session !== "object" ||
+                Object.keys(session).some((key) => !allowedKeys.includes(key)) ||
+                session.schemaVersion !== "1.0.0" ||
+                session.origin !== contract.origin ||
+                session.sessionAssertionPath !== contract.sessionAssertionPath ||
+                typeof session.headerName !== "string" ||
+                typeof session.headerValue !== "string" || !session.headerValue ||
+                Buffer.byteLength(session.headerValue, "utf8") > 8 * 1024 ||
+                /[\0\r\n]/.test(session.headerValue) ||
+                !["target-exchanged", "poc-static"].includes(session.assurance)) {
+              throw new Error("DAST session response is invalid");
+            }
+            const expiry = Date.parse(String(session.expiresAt || ""));
+            if (!Number.isFinite(expiry) || expiry <= Date.now() + 30_000 ||
+                expiry > Date.now() + 15 * 60_000) {
+              throw new Error("DAST session expiry is invalid");
+            }
+            process.stdout.write(`::add-mask::${session.headerValue}\n`);
+            const sessionPath = path.join(process.env.RUNNER_TEMP, "guardianbot-dast-session.json");
+            fs.writeFileSync(sessionPath, JSON.stringify(session), { mode: 0o600, flag: "wx" });
+            if (session.assurance === "poc-static") {
+              process.stdout.write("::warning::DAST is using an explicitly authorized PoC static credential; target-enforced one-time expiry is unavailable.\n");
+            }
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Prepare bounded same-origin OpenAPI
+        env:
+          CONTRACT_PATH: ${{ steps.contract.outputs.contract-path }}
+        shell: bash
+        run: |
+          openapi_source="$(jq -r '.openapiSource' "$CONTRACT_PATH")"
+          openapi_location="$(jq -r '.openapiLocation' "$CONTRACT_PATH")"
+          input_file="${RUNNER_TEMP}/guardianbot-openapi-input"
+          if [ "$openapi_source" = "repository-file" ]; then
+            cp -- "$openapi_location" "$input_file"
+          else
+            curl --fail --silent --show-error --proto '=https' --max-redirs 0 \
+              --max-filesize 2097152 --output "$input_file" "$openapi_location"
+          fi
+          test -s "$input_file"
+          test "$(wc -c < "$input_file")" -le 2097152
+          chmod 600 "$input_file"
+          docker run --rm --user "$(id -u):$(id -g)" --entrypoint python3 \
+            -v "${RUNNER_TEMP}:/guardian-input:rw" \
+            ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 \
+            - /guardian-input/guardianbot-openapi-input \
+              /guardian-input/guardianbot-openapi-safe.json \
+              /guardian-input/guardianbot-dast-contract.json <<'PY'
+          import json
+          import os
+          import sys
+          from urllib.parse import urljoin, urlparse
+          import yaml
+
+          source_path, output_path, contract_path = sys.argv[1:]
+          with open(contract_path, "r", encoding="utf-8") as handle:
+              contract = json.load(handle)
+          with open(source_path, "r", encoding="utf-8") as handle:
+              document = yaml.safe_load(handle)
+          if not isinstance(document, dict):
+              raise SystemExit("OpenAPI document must be an object")
+          version = document.get("openapi") or document.get("swagger")
+          if not isinstance(version, str):
+              raise SystemExit("OpenAPI document omits its version")
+
+          def walk(value):
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      if key == "$ref" and (
+                          not isinstance(item, str) or not item.startswith("#/")
+                      ):
+                          raise SystemExit("External OpenAPI references are prohibited")
+                      yield from walk(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      yield from walk(item)
+
+          list(walk(document))
+          expected_origin = urlparse(contract["origin"])
+          for server in document.get("servers", []):
+              if not isinstance(server, dict) or not isinstance(server.get("url"), str):
+                  raise SystemExit("OpenAPI server entry is invalid")
+              resolved = urlparse(urljoin(contract["origin"], server["url"]))
+              if (resolved.scheme, resolved.netloc) != (
+                  expected_origin.scheme, expected_origin.netloc
+              ):
+                  raise SystemExit("OpenAPI server escapes the exact staging origin")
+
+          paths = document.get("paths")
+          if not isinstance(paths, dict):
+              raise SystemExit("OpenAPI document omits paths")
+          excluded = tuple(
+              route if route == "/" else route.rstrip("/")
+              for route in contract["excludedRoutes"]
+          )
+          document["paths"] = {
+              route: operations
+              for route, operations in paths.items()
+              if isinstance(route, str)
+              and route.startswith("/")
+              and not any(
+                  route == blocked or (
+                      blocked != "/" and route.startswith(f"{blocked}/")
+                  )
+                  for blocked in excluded
+              )
           }
+          with open(output_path, "w", encoding="utf-8") as handle:
+              json.dump(document, handle, separators=(",", ":"), sort_keys=True)
+          os.chmod(output_path, 0o600)
+          PY
+          test -s "${RUNNER_TEMP}/guardianbot-openapi-safe.json"
+
+      - name: Require authenticated assertion and run ZAP API scan
+        env:
+          CONTRACT_PATH: ${{ steps.contract.outputs.contract-path }}
+        shell: bash
+        run: |
+          session_file="${RUNNER_TEMP}/guardianbot-dast-session.json"
+          openapi_file="${RUNNER_TEMP}/guardianbot-openapi-safe.json"
+          header_name="$(jq -r '.headerName' "$session_file")"
+          header_value="$(jq -r '.headerValue' "$session_file")"
+          target_origin="$(jq -r '.origin' "$session_file")"
+          assertion_path="$(jq -r '.sessionAssertionPath' "$session_file")"
+          scan_minutes="$(jq -r '.minutes' "$CONTRACT_PATH")"
+          echo "::add-mask::${header_value}"
+
           unauthenticated_status="$(
-            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-              "${TARGET_ORIGIN}${SESSION_ASSERTION_PATH}"
+            curl --silent --show-error --proto '=https' --max-redirs 0 \
+              --output /dev/null --write-out '%{http_code}' \
+              "${target_origin}${assertion_path}"
           )"
           case "$unauthenticated_status" in
             401|403) ;;
             *)
-              echo "Session assertion endpoint must reject an unauthenticated request with 401 or 403."
+              echo "Session assertion endpoint must reject unauthenticated access."
               exit 1
               ;;
           esac
           authenticated_status="$(
-            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            -H "Cookie: $GUARDIANBOT_SESSION_COOKIE" \
-              "${TARGET_ORIGIN}${SESSION_ASSERTION_PATH}"
+            curl --silent --show-error --proto '=https' --max-redirs 0 \
+              --output /dev/null --write-out '%{http_code}' \
+              --header "${header_name}: ${header_value}" \
+              "${target_origin}${assertion_path}"
           )"
           case "$authenticated_status" in
             2??) ;;
@@ -128,46 +415,49 @@ jobs:
               ;;
           esac
 
-      - name: Run ZAP API scan
-        env:
-          GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
-          RESOLVED_OPENAPI_URL: ${{ steps.contract.outputs.resolved-openapi }}
-          TARGET_ORIGIN: ${{ inputs.target-origin }}
-          SCAN_MINUTES: ${{ inputs.minutes }}
-        run: |
-          mkdir -p guardianbot-dast-evidence
           options_file="${RUNNER_TEMP}/guardianbot-zap-options"
           install -m 600 /dev/null "$options_file"
-          trap 'rm -f "$options_file"' EXIT
-          python3 - <<'PY'
+          GUARDIANBOT_HEADER_NAME="$header_name" \
+          GUARDIANBOT_HEADER_VALUE="$header_value" python3 - <<'PY'
           import os
           import shlex
           options = [
-            "-config", "replacer.full_list(0).description=guardianbot-session-cookie",
+            "-config", "replacer.full_list(0).description=guardianbot-session",
             "-config", "replacer.full_list(0).enabled=true",
             "-config", "replacer.full_list(0).matchtype=REQ_HEADER",
-            "-config", "replacer.full_list(0).matchstr=Cookie",
+            "-config", f"replacer.full_list(0).matchstr={os.environ['GUARDIANBOT_HEADER_NAME']}",
             "-config", "replacer.full_list(0).regex=false",
-            "-config", f"replacer.full_list(0).replacement={os.environ['GUARDIANBOT_SESSION_COOKIE']}",
+            "-config", f"replacer.full_list(0).replacement={os.environ['GUARDIANBOT_HEADER_VALUE']}",
           ]
           with open(os.path.join(os.environ["RUNNER_TEMP"], "guardianbot-zap-options"), "w", encoding="utf-8") as handle:
             handle.write(" ".join(shlex.quote(option) for option in options))
           PY
           set +e
-          docker run --rm -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
+            -v "${RUNNER_TEMP}/guardianbot-openapi-safe.json:/zap/input/openapi-safe.json:ro" \
             ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 zap-api-scan.py \
-            -t "$RESOLVED_OPENAPI_URL" -f openapi \
-            -O "$TARGET_ORIGIN" \
-            -J zap.json -r zap.html -m "$SCAN_MINUTES" \
+            -t /zap/input/openapi-safe.json -f openapi \
+            -O "$target_origin" \
+            -J zap.json -m "$scan_minutes" \
             -z "$(cat "$options_file")"
           zap_exit="$?"
           set -e
-          printf '{"zapExitCode":%s}\n' "$zap_exit" > guardianbot-dast-evidence/scan-status.json
-          GUARDIANBOT_ZAP_EXIT="$zap_exit" python3 - <<'PY'
+          jq -n \
+            --arg profile "$(jq -r '.scanProfile' "$CONTRACT_PATH")" \
+            --argjson minutes "$scan_minutes" \
+            --argjson zapExitCode "$zap_exit" \
+            '{
+              schemaVersion: "1.0.0",
+              profile: $profile,
+              minutes: $minutes,
+              zapExitCode: $zapExitCode
+            }' > guardianbot-dast-evidence/scan-status.json
+          GUARDIANBOT_HEADER_VALUE="$header_value" python3 - <<'PY'
           import os
           from pathlib import Path
 
-          secret = os.environ["GUARDIANBOT_SESSION_COOKIE"]
+          secret = os.environ["GUARDIANBOT_HEADER_VALUE"]
           for path in Path("guardianbot-dast-evidence").glob("*"):
               if not path.is_file():
                   continue
@@ -182,14 +472,18 @@ jobs:
             exit "$zap_exit"
           fi
 
-      - name: Check out immutable GuardianBot deployment manifest
+      - name: Destroy DAST session material
         if: always()
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: guardianbot-engine
-          persist-credentials: false
+        shell: bash
+        run: |
+          for file in \
+            "${RUNNER_TEMP}/guardianbot-dast-session.json" \
+            "${RUNNER_TEMP}/guardianbot-zap-options" \
+            "${RUNNER_TEMP}/guardianbot-openapi-input" \
+            "${RUNNER_TEMP}/guardianbot-openapi-safe.json" \
+            "${RUNNER_TEMP}/guardianbot-dast-contract.json"; do
+            [ ! -f "$file" ] || shred -u "$file" 2>/dev/null || rm -f "$file"
+          done
 
       - name: Attest DAST evidence provenance
         if: always()
@@ -292,6 +586,28 @@ jobs:
               endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
             throw new Error("Evidence attestation URL must be the HTTPS /evidence/attest endpoint");
           }
+          const readJsonLimited = async (response, maximum) => {
+            const declared = response.headers.get("content-length");
+            if (declared !== null &&
+                (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+              throw new Error("JSON response exceeded its size limit");
+            }
+            if (!response.body) throw new Error("JSON response body is missing");
+            const reader = response.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received += value.byteLength;
+              if (received > maximum) {
+                await reader.cancel();
+                throw new Error("JSON response exceeded its size limit");
+              }
+              chunks.push(Buffer.from(value));
+            }
+            return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          };
           const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           oidcUrl.searchParams.set("audience", "guardianbot-evidence");
           const oidcResponse = await fetch(oidcUrl, {
@@ -299,7 +615,9 @@ jobs:
             redirect: "error"
           });
           if (!oidcResponse.ok) throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
-          const oidcToken = String((await oidcResponse.json()).value || "");
+          const oidcToken = String(
+            (await readJsonLimited(oidcResponse, 64 * 1024)).value || ""
+          );
           if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
           const attestationResponse = await fetch(endpoint, {
             method: "POST",
@@ -312,7 +630,10 @@ jobs:
             redirect: "error"
           });
           if (!attestationResponse.ok) throw new Error(`Evidence attestation failed: ${attestationResponse.status}`);
-          const provenance = await attestationResponse.json();
+          const provenance = await readJsonLimited(
+            attestationResponse,
+            16 * 1024
+          );
           if (typeof provenance.token !== "string" || !provenance.token.startsWith("gbp1.")) {
             throw new Error("Evidence attestation response is invalid");
           }

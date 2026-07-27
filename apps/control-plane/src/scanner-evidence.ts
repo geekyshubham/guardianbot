@@ -21,6 +21,11 @@ import {
   type EvidenceManifest,
   type EvidenceTrustPolicy
 } from "./evidence-attestation.js";
+import {
+  createDigitalOceanDeploymentService,
+  DigitalOceanDeploymentError,
+  type DigitalOceanDeploymentService
+} from "./digitalocean-deployment.js";
 import type { GuardianScannerWorkflowRun } from "./service.js";
 import type {
   ScannerArtifactRecord,
@@ -300,6 +305,56 @@ function dedupeFindings(findings: readonly NormalizedFinding[]): NormalizedFindi
   return kept;
 }
 
+function validateSemgrepScannerReport(report: unknown): void {
+  const root = asRecord(report);
+  if (
+    !root ||
+    !Array.isArray(root.results) ||
+    root.results.some((entry) => !asRecord(entry))
+  ) {
+    throw new Error("semgrep.json is not a complete Semgrep report");
+  }
+}
+
+function validateTrivyScannerReport(
+  report: unknown,
+  fileName: "trivy.json" | "trivy-image.json"
+): void {
+  const root = asRecord(report);
+  if (
+    !root ||
+    root.SchemaVersion !== 2 ||
+    typeof root.ArtifactName !== "string" ||
+    !root.ArtifactName ||
+    typeof root.ArtifactType !== "string" ||
+    !root.ArtifactType ||
+    !Array.isArray(root.Results)
+  ) {
+    throw new Error(`${fileName} is not a complete Trivy report`);
+  }
+  for (const resultValue of root.Results) {
+    const result = asRecord(resultValue);
+    if (!result || typeof result.Target !== "string") {
+      throw new Error(`${fileName} contains an invalid result`);
+    }
+    for (const key of [
+      "Vulnerabilities",
+      "Misconfigurations",
+      "Secrets",
+      "Licenses"
+    ] as const) {
+      const entries = result[key];
+      if (
+        entries !== undefined &&
+        (!Array.isArray(entries) ||
+          entries.some((entry) => !asRecord(entry)))
+      ) {
+        throw new Error(`${fileName} contains an invalid ${key} collection`);
+      }
+    }
+  }
+}
+
 function countCriticalImageFindings(report: unknown): number {
   const root = asRecord(report);
   const results = Array.isArray(root?.Results) ? root.Results : [];
@@ -387,10 +442,33 @@ function parseSecurityGate(report: unknown): SecurityGateReport {
   };
 }
 
-function parseZapStatus(report: unknown): { zapExitCode: number } {
+function parseZapStatus(report: unknown): {
+  zapExitCode: number;
+  profile: "authenticated-baseline" | "authenticated-full";
+  minutes: number;
+} {
   const root = asRecord(report);
   if (!root) throw new Error("scan-status.json is invalid");
-  return { zapExitCode: requireInteger(root.zapExitCode, "zapExitCode") };
+  const zapExitCode = requireInteger(root.zapExitCode, "zapExitCode");
+  const minutes = requireInteger(root.minutes, "minutes");
+  if (
+    root.schemaVersion !== "1.0.0" ||
+    (root.profile !== "authenticated-baseline" &&
+      root.profile !== "authenticated-full") ||
+    minutes < 5 ||
+    minutes > 45 ||
+    (root.profile === "authenticated-baseline" && minutes > 15) ||
+    (root.profile === "authenticated-full" && minutes < 30) ||
+    zapExitCode < 0 ||
+    zapExitCode > 255
+  ) {
+    throw new Error("scan-status.json is invalid");
+  }
+  return {
+    zapExitCode,
+    profile: root.profile,
+    minutes
+  };
 }
 
 function normalizeZapFindings(report: unknown): Array<NormalizedFinding & { count: number }> {
@@ -953,6 +1031,7 @@ async function maybeImportToDefectDojo(
     fileName: string;
     report: Uint8Array;
     contentType: string;
+    evidenceKey?: string;
   }
 ): Promise<void> {
   if (!settings) return;
@@ -1039,7 +1118,8 @@ async function maybeImportToDefectDojo(
         artifactId: input.artifactId
       },
       {
-        evidenceKey: `defectdojo-import:${input.scanType}`,
+        evidenceKey:
+          input.evidenceKey ?? `defectdojo-import:${input.scanType}`,
         kind: "defectdojo-import",
         source: "defectdojo",
         status: "success",
@@ -1061,7 +1141,8 @@ async function maybeImportToDefectDojo(
         artifactId: input.artifactId
       },
       {
-        evidenceKey: `defectdojo-import:${input.scanType}`,
+        evidenceKey:
+          input.evidenceKey ?? `defectdojo-import:${input.scanType}`,
         kind: "defectdojo-import",
         source: "defectdojo",
         status: "failure",
@@ -1104,12 +1185,38 @@ async function processSecurityArtifact(
   const gate = parseSecurityGate(gateJson);
   const semgrepFailed = Boolean(asRecord(semgrepJson)?.scanner_error);
   const trivyFailed = Boolean(asRecord(trivyJson)?.scanner_error);
-  const semgrepFindings = semgrepFailed
+  if (!semgrepFailed) validateSemgrepScannerReport(semgrepJson);
+  if (!trivyFailed) validateTrivyScannerReport(trivyJson, "trivy.json");
+  const normalizedSemgrepFindings = semgrepFailed
     ? []
-    : dedupeFindings(normalizeSemgrep(semgrepJson));
-  const trivyFindings = trivyFailed
+    : normalizeSemgrep(semgrepJson);
+  const normalizedTrivyFindings = trivyFailed
     ? []
-    : dedupeFindings(normalizeTrivy(trivyJson));
+    : normalizeTrivy(trivyJson);
+  const normalizedFingerprints = new Set(
+    [...normalizedSemgrepFindings, ...normalizedTrivyFindings].map(
+      (finding) => finding.fingerprint
+    )
+  );
+  const semgrepFindings = dedupeFindings(normalizedSemgrepFindings);
+  const trivyFindings = dedupeFindings(normalizedTrivyFindings);
+  const policyFingerprints = gate.policyFindings.map((finding) =>
+    String(finding.fingerprint ?? "")
+  );
+  if (
+    gate.passed !== (gate.failures.length === 0) ||
+    ((semgrepFailed || trivyFailed) && gate.passed) ||
+    policyFingerprints.some(
+      (fingerprint) =>
+        !/^[a-f0-9]{64}$/.test(fingerprint) ||
+        !normalizedFingerprints.has(fingerprint)
+    ) ||
+    new Set(policyFingerprints).size !== policyFingerprints.length
+  ) {
+    throw new Error(
+      "gate.json does not agree with the normalized scanner evidence"
+    );
+  }
   await recordEvidence(store, base, {
     evidenceKey: "semgrep-summary",
     kind: "semgrep",
@@ -1395,11 +1502,12 @@ async function processImageArtifact(
   defaultBranch: string,
   run: Pick<
     ScannerWorkflowRunRecord,
-    "headSha" | "headBranch" | "workflowPath" | "workflowRef"
+    "headSha" | "headBranch" | "workflowPath" | "workflowRef" | "event"
   >,
   trustPolicy: EvidenceTrustPolicy,
   env: Record<string, string | undefined>,
-  defectDojoSettings: DefectDojoSettings | undefined
+  defectDojoSettings: DefectDojoSettings | undefined,
+  deploymentService: DigitalOceanDeploymentService
 ): Promise<void> {
   const base = {
     repositoryId: artifact.repositoryId,
@@ -1421,6 +1529,7 @@ async function processImageArtifact(
   if (trivyFailed) {
     throw new Error("Trivy image scanner reported scanner_error");
   }
+  validateTrivyScannerReport(trivyJson, "trivy-image.json");
   const trivyFindings = dedupeFindings(normalizeTrivy(trivyJson));
   const actualCriticalCount = countCriticalImageFindings(trivyJson);
   const policyCriticalCount = asRecord(policyJson)?.criticalFindings;
@@ -1476,6 +1585,63 @@ async function processImageArtifact(
       details: "Cosign signature and CycloneDX attestation verified",
       payload: promotion
     });
+    if (
+      run.event === "push" &&
+      run.headBranch === defaultBranch
+    ) {
+      try {
+        const deployment = await deploymentService.promote({
+          repository: repositoryFullName,
+          repositoryId: artifact.repositoryId,
+          runId: artifact.runId,
+          runAttempt: artifact.runAttempt,
+          headSha: run.headSha,
+          imageReference: promotion.imageReference
+        });
+        if (deployment) {
+          await recordEvidence(store, base, {
+            evidenceKey: `deployment:${deployment.environment}`,
+            kind: "deployment",
+            source: "digitalocean",
+            status: "success",
+            observedAt: deployment.observedAt,
+            digest: deployment.imageDigest,
+            environment: deployment.environment,
+            details: "Exact signed digest is active and healthy on DigitalOcean",
+            payload: {
+              profileId: deployment.profileId,
+              appId: deployment.appId,
+              deploymentId: deployment.deploymentId,
+              origin: deployment.origin,
+              updated: deployment.updated
+            }
+          });
+        }
+      } catch (error) {
+        const environment =
+          error instanceof DigitalOceanDeploymentError
+            ? error.environment
+            : "unknown";
+        await recordEvidence(store, base, {
+          evidenceKey: `deployment:${environment}`,
+          kind: "deployment",
+          source: "digitalocean",
+          status: "failure",
+          observedAt: new Date().toISOString(),
+          digest: promotion.imageDigest,
+          environment,
+          details:
+            error instanceof DigitalOceanDeploymentError
+              ? error.message
+              : "DigitalOcean deployment reconciliation failed"
+        });
+        throw new RetryableScannerEvidenceError(
+          error instanceof DigitalOceanDeploymentError
+            ? error.message
+            : "DigitalOcean deployment reconciliation failed"
+        );
+      }
+    }
   }
   if (artifact.artifactType === "image-validation") {
     await maybeImportToDefectDojo(store, env, defectDojoSettings, {
@@ -1523,22 +1689,26 @@ async function processDastArtifact(
   const statusJson = parseJsonFile(statusBytes, "scan-status.json");
   const exit = parseZapStatus(statusJson);
   const findings = normalizeZapFindings(zapJson);
+  const isNightly = exit.profile === "authenticated-full";
+  const evidencePrefix = isNightly ? "zap-nightly" : "zap-smoke";
   await recordEvidence(store, base, {
-    evidenceKey: "zap-summary",
-    kind: "zap-nightly",
+    evidenceKey: `${evidencePrefix}-summary`,
+    kind: evidencePrefix,
     source: "zap",
     status: exit.zapExitCode >= 3 ? "failure" : "success",
     observedAt: new Date().toISOString(),
     details: `zap exit code: ${exit.zapExitCode}`,
     payload: {
       exitCode: exit.zapExitCode,
+      profile: exit.profile,
+      minutes: exit.minutes,
       findings: findings.length
     }
   });
   for (const finding of findings) {
     await recordEvidence(store, base, {
       evidenceKey: `zap:${finding.fingerprint}`,
-      kind: "zap-nightly",
+      kind: evidencePrefix,
       source: "zap",
       status: "success",
       observedAt: new Date().toISOString(),
@@ -1566,6 +1736,8 @@ async function processDastArtifact(
       headSha: run.headSha,
       artifactType: artifact.artifactType,
       scanType: "ZAP Scan",
+      evidenceKey:
+        `defectdojo-import:ZAP Scan:${isNightly ? "nightly" : "smoke"}`,
       fileName: "zap.json",
       report: zapBytes,
       contentType: "application/json"
@@ -1707,6 +1879,12 @@ export function createScannerWorkflowRunHandler(
   const env = options.environment ?? process.env;
   const trustPolicy = parseEvidenceTrustPolicy(env);
   const defectDojoSettings = parseDefectDojoSettings(env);
+  const deploymentService = createDigitalOceanDeploymentService({
+    store: options.store,
+    environment: env,
+    fetchImpl: options.fetchImpl,
+    now: options.now
+  });
   const now = options.now ?? (() => new Date());
   const fetchImpl = options.fetchImpl ?? fetch;
   const apiBase = options.githubApiBase ?? DEFAULT_GITHUB_API_BASE;
@@ -1951,7 +2129,8 @@ export function createScannerWorkflowRunHandler(
             workflowRecord,
             trustPolicy,
             env,
-            defectDojoSettings
+            defectDojoSettings,
+            deploymentService
           );
         }
         await options.store.upsertScannerArtifact({

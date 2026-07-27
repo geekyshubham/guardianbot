@@ -149,6 +149,72 @@ test("normalizes and gates deterministic findings", () => {
   assert.equal(decision.blockers.length, 2);
 });
 
+test("normalizes every Trivy class without retaining secret material", () => {
+  const findings = normalizeTrivy({
+    Results: [
+      {
+        Target: "infra/main.tf",
+        Vulnerabilities: [
+          {
+            VulnerabilityID: "CVE-2",
+            PkgName: "lib",
+            InstalledVersion: "1",
+            FixedVersion: "",
+            Severity: "CRITICAL",
+            Title: "No fixed release"
+          }
+        ],
+        Misconfigurations: [
+          {
+            AVDID: "AVD-CLOUD-1",
+            Severity: "HIGH",
+            Title: "Public resource",
+            CauseMetadata: { Resource: "bucket", StartLine: 8, EndLine: 9 }
+          }
+        ],
+        Secrets: [
+          {
+            RuleID: "private-key",
+            Category: "Private Key",
+            Severity: "CRITICAL",
+            StartLine: 12,
+            EndLine: 20,
+            Match: "must-not-survive",
+            Code: { Lines: [{ Content: "must-not-survive" }] }
+          }
+        ],
+        Licenses: [
+          {
+            Name: "GPL-3.0",
+            Severity: "HIGH",
+            PkgName: "licensed-package",
+            InstalledVersion: "3"
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.deepEqual(
+    findings.map((finding) => finding.scannerClass),
+    ["vulnerability", "misconfiguration", "secret", "license"]
+  );
+  assert.equal(JSON.stringify(findings).includes("must-not-survive"), false);
+  const decision = evaluateGate({
+    findings,
+    baselineFingerprints: new Set(),
+    mode: "enforce"
+  });
+  assert.deepEqual(
+    decision.blockers.map((finding) => finding.scannerClass),
+    ["misconfiguration", "secret"]
+  );
+  assert.equal(
+    decision.observed.some((finding) => finding.scannerClass === "license"),
+    true
+  );
+});
+
 test("indexes symbols and retrieves local context", () => {
   const index = indexRepository({
     repository: "Geekyshubham/service",

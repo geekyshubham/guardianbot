@@ -15,6 +15,7 @@ export type EvidenceKind =
 
 export interface EvidenceRecord {
   kind: EvidenceKind;
+  evidenceKey?: string;
   observedAt: string;
   status: "success" | "failure";
   digest?: string;
@@ -25,6 +26,7 @@ export interface EvidenceRecord {
 export interface EvidenceRequirement {
   key: string;
   kind: EvidenceKind;
+  evidenceKey?: string;
   required: boolean;
   maxAgeMs: number;
   digest?: string;
@@ -44,6 +46,7 @@ function evidenceMetadata(
 ): Record<string, boolean | number | string | null> {
   return {
     kind: requirement.kind,
+    evidenceKey: match?.evidenceKey ?? requirement.evidenceKey ?? null,
     digest: match?.digest ?? requirement.digest ?? null,
     environment: match?.environment ?? requirement.environment ?? null,
     required: requirement.required,
@@ -58,6 +61,9 @@ function latestMatchingEvidence(
   const matches = evidence.filter(
     (item) =>
       item.kind === requirement.kind &&
+      (requirement.evidenceKey
+        ? item.evidenceKey === requirement.evidenceKey
+        : true) &&
       (requirement.digest ? item.digest === requirement.digest : true) &&
       (requirement.environment ? item.environment === requirement.environment : true)
   );

@@ -1,31 +1,100 @@
 # DAST
 
-DAST is staging-only. Configuration contains one exact HTTPS origin, a safe
-OpenAPI document, an opaque control-plane authentication profile, a protected
-session assertion, and excluded destructive/internal routes.
+GuardianBot runs DAST only against an exact, administratively approved HTTPS
+staging origin. Repository configuration may select an opaque authentication
+profile, but it cannot contain a credential, backend URL, DigitalOcean token, or
+production target.
 
-The [checked example OpenAPI document](examples/openapi.safe.yaml) contains only
-read-only staging probes. Documentation checks parse and validate every
-`docs/examples/openapi*.yaml` or `.json` file without resolving remote references.
+The [checked safe OpenAPI example](examples/openapi.safe.yaml) contains only
+read-only probes. Documentation checks parse every OpenAPI example without
+resolving remote references.
 
-Before ZAP:
+## One-time session broker
 
-1. Verify the deployed digest and expected workflow identity.
-2. Resolve credentials only inside the control plane or ephemeral runner.
-3. Authenticate and require the session assertion to succeed.
-4. Compare the target origin byte-for-byte with the allowlist.
-5. Prohibit production, link-local, metadata, localhost, wildcard, and redirected
-   cross-origin targets.
+The reusable workflow requests a GitHub OIDC token for the audience
+`guardianbot-dast-session` and calls the control-plane `/dast/session` endpoint.
+The broker verifies all of the following before it returns a credential:
 
-Deploy-smoke profiles run for minutes; authenticated nightly profiles are capped at
-45 minutes, and configured durations outside 5–45 minutes fail validation. The
-reusable workflow never runs on pull requests and uses the protected GitHub
-environment `guardianbot-dast`; operators should configure its required reviewers
-and restrict staging secrets to that environment.
+- the repository name and numeric repository ID are active in GuardianBot;
+- the run ID, run attempt, head SHA, and default-branch ref match the request;
+- the caller is `.github/workflows/guardianbot.yml`;
+- the called workflow is `.github/workflows/reusable-dast.yml` at the exact
+  trusted GuardianBot commit;
+- the runner is GitHub-hosted and the event is `schedule`,
+  `workflow_dispatch`, or `push`;
+- the protected environment and OIDC subject are exactly
+  `guardianbot-dast`; and
+- the profile origin and protected assertion path exactly match the request.
 
-The workflow fails closed unless an ephemeral `session_cookie` is provided. It
-first requires the protected assertion to return 401/403 without that cookie, then
-requires a 2xx response with it. It also requires the OpenAPI URL to resolve to the
-exact target origin or an explicit allowlisted URL, and scrubs the session value
-from logs and temporary files. DefectDojo import/reimport remains control-plane
-work; the PoC reusable workflow does not claim to perform it.
+Each repository, run attempt, profile, commit, and origin can obtain a session
+only once. Issuance leases are durable in PostgreSQL, and the response is
+returned with `Cache-Control: no-store`.
+
+Configure profiles centrally in `GUARDIANBOT_DAST_PROFILES_JSON`. The normal
+`exchange` mode asks a same-origin staging endpoint for a short-lived
+credential; only the control plane knows the exchange authorization value:
+
+```json
+{
+  "routelens-staging": {
+    "mode": "exchange",
+    "repository": "Geekyshubham/RouteLens",
+    "repositoryId": 123456789,
+    "origin": "https://routelens-staging.example.com",
+    "sessionAssertionPath": "/api/v1/protected-session/",
+    "headerName": "Authorization",
+    "ttlSeconds": 600,
+    "exchangeUrl": "https://routelens-staging.example.com/guardianbot/session",
+    "exchangeCredentialEnv": "ROUTELENS_DAST_EXCHANGE_TOKEN"
+  }
+}
+```
+
+The exchange endpoint must return only `schemaVersion`, `credential`, and
+`expiresAt`. Its credential must remain valid for more than 30 seconds and no
+longer than the requested profile TTL.
+
+Static mode is a lower-assurance PoC escape hatch. It is rejected unless the
+individual profile contains `pocStaticCredential: true` and the control plane
+sets `GUARDIANBOT_ALLOW_POC_STATIC_DAST=1`. It must not be used as the
+production design.
+
+## Workflow safety
+
+Before ZAP, the reusable workflow:
+
+1. proves the protected assertion returns 401 or 403 without authentication;
+2. obtains the one-time credential and masks it immediately;
+3. proves the assertion returns 2xx with the credential;
+4. accepts an OpenAPI file from the exact checked-out commit or a same-origin
+   live schema endpoint;
+5. rejects remote references, cross-origin servers, unsafe redirects, private
+   targets, and routes excluded by configuration; and
+6. destroys the temporary credential file and publishes only scrubbed evidence.
+
+The `guardianbot-dast` environment should require reviewers. Consumer
+repositories do not store a DAST session secret and do not pass `secrets:
+inherit`.
+
+The generated caller distinguishes:
+
+- `authenticated-baseline` smoke scans, capped at 15 minutes and normally
+  scheduled every 15 minutes; and
+- `authenticated-full` nightly scans, requiring at least 30 minutes and capped
+  at 45 minutes.
+
+Smoke and nightly evidence use different keys and different DefectDojo import
+identities. A fresh smoke result therefore cannot satisfy the nightly
+requirement.
+
+## Failure behavior
+
+An unauthorized origin, failed unauthenticated assertion, unavailable broker,
+replayed issuance, invalid OpenAPI document, missing ZAP output, or failed
+required import leaves DAST evidence missing or failed. AI review continues to
+be advisory, but a configured deterministic DAST requirement does not pass.
+
+RouteLens and AstraNull use this same generic contract. Their exact origins,
+repository IDs, exchange endpoints, and protected assertion paths will be added
+only after isolated DigitalOcean staging exists; no successful live
+authenticated DAST evidence is claimed yet.
