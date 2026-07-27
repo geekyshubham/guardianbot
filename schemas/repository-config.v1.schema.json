@@ -2,41 +2,203 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://guardianbot.dev/schemas/repository-config.v1.schema.json",
   "title": "GuardianBot Repository Configuration",
+  "description": "Versioned, provider-neutral repository policy. Credentials, model endpoints, and backend URLs are intentionally outside this contract.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "workflowVersion", "repository", "review", "scanners"],
   "properties": {
-    "schemaVersion": { "const": "1.0.0" },
-    "workflowVersion": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "schemaVersion": {
+      "const": "1.0.0"
+    },
+    "workflowVersion": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
     "repository": {
       "type": "object",
       "additionalProperties": false,
       "required": ["defaultBranch", "releaseBranches", "languages"],
       "properties": {
-        "defaultBranch": { "type": "string", "minLength": 1 },
-        "releaseBranches": { "type": "array", "items": { "type": "string" } },
-        "languages": { "type": "array", "items": { "type": "string" } },
-        "relatedRepositories": { "type": "array", "items": { "type": "string" } }
+        "defaultBranch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "releaseBranches": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "packageManagers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "lockfiles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/repositoryPath"
+          }
+        },
+        "codeowners": {
+          "$ref": "#/$defs/repositoryPath"
+        },
+        "relatedRepositories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+          }
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "test", "generated", "vendored", "excluded"],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "test": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "generated": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "vendored": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "excluded": {
+          "$ref": "#/$defs/repositoryPathArray"
+        }
       }
     },
     "review": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["automatic", "drafts", "incremental", "maxInlineComments", "categories", "highRiskPaths"],
+      "required": [
+        "automatic",
+        "drafts",
+        "incremental",
+        "maxInlineComments",
+        "categories",
+        "highRiskPaths"
+      ],
       "properties": {
-        "automatic": { "type": "boolean" },
-        "drafts": { "enum": ["skip", "manual", "automatic"] },
-        "incremental": { "type": "boolean" },
-        "maxInlineComments": { "type": "integer", "minimum": 0, "maximum": 50 },
-        "categories": {
+        "automatic": {
+          "type": "boolean"
+        },
+        "drafts": {
+          "enum": ["skip", "manual", "automatic"]
+        },
+        "incremental": {
+          "type": "boolean"
+        },
+        "manual": {
+          "type": "boolean"
+        },
+        "targetBranches": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
-            "enum": ["security", "logic", "reliability", "concurrency", "performance", "contract", "testing", "maintainability"]
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
           }
         },
-        "highRiskPaths": { "type": "array", "items": { "type": "string" } },
-        "contextDocuments": { "type": "array", "items": { "type": "string" } },
-        "excludedPaths": { "type": "array", "items": { "type": "string" } }
+        "maxInlineComments": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50
+        },
+        "categories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewCategory"
+          }
+        },
+        "highRiskPaths": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "contextDocuments": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "excludedPaths": {
+          "$ref": "#/$defs/repositoryPathArray"
+        },
+        "pathRules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "paths", "instructions"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "pattern": "^[^\\r\\n]+$"
+              },
+              "paths": {
+                "$ref": "#/$defs/repositoryPathArray"
+              },
+              "categories": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/reviewCategory"
+                }
+              },
+              "instructions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1000,
+                  "pattern": "^[^\\r\\n]+$"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executionEnvironment", "testCommands", "buildCommands"],
+      "properties": {
+        "executionEnvironment": {
+          "enum": ["github-hosted", "ephemeral"]
+        },
+        "testCommands": {
+          "$ref": "#/$defs/commandArray"
+        },
+        "buildCommands": {
+          "$ref": "#/$defs/commandArray"
+        }
       }
     },
     "scanners": {
@@ -44,9 +206,15 @@
       "additionalProperties": false,
       "required": ["mode", "semgrep", "trivy"],
       "properties": {
-        "mode": { "enum": ["advisory", "report-only", "enforce"] },
-        "semgrep": { "type": "boolean" },
-        "trivy": { "type": "boolean" },
+        "mode": {
+          "enum": ["advisory", "report-only", "enforce"]
+        },
+        "semgrep": {
+          "type": "boolean"
+        },
+        "trivy": {
+          "type": "boolean"
+        },
         "suppressions": {
           "type": "array",
           "items": {
@@ -54,11 +222,34 @@
             "additionalProperties": false,
             "required": ["fingerprint", "owner", "reason", "ticket", "expiresAt"],
             "properties": {
-              "fingerprint": { "type": "string" },
-              "owner": { "type": "string" },
-              "reason": { "type": "string" },
-              "ticket": { "type": "string" },
-              "expiresAt": { "type": "string", "format": "date-time" }
+              "fingerprint": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[^\\r\\n]+$"
+              },
+              "owner": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^[^\\r\\n]+$"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "pattern": "^[^\\r\\n]+$"
+              },
+              "ticket": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^[^\\r\\n]+$"
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time"
+              }
             }
           }
         }
@@ -69,30 +260,192 @@
       "additionalProperties": false,
       "required": ["dockerfile", "context", "platform", "registry", "healthPath", "sbomFormat"],
       "properties": {
-        "dockerfile": { "type": "string" },
-        "context": { "type": "string" },
-        "platform": { "type": "string" },
-        "registry": { "type": "string" },
-        "healthPath": { "type": "string" },
-        "readinessPath": { "type": "string" },
-        "containerPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
-        "sbomFormat": { "const": "cyclonedx-json" },
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._/-][a-z0-9]+)*$"
+        },
+        "dockerfile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^(?![A-Za-z]:[\\\\/])(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000\\r\\n]+$"
+        },
+        "context": {
+          "anyOf": [
+            {
+              "const": "."
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000,
+              "pattern": "^(?![A-Za-z]:[\\\\/])(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000\\r\\n]+$"
+            }
+          ]
+        },
+        "platform": {
+          "const": "linux/amd64"
+        },
+        "buildArguments": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[A-Z_][A-Z0-9_]*$"
+              },
+              {
+                "not": {
+                  "pattern": "(^|_)(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|API_KEY)(_|$)"
+                }
+              }
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000\\r\\n]*$"
+          }
+        },
+        "smokeProfile": {
+          "enum": ["http", "command", "multi-service"]
+        },
+        "registry": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[a-z0-9._-]+/[a-z0-9._/-]+$"
+        },
+        "healthPath": {
+          "type": "string",
+          "pattern": "^/(?!/)[^\\s?#]*(?:\\?[^#\\s]*)?$"
+        },
+        "readinessPath": {
+          "type": "string",
+          "pattern": "^/(?!/)[^\\s?#]*(?:\\?[^#\\s]*)?$"
+        },
+        "containerPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "containerPort", "protocol"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{0,31}$"
+              },
+              "containerPort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "protocol": {
+                "enum": ["tcp", "udp"]
+              }
+            }
+          }
+        },
+        "signing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "workflow", "ref"],
+          "properties": {
+            "mode": {
+              "const": "keyless"
+            },
+            "workflow": {
+              "type": "string",
+              "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$"
+            },
+            "ref": {
+              "type": "string",
+              "pattern": "^refs/(?:heads|tags)/[A-Za-z0-9._/-]+$"
+            }
+          }
+        },
+        "sbomFormat": {
+          "const": "cyclonedx-json"
+        },
+        "sbomRetentionDays": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650
+        },
         "dependentServices": {
           "type": "array",
-          "items": { "enum": ["postgres", "redis"] }
+          "uniqueItems": true,
+          "items": {
+            "enum": ["postgres", "redis"]
+          }
         },
         "runtimeEnvironment": {
           "type": "object",
-          "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
-          "additionalProperties": { "type": "string" }
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[A-Z_][A-Z0-9_]*$"
+              },
+              {
+                "not": {
+                  "pattern": "(^|_)(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|API_KEY)(_|$)"
+                }
+              }
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 2000,
+            "pattern": "^[^\\u0000\\r\\n]*$"
+          }
         },
         "ephemeralEnvironment": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z_][A-Z0-9_]*$"
+          }
         },
-        "migrationCommand": { "type": "string" },
-        "testCommand": { "type": "string" }
+        "migrationCommand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "testCommand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "environment",
+            "requireImmutableDigest",
+            "requireSignature",
+            "requireSbom"
+          ],
+          "properties": {
+            "environment": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,62}$"
+            },
+            "requireImmutableDigest": {
+              "const": true
+            },
+            "requireSignature": {
+              "const": true
+            },
+            "requireSbom": {
+              "const": true
+            }
+          }
+        }
       }
     },
     "dast": {
@@ -100,11 +453,145 @@
       "additionalProperties": false,
       "required": ["allowedOrigin", "openapi", "authenticationProfile", "sessionAssertionPath"],
       "properties": {
-        "allowedOrigin": { "type": "string", "format": "uri" },
-        "openapi": { "type": "string" },
-        "authenticationProfile": { "type": "string" },
-        "sessionAssertionPath": { "type": "string" },
-        "excludedRoutes": { "type": "array", "items": { "type": "string" } }
+        "allowedOrigin": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://[^/?#]+$"
+        },
+        "allowedOrigins": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://[^/?#]+$"
+          }
+        },
+        "openapi": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "^[^\\r\\n]+$"
+        },
+        "openapiSource": {
+          "enum": ["repository-file", "live-endpoint"]
+        },
+        "authenticationProfile": {
+          "type": "string",
+          "pattern": "^control-plane://profiles/[A-Za-z0-9._/-]+$"
+        },
+        "sessionAssertionPath": {
+          "type": "string",
+          "pattern": "^/(?!/)[^\\s?#]*(?:\\?[^#\\s]*)?$"
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["deploySmoke", "nightly"],
+          "properties": {
+            "deploySmoke": {
+              "enum": [
+                "baseline",
+                "authenticated-baseline",
+                "full",
+                "authenticated-full"
+              ]
+            },
+            "nightly": {
+              "enum": [
+                "baseline",
+                "authenticated-baseline",
+                "full",
+                "authenticated-full"
+              ]
+            }
+          }
+        },
+        "excludedRoutes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/(?!/)[^\\s?#]*(?:\\?[^#\\s]*)?$"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "pattern": "^(?![A-Za-z]:[\\\\/])(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000\\r\\n]+$"
+    },
+    "repositoryPathArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/repositoryPath"
+      }
+    },
+    "requestPath": {
+      "type": "string",
+      "pattern": "^/(?!/)[^\\s?#]*(?:\\?[^#\\s]*)?$"
+    },
+    "command": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "pattern": "^[^\\u0000\\r\\n]+$"
+    },
+    "commandArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/command"
+      }
+    },
+    "reviewCategory": {
+      "enum": [
+        "security",
+        "logic",
+        "reliability",
+        "concurrency",
+        "performance",
+        "contract",
+        "testing",
+        "maintainability"
+      ]
+    },
+    "dastProfile": {
+      "enum": [
+        "baseline",
+        "authenticated-baseline",
+        "full",
+        "authenticated-full"
+      ]
+    },
+    "httpsOrigin": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://[^/?#]+$"
+    },
+    "nonSecretEnvironment": {
+      "type": "object",
+      "propertyNames": {
+        "allOf": [
+          {
+            "pattern": "^[A-Z_][A-Z0-9_]*$"
+          },
+          {
+            "not": {
+              "pattern": "(^|_)(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|API_KEY)(_|$)"
+            }
+          }
+        ]
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 2000,
+        "pattern": "^[^\\u0000\\r\\n]*$"
       }
     }
   }

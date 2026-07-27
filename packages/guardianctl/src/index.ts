@@ -4,8 +4,10 @@ import {
   generateCallerWorkflow,
   generateGuardianConfig,
   parseGuardianConfig,
+  parseGuardianConfigDocument,
   renderOnboardingReport,
   serializeGuardianConfig,
+  validateGuardianConfig,
   type DetectionResult,
   type GuardianConfig,
   type GitHubRepository,
@@ -246,6 +248,10 @@ function githubErrorStatus(error: unknown): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 export function isImmutableWorkflowSha(value: string): boolean {
   return IMMUTABLE_SHA.test(value);
 }
@@ -272,16 +278,33 @@ export async function inspectRepository(
   const metadata = await github.getRepository(owner, repo);
   const files = await github.getTree(owner, repo, metadata.default_branch);
   const languages = await github.getLanguages(owner, repo);
-  const contextual = files.filter((path) =>
-    /(^|\/)(package\.json|pyproject\.toml|Gemfile|Package\.swift|docker-compose[^/]*\.ya?ml|Dockerfile(?:\.[^/]*)?|.*(?:url|route|health|ready|schema|openapi|swagger|deploy|workflow).*\.(?:ya?ml|json|py|ts|js))$/i.test(path)
+  const manifests = files.filter((path) =>
+    /(^|\/)(?:package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya?ml|yarn\.lock|bun\.lockb?|pyproject\.toml|requirements[^/]*\.(?:txt|lock)|poetry\.lock|Pipfile(?:\.lock)?|uv\.lock|pdm\.lock|Package\.swift|Package\.resolved|Gemfile(?:\.lock)?|Rakefile|[^/]+\.gemspec|CODEOWNERS|Dockerfile(?:\.[^/]*)?|Containerfile(?:\.[^/]*)?|docker-compose[^/]*\.ya?ml)$/i.test(path)
   );
-  const source = files.filter((path) => /\.(ya?ml|json|py|ts|js)$/i.test(path));
-  const candidates = [...new Set([...contextual, ...source])].slice(0, 140);
+  const operational = files.filter((path) =>
+    /(?:^|\/)(?:\.github\/workflows\/[^/]+|[^/]*(?:url|route|health|ready|schema|openapi|swagger|deploy|migration)[^/]*)\.(?:ya?ml|json|toml|py|pyi|ts|tsx|mts|cts|js|jsx|mjs|cjs|swift|rb|rake)$/i.test(path)
+  );
+  const documentation = files.filter((path) =>
+    /(^|\/)(?:README|CONTRIBUTING|SECURITY|ARCHITECTURE)(?:\.[^/]+)?$/i.test(path)
+  );
+  const source = files.filter((path) =>
+    /\.(?:ya?ml|json|toml|py|pyi|ts|tsx|mts|cts|js|jsx|mjs|cjs|swift|rb|rake|md|mdx)$/i.test(path)
+  );
+  const candidates = [
+    ...new Set([...manifests, ...operational, ...documentation, ...source])
+  ].slice(0, 220);
   const fileContents: Record<string, string> = {};
+  let nextCandidate = 0;
   await Promise.all(
-    candidates.map(async (path) => {
-      const file = await github.getFile(owner, repo, path, metadata.default_branch);
-      if (file && file.content.length <= 250_000) fileContents[path] = file.content;
+    Array.from({ length: Math.min(8, Math.max(1, candidates.length)) }, async () => {
+      while (true) {
+        const index = nextCandidate;
+        nextCandidate += 1;
+        if (index >= candidates.length) return;
+        const path = candidates[index]!;
+        const file = await github.getFile(owner, repo, path, metadata.default_branch);
+        if (file && file.content.length <= 250_000) fileContents[path] = file.content;
+      }
     })
   );
   return {
@@ -293,6 +316,43 @@ export async function inspectRepository(
     languages,
     fileContents
   };
+}
+
+function renderConfigurationCoverage(config: GuardianConfig, detection: DetectionResult): string {
+  const values = (entries: string[] | undefined) =>
+    entries?.length ? entries.map((entry) => `\`${entry}\``).join(", ") : "none detected";
+  const imageCoverage = config.image
+    ? `configured from \`${config.image.dockerfile}\` for ${config.image.platform}; GHCR, runtime smoke, CycloneDX SBOM, keyless signing, and immutable-digest promotion policy are declared`
+    : "not applicable (no container definition detected)";
+  const dastCoverage = config.dast
+    ? `configured for the exact allowlisted origin \`${config.dast.allowedOrigin}\``
+    : detection.openapi.length
+      ? `available but not configured; detected OpenAPI: ${values(detection.openapi)}`
+      : "not applicable until an exact staging origin and safe OpenAPI source are supplied";
+
+  return [
+    "## Generated reusable configuration",
+    "",
+    `- Languages: ${values(config.repository.languages)}`,
+    `- Package managers: ${values(config.repository.packageManagers)}`,
+    `- Lockfiles: ${values(config.repository.lockfiles)}`,
+    `- Source paths: ${values(config.paths?.source)}`,
+    `- Test paths: ${values(config.paths?.test)}`,
+    `- Generated paths: ${values(config.paths?.generated)}`,
+    `- Vendored paths: ${values(config.paths?.vendored)}`,
+    `- Excluded paths: ${values(config.paths?.excluded)}`,
+    `- Command execution boundary: \`${config.runner?.executionEnvironment ?? "not configured"}\``,
+    `- Test commands: ${values(config.runner?.testCommands)}`,
+    `- Build commands: ${values(config.runner?.buildCommands)}`,
+    `- Image coverage: ${imageCoverage}`,
+    `- DAST coverage: ${dastCoverage}`,
+    "",
+    detection.documentationOnly
+      ? "This is a documentation-only repository; deterministic source scans remain advisory."
+      : "Detected commands are declarations executed only by the pinned reusable workflow on GitHub-hosted or ephemeral runners.",
+    "",
+    "No model credentials, scanner credentials, deployment credentials, backend URLs, or shared secrets are written to this repository."
+  ].join("\n");
 }
 
 export async function generateOnboarding(
@@ -330,12 +390,31 @@ export async function generateOnboarding(
     }
     configObject.dast = {
       allowedOrigin: override.dastOrigin,
+      allowedOrigins: [override.dastOrigin],
       openapi: override.openapi,
+      openapiSource:
+        override.openapi.startsWith("/") || /^https:/i.test(override.openapi)
+          ? "live-endpoint"
+          : "repository-file",
       authenticationProfile: override.authenticationProfile,
       sessionAssertionPath: override.sessionAssertionPath,
+      profiles: {
+        deploySmoke: "authenticated-baseline",
+        nightly: "authenticated-full"
+      },
       excludedRoutes: []
     };
   }
+  const configurationErrors = validateGuardianConfig(configObject);
+  if (configurationErrors.length) {
+    throw new Error(
+      `Generated GuardianBot configuration is invalid:\n${configurationErrors.join("\n")}`
+    );
+  }
+  const report = [
+    renderOnboardingReport(repository, detection).trimEnd(),
+    renderConfigurationCoverage(configObject, detection)
+  ].join("\n\n");
   return {
     snapshot,
     detection,
@@ -346,7 +425,7 @@ export async function generateOnboarding(
       defaultBranch: snapshot.defaultBranch,
       image: configObject.image
     }),
-    report: renderOnboardingReport(repository, detection)
+    report
   };
 }
 
@@ -814,6 +893,19 @@ function inspectRepositoryConfiguration(
     problems.push(`releaseBranches does not include ${metadata.default_branch}`);
   }
   if (
+    config.review.targetBranches?.length &&
+    !config.review.targetBranches.includes(metadata.default_branch)
+  ) {
+    problems.push(`review.targetBranches does not include ${metadata.default_branch}`);
+  }
+  if (
+    config.paths &&
+    config.review.excludedPaths &&
+    config.paths.excluded.join("\0") !== config.review.excludedPaths.join("\0")
+  ) {
+    problems.push("paths.excluded and review.excludedPaths differ");
+  }
+  if (
     config.scanners.mode !== "advisory" &&
     !config.scanners.semgrep &&
     !config.scanners.trivy
@@ -830,7 +922,9 @@ function inspectRepositoryConfiguration(
     "repository-configuration",
     "repository configuration",
     problems.length === 0,
-    problems.length ? problems.join("; ") : "default/release branches and scanner mode are consistent"
+    problems.length
+      ? problems.join("; ")
+      : "default/release/review branches, paths, and scanner mode are consistent"
   );
 }
 
@@ -871,8 +965,35 @@ async function inspectImageConfiguration(
   if (image.readinessPath && !validRequestPath(image.readinessPath)) {
     problems.push("readinessPath must be an origin-relative path");
   }
-  if (!/^[a-z0-9.-]+(?::\d+)?\/[a-z0-9._/-]+$/.test(image.registry)) {
-    problems.push("registry must be a lowercase registry/repository path");
+  if (!/^ghcr\.io\/[a-z0-9._-]+\/[a-z0-9._/-]+$/.test(image.registry)) {
+    problems.push("registry must be a lowercase GHCR repository path");
+  }
+  if (
+    image.ports?.length &&
+    image.containerPort &&
+    !image.ports.some((port) => port.containerPort === image.containerPort)
+  ) {
+    problems.push("containerPort must be represented in image.ports");
+  }
+  if (image.signing) {
+    if (image.signing.workflow !== CALLER_WORKFLOW_PATH) {
+      problems.push(`signing workflow must be ${CALLER_WORKFLOW_PATH}`);
+    }
+    if (
+      !image.signing.ref.startsWith("refs/heads/") &&
+      !image.signing.ref.startsWith("refs/tags/")
+    ) {
+      problems.push("signing ref must identify an exact branch or tag");
+    }
+  }
+  if (image.deployment) {
+    if (
+      !image.deployment.requireImmutableDigest ||
+      !image.deployment.requireSignature ||
+      !image.deployment.requireSbom
+    ) {
+      problems.push("deployment promotion must require digest, signature, and SBOM evidence");
+    }
   }
   if (safeRepositoryPath(image.dockerfile)) {
     try {
@@ -935,17 +1056,40 @@ function inspectDastConfiguration(dast: GuardianConfig["dast"]): DoctorCheck {
   }
   const problems: string[] = [];
   const validRequestPath = (value: string) => /^\/(?!\/)[^\s?#]*(?:\?[^#\s]*)?$/.test(value);
-  let origin: URL | undefined;
-  try {
-    origin = new URL(dast.allowedOrigin);
-    if (origin.protocol !== "https:") problems.push("allowedOrigin must use HTTPS");
-    if (invalidRemoteHost(origin.hostname)) problems.push("allowedOrigin targets a local or link-local host");
-    if (origin.username || origin.password) problems.push("allowedOrigin must not contain credentials");
-    if (origin.pathname !== "/" || origin.search || origin.hash) {
-      problems.push("allowedOrigin must contain only scheme, host, and optional port");
+  const allowedOrigin =
+    typeof dast.allowedOrigin === "string" ? dast.allowedOrigin : "";
+  const allowedOrigins = Array.isArray(dast.allowedOrigins)
+    ? dast.allowedOrigins.filter((value): value is string => typeof value === "string")
+    : [];
+  const openapi = typeof dast.openapi === "string" ? dast.openapi : "";
+  const inspectOrigin = (value: string, field: string): URL | undefined => {
+    try {
+      const candidate = new URL(value);
+      if (candidate.protocol !== "https:") problems.push(`${field} must use HTTPS`);
+      if (invalidRemoteHost(candidate.hostname)) {
+        problems.push(`${field} targets a local or link-local host`);
+      }
+      if (candidate.username || candidate.password) {
+        problems.push(`${field} must not contain credentials`);
+      }
+      if (candidate.pathname !== "/" || candidate.search || candidate.hash) {
+        problems.push(`${field} must contain only scheme, host, and optional port`);
+      }
+      return candidate;
+    } catch {
+      problems.push(`${field} must be an absolute HTTPS origin`);
+      return undefined;
     }
-  } catch {
-    problems.push("allowedOrigin must be an absolute HTTPS origin");
+  };
+  const origin = inspectOrigin(allowedOrigin, "allowedOrigin");
+  for (const [index, additionalOrigin] of allowedOrigins.entries()) {
+    inspectOrigin(additionalOrigin, `allowedOrigins[${index}]`);
+  }
+  if (
+    allowedOrigins.length &&
+    !allowedOrigins.includes(allowedOrigin)
+  ) {
+    problems.push("allowedOrigins must include allowedOrigin");
   }
   if (!validRequestPath(dast.sessionAssertionPath)) {
     problems.push("sessionAssertionPath must be an origin-relative path");
@@ -954,7 +1098,9 @@ function inspectDastConfiguration(dast: GuardianConfig["dast"]): DoctorCheck {
     const authenticationProfile = new URL(dast.authenticationProfile);
     if (
       authenticationProfile.protocol !== "control-plane:" ||
-      !authenticationProfile.hostname ||
+      authenticationProfile.hostname !== "profiles" ||
+      !/^\/[A-Za-z0-9._/-]+$/.test(authenticationProfile.pathname) ||
+      authenticationProfile.pathname.includes("..") ||
       authenticationProfile.username ||
       authenticationProfile.password ||
       authenticationProfile.search ||
@@ -965,16 +1111,43 @@ function inspectDastConfiguration(dast: GuardianConfig["dast"]): DoctorCheck {
   } catch {
     problems.push("authenticationProfile must be an opaque control-plane:// reference");
   }
-  if (origin) {
+  const openapiSource =
+    dast.openapiSource ??
+    (openapi.startsWith("/") || /^https:/i.test(openapi)
+      ? "live-endpoint"
+      : "repository-file");
+  if (openapiSource === "repository-file") {
+    if (
+      openapi.startsWith("/") ||
+      openapi.split("/").includes("..") ||
+      !/\.(?:json|ya?ml)$/i.test(openapi)
+    ) {
+      problems.push("repository OpenAPI must be a JSON or YAML repository-relative path");
+    }
+  } else if (origin) {
     try {
-      const openapi = new URL(dast.openapi, origin);
-      if (openapi.protocol !== "https:") problems.push("OpenAPI must resolve to HTTPS");
-      if (invalidRemoteHost(openapi.hostname)) problems.push("OpenAPI targets a local or link-local host");
-      if (openapi.origin !== origin.origin) {
+      const openapiUrl = new URL(openapi, origin);
+      if (openapiUrl.protocol !== "https:") problems.push("OpenAPI must resolve to HTTPS");
+      if (invalidRemoteHost(openapiUrl.hostname)) problems.push("OpenAPI targets a local or link-local host");
+      if (openapiUrl.origin !== origin.origin) {
         problems.push("OpenAPI must resolve to the configured exact origin");
       }
     } catch {
       problems.push("openapi must be a valid path or HTTPS URL");
+    }
+  }
+  if (dast.profiles) {
+    const profiles = new Set([
+      "baseline",
+      "authenticated-baseline",
+      "full",
+      "authenticated-full"
+    ]);
+    if (!profiles.has(dast.profiles.deploySmoke)) {
+      problems.push("deploy-smoke DAST profile is invalid");
+    }
+    if (!profiles.has(dast.profiles.nightly)) {
+      problems.push("nightly DAST profile is invalid");
     }
   }
   for (const route of dast.excludedRoutes ?? []) {
@@ -1449,6 +1622,7 @@ async function doctorInternal(
   );
 
   let parsedConfig: GuardianConfig | undefined;
+  let diagnosticDast: GuardianConfig["dast"] | undefined;
   if (!configFile) {
     checks.push(
       makeCheck("configuration", "configuration", false, "not configured", {
@@ -1470,6 +1644,17 @@ async function doctorInternal(
       checks.push(
         makeCheck("configuration", "configuration", false, errorMessage(error))
       );
+      try {
+        const document = parseGuardianConfigDocument(configFile.content);
+        if (isObject(document) && isObject(document.dast)) {
+          // A malformed configuration is never used for review or enforcement.
+          // The raw DAST section is retained only to provide targeted doctor
+          // diagnostics that help the operator repair it.
+          diagnosticDast = document.dast as unknown as NonNullable<GuardianConfig["dast"]>;
+        }
+      } catch {
+        diagnosticDast = undefined;
+      }
     }
   }
 
@@ -1559,6 +1744,8 @@ async function doctorInternal(
       )
     );
     checks.push(inspectDastConfiguration(parsedConfig.dast));
+  } else if (diagnosticDast) {
+    checks.push(inspectDastConfiguration(diagnosticDast));
   }
 
   let reportOnlyConfiguredSince: Date | undefined;
