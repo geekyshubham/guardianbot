@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-27
+
+### Fixed
+
+- Suppression validation now uses `yq`'s condition-aware `all_c` operator.
+  The prior jq-style `all(condition)` expression was rejected by the pinned
+  `yq` release before Semgrep or Trivy could start.
+
 ### Documentation
 
 - Recorded the live signed-digest `v0.2.8` DigitalOcean App Platform

@@ -109,6 +109,14 @@ test("scanner config parsing preserves the private evidence directory contract",
       /docker run --rm --user "\$\(id -u\):\$\(id -g\)" -v "\$PWD:\/work:ro" /
     );
   }
+  assert.match(
+    workflow,
+    /\(\.scanners\.suppressions \/\/ \[\]\) \|\s+all_c\(/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /\(\.scanners\.suppressions \/\/ \[\]\) \|\s+all\(/
+  );
   assert.match(workflow, /id: rule_pack/);
   assert.match(
     workflow,

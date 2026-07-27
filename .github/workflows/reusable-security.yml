@@ -98,7 +98,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '
               (.scanners.suppressions // []) |
-              all(
+              all_c(
                 (.fingerprint | type == "!!str") and
                 (.owner | type == "!!str") and
                 (.reason | type == "!!str") and
