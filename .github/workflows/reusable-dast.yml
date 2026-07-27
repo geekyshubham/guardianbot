@@ -11,7 +11,7 @@ on:
       minutes: { required: false, type: number, default: 45 }
     secrets:
       session_cookie:
-        required: false
+        required: true
 
 permissions:
   contents: read
@@ -19,6 +19,15 @@ permissions:
 jobs:
   zap:
     name: authenticated staging DAST
+    # Repository secrets must never be released to pull-request-controlled
+    # workflow definitions. The fixed environment also lets operators apply
+    # protected-branch and reviewer rules in the consumer repository.
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'push' ||
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    environment: guardianbot-dast
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     permissions:
@@ -42,6 +51,10 @@ jobs:
 
           const target = new URL(process.env.TARGET_ORIGIN);
           const expected = new URL(process.env.EXPECTED_ORIGIN);
+          const minutes = Number(${{ inputs.minutes }});
+          if (!Number.isInteger(minutes) || minutes < 5 || minutes > 45) {
+            throw new Error("DAST minutes must be an integer between 5 and 45");
+          }
           if (target.href !== expected.href) {
             throw new Error("target-origin must match expected-origin exactly");
           }
@@ -82,21 +95,49 @@ jobs:
       - name: Require authenticated session assertion
         env:
           GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
+          TARGET_ORIGIN: ${{ inputs.target-origin }}
+          SESSION_ASSERTION_PATH: ${{ inputs.session-assertion-path }}
         shell: bash
         run: |
           [ -n "$GUARDIANBOT_SESSION_COOKIE" ] || {
             echo "Authenticated DAST requires session_cookie."
             exit 1
           }
-          curl --fail --silent --show-error \
+          unauthenticated_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              "${TARGET_ORIGIN}${SESSION_ASSERTION_PATH}"
+          )"
+          case "$unauthenticated_status" in
+            401|403) ;;
+            *)
+              echo "Session assertion endpoint must reject an unauthenticated request with 401 or 403."
+              exit 1
+              ;;
+          esac
+          authenticated_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             -H "Cookie: $GUARDIANBOT_SESSION_COOKIE" \
-            "${{ inputs.target-origin }}${{ inputs.session-assertion-path }}" >/dev/null
+              "${TARGET_ORIGIN}${SESSION_ASSERTION_PATH}"
+          )"
+          case "$authenticated_status" in
+            2??) ;;
+            *)
+              echo "Authenticated session assertion failed."
+              exit 1
+              ;;
+          esac
 
       - name: Run ZAP API scan
         env:
           GUARDIANBOT_SESSION_COOKIE: ${{ secrets.session_cookie }}
+          RESOLVED_OPENAPI_URL: ${{ steps.contract.outputs.resolved-openapi }}
+          TARGET_ORIGIN: ${{ inputs.target-origin }}
+          SCAN_MINUTES: ${{ inputs.minutes }}
         run: |
           mkdir -p guardianbot-dast-evidence
+          options_file="${RUNNER_TEMP}/guardianbot-zap-options"
+          install -m 600 /dev/null "$options_file"
+          trap 'rm -f "$options_file"' EXIT
           python3 - <<'PY'
           import os
           import shlex
@@ -108,15 +149,37 @@ jobs:
             "-config", "replacer.full_list(0).regex=false",
             "-config", f"replacer.full_list(0).replacement={os.environ['GUARDIANBOT_SESSION_COOKIE']}",
           ]
-          with open("guardianbot-dast-evidence/zap-options.txt", "w", encoding="utf-8") as handle:
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "guardianbot-zap-options"), "w", encoding="utf-8") as handle:
             handle.write(" ".join(shlex.quote(option) for option in options))
           PY
+          set +e
           docker run --rm -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
             ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 zap-api-scan.py \
-            -t "${{ steps.contract.outputs.resolved-openapi }}" -f openapi \
-            -O "${{ inputs.target-origin }}" \
-            -J zap.json -r zap.html -m "${{ inputs.minutes }}" \
-            -z "$(cat guardianbot-dast-evidence/zap-options.txt)"
+            -t "$RESOLVED_OPENAPI_URL" -f openapi \
+            -O "$TARGET_ORIGIN" \
+            -J zap.json -r zap.html -m "$SCAN_MINUTES" \
+            -z "$(cat "$options_file")"
+          zap_exit="$?"
+          set -e
+          printf '{"zapExitCode":%s}\n' "$zap_exit" > guardianbot-dast-evidence/scan-status.json
+          GUARDIANBOT_ZAP_EXIT="$zap_exit" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          secret = os.environ["GUARDIANBOT_SESSION_COOKIE"]
+          for path in Path("guardianbot-dast-evidence").glob("*"):
+              if not path.is_file():
+                  continue
+              raw = path.read_bytes()
+              if secret.encode() in raw:
+                  path.write_bytes(raw.replace(secret.encode(), b"[REDACTED_SESSION]"))
+          PY
+          # ZAP uses 1/2 for policy findings and warnings. Those remain
+          # report-only evidence; 3+ indicates an operational scan failure.
+          if [ "$zap_exit" -ge 3 ]; then
+            echo "ZAP failed operationally with exit code ${zap_exit}."
+            exit "$zap_exit"
+          fi
 
       - name: Upload DAST evidence
         if: always()

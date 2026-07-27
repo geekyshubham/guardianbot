@@ -152,7 +152,13 @@ jobs:
 
   promote-image:
     name: image push, sign, attest
-    if: inputs.push
+    # Never trust the caller's boolean by itself. A pull request can edit its
+    # caller workflow, so promotion must also be tied to the repository's real
+    # default-branch push event.
+    if: >-
+      inputs.push &&
+      github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: validate-image
     runs-on: ubuntu-24.04
     permissions:

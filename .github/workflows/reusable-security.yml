@@ -36,20 +36,81 @@ jobs:
 
       - name: Validate GuardianBot configuration
         id: config
+        env:
+          INPUT_CONFIG_PATH: ${{ inputs.config-path }}
+          INPUT_BASELINE_PATH: ${{ inputs.baseline-path }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         shell: bash
         run: |
           mkdir -p guardianbot-evidence
-          test -f "${{ inputs.config-path }}"
+          config_path="$INPUT_CONFIG_PATH"
+          baseline_path="$INPUT_BASELINE_PATH"
+          for candidate in "$config_path" "$baseline_path"; do
+            case "$candidate" in
+              ""|/*|*..*)
+                echo "GuardianBot paths must be non-empty repository-relative paths without '..'."
+                exit 1
+                ;;
+            esac
+            [[ "$candidate" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+              echo "GuardianBot paths contain unsupported characters."
+              exit 1
+            }
+          done
+          test -f "$config_path"
+
+          # A pull request must not be able to weaken its own gate by changing
+          # scanner mode, suppressions, or baseline fingerprints. Once a
+          # repository is onboarded, those controls come from the immutable
+          # base commit. The first onboarding PR may use its head config, but
+          # only in non-enforcing mode.
+          effective_config="$config_path"
+          effective_baseline="$baseline_path"
+          config_source="head"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_sha="$PULL_REQUEST_BASE_SHA"
+            if git cat-file -e "${base_sha}:${config_path}" 2>/dev/null; then
+              git show "${base_sha}:${config_path}" > guardianbot-evidence/effective-config.yml
+              effective_config="guardianbot-evidence/effective-config.yml"
+              config_source="base"
+            fi
+            if git cat-file -e "${base_sha}:${baseline_path}" 2>/dev/null; then
+              git show "${base_sha}:${baseline_path}" > guardianbot-evidence/effective-baseline.json
+              effective_baseline="guardianbot-evidence/effective-baseline.json"
+            else
+              effective_baseline="guardianbot-evidence/missing-baseline.json"
+            fi
+          fi
+
           docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '.schemaVersion == "1.0.0" and (.workflowVersion | test("^[a-f0-9]{40}$"))' \
-            "/work/${{ inputs.config-path }}" | grep -qx true
+            "/work/${effective_config}" | grep -qx true
           mode="$(docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
-            '.scanners.mode' "/work/${{ inputs.config-path }}")"
+            '.scanners.mode' "/work/${effective_config}")"
           case "$mode" in advisory|report-only|enforce) ;; *) exit 1 ;; esac
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] &&
+             [ "$config_source" = "head" ] &&
+             [ "$mode" = "enforce" ]; then
+            echo "The first onboarding pull request cannot enable enforcement."
+            exit 1
+          fi
           docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
-            -o=json '.scanners.suppressions // [] | map(.fingerprint)' \
-            "/work/${{ inputs.config-path }}" > guardianbot-evidence/suppressions.json
+            '
+              (.scanners.suppressions // []) |
+              all(
+                (.fingerprint | type == "!!str") and
+                (.owner | type == "!!str") and
+                (.reason | type == "!!str") and
+                (.ticket | type == "!!str") and
+                ((.expiresAt | type) == "!!timestamp" or (.expiresAt | type) == "!!str")
+              )
+            ' "/work/${effective_config}" | grep -qx true
+          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+            -o=json '.scanners.suppressions // []' \
+            "/work/${effective_config}" > guardianbot-evidence/suppressions.json
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "baseline-path=$effective_baseline" >> "$GITHUB_OUTPUT"
+          echo "config-source=$config_source" >> "$GITHUB_OUTPUT"
 
       - name: Semgrep
         shell: bash
@@ -70,7 +131,7 @@ jobs:
         id: gate
         env:
           SCANNER_MODE: ${{ steps.config.outputs.mode }}
-          BASELINE_PATH: ${{ inputs.baseline-path }}
+          BASELINE_PATH: ${{ steps.config.outputs.baseline-path }}
         shell: bash
         run: |
           node <<'NODE'
@@ -158,9 +219,38 @@ jobs:
           if (semgrep.scanner_error) executionFailures.push("Semgrep failed or evidence is missing");
           if (trivy.scanner_error) executionFailures.push("Trivy failed or evidence is missing");
 
-          const suppressions = new Set(
-            JSON.parse(fs.readFileSync("guardianbot-evidence/suppressions.json", "utf8")).map(String)
+          const suppressionRecords = JSON.parse(
+            fs.readFileSync("guardianbot-evidence/suppressions.json", "utf8")
           );
+          if (!Array.isArray(suppressionRecords)) {
+            throw new Error("suppressions must be an array");
+          }
+          const now = Date.now();
+          const expiredSuppressions = [];
+          const invalidSuppressions = [];
+          const suppressions = new Set();
+          for (const suppression of suppressionRecords) {
+            const expiresAt = Date.parse(String(suppression?.expiresAt || ""));
+            if (
+              !suppression ||
+              typeof suppression.fingerprint !== "string" ||
+              !suppression.fingerprint ||
+              !Number.isFinite(expiresAt)
+            ) {
+              invalidSuppressions.push(String(suppression?.fingerprint || "unknown"));
+              continue;
+            }
+            if (expiresAt <= now) {
+              expiredSuppressions.push(suppression.fingerprint);
+              continue;
+            }
+            suppressions.add(suppression.fingerprint);
+          }
+          if (invalidSuppressions.length) {
+            executionFailures.push(
+              `Invalid suppression records: ${invalidSuppressions.join(", ")}`
+            );
+          }
 
           let baselineFingerprints = new Set();
           if (process.env.SCANNER_MODE === "enforce") {
@@ -211,7 +301,9 @@ jobs:
             baselineCount: baselineFingerprints.size,
             passed: failures.length === 0,
             failures,
-            policyFindings
+            policyFindings,
+            activeSuppressions: suppressions.size,
+            expiredSuppressions
           }, null, 2));
 
           const summaryLines = [
@@ -219,8 +311,18 @@ jobs:
             "",
             `Mode: **${process.env.SCANNER_MODE}**`,
             "",
-            `Baseline fingerprints: **${baselineFingerprints.size}**`
+            `Baseline fingerprints: **${baselineFingerprints.size}**`,
+            "",
+            `Active suppressions: **${suppressions.size}**`
           ];
+          if (expiredSuppressions.length) {
+            summaryLines.push(
+              "",
+              ...expiredSuppressions.map((fingerprint) =>
+                `- ⚠️ Suppression expired: \`${fingerprint}\``
+              )
+            );
+          }
           if (executionFailures.length) {
             summaryLines.push("", ...executionFailures.map((item) => `- ❌ ${item}`));
           }
