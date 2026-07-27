@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, type PoolConfig } from "pg";
 
 export type RepositoryLifecycleState = "active" | "suspended" | "removed";
 export type WebhookJobStatus = "pending" | "leased" | "succeeded" | "dead-letter";
@@ -62,6 +62,52 @@ export interface Store {
     deadLetter: boolean
   ): Promise<void>;
   getWebhook(deliveryId: string): Promise<WebhookJob | undefined>;
+}
+
+export function postgresPoolConfig(
+  connectionString: string,
+  caCertificate?: string
+): PoolConfig {
+  const base: PoolConfig = {
+    connectionString,
+    max: 10,
+    application_name: "guardianbot-control-plane"
+  };
+  if (!caCertificate?.trim()) return base;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(connectionString);
+  } catch {
+    throw new Error("DATABASE_URL must be a valid PostgreSQL connection URL");
+  }
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    throw new Error("DATABASE_URL must use the postgres or postgresql scheme");
+  }
+
+  // pg-connection-string gives TLS query parameters precedence over an
+  // explicit Pool `ssl` object. Remove those parameters so the managed
+  // database CA below cannot be weakened by `sslmode=require` or
+  // `sslmode=no-verify` in a provider-generated URL.
+  for (const parameter of [
+    "sslmode",
+    "sslrootcert",
+    "sslcert",
+    "sslkey",
+    "sslnegotiation",
+    "uselibpqcompat"
+  ]) {
+    parsed.searchParams.delete(parameter);
+  }
+
+  return {
+    ...base,
+    connectionString: parsed.toString(),
+    ssl: {
+      ca: caCertificate.replace(/\\n/g, "\n").trim(),
+      rejectUnauthorized: true
+    }
+  };
 }
 
 function iso(value: Date): string {
@@ -217,8 +263,8 @@ export class MemoryStore implements Store {
 export class PostgresStore implements Store {
   private readonly pool: Pool;
 
-  constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString, max: 10, application_name: "guardianbot-control-plane" });
+  constructor(connectionString: string, caCertificate?: string) {
+    this.pool = new Pool(postgresPoolConfig(connectionString, caCertificate));
   }
 
   async ping(): Promise<void> {

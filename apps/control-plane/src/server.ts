@@ -17,7 +17,10 @@ function allowMemoryStore(): boolean {
 
 async function createStore(): Promise<Store> {
   if (process.env.DATABASE_URL) {
-    const postgres = new PostgresStore(process.env.DATABASE_URL);
+    const postgres = new PostgresStore(
+      process.env.DATABASE_URL,
+      process.env.GUARDIANBOT_DATABASE_CA_CERT
+    );
     await postgres.migrate();
     return postgres;
   }
