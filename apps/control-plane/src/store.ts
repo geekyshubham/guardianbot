@@ -1,9 +1,17 @@
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { PersistedVectorRow, RepositoryIndex } from "@guardianbot/core";
+import type {
+  MonitoringStatus,
+  RepositoryInventoryState
+} from "@guardianbot/monitoring";
 
 export type RepositoryLifecycleState = "active" | "suspended" | "removed";
 export type WebhookJobStatus = "pending" | "leased" | "succeeded" | "dead-letter";
 export type RepositoryIndexStorageMode = "memory" | "pgvector" | "json-array-fallback";
+
+// Fixed two-int32 namespace/key pair for the database-wide monitoring scheduler lock.
+const MONITORING_LOCK_NAMESPACE = 1_196_572_738;
+const MONITORING_LOCK_KEY = 1_297_046_866;
 
 export interface RepositoryRecord {
   installationId: number;
@@ -30,6 +38,11 @@ export interface ReviewState {
 export type ScannerWorkflowValidationStatus = "pending" | "accepted" | "rejected" | "failed";
 export type ScannerArtifactValidationStatus = "accepted" | "rejected" | "failed";
 export type ScannerEvidenceStatus = "success" | "failure";
+export type ScannerWorkflowEvent =
+  | "pull_request"
+  | "push"
+  | "schedule"
+  | "workflow_dispatch";
 
 export interface ScannerReferencedWorkflow {
   path: string;
@@ -43,6 +56,9 @@ export interface ScannerWorkflowRunRecord {
   runAttempt: number;
   headSha: string;
   headBranch?: string;
+  event?: ScannerWorkflowEvent;
+  startedAt?: string;
+  completedAt?: string;
   workflowPath: string;
   workflowRef?: string;
   workflowSha?: string;
@@ -74,6 +90,7 @@ export interface ScannerEvidenceRecord {
   runId: number;
   runAttempt: number;
   artifactId: number;
+  artifactType?: string;
   evidenceKey: string;
   kind: string;
   source: string;
@@ -86,6 +103,47 @@ export interface ScannerEvidenceRecord {
   path?: string;
   line?: number;
   payload?: Record<string, unknown>;
+}
+
+export interface MonitoringRepositoryInventory {
+  repository: RepositoryRecord;
+  index?: RepositoryIndex;
+  latestScannerRuns: ScannerWorkflowRunRecord[];
+  latestScannerEvidence: ScannerEvidenceRecord[];
+}
+
+export interface PersistedMonitoringCheck {
+  key: string;
+  status: MonitoringStatus;
+  summary: string;
+  observedAt?: string;
+  ageMs?: number;
+}
+
+export interface MonitoringSnapshotRecord {
+  repositoryId: number;
+  snapshotKey: string;
+  observedAt: string;
+  inventoryState: RepositoryInventoryState;
+  overallStatus: MonitoringStatus;
+  checks: PersistedMonitoringCheck[];
+}
+
+export interface MonitoringAlertInput {
+  alertKey: string;
+  severity: "warning" | "failing";
+  summary: string;
+}
+
+export interface MonitoringAlertRecord extends MonitoringAlertInput {
+  repositoryId: number;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  resolvedAt?: string;
+}
+
+export interface StoreLock {
+  release(): Promise<void>;
 }
 
 export interface WebhookJob {
@@ -148,6 +206,17 @@ export interface Store {
   ): Promise<ScannerWorkflowRunRecord | undefined>;
   upsertScannerArtifact(record: ScannerArtifactRecord): Promise<void>;
   upsertScannerEvidence(record: ScannerEvidenceRecord): Promise<void>;
+  listMonitoringRepositoryInventory(): Promise<MonitoringRepositoryInventory[]>;
+  saveMonitoringSnapshot(
+    snapshot: MonitoringSnapshotRecord,
+    activeAlerts: readonly MonitoringAlertInput[]
+  ): Promise<void>;
+  getLatestMonitoringSnapshot(
+    repositoryId: number
+  ): Promise<MonitoringSnapshotRecord | undefined>;
+  listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]>;
+  resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
+  acquireMonitoringLock(): Promise<StoreLock | undefined>;
 }
 
 export function postgresPoolConfig(
@@ -214,6 +283,9 @@ export class MemoryStore implements Store {
   private scannerRuns = new Map<string, ScannerWorkflowRunRecord>();
   private scannerArtifacts = new Map<string, ScannerArtifactRecord>();
   private scannerEvidence = new Map<string, ScannerEvidenceRecord>();
+  private monitoringSnapshots = new Map<string, MonitoringSnapshotRecord>();
+  private monitoringAlerts = new Map<string, MonitoringAlertRecord>();
+  private monitoringLockHeld = false;
 
   async ping(): Promise<void> {}
   async close(): Promise<void> {}
@@ -439,6 +511,213 @@ export class MemoryStore implements Store {
       }
     );
   }
+
+  async listMonitoringRepositoryInventory(): Promise<MonitoringRepositoryInventory[]> {
+    return [...this.repositories.values()]
+      .filter((repository) => repository.repositoryState === "active")
+      .sort((left, right) => left.repositoryId - right.repositoryId)
+      .map((repository) => {
+        const latestRunsByEvent = new Map<string, ScannerWorkflowRunRecord>();
+        for (const run of [...this.scannerRuns.values()]
+          .filter(
+            (run) =>
+              run.repositoryId === repository.repositoryId &&
+              run.headBranch === repository.defaultBranch
+          )
+          .sort(compareScannerRunsNewestFirst)) {
+          const event = run.event ?? "unknown";
+          if (!latestRunsByEvent.has(event)) {
+            latestRunsByEvent.set(event, cloneScannerWorkflowRun(run));
+          }
+        }
+        const evidenceByKey = new Map<string, ScannerEvidenceRecord>();
+        for (const evidence of [...this.scannerEvidence.values()]
+          .filter(
+            (item) =>
+              item.repositoryId === repository.repositoryId &&
+              item.fingerprint === undefined
+          )
+          .sort(compareScannerEvidenceNewestFirst)) {
+          const run = this.scannerRuns.get(
+            scannerRunKey(evidence.repositoryId, evidence.runId, evidence.runAttempt)
+          );
+          const artifact = this.scannerArtifacts.get(
+            scannerArtifactKey(
+              evidence.repositoryId,
+              evidence.runId,
+              evidence.runAttempt,
+              evidence.artifactId
+            )
+          );
+          const enriched = {
+            ...evidence,
+            artifactType: artifact?.artifactType ?? evidence.artifactType
+          };
+          const key = `${run?.event ?? "unknown"}:${enriched.artifactType ?? "unknown"}:${evidence.evidenceKey}`;
+          if (!evidenceByKey.has(key)) {
+            evidenceByKey.set(key, cloneScannerEvidence(enriched));
+          }
+        }
+        const index = [...this.repositoryIndexes.values()].find(
+          (entry) =>
+            entry.repositoryId === repository.repositoryId &&
+            entry.index.commitSha === repository.indexSha
+        )?.index;
+        return {
+          repository: { ...repository },
+          index: index ? structuredClone(index) : undefined,
+          latestScannerRuns: [...latestRunsByEvent.values()],
+          latestScannerEvidence: [...evidenceByKey.values()]
+        };
+      });
+  }
+
+  async saveMonitoringSnapshot(
+    snapshot: MonitoringSnapshotRecord,
+    activeAlerts: readonly MonitoringAlertInput[]
+  ): Promise<void> {
+    this.monitoringSnapshots.set(
+      monitoringSnapshotKey(snapshot.repositoryId, snapshot.snapshotKey),
+      cloneMonitoringSnapshot(snapshot)
+    );
+    const activeKeys = new Set(activeAlerts.map((alert) => alert.alertKey));
+    for (const [key, alert] of this.monitoringAlerts) {
+      if (
+        alert.repositoryId === snapshot.repositoryId &&
+        !alert.resolvedAt &&
+        !activeKeys.has(alert.alertKey)
+      ) {
+        this.monitoringAlerts.set(key, {
+          ...alert,
+          lastObservedAt: snapshot.observedAt,
+          resolvedAt: snapshot.observedAt
+        });
+      }
+    }
+    for (const alert of activeAlerts) {
+      const key = monitoringAlertKey(snapshot.repositoryId, alert.alertKey);
+      const existing = this.monitoringAlerts.get(key);
+      this.monitoringAlerts.set(key, {
+        repositoryId: snapshot.repositoryId,
+        ...alert,
+        firstObservedAt:
+          !existing || existing.resolvedAt ? snapshot.observedAt : existing.firstObservedAt,
+        lastObservedAt: snapshot.observedAt
+      });
+    }
+  }
+
+  async getLatestMonitoringSnapshot(
+    repositoryId: number
+  ): Promise<MonitoringSnapshotRecord | undefined> {
+    const snapshot = [...this.monitoringSnapshots.values()]
+      .filter((item) => item.repositoryId === repositoryId)
+      .sort(
+        (left, right) =>
+          Date.parse(right.observedAt) - Date.parse(left.observedAt) ||
+          right.snapshotKey.localeCompare(left.snapshotKey)
+      )[0];
+    return snapshot ? cloneMonitoringSnapshot(snapshot) : undefined;
+  }
+
+  async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
+    return [...this.monitoringAlerts.values()]
+      .filter(
+        (alert) =>
+          !alert.resolvedAt &&
+          (repositoryId === undefined || alert.repositoryId === repositoryId)
+      )
+      .sort(
+        (left, right) =>
+          left.repositoryId - right.repositoryId ||
+          left.alertKey.localeCompare(right.alertKey)
+      )
+      .map((alert) => ({ ...alert }));
+  }
+
+  async resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void> {
+    const timestamp = observedAt.toISOString();
+    for (const [key, alert] of this.monitoringAlerts) {
+      const repository = this.repositories.get(alert.repositoryId);
+      if (alert.resolvedAt || repository?.repositoryState === "active") continue;
+      this.monitoringAlerts.set(key, {
+        ...alert,
+        lastObservedAt: timestamp,
+        resolvedAt: timestamp
+      });
+    }
+  }
+
+  async acquireMonitoringLock(): Promise<StoreLock | undefined> {
+    if (this.monitoringLockHeld) return undefined;
+    this.monitoringLockHeld = true;
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        this.monitoringLockHeld = false;
+      }
+    };
+  }
+}
+
+function timestamp(value?: string): number {
+  if (!value) return -1;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? -1 : parsed;
+}
+
+function compareScannerRunsNewestFirst(
+  left: ScannerWorkflowRunRecord,
+  right: ScannerWorkflowRunRecord
+): number {
+  return (
+    timestamp(right.completedAt ?? right.startedAt ?? right.processedAt) -
+      timestamp(left.completedAt ?? left.startedAt ?? left.processedAt) ||
+    right.runId - left.runId ||
+    right.runAttempt - left.runAttempt
+  );
+}
+
+function compareScannerEvidenceNewestFirst(
+  left: ScannerEvidenceRecord,
+  right: ScannerEvidenceRecord
+): number {
+  return (
+    timestamp(right.observedAt) - timestamp(left.observedAt) ||
+    right.runId - left.runId ||
+    right.runAttempt - left.runAttempt
+  );
+}
+
+function cloneScannerWorkflowRun(record: ScannerWorkflowRunRecord): ScannerWorkflowRunRecord {
+  return {
+    ...record,
+    referencedWorkflows: record.referencedWorkflows.map((workflow) => ({ ...workflow }))
+  };
+}
+
+function cloneScannerEvidence(record: ScannerEvidenceRecord): ScannerEvidenceRecord {
+  return {
+    ...record,
+    payload: record.payload ? structuredClone(record.payload) : undefined
+  };
+}
+
+function cloneMonitoringSnapshot(record: MonitoringSnapshotRecord): MonitoringSnapshotRecord {
+  return {
+    ...record,
+    checks: record.checks.map((check) => ({ ...check }))
+  };
+}
+
+function monitoringSnapshotKey(repositoryId: number, snapshotKey: string): string {
+  return `${repositoryId}:${snapshotKey}`;
+}
+
+function monitoringAlertKey(repositoryId: number, alertKey: string): string {
+  return `${repositoryId}:${alertKey}`;
 }
 
 function scannerRunKey(repositoryId: number, runId: number, runAttempt: number): string {
@@ -576,6 +855,9 @@ export class PostgresStore implements Store {
         run_attempt INTEGER NOT NULL,
         head_sha TEXT NOT NULL,
         head_branch TEXT,
+        event TEXT,
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
         workflow_path TEXT NOT NULL,
         workflow_ref TEXT,
         workflow_sha TEXT,
@@ -588,6 +870,12 @@ export class PostgresStore implements Store {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (repository_id, run_id, run_attempt)
       );
+      ALTER TABLE scanner_workflow_runs ADD COLUMN IF NOT EXISTS event TEXT;
+      ALTER TABLE scanner_workflow_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+      ALTER TABLE scanner_workflow_runs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+      CREATE INDEX IF NOT EXISTS scanner_workflow_runs_monitoring_idx
+        ON scanner_workflow_runs
+          (repository_id, head_branch, event, completed_at DESC, started_at DESC);
 
       CREATE TABLE IF NOT EXISTS scanner_artifacts (
         repository_id BIGINT NOT NULL,
@@ -634,6 +922,38 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS scanner_evidence_kind_idx
         ON scanner_evidence (repository_id, kind, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS scanner_evidence_monitoring_idx
+        ON scanner_evidence (repository_id, evidence_key, observed_at DESC)
+        WHERE fingerprint IS NULL;
+
+      CREATE TABLE IF NOT EXISTS monitoring_snapshots (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        snapshot_key TEXT NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        inventory_state TEXT NOT NULL,
+        overall_status TEXT NOT NULL,
+        checks JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, snapshot_key)
+      );
+      CREATE INDEX IF NOT EXISTS monitoring_snapshots_latest_idx
+        ON monitoring_snapshots (repository_id, observed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS monitoring_alerts (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        alert_key TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        active BOOLEAN NOT NULL DEFAULT true,
+        first_observed_at TIMESTAMPTZ NOT NULL,
+        last_observed_at TIMESTAMPTZ NOT NULL,
+        resolved_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, alert_key)
+      );
+      CREATE INDEX IF NOT EXISTS monitoring_alerts_active_idx
+        ON monitoring_alerts (active, severity, last_observed_at DESC);
     `);
     if (this.repositoryIndexStorageMode === "pgvector") {
       await this.pool.query(
@@ -937,13 +1257,16 @@ export class PostgresStore implements Store {
   async upsertScannerWorkflowRun(record: ScannerWorkflowRunRecord) {
     await this.pool.query(
       `INSERT INTO scanner_workflow_runs
-       (repository_id, run_id, run_attempt, head_sha, head_branch, workflow_path, workflow_ref,
-        workflow_sha, conclusion, status, validation_status, validation_error, referenced_workflows,
-        processed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       (repository_id, run_id, run_attempt, head_sha, head_branch, event, started_at, completed_at,
+        workflow_path, workflow_ref, workflow_sha, conclusion, status, validation_status,
+        validation_error, referenced_workflows, processed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        ON CONFLICT (repository_id, run_id, run_attempt) DO UPDATE SET
          head_sha=excluded.head_sha,
          head_branch=excluded.head_branch,
+         event=excluded.event,
+         started_at=excluded.started_at,
+         completed_at=excluded.completed_at,
          workflow_path=excluded.workflow_path,
          workflow_ref=excluded.workflow_ref,
          workflow_sha=excluded.workflow_sha,
@@ -960,6 +1283,9 @@ export class PostgresStore implements Store {
         record.runAttempt,
         record.headSha,
         record.headBranch ?? null,
+        record.event ?? null,
+        record.startedAt ?? null,
+        record.completedAt ?? null,
         record.workflowPath,
         record.workflowRef ?? null,
         record.workflowSha ?? null,
@@ -980,26 +1306,7 @@ export class PostgresStore implements Store {
        WHERE repository_id=$1 AND run_id=$2 AND run_attempt=$3`,
       [repositoryId, runId, runAttempt]
     );
-    const row = result.rows[0];
-    if (!row) return undefined;
-    return {
-      repositoryId: Number(row.repository_id),
-      runId: Number(row.run_id),
-      runAttempt: Number(row.run_attempt),
-      headSha: row.head_sha,
-      headBranch: row.head_branch ?? undefined,
-      workflowPath: row.workflow_path,
-      workflowRef: row.workflow_ref ?? undefined,
-      workflowSha: row.workflow_sha ?? undefined,
-      conclusion: row.conclusion,
-      status: row.status,
-      validationStatus: row.validation_status,
-      validationError: row.validation_error ?? undefined,
-      referencedWorkflows: Array.isArray(row.referenced_workflows)
-        ? row.referenced_workflows
-        : [],
-      processedAt: fromUnknownDate(row.processed_at)
-    } as ScannerWorkflowRunRecord;
+    return result.rows[0] ? this.toScannerWorkflowRun(result.rows[0]) : undefined;
   }
 
   async upsertScannerArtifact(record: ScannerArtifactRecord) {
@@ -1075,6 +1382,359 @@ export class PostgresStore implements Store {
     );
   }
 
+  async listMonitoringRepositoryInventory(): Promise<MonitoringRepositoryInventory[]> {
+    const [repositoriesResult, indexesResult, runsResult, evidenceResult] = await Promise.all([
+      this.pool.query(
+        `SELECT *
+         FROM repositories
+         WHERE repository_state='active'
+         ORDER BY repository_id ASC`
+      ),
+      this.pool.query(
+        `SELECT indexes.repository_id, indexes.index_document
+         FROM repository_indexes AS indexes
+         JOIN repositories AS repositories
+           ON repositories.repository_id=indexes.repository_id
+          AND repositories.repository_state='active'
+          AND repositories.index_sha=indexes.commit_sha`
+      ),
+      this.pool.query(
+        `SELECT DISTINCT ON (runs.repository_id, runs.event)
+           runs.*
+         FROM scanner_workflow_runs AS runs
+         JOIN repositories AS repositories
+           ON repositories.repository_id=runs.repository_id
+          AND repositories.repository_state='active'
+          AND runs.head_branch=repositories.default_branch
+         ORDER BY runs.repository_id,
+                  runs.event,
+                  COALESCE(
+                    runs.completed_at,
+                    runs.started_at,
+                    runs.processed_at,
+                    runs.updated_at
+                  ) DESC,
+                  runs.run_id DESC,
+                  runs.run_attempt DESC`
+      ),
+      this.pool.query(
+        `SELECT DISTINCT ON (
+           evidence.repository_id,
+           evidence.evidence_key,
+           runs.event,
+           artifacts.artifact_type
+         )
+           evidence.*,
+           artifacts.artifact_type AS monitoring_artifact_type
+         FROM scanner_evidence AS evidence
+         JOIN scanner_workflow_runs AS runs
+           ON runs.repository_id=evidence.repository_id
+          AND runs.run_id=evidence.run_id
+          AND runs.run_attempt=evidence.run_attempt
+         JOIN scanner_artifacts AS artifacts
+           ON artifacts.repository_id=evidence.repository_id
+          AND artifacts.run_id=evidence.run_id
+          AND artifacts.run_attempt=evidence.run_attempt
+          AND artifacts.artifact_id=evidence.artifact_id
+         JOIN repositories AS repositories
+          ON repositories.repository_id=evidence.repository_id
+          AND repositories.repository_state='active'
+         WHERE evidence.fingerprint IS NULL
+         ORDER BY evidence.repository_id,
+                  evidence.evidence_key,
+                  runs.event,
+                  artifacts.artifact_type,
+                  evidence.observed_at DESC,
+                  evidence.updated_at DESC,
+                  evidence.run_id DESC,
+                  evidence.run_attempt DESC`
+      )
+    ]);
+    const indexByRepository = new Map<number, RepositoryIndex>();
+    for (const row of indexesResult.rows) {
+      indexByRepository.set(
+        Number(row.repository_id),
+        structuredClone(row.index_document as RepositoryIndex)
+      );
+    }
+    const runsByRepository = new Map<number, ScannerWorkflowRunRecord[]>();
+    for (const row of runsResult.rows) {
+      const run = this.toScannerWorkflowRun(row);
+      const records = runsByRepository.get(run.repositoryId) ?? [];
+      records.push(run);
+      runsByRepository.set(run.repositoryId, records);
+    }
+    const evidenceByRepository = new Map<number, ScannerEvidenceRecord[]>();
+    for (const row of evidenceResult.rows) {
+      const evidence = this.toScannerEvidence(row);
+      const records = evidenceByRepository.get(evidence.repositoryId) ?? [];
+      records.push(evidence);
+      evidenceByRepository.set(evidence.repositoryId, records);
+    }
+    return repositoriesResult.rows.map((row) => {
+      const repository = this.toRepositoryRecord(row);
+      return {
+        repository,
+        index: indexByRepository.get(repository.repositoryId),
+        latestScannerRuns:
+          runsByRepository.get(repository.repositoryId)?.map(cloneScannerWorkflowRun) ?? [],
+        latestScannerEvidence:
+          evidenceByRepository.get(repository.repositoryId)?.map(cloneScannerEvidence) ?? []
+      };
+    });
+  }
+
+  async saveMonitoringSnapshot(
+    snapshot: MonitoringSnapshotRecord,
+    activeAlerts: readonly MonitoringAlertInput[]
+  ): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO monitoring_snapshots
+           (repository_id, snapshot_key, observed_at, inventory_state, overall_status, checks)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (repository_id, snapshot_key) DO UPDATE SET
+           observed_at=excluded.observed_at,
+           inventory_state=excluded.inventory_state,
+           overall_status=excluded.overall_status,
+           checks=excluded.checks,
+           updated_at=now()`,
+        [
+          snapshot.repositoryId,
+          snapshot.snapshotKey,
+          snapshot.observedAt,
+          snapshot.inventoryState,
+          snapshot.overallStatus,
+          JSON.stringify(snapshot.checks)
+        ]
+      );
+      for (const alert of activeAlerts) {
+        await client.query(
+          `INSERT INTO monitoring_alerts
+             (repository_id, alert_key, severity, summary, active,
+              first_observed_at, last_observed_at, resolved_at)
+           VALUES ($1,$2,$3,$4,true,$5,$5,NULL)
+           ON CONFLICT (repository_id, alert_key) DO UPDATE SET
+             severity=excluded.severity,
+             summary=excluded.summary,
+             active=true,
+             first_observed_at=CASE
+               WHEN monitoring_alerts.active THEN monitoring_alerts.first_observed_at
+               ELSE excluded.first_observed_at
+             END,
+             last_observed_at=excluded.last_observed_at,
+             resolved_at=NULL,
+             updated_at=now()`,
+          [
+            snapshot.repositoryId,
+            alert.alertKey,
+            alert.severity,
+            alert.summary,
+            snapshot.observedAt
+          ]
+        );
+      }
+      await client.query(
+        `UPDATE monitoring_alerts
+         SET active=false,
+             last_observed_at=$2,
+             resolved_at=$2,
+             updated_at=now()
+         WHERE repository_id=$1
+           AND active=true
+           AND NOT (alert_key = ANY($3::text[]))`,
+        [snapshot.repositoryId, snapshot.observedAt, activeAlerts.map((alert) => alert.alertKey)]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getLatestMonitoringSnapshot(
+    repositoryId: number
+  ): Promise<MonitoringSnapshotRecord | undefined> {
+    const result = await this.pool.query(
+      `SELECT *
+       FROM monitoring_snapshots
+       WHERE repository_id=$1
+       ORDER BY observed_at DESC, snapshot_key DESC
+       LIMIT 1`,
+      [repositoryId]
+    );
+    return result.rows[0] ? this.toMonitoringSnapshot(result.rows[0]) : undefined;
+  }
+
+  async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
+    const result =
+      repositoryId === undefined
+        ? await this.pool.query(
+            `SELECT *
+             FROM monitoring_alerts
+             WHERE active=true
+             ORDER BY repository_id ASC, alert_key ASC`
+          )
+        : await this.pool.query(
+            `SELECT *
+             FROM monitoring_alerts
+             WHERE active=true AND repository_id=$1
+             ORDER BY alert_key ASC`,
+            [repositoryId]
+          );
+    return result.rows.map((row) => this.toMonitoringAlert(row));
+  }
+
+  async resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void> {
+    await this.pool.query(
+      `UPDATE monitoring_alerts AS alerts
+       SET active=false,
+           last_observed_at=$1,
+           resolved_at=$1,
+           updated_at=now()
+       WHERE alerts.active=true
+         AND NOT EXISTS (
+           SELECT 1
+           FROM repositories
+           WHERE repositories.repository_id=alerts.repository_id
+             AND repositories.repository_state='active'
+         )`,
+      [observedAt]
+    );
+  }
+
+  async acquireMonitoringLock(): Promise<StoreLock | undefined> {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_lock($1, $2) AS acquired",
+        [MONITORING_LOCK_NAMESPACE, MONITORING_LOCK_KEY]
+      );
+      if (!result.rows[0]?.acquired) {
+        client.release();
+        return undefined;
+      }
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          const result = await client.query<{ released: boolean }>(
+            "SELECT pg_advisory_unlock($1, $2) AS released",
+            [MONITORING_LOCK_NAMESPACE, MONITORING_LOCK_KEY]
+          );
+          if (!result.rows[0]?.released) {
+            throw new Error("PostgreSQL monitoring advisory lock was not held");
+          }
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+    };
+  }
+
+  private toRepositoryRecord(row: Record<string, any>): RepositoryRecord {
+    return {
+      repositoryId: Number(row.repository_id),
+      installationId: Number(row.installation_id),
+      fullName: String(row.full_name),
+      visibility: String(row.visibility),
+      defaultBranch: String(row.default_branch),
+      indexSha: row.index_sha ?? undefined,
+      indexUpdatedAt: fromUnknownDate(row.index_updated_at),
+      scannerState: row.scanner_state,
+      repositoryState: row.repository_state,
+      automaticReviewPaused: Boolean(row.automatic_review_paused)
+    } as RepositoryRecord;
+  }
+
+  private toScannerWorkflowRun(row: Record<string, any>): ScannerWorkflowRunRecord {
+    return {
+      repositoryId: Number(row.repository_id),
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      headSha: String(row.head_sha),
+      headBranch: row.head_branch ?? undefined,
+      event: row.event ?? undefined,
+      startedAt: fromUnknownDate(row.started_at),
+      completedAt: fromUnknownDate(row.completed_at),
+      workflowPath: String(row.workflow_path),
+      workflowRef: row.workflow_ref ?? undefined,
+      workflowSha: row.workflow_sha ?? undefined,
+      conclusion: String(row.conclusion),
+      status: String(row.status),
+      validationStatus: row.validation_status,
+      validationError: row.validation_error ?? undefined,
+      referencedWorkflows: Array.isArray(row.referenced_workflows)
+        ? row.referenced_workflows
+        : [],
+      processedAt: fromUnknownDate(row.processed_at)
+    } as ScannerWorkflowRunRecord;
+  }
+
+  private toScannerEvidence(row: Record<string, any>): ScannerEvidenceRecord {
+    return {
+      repositoryId: Number(row.repository_id),
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      artifactId: Number(row.artifact_id),
+      artifactType: row.monitoring_artifact_type ?? undefined,
+      evidenceKey: String(row.evidence_key),
+      kind: String(row.kind),
+      source: String(row.source),
+      status: row.status,
+      observedAt: fromUnknownDate(row.observed_at) ?? String(row.observed_at),
+      digest: row.digest ?? undefined,
+      environment: row.environment ?? undefined,
+      details: row.details ?? undefined,
+      fingerprint: row.fingerprint ?? undefined,
+      path: row.path ?? undefined,
+      line: row.line === null || row.line === undefined ? undefined : Number(row.line),
+      payload:
+        row.payload && typeof row.payload === "object"
+          ? structuredClone(row.payload as Record<string, unknown>)
+          : undefined
+    } as ScannerEvidenceRecord;
+  }
+
+  private toMonitoringSnapshot(row: Record<string, any>): MonitoringSnapshotRecord {
+    const checks = Array.isArray(row.checks) ? row.checks : [];
+    return {
+      repositoryId: Number(row.repository_id),
+      snapshotKey: String(row.snapshot_key),
+      observedAt: fromUnknownDate(row.observed_at) ?? String(row.observed_at),
+      inventoryState: row.inventory_state,
+      overallStatus: row.overall_status,
+      checks: checks.map((check) => ({ ...check })) as PersistedMonitoringCheck[]
+    };
+  }
+
+  private toMonitoringAlert(row: Record<string, any>): MonitoringAlertRecord {
+    return {
+      repositoryId: Number(row.repository_id),
+      alertKey: String(row.alert_key),
+      severity: row.severity,
+      summary: String(row.summary),
+      firstObservedAt:
+        fromUnknownDate(row.first_observed_at) ?? String(row.first_observed_at),
+      lastObservedAt:
+        fromUnknownDate(row.last_observed_at) ?? String(row.last_observed_at),
+      resolvedAt: fromUnknownDate(row.resolved_at)
+    };
+  }
+
   private toWebhookJob(row: Record<string, any>): WebhookJob {
     return {
       deliveryId: row.delivery_id,
@@ -1111,67 +1771,85 @@ export class PostgresStore implements Store {
     repositoryId: number,
     vectors: readonly PersistedVectorRow[]
   ): Promise<void> {
-    if (!vectors.length) return;
-    const values: unknown[] = [];
-    const rows: string[] = [];
-    const usePgvector = this.repositoryIndexStorageMode === "pgvector";
-    for (const vector of vectors) {
-      values.push(
-        vector.storageKey,
-        repositoryId,
-        vector.repositoryScope,
-        vector.commitSha,
-        vector.visibility,
-        vector.providerId,
-        vector.dimensions,
-        vector.recordType,
-        vector.recordId,
-        vector.path ?? null,
-        JSON.stringify(vector.vector)
-      );
-      const base = values.length - 10;
-      const vectorLiteralPosition = base + 11;
-      if (usePgvector) {
-        values.push(vectorLiteral(vector.vector));
-        rows.push(
-          `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10},$${base + 11},$${vectorLiteralPosition}::vector)`
-        );
-      } else {
-        rows.push(`($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10},$${base + 11})`);
-      }
-    }
-    const query = usePgvector
-      ? `INSERT INTO repository_index_vectors
-         (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,
-          record_type, record_id, path, vector_json, vector_pgvector)
-         VALUES ${rows.join(",")}
-         ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
-           repository_id=excluded.repository_id,
-           repository_scope=excluded.repository_scope,
-           commit_sha=excluded.commit_sha,
-           visibility=excluded.visibility,
-           provider_id=excluded.provider_id,
-           dimensions=excluded.dimensions,
-           path=excluded.path,
-           vector_json=excluded.vector_json,
-           vector_pgvector=excluded.vector_pgvector,
-           updated_at=now()`
-      : `INSERT INTO repository_index_vectors
-         (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,
-          record_type, record_id, path, vector_json)
-         VALUES ${rows.join(",")}
-         ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
-           repository_id=excluded.repository_id,
-           repository_scope=excluded.repository_scope,
-           commit_sha=excluded.commit_sha,
-           visibility=excluded.visibility,
-           provider_id=excluded.provider_id,
-           dimensions=excluded.dimensions,
-           path=excluded.path,
-           vector_json=excluded.vector_json,
-           updated_at=now()`;
-    await client.query(query, values);
+    const statement = buildRepositoryIndexVectorBatchStatement(
+      repositoryId,
+      vectors,
+      this.repositoryIndexStorageMode === "pgvector"
+    );
+    if (!statement) return;
+    await client.query(statement.text, statement.values);
   }
+}
+
+export interface RepositoryIndexVectorBatchStatement {
+  text: string;
+  values: unknown[];
+}
+
+export function buildRepositoryIndexVectorBatchStatement(
+  repositoryId: number,
+  vectors: readonly PersistedVectorRow[],
+  usePgvector: boolean
+): RepositoryIndexVectorBatchStatement | undefined {
+  if (!vectors.length) return undefined;
+  const values: unknown[] = [];
+  const rows: string[] = [];
+  for (const vector of vectors) {
+    const firstPosition = values.length + 1;
+    values.push(
+      vector.storageKey,
+      repositoryId,
+      vector.repositoryScope,
+      vector.commitSha,
+      vector.visibility,
+      vector.providerId,
+      vector.dimensions,
+      vector.recordType,
+      vector.recordId,
+      vector.path ?? null,
+      JSON.stringify(vector.vector)
+    );
+    const placeholders = Array.from(
+      { length: 11 },
+      (_, offset) => `$${firstPosition + offset}`
+    );
+    if (usePgvector) {
+      values.push(vectorLiteral(vector.vector));
+      placeholders.push(`$${firstPosition + 11}::vector`);
+    }
+    rows.push(`(${placeholders.join(",")})`);
+  }
+  const text = usePgvector
+    ? `INSERT INTO repository_index_vectors
+       (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,
+        record_type, record_id, path, vector_json, vector_pgvector)
+       VALUES ${rows.join(",")}
+       ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         repository_scope=excluded.repository_scope,
+         commit_sha=excluded.commit_sha,
+         visibility=excluded.visibility,
+         provider_id=excluded.provider_id,
+         dimensions=excluded.dimensions,
+         path=excluded.path,
+         vector_json=excluded.vector_json,
+         vector_pgvector=excluded.vector_pgvector,
+         updated_at=now()`
+    : `INSERT INTO repository_index_vectors
+       (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,
+        record_type, record_id, path, vector_json)
+       VALUES ${rows.join(",")}
+       ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         repository_scope=excluded.repository_scope,
+         commit_sha=excluded.commit_sha,
+         visibility=excluded.visibility,
+         provider_id=excluded.provider_id,
+         dimensions=excluded.dimensions,
+         path=excluded.path,
+         vector_json=excluded.vector_json,
+         updated_at=now()`;
+  return { text, values };
 }
 
 function vectorLiteral(vector: readonly number[]): string {

@@ -6,12 +6,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "test": "npm run build --workspace @guardianbot/defectdojo && tsx --test test/**/*.test.ts",
+    "test": "npm run build --workspace @guardianbot/defectdojo && npm run build --workspace @guardianbot/monitoring && tsx --test test/**/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@guardianbot/core": "0.1.1",
     "@guardianbot/defectdojo": "0.1.1",
+    "@guardianbot/monitoring": "0.1.1",
     "@guardianbot/protocol": "0.1.1",
     "pg": "^8.13.1"
   },
