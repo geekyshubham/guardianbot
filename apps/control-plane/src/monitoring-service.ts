@@ -4,12 +4,14 @@ import {
   type GuardianConfig
 } from "@guardianbot/core";
 import {
+  buildWeeklyCoverageReport,
   evaluateRepositoryMonitoring,
   type EvidenceKind,
   type EvidenceRequirement,
   type MonitoringCheckResult,
   type MonitoringClock,
   type ObservedWorkflowRun,
+  type RepositoryWeeklyMetrics,
   type RepositoryMonitoringSnapshot,
   systemClock,
   worstMonitoringStatus
@@ -18,6 +20,7 @@ import type {
   MonitoringAlertInput,
   MonitoringRepositoryInventory,
   MonitoringSnapshotRecord,
+  MonitoringWeeklyReportRecord,
   PersistedMonitoringCheck,
   ScannerWorkflowRunRecord,
   Store
@@ -51,6 +54,9 @@ const SIGNATURE_EVIDENCE_KEY = "signature";
 const ZAP_EVIDENCE_KEY = "zap-summary";
 const ZAP_IMPORT_EVIDENCE_KEY = "defectdojo-import:ZAP Scan";
 const SUPPRESSION_NOTIFY_BEFORE_MS = 7 * 24 * 60 * 60_000;
+const BASELINE_FINGERPRINT = /^[a-f0-9]{64}$/;
+const BASELINE_PATH = ".guardianbot/baseline.json";
+const WEEK_MS = 7 * 24 * 60 * 60_000;
 const MONITORED_EVIDENCE_KEYS = new Set([
   SEMGREP_EVIDENCE_KEY,
   TRIVY_EVIDENCE_KEY,
@@ -349,6 +355,7 @@ export class MonitoringService {
       let failingRepositories = 0;
       let warningRepositories = 0;
       let activeAlerts = 0;
+      const weeklyRepositories: RepositoryWeeklyMetrics[] = [];
       for (const item of inventory) {
         const snapshot = evaluateInventoryItem(
           item,
@@ -371,6 +378,11 @@ export class MonitoringService {
         const alerts = activeAlertsFor(snapshot.checks);
         activeAlerts += alerts.length;
         await this.store.saveMonitoringSnapshot(persisted, alerts);
+        weeklyRepositories.push(toWeeklyRepositoryMetrics(item, snapshot));
+      }
+      const weeklyReport = toMonitoringWeeklyReport(weeklyRepositories, observedAt);
+      if (weeklyReport) {
+        await this.store.saveMonitoringWeeklyReport(weeklyReport);
       }
       result = {
         acquired: true,
@@ -453,12 +465,9 @@ function evaluateInventoryItem(
   const supplementaryChecks: MonitoringCheckResult[] = [configuration.check];
   let baselineReady: boolean | undefined;
   if (config?.scanners.mode === "enforce") {
-    baselineReady = false;
-    supplementaryChecks.push({
-      key: "baseline-readiness",
-      status: "failing",
-      summary: "Enforcement baseline readiness is not persisted for this immutable config"
-    });
+    const baseline = readIndexedBaseline(item);
+    baselineReady = baseline.ready;
+    supplementaryChecks.push(baseline.check);
   }
   if (config?.image) {
     const imageSummary = relevantEvidence.find(
@@ -555,6 +564,69 @@ function evaluateInventoryItem(
     ...base,
     checks,
     overallStatus: worstMonitoringStatus(checks.map((check) => check.status))
+  };
+}
+
+function readIndexedBaseline(item: MonitoringRepositoryInventory): {
+  ready: boolean;
+  check: MonitoringCheckResult;
+} {
+  if (
+    !item.index ||
+    !item.repository.indexSha ||
+    item.index.commitSha !== item.repository.indexSha
+  ) {
+    return invalidBaseline("Enforcement baseline is not available in the current index");
+  }
+  const baselineSymbol = item.index.symbols.find(
+    (symbol) => symbol.path === BASELINE_PATH
+  );
+  if (!baselineSymbol) {
+    return invalidBaseline("Current repository index does not contain an enforcement baseline");
+  }
+  try {
+    const parsed: unknown = JSON.parse(baselineSymbol.content);
+    const fingerprints = Array.isArray(parsed)
+      ? parsed
+      : parsed &&
+          typeof parsed === "object" &&
+          Array.isArray((parsed as { fingerprints?: unknown }).fingerprints)
+        ? (parsed as { fingerprints: unknown[] }).fingerprints
+        : undefined;
+    if (
+      !fingerprints?.length ||
+      !fingerprints.every(
+        (fingerprint): fingerprint is string =>
+          typeof fingerprint === "string" && BASELINE_FINGERPRINT.test(fingerprint)
+      ) ||
+      new Set(fingerprints).size !== fingerprints.length
+    ) {
+      return invalidBaseline("Indexed enforcement baseline is invalid");
+    }
+    return {
+      ready: true,
+      check: {
+        key: "baseline-readiness",
+        status: "passing",
+        summary: "Immutable enforcement baseline is valid in the current index"
+      }
+    };
+  } catch {
+    return invalidBaseline("Indexed enforcement baseline is invalid");
+  }
+}
+
+function invalidBaseline(summary: string): {
+  ready: false;
+  check: MonitoringCheckResult;
+} {
+  return {
+    ready: false,
+    check: {
+      key: "baseline-readiness",
+      status: "failing",
+      summary
+    }
   };
 }
 
@@ -756,6 +828,90 @@ function imageDigestFromEvidence(
       : undefined;
   const digest = evidence?.digest ?? payloadDigest;
   return digest && /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : undefined;
+}
+
+function toWeeklyRepositoryMetrics(
+  item: MonitoringRepositoryInventory,
+  snapshot: RepositoryMonitoringSnapshot
+): RepositoryWeeklyMetrics {
+  const checks = new Map(snapshot.checks.map((check) => [check.key, check]));
+  const expectedRun = checks.get("scanner-run");
+  const indexStatus = checks.get("index-freshness")?.status;
+
+  return {
+    repository: item.repository.fullName,
+    visibility: item.repository.visibility === "public" ? "public" : "private",
+    inventoryState: snapshot.inventoryState,
+    review: {
+      prsReviewed: 0,
+      advisoryFindingsOpened: 0,
+      advisoryFindingsAccepted: 0,
+      advisoryFindingsDismissed: 0,
+      advisoryFindingsResolved: 0,
+      deterministicBlockersOpened: 0,
+      bridgeFailures: 0,
+      partialReviews: 0
+    },
+    scanner: {
+      expectedRuns: expectedRun ? 1 : 0,
+      successfulRuns: expectedRun?.status === "passing" ? 1 : 0,
+      evidenceCompleteRuns:
+        expectedRun?.status === "passing" &&
+        Boolean(snapshot.evidence?.checks.length) &&
+        snapshot.evidence?.status === "passing"
+          ? 1
+          : 0,
+      missingEvidenceAlerts: snapshot.evidence?.missingCount ?? 0
+    },
+    monitoring: {
+      freshIndexes:
+        indexStatus === "passing" || indexStatus === "warning" ? 1 : 0,
+      staleIndexes: indexStatus === "failing" ? 1 : 0,
+      expiredSuppressions: snapshot.suppressions?.expired.length ?? 0,
+      expiringSuppressions: snapshot.suppressions?.expiringSoon.length ?? 0,
+      protectedDigests: 0,
+      completeEvidenceDigests: 0,
+      missingEvidenceDigests: 0
+    }
+  };
+}
+
+function toMonitoringWeeklyReport(
+  repositories: RepositoryWeeklyMetrics[],
+  observedAt: Date
+): MonitoringWeeklyReportRecord | undefined {
+  const periodStart = startOfUtcWeek(observedAt);
+  if (observedAt.getTime() <= periodStart.getTime()) return undefined;
+  const periodEnd = new Date(
+    Math.min(periodStart.getTime() + WEEK_MS, observedAt.getTime())
+  );
+  const report = buildWeeklyCoverageReport({
+    periodStart: periodStart.toISOString(),
+    periodEnd: periodEnd.toISOString(),
+    repositories
+  });
+  return {
+    weekKey: `v1:${periodStart.toISOString().slice(0, 10)}`,
+    periodStart: report.periodStart,
+    periodEnd: report.periodEnd,
+    generatedAt: observedAt.toISOString(),
+    report,
+    sourceCompleteness: {
+      review: "unavailable",
+      scanner: "latest-reconciliation",
+      monitoring: "latest-reconciliation",
+      imageProtection: "unavailable"
+    }
+  };
+}
+
+function startOfUtcWeek(value: Date): Date {
+  const start = new Date(
+    Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate())
+  );
+  const daysSinceMonday = (start.getUTCDay() + 6) % 7;
+  start.setUTCDate(start.getUTCDate() - daysSinceMonday);
+  return start;
 }
 
 function toPersistedSnapshot(

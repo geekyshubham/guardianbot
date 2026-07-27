@@ -100,7 +100,8 @@ async function seedConfiguredRepository(store: MemoryStore): Promise<void> {
 
 async function seedImmutableConfigIndex(
   store: MemoryStore,
-  overrides: Partial<GuardianConfig["scanners"]> = {}
+  overrides: Partial<GuardianConfig["scanners"]> = {},
+  baselineContent?: string
 ): Promise<void> {
   const config: GuardianConfig = {
     schemaVersion: "1.0.0",
@@ -128,15 +129,19 @@ async function seedImmutableConfigIndex(
     image: null,
     dast: null
   };
+  const files: Record<string, string> = {
+    ".guardianbot/config.yml": JSON.stringify(config)
+  };
+  if (baselineContent !== undefined) {
+    files[".guardianbot/baseline.json"] = baselineContent;
+  }
   const index = await indexRepositorySyntaxAware({
     repository: "acme/service",
     repositoryId: 20,
     repositoryScope: "github:20",
     visibility: "private",
     commitSha: "a".repeat(40),
-    files: {
-      ".guardianbot/config.yml": JSON.stringify(config)
-    }
+    files
   });
   await store.replaceRepositoryIndex(
     20,
@@ -269,6 +274,22 @@ test("reconciliation persists sanitized snapshots and idempotent alerts from sto
   assert.match(metrics, /guardianbot_monitoring_active_alerts 0/);
   assert.equal(metrics.includes("acme/service"), false);
   assert.equal(metrics.includes("secret"), false);
+
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(weekly?.generatedAt, new Date(nowMs).toISOString());
+  assert.equal(weekly?.periodStart, "2026-07-27T00:00:00.000Z");
+  assert.equal(weekly?.periodEnd, new Date(nowMs).toISOString());
+  assert.equal(weekly?.report.totalRepositories, 1);
+  assert.equal(weekly?.report.scanner.expectedRuns, 1);
+  assert.equal(weekly?.report.scanner.successfulRuns, 1);
+  assert.equal(weekly?.report.scanner.evidenceCompleteRuns, 1);
+  assert.equal(weekly?.report.review.prsReviewed, 0);
+  assert.deepEqual(weekly?.sourceCompleteness, {
+    review: "unavailable",
+    scanner: "latest-reconciliation",
+    monitoring: "latest-reconciliation",
+    imageProtection: "unavailable"
+  });
 });
 
 test("the Store lock skips a competing reconciliation and releases cleanly", async () => {
@@ -375,6 +396,70 @@ test("enforcement never assumes an unpersisted baseline is ready", async () => {
   const store = new MemoryStore();
   await store.upsertRepository(repository({ scannerState: "enforced" }));
   await seedImmutableConfigIndex(store, { mode: "enforce" });
+  await store.upsertScannerWorkflowRun(scannerRun());
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.inventoryState, "misconfigured");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "baseline-readiness")?.status,
+    "failing"
+  );
+});
+
+test("enforcement accepts a valid non-empty baseline from the exact immutable index", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository({ scannerState: "enforced" }));
+  await seedImmutableConfigIndex(
+    store,
+    { mode: "enforce" },
+    JSON.stringify({ fingerprints: ["c".repeat(64)] })
+  );
+  await store.upsertScannerWorkflowRun(scannerRun());
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.inventoryState, "enforced");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "baseline-readiness")?.status,
+    "passing"
+  );
+});
+
+test("enforcement rejects an invalid baseline from the exact immutable index", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository({ scannerState: "enforced" }));
+  await seedImmutableConfigIndex(
+    store,
+    { mode: "enforce" },
+    JSON.stringify({ fingerprints: ["not-a-fingerprint"] })
+  );
   await store.upsertScannerWorkflowRun(scannerRun());
   for (const record of [
     evidence("semgrep-summary", "semgrep"),

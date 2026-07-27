@@ -2,7 +2,8 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { PersistedVectorRow, RepositoryIndex } from "@guardianbot/core";
 import type {
   MonitoringStatus,
-  RepositoryInventoryState
+  RepositoryInventoryState,
+  WeeklyCoverageReport
 } from "@guardianbot/monitoring";
 
 export type RepositoryLifecycleState = "active" | "suspended" | "removed";
@@ -142,6 +143,20 @@ export interface MonitoringAlertRecord extends MonitoringAlertInput {
   resolvedAt?: string;
 }
 
+export interface MonitoringWeeklyReportRecord {
+  weekKey: string;
+  periodStart: string;
+  periodEnd: string;
+  generatedAt: string;
+  report: WeeklyCoverageReport;
+  sourceCompleteness: {
+    review: "unavailable";
+    scanner: "latest-reconciliation";
+    monitoring: "latest-reconciliation";
+    imageProtection: "unavailable";
+  };
+}
+
 export interface StoreLock {
   release(): Promise<void>;
 }
@@ -214,6 +229,10 @@ export interface Store {
   getLatestMonitoringSnapshot(
     repositoryId: number
   ): Promise<MonitoringSnapshotRecord | undefined>;
+  saveMonitoringWeeklyReport(report: MonitoringWeeklyReportRecord): Promise<void>;
+  getMonitoringWeeklyReport(
+    weekKey: string
+  ): Promise<MonitoringWeeklyReportRecord | undefined>;
   listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]>;
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
@@ -285,6 +304,7 @@ export class MemoryStore implements Store {
   private scannerEvidence = new Map<string, ScannerEvidenceRecord>();
   private monitoringSnapshots = new Map<string, MonitoringSnapshotRecord>();
   private monitoringAlerts = new Map<string, MonitoringAlertRecord>();
+  private monitoringWeeklyReports = new Map<string, MonitoringWeeklyReportRecord>();
   private monitoringLockHeld = false;
 
   async ping(): Promise<void> {}
@@ -620,6 +640,17 @@ export class MemoryStore implements Store {
     return snapshot ? cloneMonitoringSnapshot(snapshot) : undefined;
   }
 
+  async saveMonitoringWeeklyReport(report: MonitoringWeeklyReportRecord): Promise<void> {
+    this.monitoringWeeklyReports.set(report.weekKey, cloneMonitoringWeeklyReport(report));
+  }
+
+  async getMonitoringWeeklyReport(
+    weekKey: string
+  ): Promise<MonitoringWeeklyReportRecord | undefined> {
+    const report = this.monitoringWeeklyReports.get(weekKey);
+    return report ? cloneMonitoringWeeklyReport(report) : undefined;
+  }
+
   async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
     return [...this.monitoringAlerts.values()]
       .filter(
@@ -710,6 +741,12 @@ function cloneMonitoringSnapshot(record: MonitoringSnapshotRecord): MonitoringSn
     ...record,
     checks: record.checks.map((check) => ({ ...check }))
   };
+}
+
+function cloneMonitoringWeeklyReport(
+  record: MonitoringWeeklyReportRecord
+): MonitoringWeeklyReportRecord {
+  return structuredClone(record);
 }
 
 function monitoringSnapshotKey(repositoryId: number, snapshotKey: string): string {
@@ -954,6 +991,19 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS monitoring_alerts_active_idx
         ON monitoring_alerts (active, severity, last_observed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS monitoring_weekly_reports (
+        week_key TEXT PRIMARY KEY,
+        period_start TIMESTAMPTZ NOT NULL,
+        period_end TIMESTAMPTZ NOT NULL,
+        generated_at TIMESTAMPTZ NOT NULL,
+        report JSONB NOT NULL,
+        source_completeness JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS monitoring_weekly_reports_period_idx
+        ON monitoring_weekly_reports (period_start DESC);
     `);
     if (this.repositoryIndexStorageMode === "pgvector") {
       await this.pool.query(
@@ -1570,6 +1620,41 @@ export class PostgresStore implements Store {
     return result.rows[0] ? this.toMonitoringSnapshot(result.rows[0]) : undefined;
   }
 
+  async saveMonitoringWeeklyReport(report: MonitoringWeeklyReportRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO monitoring_weekly_reports
+         (week_key, period_start, period_end, generated_at, report, source_completeness)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (week_key) DO UPDATE SET
+         period_start=excluded.period_start,
+         period_end=excluded.period_end,
+         generated_at=excluded.generated_at,
+         report=excluded.report,
+         source_completeness=excluded.source_completeness,
+         updated_at=now()`,
+      [
+        report.weekKey,
+        report.periodStart,
+        report.periodEnd,
+        report.generatedAt,
+        JSON.stringify(report.report),
+        JSON.stringify(report.sourceCompleteness)
+      ]
+    );
+  }
+
+  async getMonitoringWeeklyReport(
+    weekKey: string
+  ): Promise<MonitoringWeeklyReportRecord | undefined> {
+    const result = await this.pool.query(
+      `SELECT *
+       FROM monitoring_weekly_reports
+       WHERE week_key=$1`,
+      [weekKey]
+    );
+    return result.rows[0] ? this.toMonitoringWeeklyReport(result.rows[0]) : undefined;
+  }
+
   async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
     const result =
       repositoryId === undefined
@@ -1718,6 +1803,23 @@ export class PostgresStore implements Store {
       inventoryState: row.inventory_state,
       overallStatus: row.overall_status,
       checks: checks.map((check) => ({ ...check })) as PersistedMonitoringCheck[]
+    };
+  }
+
+  private toMonitoringWeeklyReport(
+    row: Record<string, any>
+  ): MonitoringWeeklyReportRecord {
+    return {
+      weekKey: String(row.week_key),
+      periodStart:
+        fromUnknownDate(row.period_start) ?? String(row.period_start),
+      periodEnd: fromUnknownDate(row.period_end) ?? String(row.period_end),
+      generatedAt:
+        fromUnknownDate(row.generated_at) ?? String(row.generated_at),
+      report: structuredClone(row.report as WeeklyCoverageReport),
+      sourceCompleteness: structuredClone(
+        row.source_completeness as MonitoringWeeklyReportRecord["sourceCompleteness"]
+      )
     };
   }
 
