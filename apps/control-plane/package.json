@@ -1,6 +1,6 @@
 {
   "name": "@guardianbot/control-plane",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,10 +10,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@guardianbot/core": "0.2.4",
-    "@guardianbot/defectdojo": "0.2.4",
-    "@guardianbot/monitoring": "0.2.4",
-    "@guardianbot/protocol": "0.2.4",
+    "@guardianbot/core": "0.2.5",
+    "@guardianbot/defectdojo": "0.2.5",
+    "@guardianbot/monitoring": "0.2.5",
+    "@guardianbot/protocol": "0.2.5",
     "pg": "^8.13.1"
   },
   "devDependencies": {

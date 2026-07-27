@@ -27,6 +27,20 @@ function now(): number {
   return Date.now();
 }
 
+function referencedTimeout(timeoutMs: number): {
+  signal: AbortSignal;
+  clear: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException("Timed out", "TimeoutError"));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer)
+  };
+}
+
 function parseStructuredResponse(
   body: unknown,
   request: ReviewRequest,
@@ -162,47 +176,58 @@ export class OpenAIResponsesAdapter {
 
   async review(input: AdapterReviewRequest): Promise<AdapterReviewResult> {
     const startedAt = now();
-    let response: Response;
+    const timeout = referencedTimeout(input.route.timeoutMs);
     try {
-      response = await (this.context.fetchImpl ?? fetch)(
+      const response = await (this.context.fetchImpl ?? fetch)(
         new URL("/v1/responses", this.binding.baseUrl),
         {
           method: "POST",
           headers: this.headers(),
           body: JSON.stringify(this.buildRequestBody(input)),
-          signal: AbortSignal.timeout(input.route.timeoutMs)
+          signal: timeout.signal
         }
       );
+
+      if (response.status === 401 || response.status === 403) {
+        throw new BridgeError("unavailable", "authentication failed", 503, false);
+      }
+      if (response.status === 408 || response.status === 429 || response.status >= 500) {
+        throw new BridgeError("unavailable", `upstream status ${response.status}`, 503, true);
+      }
+      if (response.status === 413) {
+        throw new BridgeError("payload_too_large", "upstream request too large", 413, false);
+      }
+      if (!response.ok) {
+        throw new BridgeError("refusal", `upstream refusal ${response.status}`, 422, false);
+      }
+
+      const body = await readResponseJsonLimited(
+        response,
+        this.context.responseBodyBytes
+      );
+      const fixed = buildFixedResultFields(input.request, input.route);
+      const result = parseStructuredResponse(body, input.request, fixed);
+      result.backend = {
+        backendId: this.binding.alias,
+        modelId: this.binding.profileModels[input.route.profile],
+        latencyMs: Math.max(0, now() - startedAt),
+        ...(extractUsage(body) ?? {})
+      };
+      return { result };
     } catch (error) {
-      if (error instanceof DOMException && error.name === "TimeoutError") {
+      if (error instanceof BridgeError) {
+        throw error;
+      }
+      if (
+        timeout.signal.aborted ||
+        (error instanceof DOMException && error.name === "TimeoutError")
+      ) {
         throw new BridgeError("timeout", "request timed out", 503, true);
       }
       throw new BridgeError("unavailable", String(error), 503, true);
+    } finally {
+      timeout.clear();
     }
-
-    if (response.status === 401 || response.status === 403) {
-      throw new BridgeError("unavailable", "authentication failed", 503, false);
-    }
-    if (response.status === 408 || response.status === 429 || response.status >= 500) {
-      throw new BridgeError("unavailable", `upstream status ${response.status}`, 503, true);
-    }
-    if (response.status === 413) {
-      throw new BridgeError("payload_too_large", "upstream request too large", 413, false);
-    }
-    if (!response.ok) {
-      throw new BridgeError("refusal", `upstream refusal ${response.status}`, 422, false);
-    }
-
-    const body = await readResponseJsonLimited(response, this.context.responseBodyBytes);
-    const fixed = buildFixedResultFields(input.request, input.route);
-    const result = parseStructuredResponse(body, input.request, fixed);
-    result.backend = {
-      backendId: this.binding.alias,
-      modelId: this.binding.profileModels[input.route.profile],
-      latencyMs: Math.max(0, now() - startedAt),
-      ...(extractUsage(body) ?? {})
-    };
-    return { result };
   }
 }
 

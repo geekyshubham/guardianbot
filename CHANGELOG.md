@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-27
+
+### Fixed
+
+- Model-backend request deadlines now use a referenced abort timer covering both
+  response headers and body consumption, so a completely hung compatible
+  endpoint cannot outlive its fail-closed startup probe in a short-lived
+  process.
+
 ## [0.2.4] - 2026-07-27
 
 ### Fixed

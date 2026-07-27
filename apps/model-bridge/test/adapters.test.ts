@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { OpenAICompatibleAdapter } from "../src/adapters/openai-compatible.js";
 import { OpenAIResponsesAdapter } from "../src/adapters/openai-responses.js";
@@ -194,6 +195,11 @@ test("OpenAI-compatible probe honors startupProbeTimeoutMs", async () => {
     /strict structured-output probe/
   );
   assert.ok(Date.now() - startedAt < 1_000);
+  const adapterSource = await readFile(
+    new URL("../src/adapters/openai-responses.ts", import.meta.url),
+    "utf8"
+  );
+  assert.doesNotMatch(adapterSource, /AbortSignal\.timeout/);
 });
 
 test("strict model-output schema requires every object property and forbids extras", () => {
