@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { GuardianMetrics } from "./metrics.js";
+import { metricsRequestAuthorized } from "./http-security.js";
 import { GuardianService } from "./service.js";
 import { MemoryStore, PostgresStore, type Store } from "./store.js";
 
@@ -77,6 +78,16 @@ async function start() {
       return;
     }
     if (request.url === "/metrics") {
+      if (
+        !metricsRequestAuthorized(
+          request.headers.authorization,
+          process.env.GUARDIANBOT_METRICS_BEARER_TOKEN,
+          process.env.GUARDIANBOT_TRUST_PRIVATE_METRICS === "1"
+        )
+      ) {
+        response.writeHead(404).end();
+        return;
+      }
       response
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
         .end(metrics.render());

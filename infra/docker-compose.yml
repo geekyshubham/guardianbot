@@ -17,6 +17,7 @@ services:
         required: true
     environment:
       DATABASE_URL: postgresql://guardianbot:${POSTGRES_PASSWORD}@postgres:5432/guardianbot
+      GUARDIANBOT_TRUST_PRIVATE_METRICS: "1"
       PORT: 3000
     depends_on:
       postgres:
