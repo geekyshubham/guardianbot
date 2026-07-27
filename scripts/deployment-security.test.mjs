@@ -17,6 +17,9 @@ for (const script of scripts) {
       encoding: "utf8"
     });
     assert.equal(checked.status, 0, checked.stderr);
+    assert.match(source, /gh attestation verify/);
+    assert.match(source, /--cert-identity/);
+    assert.doesNotMatch(source, /--signer-workflow/);
   });
 }
 
@@ -30,6 +33,7 @@ test("droplet deployment requires canonical signed release assets", async () => 
   assert.match(source, /cosign verify-blob/);
   assert.match(source, /cosign verify-attestation/);
   assert.match(source, /gh attestation verify/);
+  assert.match(source, /CANONICAL_REPOSITORY="geekyshubham\/guardianbot"/);
   assert.match(source, /verify_stack "\$GUARDIANBOT_IMAGE"/);
   assert.doesNotMatch(source, /rm -rf/);
 });
@@ -40,6 +44,10 @@ test("App Platform deployment verifies the active immutable digest", async () =>
     "utf8"
   );
   assert.match(source, /release-evidence\.mjs verify-assets/);
+  assert.match(
+    source,
+    /\[\[ "\$release_repository" == "geekyshubham\/guardianbot" \]\]/
+  );
   assert.match(source, /\.name == "guardianbot-prod"/);
   assert.match(source, /--deployment "\$active_deployment"/);
   assert.match(source, /\.image\.digest == \$digest/);

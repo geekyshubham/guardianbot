@@ -57,7 +57,7 @@ expected_workflow_identity="$(
     "$release_repository" "$release_ref"
 )"
 
-[[ "$release_repository" == "Geekyshubham/guardianbot" ]] ||
+[[ "$release_repository" == "geekyshubham/guardianbot" ]] ||
   die "release repository is not Geekyshubham/guardianbot"
 [[ "$release_image" == "ghcr.io/geekyshubham/guardianbot" ]] ||
   die "release image is not the canonical GuardianBot image"
@@ -98,8 +98,6 @@ gh attestation verify "oci://${release_reference}" \
   --bundle-from-oci \
   --cert-identity "$workflow_identity" \
   --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --signer-workflow \
-    "github.com/${release_repository}/.github/workflows/release.yml" \
   --source-digest "$release_sha" \
   --source-ref "$release_ref" \
   --deny-self-hosted-runners \

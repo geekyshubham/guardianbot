@@ -470,7 +470,8 @@ test("stable tags are attached only after candidate trust evidence is verified",
   assert.ok(stable < release);
   assert.match(source, /--scanners vuln,misconfig,secret/);
   assert.match(source, /--image-config-scanners misconfig/);
-  assert.match(source, /--signer-workflow/);
+  assert.doesNotMatch(source, /--signer-workflow/);
+  assert.match(source, /--cert-identity "\$\{WORKFLOW_IDENTITY\}"/);
   assert.match(source, /--source-digest "\$\{RELEASE_SHA\}"/);
   assert.match(source, /--source-ref "\$\{RELEASE_REF\}"/);
   assert.match(source, /--deny-self-hosted-runners/);

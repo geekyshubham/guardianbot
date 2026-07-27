@@ -11,9 +11,8 @@ PREVIOUS_RELEASE_DIR="${STATE_DIR}/previous-release"
 CURRENT_IMAGE_FILE="${STATE_DIR}/current-image"
 PREVIOUS_IMAGE_FILE="${STATE_DIR}/previous-image"
 BACKUP_SCRIPT="${SCRIPT_DIR}/backup-postgres.sh"
-CANONICAL_REPOSITORY="Geekyshubham/guardianbot"
+CANONICAL_REPOSITORY="geekyshubham/guardianbot"
 CANONICAL_IMAGE="ghcr.io/geekyshubham/guardianbot"
-CANONICAL_WORKFLOW_PATH="github.com/${CANONICAL_REPOSITORY}/.github/workflows/release.yml"
 GITHUB_OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 usage() {
@@ -244,7 +243,6 @@ verify_release_directory() {
     --bundle-from-oci \
     --cert-identity "$workflow_identity" \
     --cert-oidc-issuer "$GITHUB_OIDC_ISSUER" \
-    --signer-workflow "$CANONICAL_WORKFLOW_PATH" \
     --source-digest "$release_sha" \
     --source-ref "$release_ref" \
     --deny-self-hosted-runners \

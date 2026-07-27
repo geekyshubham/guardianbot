@@ -24,10 +24,10 @@ requires Docker with Compose.
 Download a complete release to a new operator-controlled directory:
 
 ```sh
-mkdir guardianbot-release-v0.2.5
-gh release download v0.2.5 \
+mkdir guardianbot-release-v0.2.6
+gh release download v0.2.6 \
   --repo Geekyshubham/guardianbot \
-  --dir guardianbot-release-v0.2.5
+  --dir guardianbot-release-v0.2.6
 ```
 
 The deployment scripts verify:
@@ -46,7 +46,7 @@ For the existing `guardianbot-prod` app:
 ```sh
 ./scripts/deploy-digitalocean-app-platform.sh \
   11111111-2222-4333-8444-555555555555 \
-  guardianbot-release-v0.2.5
+  guardianbot-release-v0.2.6
 ```
 
 The script refuses an unexpected app name or image source, updates only the
@@ -90,7 +90,7 @@ Before a deployment:
 cd /opt/guardianbot
 ./scripts/backup-postgres.sh
 ./scripts/deploy-digitalocean.sh deploy \
-  /opt/guardianbot/releases/guardianbot-release-v0.2.5
+  /opt/guardianbot/releases/guardianbot-release-v0.2.6
 ./scripts/deploy-digitalocean.sh verify
 ```
 

@@ -100,7 +100,7 @@ sha256sum --check checksums.sha256
 cosign verify-blob release-manifest.json \
   --bundle release-manifest.sigstore.json \
   --certificate-identity \
-  "https://github.com/Geekyshubham/guardianbot/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  "https://github.com/geekyshubham/guardianbot/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 jq -er '.image.reference' release-manifest.json
 ```
@@ -111,21 +111,24 @@ Then verify the referenced image independently:
 image="$(jq -er '.image.reference' release-manifest.json)"
 source_sha="$(jq -er '.source.commit' release-manifest.json)"
 source_ref="$(jq -er '.source.ref' release-manifest.json)"
-identity="https://github.com/Geekyshubham/guardianbot/.github/workflows/release.yml@$source_ref"
+identity="https://github.com/geekyshubham/guardianbot/.github/workflows/release.yml@$source_ref"
 cosign verify "$image" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 gh attestation verify "oci://$image" \
-  --repo Geekyshubham/guardianbot \
+  --repo geekyshubham/guardianbot \
   --bundle-from-oci \
   --cert-identity "$identity" \
   --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --signer-workflow \
-  github.com/Geekyshubham/guardianbot/.github/workflows/release.yml \
   --source-digest "$source_sha" \
   --source-ref "$source_ref" \
   --deny-self-hosted-runners
 ```
+
+The exact certificate identity and signer-workflow selectors are mutually
+exclusive in GitHub CLI. GuardianBot uses the exact certificate identity,
+repository, OIDC issuer, source commit, source ref, and GitHub-hosted-runner
+constraints together.
 
 Deployment automation must pass the exact `name@sha256:...` value through to
 DigitalOcean and verify the running digest. A tag is discovery metadata only.

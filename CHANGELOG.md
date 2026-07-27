@@ -5,6 +5,16 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-27
+
+### Fixed
+
+- GitHub provenance verification now uses its exact certificate identity without
+  the mutually exclusive signer-workflow selector while retaining repository,
+  issuer, source commit, source ref, and hosted-runner enforcement.
+- DigitalOcean deployment verification now compares the canonical lowercase
+  GitHub repository identity emitted into signed release manifests.
+
 ## [0.2.5] - 2026-07-27
 
 ### Fixed

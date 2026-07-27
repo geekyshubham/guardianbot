@@ -172,8 +172,6 @@ jobs:
             --bundle-from-oci \
             --cert-identity "${WORKFLOW_IDENTITY}" \
             --cert-oidc-issuer "${OIDC_ISSUER}" \
-            --signer-workflow \
-              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
             --source-digest "${RELEASE_SHA}" \
             --source-ref "${RELEASE_REF}" \
             --deny-self-hosted-runners \
@@ -328,8 +326,6 @@ jobs:
             --bundle release-evidence/github-provenance.sigstore.json \
             --cert-identity "${WORKFLOW_IDENTITY}" \
             --cert-oidc-issuer "${OIDC_ISSUER}" \
-            --signer-workflow \
-              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
             --source-digest "${RELEASE_SHA}" \
             --source-ref "${RELEASE_REF}" \
             --deny-self-hosted-runners \
@@ -340,8 +336,6 @@ jobs:
             --bundle-from-oci \
             --cert-identity "${WORKFLOW_IDENTITY}" \
             --cert-oidc-issuer "${OIDC_ISSUER}" \
-            --signer-workflow \
-              "github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml" \
             --source-digest "${RELEASE_SHA}" \
             --source-ref "${RELEASE_REF}" \
             --deny-self-hosted-runners \
