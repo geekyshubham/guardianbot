@@ -34,7 +34,7 @@
     },
     "contextIndexSha": {
       "type": "string",
-      "minLength": 7
+      "pattern": "^[a-f0-9]{64}$"
     },
     "summary": {
       "type": "object",

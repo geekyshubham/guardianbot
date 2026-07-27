@@ -1,44 +1,89 @@
 import {
-  GitHubClient,
+  buildReviewBundle,
   detectRepository,
   parseGuardianConfig,
-  verifyWebhookSignature
+  scoreChangeRisk,
+  stableFingerprint,
+  verifyWebhookSignature,
+  type GitHubClient,
+  type GuardianConfig,
+  type ReviewBundleContextCandidate
 } from "@guardianbot/core";
 import {
   BackendError,
-  GuardianReviewClient,
   validateReviewResult,
   type BackendCapabilities,
+  type DataClassification,
+  type ReviewFinding,
+  type ReviewProfile,
   type ReviewRequest,
   type ReviewResult
 } from "@guardianbot/protocol";
-import { createHash } from "node:crypto";
 import { installationClient } from "./app-auth.js";
+import {
+  ReviewBackendRegistry,
+  type AdminBackendRegistryConfig
+} from "./backend-registry.js";
 import { GuardianMetrics } from "./metrics.js";
-import { onboardingIssue, renderPlaceholder, renderReview } from "./render.js";
-import type { RepositoryLifecycleState, ReviewState, Store } from "./store.js";
+import {
+  extractFindingMarker,
+  findingMarker,
+  onboardingIssue,
+  renderInlineFinding,
+  renderPlaceholder,
+  renderReview,
+  renderStaleReview,
+  renderUnavailable,
+  type FindingLifecycleSummary,
+  type ReviewFileGroup
+} from "./render.js";
+import type { ReviewState, Store } from "./store.js";
 
-interface ServiceOptions {
+export interface ServiceOptions {
   appId: string;
   privateKey: string;
   webhookSecret: string;
   modelBackendUrl?: string;
   modelBackendToken?: string;
+  backendRegistry?: ReviewBackendRegistry;
+  backendRegistryConfig?: string | AdminBackendRegistryConfig;
+  backendEnvironment?: Record<string, string | undefined>;
   maxWebhookAttempts?: number;
   webhookLeaseMs?: number;
   githubClientFactory?: (event: GitHubEvent, repositoryIds?: number[]) => Promise<GitHubClientLike>;
-  reviewClientFactory?: () => ReviewBackend | undefined;
+  reviewClientFactory?: (
+    profile: ReviewProfile,
+    classification: DataClassification
+  ) => ReviewBackend | undefined;
+  scannerWorkflowRunHandler?: (run: GuardianScannerWorkflowRun) => Promise<void>;
   now?: () => Date;
   metrics?: GuardianMetrics;
+}
+
+export interface GuardianScannerWorkflowRun {
+  repositoryId: number;
+  repositoryFullName: string;
+  runId: number;
+  runAttempt: number;
+  headSha: string;
+  conclusion: string;
+  workflowPath: ".github/workflows/guardianbot.yml";
+  artifactNamePrefixes: readonly [
+    "guardianbot-evidence-",
+    "guardianbot-image-evidence-",
+    "guardianbot-dast-evidence-"
+  ];
 }
 
 type GitHubEvent = Record<string, any>;
 
 interface GitHubPullFile {
   filename: string;
+  previous_filename?: string;
   patch?: string;
   status: string;
   additions?: number;
+  deletions?: number;
   changes?: number;
 }
 
@@ -52,19 +97,57 @@ interface GitHubPull {
   draft?: boolean;
 }
 
+interface GitHubReviewComment {
+  id: number;
+  body: string;
+  commit_id?: string;
+  path?: string;
+  line?: number | null;
+}
+
 interface GitHubClientLike {
   getTree(owner: string, repo: string, ref: string): Promise<string[]>;
   getLanguages(owner: string, repo: string): Promise<Record<string, number>>;
-  getFile(owner: string, repo: string, path: string, ref: string): Promise<{ content: string; sha: string } | undefined>;
-  createIssue(owner: string, repo: string, title: string, body: string): Promise<{ html_url: string; number: number }>;
-  createComment(owner: string, repo: string, issueNumber: number, body: string): Promise<{ id: number; html_url: string }>;
-  updateComment(owner: string, repo: string, commentId: number, body: string): Promise<{ id: number; html_url: string }>;
-  request<T>(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<T>;
+  getFile(
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string
+  ): Promise<{ content: string; sha: string } | undefined>;
+  createIssue(
+    owner: string,
+    repo: string,
+    title: string,
+    body: string
+  ): Promise<{ html_url: string; number: number }>;
+  createComment(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    body: string
+  ): Promise<{ id: number; html_url: string }>;
+  updateComment(
+    owner: string,
+    repo: string,
+    commentId: number,
+    body: string
+  ): Promise<{ id: number; html_url: string }>;
+  request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    extraHeaders?: Record<string, string>
+  ): Promise<T>;
 }
 
-interface ReviewBackend {
+export interface ReviewBackend {
   capabilities(): Promise<BackendCapabilities>;
   review(request: ReviewRequest): Promise<ReviewResult>;
+}
+
+interface RoutedReviewBackend {
+  alias: string;
+  backend: ReviewBackend;
 }
 
 interface SelectedReviewFiles {
@@ -76,22 +159,72 @@ interface SelectedReviewFiles {
   omittedChangedLines: number;
 }
 
-const HIGH_RISK_PATH = /(^|\/)(auth|security|migrations)(\/|$)|\.github\/workflows|Dockerfile|secret|tenant/i;
+interface LoadedRepositoryContext {
+  config?: GuardianConfig;
+  configSource?: string;
+  codeOwnersPath?: string;
+  codeOwnersSource?: string;
+  scannerConfigured: boolean;
+}
+
+interface ReviewExecutionOptions {
+  manual?: boolean;
+  full?: boolean;
+}
+
+interface ReviewFileScope {
+  files: GitHubPullFile[];
+  baseSha: string;
+  summary: string;
+  partialReason?: string;
+}
+
+const HIGH_RISK_PATH =
+  /(^|\/)(auth|security|migrations)(\/|$)|\.github\/workflows|Dockerfile|secret|tenant/i;
 const REVIEW_FILE_LIMIT = 50;
 const REVIEW_LINE_LIMIT = 5_000;
 const INPUT_CHARACTER_LIMIT = 200_000;
+const REVIEW_BUNDLE_CHARACTER_LIMIT = 180_000;
+const REQUEST_ENVELOPE_RESERVE = 12_000;
+const MAX_BACKEND_TIMEOUT_MS = 600_000;
+const MIN_WEBHOOK_LEASE_MS = MAX_BACKEND_TIMEOUT_MS + 120_000;
+const DEFAULT_WEBHOOK_LEASE_MS = 15 * 60_000;
+const MAX_REVIEW_COMMENT_PAGES = 20;
+const DEFAULT_INLINE_LIMIT = 8;
 
 export class GuardianService {
   readonly metrics: GuardianMetrics;
   private readonly maxWebhookAttempts: number;
   private readonly webhookLeaseMs: number;
   private readonly now: () => Date;
+  private readonly backendRegistry?: ReviewBackendRegistry;
 
   constructor(private readonly options: ServiceOptions, private readonly store: Store) {
     this.metrics = options.metrics ?? new GuardianMetrics();
     this.maxWebhookAttempts = options.maxWebhookAttempts ?? 5;
-    this.webhookLeaseMs = options.webhookLeaseMs ?? 60_000;
+    const webhookLeaseMs = options.webhookLeaseMs ?? DEFAULT_WEBHOOK_LEASE_MS;
+    if (webhookLeaseMs < MIN_WEBHOOK_LEASE_MS) {
+      throw new Error(
+        `webhookLeaseMs must be at least ${MIN_WEBHOOK_LEASE_MS}ms to exceed the maximum backend timeout`
+      );
+    }
+    this.webhookLeaseMs = webhookLeaseMs;
     this.now = options.now ?? (() => new Date());
+    this.backendRegistry = options.backendRegistry ??
+      (options.backendRegistryConfig
+        ? new ReviewBackendRegistry(
+            options.backendRegistryConfig,
+            options.backendEnvironment ?? process.env
+          )
+        : options.reviewClientFactory
+          ? undefined
+          : ReviewBackendRegistry.fromAdministrativeEnvironment(
+              options.backendEnvironment ?? process.env,
+              {
+                endpoint: options.modelBackendUrl,
+                token: options.modelBackendToken
+              }
+            ));
   }
 
   authenticate(body: string, signature: string | undefined, delivery: string): void {
@@ -99,7 +232,10 @@ export class GuardianService {
       this.metrics.increment("webhook_invalid_total");
       throw new Error("invalid delivery identifier");
     }
-    if (!signature || !verifyWebhookSignature(Buffer.from(body), signature, this.options.webhookSecret)) {
+    if (
+      !signature ||
+      !verifyWebhookSignature(Buffer.from(body), signature, this.options.webhookSecret)
+    ) {
       this.metrics.increment("webhook_invalid_total");
       throw new Error("invalid webhook signature");
     }
@@ -160,20 +296,25 @@ export class GuardianService {
   }
 
   private client(event: GitHubEvent, repositoryIds?: number[]): Promise<GitHubClientLike> {
-    if (this.options.githubClientFactory) return this.options.githubClientFactory(event, repositoryIds);
-    return installationClient(this.options.appId, this.options.privateKey, event.installation.id, repositoryIds);
+    if (this.options.githubClientFactory) {
+      return this.options.githubClientFactory(event, repositoryIds);
+    }
+    return installationClient(
+      this.options.appId,
+      this.options.privateKey,
+      event.installation.id,
+      repositoryIds
+    ) as Promise<GitHubClient>;
   }
 
-  private reviewClient(): ReviewBackend | undefined {
-    if (this.options.reviewClientFactory) return this.options.reviewClientFactory();
-    if (!this.options.modelBackendUrl) return undefined;
-    return new GuardianReviewClient({
-      id: "administratively-configured",
-      baseUrl: this.options.modelBackendUrl,
-      authSecret: this.options.modelBackendToken,
-      allowedClassifications: ["public", "private"],
-      timeoutMs: 90_000
-    });
+  private reviewClient(
+    profile: ReviewProfile,
+    classification: DataClassification
+  ): RoutedReviewBackend | undefined {
+    const factoryBackend = this.options.reviewClientFactory?.(profile, classification);
+    if (factoryBackend) return { alias: "injected", backend: factoryBackend };
+    const resolved = this.backendRegistry?.resolve(profile, classification);
+    return resolved ? { alias: resolved.alias, backend: resolved.client } : undefined;
   }
 
   private async handle(name: string, event: GitHubEvent): Promise<void> {
@@ -212,14 +353,20 @@ export class GuardianService {
       if (event.action === "unarchived") {
         await this.store.setRepositoryState(event.repository.id, "active");
       }
-      if (event.repository) {
-        await this.discover(event, event.repository);
-      }
+      if (event.repository) await this.discover(event, event.repository);
       return;
     }
 
-    if (name === "pull_request" && ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)) {
+    if (
+      name === "pull_request" &&
+      ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)
+    ) {
       await this.reviewPullRequest(event);
+      return;
+    }
+
+    if (name === "workflow_run" && event.action === "completed") {
+      await this.handleScannerWorkflowRun(event);
       return;
     }
 
@@ -251,6 +398,7 @@ export class GuardianService {
       defaultBranch: repository.default_branch,
       scannerState: "not-configured",
       repositoryState: "active",
+      automaticReviewPaused: existing?.automaticReviewPaused ?? false,
       indexUpdatedAt: this.now().toISOString()
     });
     if (!existing) {
@@ -258,14 +406,54 @@ export class GuardianService {
         owner,
         name,
         "GuardianBot onboarding inventory",
-        onboardingIssue(repository.full_name, [...detection.languages, ...detection.packageManagers], detection.notes)
+        onboardingIssue(
+          repository.full_name,
+          [...detection.languages, ...detection.packageManagers],
+          detection.notes
+        )
       );
     }
   }
 
-  private async reviewPullRequest(event: GitHubEvent): Promise<void> {
+  private async handleScannerWorkflowRun(event: GitHubEvent): Promise<void> {
+    const repository = await this.store.getRepository(event.repository.id);
+    if (!repository || repository.repositoryState !== "active") return;
+    const run = event.workflow_run;
+    const workflowPath = String(run?.path ?? "").split("@", 1)[0];
+    if (
+      workflowPath !== ".github/workflows/guardianbot.yml" ||
+      String(run?.name ?? "") !== "GuardianBot" ||
+      !Number.isSafeInteger(run?.id) ||
+      !Number.isSafeInteger(run?.run_attempt) ||
+      !/^[a-f0-9]{40}$/.test(String(run?.head_sha ?? ""))
+    ) {
+      return;
+    }
+    await this.options.scannerWorkflowRunHandler?.({
+      repositoryId: event.repository.id,
+      repositoryFullName: event.repository.full_name,
+      runId: run.id,
+      runAttempt: run.run_attempt,
+      headSha: run.head_sha,
+      conclusion: String(run.conclusion ?? "unknown"),
+      workflowPath: ".github/workflows/guardianbot.yml",
+      artifactNamePrefixes: [
+        "guardianbot-evidence-",
+        "guardianbot-image-evidence-",
+        "guardianbot-dast-evidence-"
+      ]
+    });
+  }
+
+  private async reviewPullRequest(
+    event: GitHubEvent,
+    execution: ReviewExecutionOptions = {}
+  ): Promise<void> {
     const pull = event.pull_request as GitHubPull;
-    if (pull.draft) return;
+
+    const repositoryRecord = await this.store.getRepository(event.repository.id);
+    if (repositoryRecord && repositoryRecord.repositoryState !== "active") return;
+    if (!execution.manual && repositoryRecord?.automaticReviewPaused) return;
 
     const github = await this.client(event, [event.repository.id]);
     const [owner, repo] = event.repository.full_name.split("/");
@@ -275,75 +463,198 @@ export class GuardianService {
       return;
     }
 
+    const repositoryContext = await this.loadRepositoryContext(
+      github,
+      owner,
+      repo,
+      pull.base.sha
+    );
+    if (
+      pull.draft &&
+      !execution.manual &&
+      repositoryContext.config?.review.drafts !== "automatic"
+    ) {
+      return;
+    }
+    if (!execution.manual && repositoryContext.config?.review.automatic === false) return;
+
     const existing = await this.store.getReview(event.repository.id, pull.number);
     const placeholder = existing?.placeholderCommentId
       ? { id: existing.placeholderCommentId }
       : await github.createComment(owner, repo, pull.number, renderPlaceholder(pull.head.sha));
-    await this.store.saveReviewHead(event.repository.id, pull.number, pull.head.sha, placeholder.id);
+    await this.store.saveReviewHead(
+      event.repository.id,
+      pull.number,
+      pull.head.sha,
+      placeholder.id
+    );
     await github.updateComment(owner, repo, placeholder.id, renderPlaceholder(pull.head.sha));
 
-    const configFile = await github.getFile(owner, repo, ".guardianbot/config.yml", pull.base.ref);
-    let scannerConfigured = false;
-    if (configFile) {
-      try {
-        parseGuardianConfig(configFile.content);
-        scannerConfigured = true;
-      } catch {
-        scannerConfigured = false;
-      }
-    }
-
-    const backend = this.reviewClient();
-    if (!backend) {
-      const saved = await this.store.saveReview(
-        {
-          repositoryId: event.repository.id,
-          pullNumber: pull.number,
-          headSha: pull.head.sha,
-          placeholderCommentId: placeholder.id,
-          findings: existing?.findings ?? []
-        },
-        pull.head.sha
+    const fileScope = await this.resolveReviewFileScope(
+      github,
+      owner,
+      repo,
+      pull,
+      existing,
+      repositoryContext.config?.review.incremental === true,
+      execution
+    );
+    const selected = selectFilesForReview(fileScope.files);
+    const deterministicRisk = scoreChangeRisk(
+      fileScope.files.map((file) => ({
+        path: file.filename,
+        additions: file.additions ?? countPatchLines(file.patch ?? "", "+"),
+        deletions: file.deletions ?? countPatchLines(file.patch ?? "", "-"),
+        patch: file.patch
+      })),
+      false
+    );
+    const configuredHighRisk = selected.files.some((file) =>
+      (repositoryContext.config?.review.highRiskPaths ?? []).some((pattern) =>
+        pathMatchesPattern(pattern, file.filename)
+      )
+    );
+    const profile: ReviewProfile =
+      deterministicRisk.highRisk || configuredHighRisk
+        ? "high-risk-review"
+        : "routine-review";
+    const classification: DataClassification = event.repository.private
+      ? "private"
+      : "public";
+    const routed = this.reviewClient(profile, classification);
+    if (!routed) {
+      await this.publishUnavailable(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured,
+        "no-route"
       );
-      if (saved) {
-        await github.updateComment(
-          owner,
-          repo,
-          placeholder.id,
-          `${renderPlaceholder(pull.head.sha)}\n\nAI review unavailable: no approved backend route.`
-        );
-      }
       return;
     }
 
-    const allFiles = await this.listPullFiles(github, owner, repo, pull.number);
-    const selected = selectFilesForReview(allFiles);
-    const validChangedLines = selected.files.flatMap((file) =>
-      addedLineRanges(file.patch ?? "").map((range) => ({ path: file.filename, ...range }))
-    );
-    let remainingCharacters = 180_000;
-    let localPartial = selected.partial;
-    const contexts = selected.files.flatMap((file, index) => {
-      if (remainingCharacters <= 0) {
-        localPartial = true;
+    let capabilities: BackendCapabilities;
+    try {
+      capabilities = await routed.backend.capabilities();
+      this.assertCapabilities(capabilities, profile, classification);
+    } catch (error) {
+      const backendError = normalizeBackendFailure(error, "capability");
+      await this.publishUnavailable(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured,
+        unavailableReason(backendError)
+      );
+      throw backendError;
+    }
+
+    const linkedIssues = extractLinkedIssues(pull.title, pull.body ?? "");
+    const codeOwners = repositoryContext.codeOwnersSource
+      ? matchingCodeOwners(
+          repositoryContext.codeOwnersSource,
+          fileScope.files.map((file) => file.filename)
+        )
+      : [];
+    const preTruncatedPaths: string[] = [];
+    const unavailablePatchPaths: string[] = [];
+    const contextCandidates: ReviewBundleContextCandidate[] = selected.files.flatMap((file) => {
+      const redacted = redactUntrustedText(String(file.patch ?? ""));
+      if (!redacted) {
+        unavailablePatchPaths.push(file.filename);
         return [];
       }
-      const content = redactUntrustedText(String(file.patch ?? ""))
-        .slice(0, Math.min(30_000, remainingCharacters));
-      remainingCharacters -= content.length;
-      if (!content) return [];
+      const content = redacted.slice(0, 30_000);
+      if (content.length < redacted.length) preTruncatedPaths.push(file.filename);
       return {
-        id: `diff-${index}`,
+        id: `diff-${stableFingerprint(["diff", file.filename]).slice(0, 20)}`,
         path: file.filename,
         kind: "diff" as const,
         content,
-        sha256: createHash("sha256").update(content).digest("hex")
+        priority: HIGH_RISK_PATH.test(file.filename) ? 25 : 0
       };
     });
-    const highRisk =
-      selected.totalFiles > REVIEW_FILE_LIMIT ||
-      selected.totalChangedLines > REVIEW_LINE_LIMIT ||
-      selected.files.some((file) => HIGH_RISK_PATH.test(file.filename));
+    const pullMetadata = redactUntrustedText(
+      `title: ${String(pull.title).slice(0, 1_000)}\nbody:\n${String(pull.body ?? "").slice(0, 4_000)}`
+    );
+    if (pullMetadata.trim()) {
+      contextCandidates.push({
+        id: `pull-${pull.number}`,
+        path: `pull-request/${pull.number}`,
+        kind: "issue",
+        content: pullMetadata,
+        priority: 0
+      });
+    }
+    if (repositoryContext.configSource) {
+      contextCandidates.push({
+        id: "guardian-config",
+        path: ".guardianbot/config.yml",
+        kind: "config",
+        content: redactUntrustedText(repositoryContext.configSource).slice(0, 20_000),
+        priority: 10
+      });
+    }
+    if (repositoryContext.codeOwnersSource && repositoryContext.codeOwnersPath) {
+      contextCandidates.push({
+        id: "codeowners",
+        path: repositoryContext.codeOwnersPath,
+        kind: "config",
+        content: redactUntrustedText(repositoryContext.codeOwnersSource).slice(0, 20_000),
+        priority: 8
+      });
+    }
+
+    const availableBundleCharacters = Math.min(
+      REVIEW_BUNDLE_CHARACTER_LIMIT,
+      capabilities.maxInputCharacters - REQUEST_ENVELOPE_RESERVE
+    );
+    if (availableBundleCharacters < 1_000) {
+      const error = new BackendError(
+        "context_limit",
+        "model backend capability is too small for the minimum review envelope",
+        false
+      );
+      await this.publishUnavailable(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured,
+        "capability"
+      );
+      throw error;
+    }
+    const bundle = buildReviewBundle({
+      contexts: contextCandidates,
+      scannerEvidence: [],
+      rules: [],
+      maxInputCharacters: availableBundleCharacters,
+      maxContextChunks: REVIEW_FILE_LIMIT + 3
+    });
+    const includedContextIds = new Set(bundle.contexts.map((context) => context.id));
+    const includedDiffFiles = selected.files.filter((file) =>
+      includedContextIds.has(`diff-${stableFingerprint(["diff", file.filename]).slice(0, 20)}`)
+    );
+    const validChangedLines = includedDiffFiles.flatMap((file) =>
+      addedLineRanges(file.patch ?? "").map((range) => ({
+        path: file.filename,
+        ...range
+      }))
+    );
+    const maxInlineComments =
+      repositoryContext.config?.review.maxInlineComments ?? DEFAULT_INLINE_LIMIT;
     const request: ReviewRequest = {
       protocolVersion: "guardian.review.v1",
       schemaVersion: "1.0.0",
@@ -351,103 +662,236 @@ export class GuardianService {
       repository: {
         owner,
         name: repo,
-        visibility: event.repository.private ? "private" : "public",
+        visibility: classification,
         defaultBranch: event.repository.default_branch
       },
       pullRequest: {
         number: pull.number,
-        baseSha: pull.base.sha,
+        baseSha: fileScope.baseSha,
         headSha: pull.head.sha,
-        title: pull.title,
-        body: String(pull.body ?? "").slice(0, 4000),
+        title: redactUntrustedText(String(pull.title)).slice(0, 1_000),
+        body: redactUntrustedText(String(pull.body ?? "")).slice(0, 4_000),
         author: pull.user.login
       },
-      profile: highRisk ? "high-risk-review" : "routine-review",
-      promptVersion: "guardianbot-review-2026-07-27",
+      profile,
+      promptVersion: execution.full
+        ? "guardianbot-full-review-2026-07-27"
+        : "guardianbot-review-2026-07-27",
+      expectedContextIndexSha: bundle.manifestSha256,
       validChangedLines,
-      contexts,
-      scannerEvidence: [],
-      rules: [],
-      limits: { maxInlineComments: 8, maxInputCharacters: INPUT_CHARACTER_LIMIT, timeoutMs: 90_000 }
+      contexts: bundle.contexts,
+      scannerEvidence: bundle.scannerEvidence,
+      rules: bundle.rules,
+      limits: {
+        maxInlineComments,
+        maxInputCharacters: Math.min(
+          INPUT_CHARACTER_LIMIT,
+          capabilities.maxInputCharacters
+        ),
+        timeoutMs: Math.min(MAX_BACKEND_TIMEOUT_MS, 90_000)
+      }
     };
-
-    try {
-      const capabilities = await backend.capabilities();
-      this.assertCapabilities(capabilities, request);
-      const result = await backend.review(request);
-      validateReviewResult(result, request);
-
-      const latestPull = await this.getCurrentPull(github, owner, repo, pull.number);
-      if (!latestPull || latestPull.head.sha !== pull.head.sha) {
-        this.metrics.increment("review_stale_total");
-        return;
-      }
-
-      const saved = await this.store.saveReview(
-        {
-          repositoryId: event.repository.id,
-          pullNumber: pull.number,
-          headSha: pull.head.sha,
-          placeholderCommentId: placeholder.id,
-          findings: result.findings.map((finding) => ({ fingerprint: finding.fingerprint, state: "open" as const }))
-        },
-        pull.head.sha
+    if (JSON.stringify(request).length > capabilities.maxInputCharacters) {
+      const error = new BackendError(
+        "context_limit",
+        "bounded review request exceeds the backend-declared input capability",
+        false
       );
-      if (!saved) {
-        this.metrics.increment("review_stale_total");
-        return;
-      }
-
-      const finalResult: ReviewResult = localPartial
-        ? {
-            ...result,
-            summary: {
-              ...result.summary,
-              partialReview: true
-            }
-          }
-        : result;
-      const partialSuffix = localPartial
-        ? `\n\nPartial review warning: reviewed ${selected.files.length}/${selected.totalFiles} files and ${selected.totalChangedLines - selected.omittedChangedLines}/${selected.totalChangedLines} changed lines. Omitted files include ${selected.omittedFiles.slice(0, 5).map((value) => `\`${value}\``).join(", ") || "none"}.`
-        : "";
-      await github.updateComment(
+      await this.publishUnavailable(
+        github,
         owner,
         repo,
+        event.repository.id,
+        pull,
         placeholder.id,
-        `${renderReview(finalResult, scannerConfigured)}${partialSuffix}`
+        existing,
+        repositoryContext.scannerConfigured,
+        "capability"
       );
-    } catch (error) {
-      const saved = await this.store.saveReview(
-        {
-          repositoryId: event.repository.id,
-          pullNumber: pull.number,
-          headSha: pull.head.sha,
-          placeholderCommentId: placeholder.id,
-          findings: existing?.findings ?? []
-        },
-        pull.head.sha
-      );
-      if (saved) {
-        await github.updateComment(
-          owner,
-          repo,
-          placeholder.id,
-          `${renderPlaceholder(pull.head.sha)}\n\nAI review unavailable: output failed transport or strict validation.`
-        );
-      }
-      if (error instanceof BackendError) throw error;
-      throw new BackendError("invalid_output", "review processing failed strict validation", false);
+      throw error;
     }
+
+    let result: ReviewResult;
+    try {
+      result = await routed.backend.review(request);
+      validateReviewResult(result, request);
+      result = {
+        ...result,
+        findings: canonicalizeFindingFingerprints(result.findings)
+      };
+    } catch (error) {
+      const backendError = normalizeBackendFailure(error, "review");
+      await this.publishUnavailable(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured,
+        unavailableReason(backendError)
+      );
+      throw backendError;
+    }
+
+    const latestPull = await this.getCurrentPull(github, owner, repo, pull.number);
+    if (!latestPull || latestPull.head.sha !== pull.head.sha) {
+      await this.publishStale(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        latestPull?.head.sha ?? "unknown",
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured
+      );
+      return;
+    }
+
+    const evidenceBackedFindings = result.findings
+      .filter((finding) => finding.severity === "P0" ||
+        finding.severity === "P1" ||
+        finding.severity === "P2")
+      .slice(0, maxInlineComments);
+    const findingStates = mergeFindingStates(existing, pull.head.sha, evidenceBackedFindings);
+    const saved = await this.store.saveReview(
+      {
+        repositoryId: event.repository.id,
+        pullNumber: pull.number,
+        headSha: pull.head.sha,
+        reviewedHeadSha: pull.head.sha,
+        placeholderCommentId: placeholder.id,
+        findings: findingStates
+      },
+      pull.head.sha
+    );
+    if (!saved) {
+      this.metrics.increment("review_stale_total");
+      return;
+    }
+
+    const publishedComments = await this.listReviewComments(
+      github,
+      owner,
+      repo,
+      pull.number
+    );
+    const publishedMarkers = new Set(
+      publishedComments
+        .map((comment) => extractFindingMarker(comment.body))
+        .filter((marker): marker is string => Boolean(marker))
+    );
+    const newFindings = evidenceBackedFindings.filter(
+      (finding) => !publishedMarkers.has(markerDigest(finding.fingerprint))
+    );
+    const stillCurrent = await this.getCurrentPull(github, owner, repo, pull.number);
+    if (!stillCurrent || stillCurrent.head.sha !== pull.head.sha) {
+      await this.publishStale(
+        github,
+        owner,
+        repo,
+        event.repository.id,
+        pull,
+        stillCurrent?.head.sha ?? "unknown",
+        placeholder.id,
+        existing,
+        repositoryContext.scannerConfigured
+      );
+      return;
+    }
+    if (newFindings.length) {
+      await github.request(
+        "POST",
+        `/repos/${owner}/${repo}/pulls/${pull.number}/reviews`,
+        {
+          commit_id: pull.head.sha,
+          event: "COMMENT",
+          body: "GuardianBot advisory review. Deterministic security checks are reported separately.",
+          comments: newFindings.map((finding) => ({
+            path: finding.path,
+            line: finding.endLine,
+            side: "RIGHT",
+            ...(finding.startLine < finding.endLine
+              ? { start_line: finding.startLine, start_side: "RIGHT" }
+              : {}),
+            body: renderInlineFinding(finding)
+          }))
+        }
+      );
+    }
+
+    const reviewedChangedLines = includedDiffFiles.reduce(
+      (sum, file) => sum + countChangedLines(file),
+      0
+    );
+    const localPartial =
+      selected.partial ||
+      Boolean(fileScope.partialReason) ||
+      bundle.partial ||
+      preTruncatedPaths.length > 0 ||
+      unavailablePatchPaths.length > 0 ||
+      result.summary.partialReview;
+    const finalResult: ReviewResult = {
+      ...result,
+      summary: {
+        ...result.summary,
+        riskScore: deterministicRisk.score,
+        reviewEffort: deterministicRisk.effort,
+        partialReview: localPartial
+      },
+      findings: evidenceBackedFindings
+    };
+    const changeGroups = groupChangedFiles(fileScope.files);
+    await github.updateComment(
+      owner,
+      repo,
+      placeholder.id,
+      renderReview(finalResult, {
+        scannerConfigured: repositoryContext.scannerConfigured,
+        riskScore: deterministicRisk.score,
+        reviewEffort: deterministicRisk.effort,
+        riskReasons: deterministicRisk.reasons,
+        changeGroups,
+        impactedComponents: changeGroups.map((group) => group.title),
+        linkedIssues,
+        codeOwners,
+        lifecycle: lifecycleSummary(findingStates),
+        inlinePosted: newFindings.length,
+        inlineAlreadyPresent: evidenceBackedFindings.length - newFindings.length,
+        backendAlias: routed.alias,
+        contextIndexSha: bundle.manifestSha256,
+        reviewScope: fileScope.summary,
+        partialWarning: localPartial
+          ? buildPartialWarning(
+              selected,
+              includedDiffFiles.length,
+              reviewedChangedLines,
+              preTruncatedPaths,
+              unavailablePatchPaths,
+              bundle.dropped.length,
+              result.summary.partialReview,
+              fileScope.partialReason
+            )
+          : undefined
+      })
+    );
   }
 
   private async command(event: GitHubEvent): Promise<void> {
     if (!event.issue.pull_request) return;
     const text = String(event.comment.body).trim();
-    if (!/^@guardianbot\b/i.test(text)) return;
+    const parsed = /^@guardianbot(?:\s+([a-z-]+))?(?:\s+([\s\S]*))?$/i.exec(text);
+    if (!parsed) return;
+
     const github = await this.client(event, [event.repository.id]);
     const [owner, repo] = event.repository.full_name.split("/");
     const actor = String(event.comment.user?.login ?? "");
     const permission = await this.getActorPermission(github, owner, repo, actor);
+    const command = (parsed[1] ?? "help").toLowerCase();
+    const argument = String(parsed[2] ?? "").trim().slice(0, 200);
     if (!["write", "maintain", "admin"].includes(permission)) {
       this.metrics.increment("commands_rejected_total");
       await github.createComment(
@@ -458,15 +902,293 @@ export class GuardianService {
       );
       return;
     }
+    if (
+      (command === "pause" || command === "resume") &&
+      !["maintain", "admin"].includes(permission)
+    ) {
+      this.metrics.increment("commands_rejected_total");
+      await github.createComment(
+        owner,
+        repo,
+        event.issue.number,
+        `@${actor} needs maintain or admin permission to change automatic advisory review state.`
+      );
+      return;
+    }
     this.metrics.increment("commands_authorized_total");
-    const command = text.replace(/^@guardianbot\s*/i, "").split(/\s+/)[0]?.toLowerCase();
-    const reply =
-      command === "help"
-        ? "Commands: `review`, `full-review`, `status`, `explain <id>`, `suggest-fix <id>`, `pause`, `resume`, `help`."
-        : command === "status"
-          ? "GuardianBot is installed. Use `guardianctl doctor OWNER/REPOSITORY` for deterministic workflow diagnostics."
-          : "Command acknowledged. Automated execution is available for `review`, `full-review`, `status`, and `help` in the PoC; other commands are recorded for the production roadmap.";
-    await github.createComment(owner, repo, event.issue.number, reply);
+
+    if (command === "help") {
+      await github.createComment(
+        owner,
+        repo,
+        event.issue.number,
+        "Commands: `review`, `full-review`, `status`, `explain <id>`, `suggest-fix <id>`, `pause`, `resume`, `help`. All AI output is advisory; no command merges code or waives deterministic scanners."
+      );
+      return;
+    }
+    if (command === "status") {
+      const [repository, review] = await Promise.all([
+        this.store.getRepository(event.repository.id),
+        this.store.getReview(event.repository.id, event.issue.number)
+      ]);
+      const state =
+        repository?.automaticReviewPaused
+          ? "paused"
+          : repository
+            ? "active"
+            : "not inventoried";
+      const lifecycle = lifecycleSummary(review?.findings ?? []);
+      await github.createComment(
+        owner,
+        repo,
+        event.issue.number,
+        `GuardianBot advisory state: **${state}**. App lifecycle: **${repository?.repositoryState ?? "unknown"}**. Last reviewed head: \`${review?.reviewedHeadSha?.slice(0, 12) ?? "none"}\`. Findings: ${lifecycle.open} open, ${lifecycle.resolved} resolved, ${lifecycle.superseded} superseded. Routine route: ${this.hasReviewRoute("routine-review") ? "configured" : "unavailable"}; high-risk route: ${this.hasReviewRoute("high-risk-review") ? "configured" : "unavailable"}. Scanner state: ${repository?.scannerState ?? "unknown"}. Use \`guardianctl doctor ${event.repository.full_name}\` for deterministic workflow diagnostics.`
+      );
+      return;
+    }
+    if (command === "pause" || command === "resume") {
+      const repository = await this.ensureRepositoryRecord(event);
+      if (repository.repositoryState === "removed") {
+        await github.createComment(
+          owner,
+          repo,
+          event.issue.number,
+          "GuardianBot cannot change review state because this repository is removed."
+        );
+        return;
+      }
+      await this.store.setAutomaticReviewPaused(
+        event.repository.id,
+        command === "pause"
+      );
+      await github.createComment(
+        owner,
+        repo,
+        event.issue.number,
+        command === "pause"
+          ? "Automatic AI advisory review is paused. Manual `review` remains available; deterministic scanners, merge protection, and existing findings are unchanged."
+          : "Automatic AI advisory review is resumed. This does not merge code or waive deterministic scanner findings."
+      );
+      return;
+    }
+    if (command === "review" || command === "full-review") {
+      const pull = await this.getCurrentPull(github, owner, repo, event.issue.number);
+      if (!pull) {
+        await github.createComment(
+          owner,
+          repo,
+          event.issue.number,
+          "GuardianBot could not load this pull request; no review was started."
+        );
+        return;
+      }
+      await this.reviewPullRequest(
+        {
+          ...event,
+          action: "guardianbot-command",
+          pull_request: pull
+        },
+        { manual: true, full: command === "full-review" }
+      );
+      return;
+    }
+    if (command === "explain" || command === "suggest-fix") {
+      if (!argument) {
+        await github.createComment(
+          owner,
+          repo,
+          event.issue.number,
+          `Usage: \`@guardianbot ${command} <id>\`.`
+        );
+        return;
+      }
+      const comments = await this.listReviewComments(
+        github,
+        owner,
+        repo,
+        event.issue.number
+      );
+      const finding = comments.find((comment) =>
+        commentMatchesIdentifier(comment.body, argument)
+      );
+      if (!finding) {
+        await github.createComment(
+          owner,
+          repo,
+          event.issue.number,
+          `No published GuardianBot finding matches \`${safeInline(argument)}\`.`
+        );
+        return;
+      }
+      if (command === "explain") {
+        await github.createComment(
+          owner,
+          repo,
+          event.issue.number,
+          finding.body
+            .replace(/<!--\s*guardianbot-finding:[a-f0-9]{64}\s*-->\s*/i, "")
+            .replace(
+              /\n\nExact replacement proposed for this changed range:[\s\S]*?(?=\n\nFinding ID:)/,
+              ""
+            )
+        );
+        return;
+      }
+      const suggestion = /```suggestion\n([\s\S]*?)\n```/.exec(finding.body)?.[1];
+      await github.createComment(
+        owner,
+        repo,
+        event.issue.number,
+        suggestion
+          ? `Exact advisory replacement for \`${safeInline(argument)}\`:\n\n\`\`\`suggestion\n${suggestion}\n\`\`\`\n\nApply only after human verification. GuardianBot did not commit, merge, or waive scanners.`
+          : `Finding \`${safeInline(argument)}\` has no exact safe replacement. Follow its remediation guidance and verify the change manually.`
+      );
+      return;
+    }
+
+    await github.createComment(
+      owner,
+      repo,
+      event.issue.number,
+      `Unknown GuardianBot command \`${safeInline(command)}\`. Use \`@guardianbot help\`.`
+    );
+  }
+
+  private hasReviewRoute(profile: ReviewProfile): boolean {
+    return Boolean(this.options.reviewClientFactory) ||
+      Boolean(this.backendRegistry?.hasRoute(profile));
+  }
+
+  private async ensureRepositoryRecord(event: GitHubEvent) {
+    const existing = await this.store.getRepository(event.repository.id);
+    if (existing) return existing;
+    const record = {
+      installationId: event.installation.id,
+      repositoryId: event.repository.id,
+      fullName: event.repository.full_name,
+      visibility: event.repository.private ? "private" : "public",
+      defaultBranch: event.repository.default_branch,
+      scannerState: "not-configured" as const,
+      repositoryState: "active" as const,
+      automaticReviewPaused: false,
+      indexUpdatedAt: this.now().toISOString()
+    };
+    await this.store.upsertRepository(record);
+    return record;
+  }
+
+  private async loadRepositoryContext(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    ref: string
+  ): Promise<LoadedRepositoryContext> {
+    const configFile = await github.getFile(owner, repo, ".guardianbot/config.yml", ref);
+    let config: GuardianConfig | undefined;
+    if (configFile) {
+      try {
+        config = parseGuardianConfig(configFile.content);
+      } catch {
+        config = undefined;
+      }
+    }
+    let codeOwnersPath: string | undefined;
+    let codeOwnersSource: string | undefined;
+    for (const path of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
+      const file = await github.getFile(owner, repo, path, ref);
+      if (!file) continue;
+      codeOwnersPath = path;
+      codeOwnersSource = file.content;
+      break;
+    }
+    return {
+      config,
+      configSource: configFile?.content,
+      codeOwnersPath,
+      codeOwnersSource,
+      scannerConfigured: Boolean(config)
+    };
+  }
+
+  private async publishUnavailable(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    repositoryId: number,
+    pull: GitHubPull,
+    placeholderCommentId: number,
+    existing: ReviewState | undefined,
+    scannerConfigured: boolean,
+    reason: "no-route" | "capability" | "transport" | "invalid-output"
+  ): Promise<void> {
+    const findings = preserveFindingStates(existing, pull.head.sha);
+    const saved = await this.store.saveReview(
+      {
+        repositoryId,
+        pullNumber: pull.number,
+        headSha: pull.head.sha,
+        reviewedHeadSha: existing?.reviewedHeadSha,
+        placeholderCommentId,
+        findings
+      },
+      pull.head.sha
+    );
+    if (!saved) {
+      this.metrics.increment("review_stale_total");
+      return;
+    }
+    await github.updateComment(
+      owner,
+      repo,
+      placeholderCommentId,
+      renderUnavailable(
+        pull.head.sha,
+        scannerConfigured,
+        lifecycleSummary(findings),
+        reason
+      )
+    );
+  }
+
+  private async publishStale(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    repositoryId: number,
+    pull: GitHubPull,
+    currentHeadSha: string,
+    placeholderCommentId: number,
+    existing: ReviewState | undefined,
+    scannerConfigured: boolean
+  ): Promise<void> {
+    this.metrics.increment("review_stale_total");
+    const findings = (existing?.findings ?? []).map((finding) => ({
+      fingerprint: finding.fingerprint,
+      state: finding.state === "open" ? ("superseded" as const) : finding.state
+    }));
+    const saved = await this.store.saveReview(
+      {
+        repositoryId,
+        pullNumber: pull.number,
+        headSha: pull.head.sha,
+        reviewedHeadSha: existing?.reviewedHeadSha,
+        placeholderCommentId,
+        findings
+      },
+      pull.head.sha
+    );
+    if (!saved) return;
+    await github.updateComment(
+      owner,
+      repo,
+      placeholderCommentId,
+      renderStaleReview(
+        pull.head.sha,
+        currentHeadSha,
+        scannerConfigured,
+        lifecycleSummary(findings)
+      )
+    );
   }
 
   private async getCurrentPull(
@@ -476,10 +1198,91 @@ export class GuardianService {
     pullNumber: number
   ): Promise<GitHubPull | undefined> {
     try {
-      return await github.request<GitHubPull>("GET", `/repos/${owner}/${repo}/pulls/${pullNumber}`);
+      return await github.request<GitHubPull>(
+        "GET",
+        `/repos/${owner}/${repo}/pulls/${pullNumber}`
+      );
     } catch (error) {
       if (String(error).includes("returned 404")) return undefined;
       throw error;
+    }
+  }
+
+  private async resolveReviewFileScope(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    pull: GitHubPull,
+    existing: ReviewState | undefined,
+    incrementalEnabled: boolean,
+    execution: ReviewExecutionOptions
+  ): Promise<ReviewFileScope> {
+    const full = async (summary: string): Promise<ReviewFileScope> => ({
+      files: await this.listPullFiles(github, owner, repo, pull.number),
+      baseSha: pull.base.sha,
+      summary
+    });
+    if (execution.full) {
+      return full("full pull-request diff requested by a maintainer");
+    }
+    if (!incrementalEnabled) {
+      return full("full pull-request diff; incremental review is disabled or unavailable");
+    }
+    const lastReviewedHeadSha = existing?.reviewedHeadSha;
+    if (!lastReviewedHeadSha) {
+      return full("full pull-request diff; no prior reviewed head exists");
+    }
+    if (lastReviewedHeadSha === pull.head.sha) {
+      return full("full pull-request recheck; the recorded review head already matches");
+    }
+    if (
+      !/^[a-f0-9]{40}$/.test(lastReviewedHeadSha) ||
+      !/^[a-f0-9]{40}$/.test(pull.head.sha)
+    ) {
+      return full("full pull-request fallback; the prior comparison SHA was invalid");
+    }
+
+    try {
+      const comparison = await github.request<{
+        status: string;
+        base_commit?: { sha: string };
+        merge_base_commit?: { sha: string };
+        head_commit?: { sha: string };
+        files?: GitHubPullFile[];
+      }>(
+        "GET",
+        `/repos/${owner}/${repo}/compare/${encodeURIComponent(lastReviewedHeadSha)}...${encodeURIComponent(pull.head.sha)}?per_page=100`
+      );
+      const ancestryVerified =
+        comparison.status === "ahead" &&
+        comparison.base_commit?.sha === lastReviewedHeadSha &&
+        comparison.merge_base_commit?.sha === lastReviewedHeadSha &&
+        comparison.head_commit?.sha === pull.head.sha;
+      if (!ancestryVerified || !Array.isArray(comparison.files)) {
+        return full(
+          "full pull-request fallback; GitHub did not verify the prior review head as an ancestor"
+        );
+      }
+      return {
+        files: comparison.files,
+        baseSha: lastReviewedHeadSha,
+        summary: `incremental diff from ${lastReviewedHeadSha.slice(0, 12)} to ${pull.head.sha.slice(0, 12)}`,
+        ...(comparison.files.length >= 300
+          ? {
+              partialReason:
+                "GitHub compare reached its 300-file response ceiling; incremental context may be incomplete"
+            }
+          : {})
+      };
+    } catch (error) {
+      if (
+        !/returned (404|409|422)\b/.test(String(error))
+      ) {
+        throw error;
+      }
+      return full(
+        "full pull-request fallback; incremental comparison was unavailable"
+      );
     }
   }
 
@@ -501,6 +1304,24 @@ export class GuardianService {
     return files;
   }
 
+  private async listReviewComments(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    pullNumber: number
+  ): Promise<GitHubReviewComment[]> {
+    const comments: GitHubReviewComment[] = [];
+    for (let page = 1; page <= MAX_REVIEW_COMMENT_PAGES; page += 1) {
+      const batch = await github.request<GitHubReviewComment[]>(
+        "GET",
+        `/repos/${owner}/${repo}/pulls/${pullNumber}/comments?per_page=100&page=${page}`
+      );
+      comments.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return comments;
+  }
+
   private async getActorPermission(
     github: GitHubClientLike,
     owner: string,
@@ -519,16 +1340,65 @@ export class GuardianService {
     }
   }
 
-  private assertCapabilities(capabilities: BackendCapabilities, request: ReviewRequest): void {
-    if (
-      !capabilities.structuredOutput ||
-      !capabilities.supportedProfiles.includes(request.profile) ||
-      !capabilities.supportedDataClassifications.includes(request.repository.visibility) ||
-      capabilities.maxInputCharacters < request.limits.maxInputCharacters
-    ) {
-      throw new Error("model backend capability policy rejected this review");
+  private assertCapabilities(
+    capabilities: BackendCapabilities,
+    profile: ReviewProfile,
+    classification: DataClassification
+  ): void {
+    if (capabilities.protocolVersion !== "guardian.review.v1") {
+      throw new BackendError("refusal", "backend protocol version is not supported", false);
+    }
+    if (!capabilities.structuredOutput) {
+      throw new BackendError("refusal", "backend lacks strict structured output", false);
+    }
+    if (!capabilities.supportedProfiles.includes(profile)) {
+      throw new BackendError("refusal", "backend does not support the routed profile", false);
+    }
+    if (!capabilities.supportedDataClassifications.includes(classification)) {
+      throw new BackendError(
+        "refusal",
+        "backend does not support the repository data classification",
+        false
+      );
+    }
+    if (capabilities.maxInputCharacters < REQUEST_ENVELOPE_RESERVE + 1_000) {
+      throw new BackendError("context_limit", "backend input capability is too small", false);
+    }
+    if (capabilities.retention === "unknown") {
+      throw new BackendError("refusal", "backend retention capability is unknown", false);
     }
   }
+}
+
+function normalizeBackendFailure(
+  error: unknown,
+  phase: "capability" | "review"
+): BackendError {
+  if (error instanceof BackendError) {
+    if (error.code === "invalid_output") {
+      return new BackendError("invalid_output", error.message, false);
+    }
+    return error;
+  }
+  return new BackendError(
+    "invalid_output",
+    `${phase} response failed strict protocol validation`,
+    false
+  );
+}
+
+function unavailableReason(
+  error: BackendError
+): "capability" | "transport" | "invalid-output" {
+  if (
+    error.code === "timeout" ||
+    error.code === "unavailable" ||
+    error.code === "rate_limit"
+  ) {
+    return "transport";
+  }
+  if (error.code === "invalid_output") return "invalid-output";
+  return "capability";
 }
 
 function computeBackoffMs(attempt: number): number {
@@ -537,26 +1407,41 @@ function computeBackoffMs(attempt: number): number {
 
 function filePriority(file: GitHubPullFile): number {
   const sensitive = HIGH_RISK_PATH.test(file.filename) ? 10_000 : 0;
-  const additions = file.additions ?? 0;
-  const changes = file.changes ?? additions;
+  const additions = file.additions ?? countPatchLines(file.patch ?? "", "+");
+  const changes = file.changes ?? countChangedLines(file);
   const patchLength = file.patch?.length ?? 0;
   return sensitive + changes * 10 + additions * 5 + patchLength;
 }
 
-function countAddedLines(file: GitHubPullFile): number {
-  return addedLineRanges(file.patch ?? "").reduce((sum, range) => sum + (range.end - range.start + 1), 0);
+function countPatchLines(patch: string, prefix: "+" | "-"): number {
+  return patch
+    .split("\n")
+    .filter((line) => line.startsWith(prefix) && !line.startsWith(`${prefix}${prefix}${prefix}`))
+    .length;
+}
+
+function countChangedLines(file: GitHubPullFile): number {
+  return file.changes ??
+    (file.additions ?? countPatchLines(file.patch ?? "", "+")) +
+      (file.deletions ?? countPatchLines(file.patch ?? "", "-"));
 }
 
 function selectFilesForReview(files: GitHubPullFile[]): SelectedReviewFiles {
-  const sorted = [...files].sort((left, right) => filePriority(right) - filePriority(left));
+  const sorted = [...files].sort(
+    (left, right) =>
+      filePriority(right) - filePriority(left) ||
+      left.filename.localeCompare(right.filename)
+  );
   const selected: GitHubPullFile[] = [];
   const omittedFiles: string[] = [];
   let selectedLines = 0;
   let omittedLines = 0;
   for (const file of sorted) {
-    const fileLines = countAddedLines(file);
+    const fileLines = countChangedLines(file);
     const wouldExceedLineBudget =
-      selected.length > 0 && selectedLines + fileLines > REVIEW_LINE_LIMIT && !HIGH_RISK_PATH.test(file.filename);
+      selected.length > 0 &&
+      selectedLines + fileLines > REVIEW_LINE_LIMIT &&
+      !HIGH_RISK_PATH.test(file.filename);
     if (selected.length >= REVIEW_FILE_LIMIT || wouldExceedLineBudget) {
       omittedFiles.push(file.filename);
       omittedLines += fileLines;
@@ -565,10 +1450,16 @@ function selectFilesForReview(files: GitHubPullFile[]): SelectedReviewFiles {
     selected.push(file);
     selectedLines += fileLines;
   }
-  const totalChangedLines = sorted.reduce((sum, file) => sum + countAddedLines(file), 0);
+  const totalChangedLines = sorted.reduce(
+    (sum, file) => sum + countChangedLines(file),
+    0
+  );
   return {
     files: selected,
-    partial: omittedFiles.length > 0,
+    partial:
+      omittedFiles.length > 0 ||
+      sorted.length > REVIEW_FILE_LIMIT ||
+      totalChangedLines > REVIEW_LINE_LIMIT,
     totalFiles: sorted.length,
     totalChangedLines,
     omittedFiles,
@@ -611,8 +1502,225 @@ export function addedLineRanges(patch: string): Array<{ start: number; end: numb
 
 export function redactUntrustedText(value: string): string {
   return value
+    .replace(/\u0000/g, "")
     .replace(/\b(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\b(AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED_ACCESS_KEY]")
-    .replace(/(authorization\s*[:=]\s*(?:bearer|token)\s+)[^\s"']+/gi, "$1[REDACTED]")
-    .replace(/((?:api[_-]?key|secret|password|token)\s*[:=]\s*)["']?[^\s"',}]+/gi, "$1[REDACTED]");
+    .replace(
+      /(authorization\s*[:=]\s*(?:bearer|token)\s+)[^\s"']+/gi,
+      "$1[REDACTED]"
+    )
+    .replace(
+      /((?:api[_-]?key|secret|password|token)\s*[:=]\s*)["']?[^\s"',}]+/gi,
+      "$1[REDACTED]"
+    );
+}
+
+function preserveFindingStates(
+  existing: ReviewState | undefined,
+  headSha: string
+): ReviewState["findings"] {
+  return (existing?.findings ?? []).map((finding) => ({
+    fingerprint: finding.fingerprint,
+    state:
+      existing?.reviewedHeadSha !== headSha && finding.state === "open"
+        ? ("superseded" as const)
+        : finding.state
+  }));
+}
+
+function canonicalizeFindingFingerprints(
+  findings: ReviewFinding[]
+): ReviewFinding[] {
+  const fingerprints = new Set<string>();
+  return findings.map((finding) => {
+    const fingerprint = stableFingerprint([
+      "guardianbot-review-finding-v1",
+      finding.category,
+      finding.path,
+      finding.startLine,
+      finding.endLine,
+      finding.title,
+      finding.evidence
+    ]);
+    if (fingerprints.has(fingerprint)) {
+      throw new BackendError(
+        "invalid_output",
+        "backend returned semantically duplicate findings",
+        false
+      );
+    }
+    fingerprints.add(fingerprint);
+    return { ...finding, fingerprint };
+  });
+}
+
+function mergeFindingStates(
+  existing: ReviewState | undefined,
+  headSha: string,
+  findings: ReviewFinding[]
+): ReviewState["findings"] {
+  const current = new Set(findings.map((finding) => finding.fingerprint));
+  const previous = (existing?.findings ?? [])
+    .filter((finding) => !current.has(finding.fingerprint))
+    .map((finding) => ({
+      fingerprint: finding.fingerprint,
+      state:
+        finding.state !== "open"
+          ? finding.state
+          : existing?.reviewedHeadSha === headSha
+            ? ("resolved" as const)
+            : ("superseded" as const)
+    }));
+  return [
+    ...previous,
+    ...findings.map((finding) => ({
+      fingerprint: finding.fingerprint,
+      state: "open" as const
+    }))
+  ];
+}
+
+function lifecycleSummary(
+  findings: ReviewState["findings"]
+): FindingLifecycleSummary {
+  return {
+    open: findings.filter((finding) => finding.state === "open").length,
+    resolved: findings.filter((finding) => finding.state === "resolved").length,
+    superseded: findings.filter((finding) => finding.state === "superseded").length
+  };
+}
+
+function markerDigest(fingerprint: string): string {
+  return /guardianbot-finding:([a-f0-9]{64})/.exec(findingMarker(fingerprint))?.[1] ??
+    stableFingerprint(["finding", fingerprint]);
+}
+
+function groupChangedFiles(files: GitHubPullFile[]): ReviewFileGroup[] {
+  const groups = new Map<string, GitHubPullFile[]>();
+  for (const file of [...files].sort((left, right) => left.filename.localeCompare(right.filename))) {
+    const slash = file.filename.indexOf("/");
+    const component = slash > 0 ? file.filename.slice(0, slash) : "repository root";
+    groups.set(component, [...(groups.get(component) ?? []), file]);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([title, grouped]) => {
+      const statusCounts = new Map<string, number>();
+      for (const file of grouped) {
+        statusCounts.set(file.status, (statusCounts.get(file.status) ?? 0) + 1);
+      }
+      const statuses = [...statusCounts.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([status, count]) => `${count} ${status}`)
+        .join(", ");
+      const paths = grouped.slice(0, 12).map((file) => file.filename);
+      if (grouped.length > paths.length) {
+        paths.push(`… ${grouped.length - paths.length} more file(s)`);
+      }
+      return {
+        title,
+        paths,
+        summary: `${grouped.length} file(s), ${grouped.reduce((sum, file) => sum + countChangedLines(file), 0)} changed lines (${statuses})`
+      };
+    });
+}
+
+function extractLinkedIssues(title: string, body: string): string[] {
+  const source = `${title}\n${body}`;
+  const references = new Set<string>();
+  for (const match of source.matchAll(/(?:^|[\s(])((?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#\d+)\b/g)) {
+    if (match[1]) references.add(match[1]);
+  }
+  for (const match of source.matchAll(
+    /https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)\b/g
+  )) {
+    references.add(`${match[1]}#${match[2]}`);
+  }
+  return [...references].sort();
+}
+
+function pathMatchesPattern(pattern: string, path: string): boolean {
+  const normalized = pattern.replace(/^\/+/, "");
+  if (!normalized) return false;
+  const escaped = normalized
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "\u0000")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/\u0000/g, ".*");
+  const directory = normalized.endsWith("/") ? ".*" : "";
+  const prefix = normalized.includes("/") ? "^" : "(?:^|/)";
+  return new RegExp(`${prefix}${escaped}${directory}$`).test(path);
+}
+
+function matchingCodeOwners(source: string, paths: string[]): string[] {
+  const rules: Array<{ pattern: string; owners: string[] }> = [];
+  for (const rawLine of source.replace(/\r\n/g, "\n").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const fields = line.split(/\s+/);
+    const pattern = fields[0];
+    const owners = fields.slice(1).filter((field) => /^@[A-Za-z0-9_.\-/]+$/.test(field));
+    if (!pattern || !owners.length) continue;
+    rules.push({ pattern, owners });
+  }
+  const matched = new Set<string>();
+  for (const path of paths) {
+    let owners: string[] = [];
+    for (const rule of rules) {
+      if (pathMatchesPattern(rule.pattern, path)) owners = rule.owners;
+    }
+    for (const owner of owners) matched.add(owner);
+  }
+  return [...matched].sort();
+}
+
+function buildPartialWarning(
+  selected: SelectedReviewFiles,
+  reviewedFiles: number,
+  reviewedChangedLines: number,
+  truncatedPaths: string[],
+  unavailablePatchPaths: string[],
+  bundleDrops: number,
+  backendPartial: boolean,
+  scopePartialReason?: string
+): string {
+  const reasons: string[] = [];
+  if (scopePartialReason) reasons.push(scopePartialReason);
+  if (
+    selected.totalFiles > REVIEW_FILE_LIMIT ||
+    selected.totalChangedLines > REVIEW_LINE_LIMIT
+  ) {
+    reasons.push(
+      `scope exceeded 50 files or 5,000 changed lines; diff context covered ${reviewedFiles}/${selected.totalFiles} files and ${reviewedChangedLines}/${selected.totalChangedLines} changed lines`
+    );
+  } else if (selected.omittedFiles.length) {
+    reasons.push(
+      `diff context covered ${reviewedFiles}/${selected.totalFiles} files and ${reviewedChangedLines}/${selected.totalChangedLines} changed lines`
+    );
+  }
+  if (truncatedPaths.length) {
+    reasons.push(
+      `${truncatedPaths.length} oversized patch(es) were truncated before bundling`
+    );
+  }
+  if (unavailablePatchPaths.length) {
+    reasons.push(
+      `${unavailablePatchPaths.length} changed file(s) had no textual patch context`
+    );
+  }
+  if (bundleDrops) reasons.push(`${bundleDrops} context item(s) were dropped by the deterministic bundle budget`);
+  if (backendPartial) reasons.push("the backend marked its review incomplete");
+  return reasons.join("; ") || "review context was incomplete";
+}
+
+function safeInline(value: string): string {
+  return value.replace(/`/g, "ˋ").replace(/[\r\n\u0000]/g, " ").slice(0, 200);
+}
+
+function commentMatchesIdentifier(body: string, identifier: string): boolean {
+  const normalized = identifier.toLowerCase();
+  const id = /Finding ID:\s*`([^`]+)`/i.exec(body)?.[1]?.toLowerCase();
+  const fingerprint = /Fingerprint:\s*`([^`]+)`/i.exec(body)?.[1]?.toLowerCase();
+  return id === normalized || Boolean(fingerprint?.startsWith(normalized));
 }

@@ -13,12 +13,14 @@ export interface RepositoryRecord {
   indexUpdatedAt?: string;
   scannerState: "not-configured" | "report-only" | "enforced";
   repositoryState: RepositoryLifecycleState;
+  automaticReviewPaused: boolean;
 }
 
 export interface ReviewState {
   repositoryId: number;
   pullNumber: number;
   headSha: string;
+  reviewedHeadSha?: string;
   placeholderCommentId?: number;
   findings: Array<{ fingerprint: string; state: "open" | "resolved" | "superseded" }>;
 }
@@ -43,6 +45,7 @@ export interface Store {
   getRepository(repositoryId: number): Promise<RepositoryRecord | undefined>;
   setRepositoryState(repositoryId: number, state: RepositoryLifecycleState): Promise<void>;
   setInstallationState(installationId: number, state: RepositoryLifecycleState): Promise<void>;
+  setAutomaticReviewPaused(repositoryId: number, paused: boolean): Promise<void>;
   saveReviewHead(
     repositoryId: number,
     pullNumber: number,
@@ -150,6 +153,15 @@ export class MemoryStore implements Store {
     }
   }
 
+  async setAutomaticReviewPaused(repositoryId: number, paused: boolean) {
+    const repository = this.repositories.get(repositoryId);
+    if (!repository) return;
+    this.repositories.set(repositoryId, {
+      ...repository,
+      automaticReviewPaused: paused
+    });
+  }
+
   async saveReviewHead(
     repositoryId: number,
     pullNumber: number,
@@ -162,6 +174,7 @@ export class MemoryStore implements Store {
       repositoryId,
       pullNumber,
       headSha,
+      reviewedHeadSha: current?.reviewedHeadSha,
       placeholderCommentId: placeholderCommentId ?? current?.placeholderCommentId,
       findings: current?.findings ?? []
     });
@@ -287,19 +300,23 @@ export class PostgresStore implements Store {
         index_updated_at TIMESTAMPTZ,
         scanner_state TEXT NOT NULL,
         repository_state TEXT NOT NULL DEFAULT 'active',
+        automatic_review_paused BOOLEAN NOT NULL DEFAULT false,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       ALTER TABLE repositories ADD COLUMN IF NOT EXISTS repository_state TEXT NOT NULL DEFAULT 'active';
+      ALTER TABLE repositories ADD COLUMN IF NOT EXISTS automatic_review_paused BOOLEAN NOT NULL DEFAULT false;
 
       CREATE TABLE IF NOT EXISTS reviews (
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id),
         pull_number INTEGER NOT NULL,
         head_sha TEXT NOT NULL,
+        reviewed_head_sha TEXT,
         placeholder_comment_id BIGINT,
         findings JSONB NOT NULL DEFAULT '[]',
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (repository_id, pull_number)
       );
+      ALTER TABLE reviews ADD COLUMN IF NOT EXISTS reviewed_head_sha TEXT;
 
       CREATE TABLE IF NOT EXISTS webhook_jobs (
         delivery_id TEXT PRIMARY KEY,
@@ -323,13 +340,14 @@ export class PostgresStore implements Store {
   async upsertRepository(record: RepositoryRecord) {
     await this.pool.query(
       `INSERT INTO repositories
-       (repository_id, installation_id, full_name, visibility, default_branch, index_sha, index_updated_at, scanner_state, repository_state)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       (repository_id, installation_id, full_name, visibility, default_branch, index_sha, index_updated_at, scanner_state, repository_state, automatic_review_paused)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT (repository_id) DO UPDATE SET
        installation_id=excluded.installation_id, full_name=excluded.full_name,
        visibility=excluded.visibility, default_branch=excluded.default_branch,
        index_sha=excluded.index_sha, index_updated_at=excluded.index_updated_at,
-       scanner_state=excluded.scanner_state, repository_state=excluded.repository_state, updated_at=now()`,
+       scanner_state=excluded.scanner_state, repository_state=excluded.repository_state,
+       automatic_review_paused=excluded.automatic_review_paused, updated_at=now()`,
       [
         record.repositoryId,
         record.installationId,
@@ -339,7 +357,8 @@ export class PostgresStore implements Store {
         record.indexSha,
         record.indexUpdatedAt,
         record.scannerState,
-        record.repositoryState
+        record.repositoryState,
+        record.automaticReviewPaused
       ]
     );
   }
@@ -357,7 +376,8 @@ export class PostgresStore implements Store {
       indexSha: row.index_sha ?? undefined,
       indexUpdatedAt: fromUnknownDate(row.index_updated_at),
       scannerState: row.scanner_state,
-      repositoryState: row.repository_state
+      repositoryState: row.repository_state,
+      automaticReviewPaused: Boolean(row.automatic_review_paused)
     } as RepositoryRecord;
   }
 
@@ -375,6 +395,13 @@ export class PostgresStore implements Store {
     );
   }
 
+  async setAutomaticReviewPaused(repositoryId: number, paused: boolean) {
+    await this.pool.query(
+      "UPDATE repositories SET automatic_review_paused=$2, updated_at=now() WHERE repository_id=$1",
+      [repositoryId, paused]
+    );
+  }
+
   async saveReviewHead(
     repositoryId: number,
     pullNumber: number,
@@ -382,8 +409,8 @@ export class PostgresStore implements Store {
     placeholderCommentId?: number
   ) {
     await this.pool.query(
-      `INSERT INTO reviews (repository_id,pull_number,head_sha,placeholder_comment_id,findings)
-       VALUES ($1,$2,$3,$4,'[]'::jsonb)
+      `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings)
+       VALUES ($1,$2,$3,NULL,$4,'[]'::jsonb)
        ON CONFLICT (repository_id,pull_number) DO UPDATE SET
        head_sha=excluded.head_sha,
        placeholder_comment_id=COALESCE(excluded.placeholder_comment_id, reviews.placeholder_comment_id),
@@ -394,18 +421,20 @@ export class PostgresStore implements Store {
 
   async saveReview(state: ReviewState, expectedHeadSha?: string) {
     const result = await this.pool.query(
-      `INSERT INTO reviews (repository_id,pull_number,head_sha,placeholder_comment_id,findings)
-       VALUES ($1,$2,$3,$4,$5)
+      `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings)
+       VALUES ($1,$2,$3,$4,$5,$6)
        ON CONFLICT (repository_id,pull_number) DO UPDATE SET
        head_sha=excluded.head_sha,
+       reviewed_head_sha=excluded.reviewed_head_sha,
        placeholder_comment_id=excluded.placeholder_comment_id,
        findings=excluded.findings,
        updated_at=now()
-       WHERE $6::text IS NULL OR reviews.head_sha=$6`,
+       WHERE $7::text IS NULL OR reviews.head_sha=$7`,
       [
         state.repositoryId,
         state.pullNumber,
         state.headSha,
+        state.reviewedHeadSha,
         state.placeholderCommentId,
         JSON.stringify(state.findings),
         expectedHeadSha ?? null
@@ -425,6 +454,7 @@ export class PostgresStore implements Store {
       repositoryId: Number(row.repository_id),
       pullNumber: row.pull_number,
       headSha: row.head_sha,
+      reviewedHeadSha: row.reviewed_head_sha ?? undefined,
       placeholderCommentId: row.placeholder_comment_id ? Number(row.placeholder_comment_id) : undefined,
       findings: row.findings
     } as ReviewState;

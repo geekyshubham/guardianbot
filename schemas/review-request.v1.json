@@ -111,6 +111,10 @@
       "type": "string",
       "minLength": 1
     },
+    "expectedContextIndexSha": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "validChangedLines": {
       "type": "array",
       "items": {
