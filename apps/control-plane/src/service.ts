@@ -25,6 +25,7 @@ import {
   type AdminBackendRegistryConfig
 } from "./backend-registry.js";
 import { GuardianMetrics } from "./metrics.js";
+import type { RepositoryIndexService } from "./repository-index-service.js";
 import {
   extractFindingMarker,
   findingMarker,
@@ -58,6 +59,7 @@ export interface ServiceOptions {
   scannerWorkflowRunHandler?: (run: GuardianScannerWorkflowRun) => Promise<void>;
   now?: () => Date;
   metrics?: GuardianMetrics;
+  repositoryIndexService?: RepositoryIndexService;
 }
 
 export interface GuardianScannerWorkflowRun {
@@ -357,6 +359,11 @@ export class GuardianService {
       return;
     }
 
+    if (name === "push" && event.repository && !event.deleted) {
+      await this.refreshDefaultBranchIndex(event, event.repository);
+      return;
+    }
+
     if (
       name === "pull_request" &&
       ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)
@@ -396,10 +403,19 @@ export class GuardianService {
       fullName: repository.full_name,
       visibility: snapshot.visibility,
       defaultBranch: repository.default_branch,
+      indexSha: existing?.indexSha,
+      indexUpdatedAt: existing?.indexUpdatedAt,
       scannerState: "not-configured",
       repositoryState: "active",
-      automaticReviewPaused: existing?.automaticReviewPaused ?? false,
-      indexUpdatedAt: this.now().toISOString()
+      automaticReviewPaused: existing?.automaticReviewPaused ?? false
+    });
+    await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+      github,
+      repositoryId: repository.id,
+      installationId: event.installation.id,
+      fullName: repository.full_name,
+      defaultBranch: repository.default_branch,
+      visibility: snapshot.visibility
     });
     if (!existing) {
       await github.createIssue(
@@ -1070,11 +1086,37 @@ export class GuardianService {
       defaultBranch: event.repository.default_branch,
       scannerState: "not-configured" as const,
       repositoryState: "active" as const,
-      automaticReviewPaused: false,
-      indexUpdatedAt: this.now().toISOString()
+      automaticReviewPaused: false
     };
     await this.store.upsertRepository(record);
     return record;
+  }
+
+  private async refreshDefaultBranchIndex(event: GitHubEvent, repository: any): Promise<void> {
+    const branchRef = `refs/heads/${repository.default_branch}`;
+    if (event.ref !== branchRef) return;
+    const existing = await this.store.getRepository(repository.id);
+    await this.store.upsertRepository({
+      installationId: event.installation.id,
+      repositoryId: repository.id,
+      fullName: repository.full_name,
+      visibility: repository.private ? "private" : "public",
+      defaultBranch: repository.default_branch,
+      indexSha: existing?.indexSha,
+      indexUpdatedAt: existing?.indexUpdatedAt,
+      scannerState: existing?.scannerState ?? "not-configured",
+      repositoryState: "active",
+      automaticReviewPaused: existing?.automaticReviewPaused ?? false
+    });
+    const github = await this.client(event, [repository.id]);
+    await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+      github,
+      repositoryId: repository.id,
+      installationId: event.installation.id,
+      fullName: repository.full_name,
+      defaultBranch: repository.default_branch,
+      visibility: repository.private ? "private" : "public"
+    });
   }
 
   private async loadRepositoryContext(

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ReviewRequest } from "@guardianbot/protocol";
+import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { ReviewBackendRegistry } from "../src/backend-registry.js";
 import { GuardianService, addedLineRanges, redactUntrustedText } from "../src/service.js";
 import { MemoryStore } from "../src/store.js";
@@ -15,6 +16,7 @@ class FakeGitHub {
   pullFiles: Array<Array<Record<string, any>>> = [];
   comparisons: Array<Record<string, any>> = [];
   comparePaths: string[] = [];
+  treeRefs: string[] = [];
   fileReads: Array<{ path: string; ref: string }> = [];
   permission = "write";
 
@@ -24,10 +26,13 @@ class FakeGitHub {
       languages?: Record<string, number>;
       config?: string;
       codeowners?: string;
+      refSha?: string;
+      contents?: Record<string, Buffer>;
     } = {}
   ) {}
 
-  async getTree(): Promise<string[]> {
+  async getTree(_owner?: string, _repo?: string, ref?: string): Promise<string[]> {
+    if (ref) this.treeRefs.push(ref);
     return this.options.tree ?? ["package-lock.json", "src/index.ts"];
   }
 
@@ -67,6 +72,42 @@ class FakeGitHub {
   }
 
   async request<T>(method: string, path: string, body?: any): Promise<T> {
+    if (method === "GET" && /\/git\/ref\/heads\//.test(path)) {
+      return { object: { sha: this.options.refSha ?? "a".repeat(40) } } as T;
+    }
+    if (method === "GET" && path.includes("/contents/")) {
+      const encodedPath = path.split("/contents/")[1]?.split("?")[0];
+      const repositoryPath = decodeURIComponent(encodedPath ?? "");
+      if (repositoryPath === ".guardianbot/config.yml" && this.options.config) {
+        return {
+          type: "file",
+          sha: "config-sha",
+          size: Buffer.byteLength(this.options.config, "utf8"),
+          encoding: "base64",
+          content: Buffer.from(this.options.config, "utf8").toString("base64")
+        } as T;
+      }
+      if (repositoryPath === ".github/CODEOWNERS" && this.options.codeowners) {
+        return {
+          type: "file",
+          sha: "codeowners-sha",
+          size: Buffer.byteLength(this.options.codeowners, "utf8"),
+          encoding: "base64",
+          content: Buffer.from(this.options.codeowners, "utf8").toString("base64")
+        } as T;
+      }
+      const content = this.options.contents?.[repositoryPath];
+      if (content) {
+        return {
+          type: "file",
+          sha: `${repositoryPath}-sha`,
+          size: content.length,
+          encoding: "base64",
+          content: content.toString("base64")
+        } as T;
+      }
+      throw new Error(`GitHub GET ${path} returned 404: missing`);
+    }
     if (method === "GET" && /\/pulls\/\d+$/.test(path)) {
       const current =
         this.currentPulls.shift() ?? createPullEvent().pull_request;
@@ -278,6 +319,67 @@ test("enqueue is idempotent and discovery succeeds once", async () => {
   assert.equal(repository?.repositoryState, "active");
   const job = await store.getWebhook("delivery-1");
   assert.equal(job?.status, "succeeded");
+});
+
+test("default-branch push refreshes the exact repository index without affecting other refs", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", ".guardianbot/config.yml"],
+    refSha: "f".repeat(40),
+    contents: {
+      "src/auth.ts": Buffer.from("export function authorize(user) { return user.role === 'admin'; }\n")
+    },
+    config: "review:\n  incremental: true\n"
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      repositoryIndexService: new RepositoryIndexService(store)
+    },
+    store
+  );
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/main",
+      deleted: false,
+      repository: {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        default_branch: "main",
+        private: false
+      }
+    },
+    "delivery-push"
+  );
+
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  const repository = await store.getRepository(99);
+  assert.equal(repository?.indexSha, "f".repeat(40));
+  const index = await store.getRepositoryIndex(99, "github:99", "f".repeat(40));
+  assert.ok(index);
+
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/feature",
+      deleted: false,
+      repository: {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        default_branch: "main",
+        private: false
+      }
+    },
+    "delivery-push-ignored"
+  );
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal(github.treeRefs.length, 1);
 });
 
 test("failing jobs retry and dead-letter after the max attempt budget", async () => {

@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
+import { RepositoryIndexService } from "./repository-index-service.js";
 import { GuardianService } from "./service.js";
 import { MemoryStore, PostgresStore, type Store } from "./store.js";
 
@@ -33,6 +34,7 @@ async function start() {
   const metrics = new GuardianMetrics();
   const store = await createStore();
   const privateKey = required("GITHUB_APP_PRIVATE_KEY").replace(/\\n/g, "\n");
+  const repositoryIndexService = new RepositoryIndexService(store);
   const service = new GuardianService(
     {
       appId: required("GITHUB_APP_ID"),
@@ -40,7 +42,8 @@ async function start() {
       webhookSecret: required("GITHUB_WEBHOOK_SECRET"),
       modelBackendUrl: process.env.GUARDIAN_MODEL_BACKEND_URL,
       modelBackendToken: process.env.GUARDIAN_MODEL_BACKEND_TOKEN,
-      metrics
+      metrics,
+      repositoryIndexService
     },
     store
   );
