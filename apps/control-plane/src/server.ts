@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
 import { RepositoryIndexService } from "./repository-index-service.js";
+import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
 import { GuardianService } from "./service.js";
 import { MemoryStore, PostgresStore, type Store } from "./store.js";
 
@@ -43,6 +44,12 @@ async function start() {
       modelBackendUrl: process.env.GUARDIAN_MODEL_BACKEND_URL,
       modelBackendToken: process.env.GUARDIAN_MODEL_BACKEND_TOKEN,
       metrics,
+      scannerWorkflowRunHandler: createScannerWorkflowRunHandler({
+        appId: required("GITHUB_APP_ID"),
+        privateKey,
+        store,
+        environment: process.env
+      }),
       repositoryIndexService
     },
     store
