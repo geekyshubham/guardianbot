@@ -292,6 +292,7 @@ function splitFullName(fullName: string): [string, string] {
 function classifyIndexCandidate(path: string): number | undefined {
   if (/^(?:\.github\/CODEOWNERS|CODEOWNERS|docs\/CODEOWNERS)$/i.test(path)) return 0;
   if (/^\.guardianbot\/config\.ya?ml$/i.test(path)) return 1;
+  if (/^\.guardianbot\/baseline\.json$/i.test(path)) return 1;
   if (/^\.github\/workflows\/[^/]+\.(?:ya?ml)$/i.test(path)) return 2;
   if (
     /(?:^|\/)(?:Dockerfile(?:\.[^/]+)?|docker-compose[^/]*\.(?:ya?ml))$/i.test(path)

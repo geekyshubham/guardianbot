@@ -82,12 +82,19 @@ class FailingReplaceStore extends MemoryStore {
 test("refresh resolves the default branch to an immutable commit and persists the exact index", async () => {
   const store = new MemoryStore();
   await store.upsertRepository(defaultRepository);
-  const github = new FakeGitHub("a".repeat(40), ["src/auth.ts", ".guardianbot/config.yml"], {
+  const github = new FakeGitHub("a".repeat(40), [
+    "src/auth.ts",
+    ".guardianbot/config.yml",
+    ".guardianbot/baseline.json"
+  ], {
     "src/auth.ts": {
       content: Buffer.from("export function authorize(user) { return user.role === 'admin'; }\n")
     },
     ".guardianbot/config.yml": {
       content: Buffer.from("review:\n  incremental: true\n")
+    },
+    ".guardianbot/baseline.json": {
+      content: Buffer.from('{"schemaVersion":"1.0.0","fingerprints":[]}\n')
     }
   });
 
@@ -114,6 +121,7 @@ test("refresh resolves the default branch to an immutable commit and persists th
   assert.ok(index);
   assert.equal(index?.repositoryScope, "github:42");
   assert.ok(index?.files.some((file) => file.path === "src/auth.ts"));
+  assert.ok(index?.files.some((file) => file.path === ".guardianbot/baseline.json"));
 });
 
 test("refresh is repository-isolated and idempotent for an already persisted commit", async () => {
