@@ -2,11 +2,15 @@ import {
   buildReviewBundle,
   detectRepository,
   parseGuardianConfig,
+  retrievalToReviewContextCandidates,
+  retrieveRepositoryContext,
   scoreChangeRisk,
   stableFingerprint,
   verifyWebhookSignature,
   type GitHubClient,
   type GuardianConfig,
+  type IndexChangedFile,
+  type RepositoryVisibility,
   type ReviewBundleContextCandidate
 } from "@guardianbot/core";
 import {
@@ -169,6 +173,21 @@ interface LoadedRepositoryContext {
   scannerConfigured: boolean;
 }
 
+interface LoadedIndexReviewContext {
+  candidates: ReviewBundleContextCandidate[];
+  partial: boolean;
+  warning?: string;
+}
+
+interface IndexedReviewContextInput {
+  repositoryId: number;
+  repositoryFullName: string;
+  visibility: RepositoryVisibility;
+  baseSha: string;
+  files: GitHubPullFile[];
+  query: string;
+}
+
 interface ReviewExecutionOptions {
   manual?: boolean;
   full?: boolean;
@@ -193,6 +212,10 @@ const MIN_WEBHOOK_LEASE_MS = MAX_BACKEND_TIMEOUT_MS + 120_000;
 const DEFAULT_WEBHOOK_LEASE_MS = 15 * 60_000;
 const MAX_REVIEW_COMMENT_PAGES = 20;
 const DEFAULT_INLINE_LIMIT = 8;
+const REPOSITORY_CONTEXT_LIMIT = 24;
+const ONBOARDING_ISSUE_TITLE = "GuardianBot onboarding inventory";
+const ONBOARDING_ISSUE_MARKER = "<!-- guardianbot-onboarding-inventory -->";
+const MAX_ONBOARDING_ISSUE_PAGES = 10;
 
 export class GuardianService {
   readonly metrics: GuardianMetrics;
@@ -200,6 +223,7 @@ export class GuardianService {
   private readonly webhookLeaseMs: number;
   private readonly now: () => Date;
   private readonly backendRegistry?: ReviewBackendRegistry;
+  private readonly onboardingIssuePromises = new Map<number, Promise<void>>();
 
   constructor(private readonly options: ServiceOptions, private readonly store: Store) {
     this.metrics = options.metrics ?? new GuardianMetrics();
@@ -387,11 +411,12 @@ export class GuardianService {
     const [owner, name] = repository.full_name.split("/");
     const files = await github.getTree(owner, name, repository.default_branch);
     const languages = await github.getLanguages(owner, name);
+    const visibility = repositoryVisibility(repository);
     const snapshot = {
       owner,
       name,
       defaultBranch: repository.default_branch,
-      visibility: repository.private ? ("private" as const) : ("public" as const),
+      visibility: visibility === "internal" ? ("restricted" as const) : visibility,
       files,
       languages
     };
@@ -401,34 +426,141 @@ export class GuardianService {
       installationId: event.installation.id,
       repositoryId: repository.id,
       fullName: repository.full_name,
-      visibility: snapshot.visibility,
+      visibility,
       defaultBranch: repository.default_branch,
       indexSha: existing?.indexSha,
       indexUpdatedAt: existing?.indexUpdatedAt,
-      scannerState: "not-configured",
+      scannerState: existing?.scannerState ?? "not-configured",
       repositoryState: "active",
       automaticReviewPaused: existing?.automaticReviewPaused ?? false
     });
-    await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+    await this.ensureOnboardingIssue(
+      github,
+      repository.id,
+      owner,
+      name,
+      onboardingIssue(
+        repository.full_name,
+        [...detection.languages, ...detection.packageManagers],
+        detection.notes
+      )
+    );
+    const refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
       github,
       repositoryId: repository.id,
       installationId: event.installation.id,
       fullName: repository.full_name,
       defaultBranch: repository.default_branch,
-      visibility: snapshot.visibility
+      visibility
     });
-    if (!existing) {
-      await github.createIssue(
+    if (refresh) {
+      await this.refreshScannerStateFromConfig(
+        github,
+        repository.id,
         owner,
         name,
-        "GuardianBot onboarding inventory",
-        onboardingIssue(
-          repository.full_name,
-          [...detection.languages, ...detection.packageManagers],
-          detection.notes
-        )
+        refresh.commitSha
       );
     }
+  }
+
+  private async ensureOnboardingIssue(
+    github: GitHubClientLike,
+    repositoryId: number,
+    owner: string,
+    repo: string,
+    body: string
+  ): Promise<void> {
+    const pending = this.onboardingIssuePromises.get(repositoryId);
+    if (pending) {
+      await pending;
+      return;
+    }
+    const operation = this.ensureOnboardingIssueOnce(github, owner, repo, body);
+    this.onboardingIssuePromises.set(repositoryId, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.onboardingIssuePromises.get(repositoryId) === operation) {
+        this.onboardingIssuePromises.delete(repositoryId);
+      }
+    }
+  }
+
+  private async ensureOnboardingIssueOnce(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    body: string
+  ): Promise<void> {
+    for (let page = 1; page <= MAX_ONBOARDING_ISSUE_PAGES; page += 1) {
+      const issues = await github.request<Array<{
+        title?: string;
+        body?: string;
+        pull_request?: unknown;
+      }>>(
+        "GET",
+        `/repos/${owner}/${repo}/issues?state=all&sort=created&direction=desc&per_page=100&page=${page}`
+      );
+      if (
+        issues.some(
+          (issue) =>
+            !issue.pull_request &&
+            (
+              String(issue.title ?? "") === ONBOARDING_ISSUE_TITLE ||
+              String(issue.body ?? "").includes(ONBOARDING_ISSUE_MARKER)
+            )
+        )
+      ) {
+        return;
+      }
+      if (issues.length < 100) break;
+    }
+    await github.createIssue(
+      owner,
+      repo,
+      ONBOARDING_ISSUE_TITLE,
+      `${body}\n\n${ONBOARDING_ISSUE_MARKER}`
+    );
+  }
+
+  private async refreshScannerStateFromConfig(
+    github: GitHubClientLike,
+    repositoryId: number,
+    owner: string,
+    repo: string,
+    commitSha: string
+  ): Promise<void> {
+    let configFile: { content: string; sha: string } | undefined;
+    try {
+      configFile = await github.getFile(
+        owner,
+        repo,
+        ".guardianbot/config.yml",
+        commitSha
+      );
+    } catch {
+      // A transient read failure must not erase the last confirmed scanner state.
+      return;
+    }
+    let scannerState: "not-configured" | "report-only" | "enforced" =
+      "not-configured";
+    if (configFile) {
+      try {
+        const config = parseGuardianConfig(configFile.content);
+        scannerState =
+          config.scanners.mode === "enforce"
+            ? "enforced"
+            : config.scanners.mode === "report-only"
+              ? "report-only"
+              : "not-configured";
+      } catch {
+        scannerState = "not-configured";
+      }
+    }
+    const repository = await this.store.getRepository(repositoryId);
+    if (!repository || repository.scannerState === scannerState) return;
+    await this.store.upsertRepository({ ...repository, scannerState });
   }
 
   private async handleScannerWorkflowRun(event: GitHubEvent): Promise<void> {
@@ -534,9 +666,9 @@ export class GuardianService {
       deterministicRisk.highRisk || configuredHighRisk
         ? "high-risk-review"
         : "routine-review";
-    const classification: DataClassification = event.repository.private
-      ? "private"
-      : "public";
+    const indexVisibility = repositoryVisibility(event.repository);
+    const classification: DataClassification =
+      indexVisibility === "public" ? "public" : "private";
     const routed = this.reviewClient(profile, classification);
     if (!routed) {
       await this.publishUnavailable(
@@ -628,6 +760,21 @@ export class GuardianService {
         priority: 8
       });
     }
+    const indexedContext = await this.loadIndexedReviewContext({
+      repositoryId: event.repository.id,
+      repositoryFullName: event.repository.full_name,
+      visibility: indexVisibility,
+      baseSha: pull.base.sha,
+      files: fileScope.files,
+      query: redactUntrustedText(
+        [
+          pull.title,
+          pull.body ?? "",
+          ...selected.files.map((file) => file.filename)
+        ].join("\n")
+      )
+    });
+    contextCandidates.push(...indexedContext.candidates);
 
     const availableBundleCharacters = Math.min(
       REVIEW_BUNDLE_CHARACTER_LIMIT,
@@ -657,7 +804,7 @@ export class GuardianService {
       scannerEvidence: [],
       rules: [],
       maxInputCharacters: availableBundleCharacters,
-      maxContextChunks: REVIEW_FILE_LIMIT + 3
+      maxContextChunks: REVIEW_FILE_LIMIT + 3 + REPOSITORY_CONTEXT_LIMIT
     });
     const includedContextIds = new Set(bundle.contexts.map((context) => context.id));
     const includedDiffFiles = selected.files.filter((file) =>
@@ -847,6 +994,7 @@ export class GuardianService {
       selected.partial ||
       Boolean(fileScope.partialReason) ||
       bundle.partial ||
+      indexedContext.partial ||
       preTruncatedPaths.length > 0 ||
       unavailablePatchPaths.length > 0 ||
       result.summary.partialReview;
@@ -889,7 +1037,8 @@ export class GuardianService {
               unavailablePatchPaths,
               bundle.dropped.length,
               result.summary.partialReview,
-              fileScope.partialReason
+              fileScope.partialReason,
+              indexedContext.warning
             )
           : undefined
       })
@@ -1082,7 +1231,7 @@ export class GuardianService {
       installationId: event.installation.id,
       repositoryId: event.repository.id,
       fullName: event.repository.full_name,
-      visibility: event.repository.private ? "private" : "public",
+      visibility: repositoryVisibility(event.repository),
       defaultBranch: event.repository.default_branch,
       scannerState: "not-configured" as const,
       repositoryState: "active" as const,
@@ -1096,11 +1245,12 @@ export class GuardianService {
     const branchRef = `refs/heads/${repository.default_branch}`;
     if (event.ref !== branchRef) return;
     const existing = await this.store.getRepository(repository.id);
+    const visibility = repositoryVisibility(repository);
     await this.store.upsertRepository({
       installationId: event.installation.id,
       repositoryId: repository.id,
       fullName: repository.full_name,
-      visibility: repository.private ? "private" : "public",
+      visibility,
       defaultBranch: repository.default_branch,
       indexSha: existing?.indexSha,
       indexUpdatedAt: existing?.indexUpdatedAt,
@@ -1109,14 +1259,24 @@ export class GuardianService {
       automaticReviewPaused: existing?.automaticReviewPaused ?? false
     });
     const github = await this.client(event, [repository.id]);
-    await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+    const refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
       github,
       repositoryId: repository.id,
       installationId: event.installation.id,
       fullName: repository.full_name,
       defaultBranch: repository.default_branch,
-      visibility: repository.private ? "private" : "public"
+      visibility
     });
+    if (refresh) {
+      const [owner, repo] = repository.full_name.split("/");
+      await this.refreshScannerStateFromConfig(
+        github,
+        repository.id,
+        owner,
+        repo,
+        refresh.commitSha
+      );
+    }
   }
 
   private async loadRepositoryContext(
@@ -1150,6 +1310,102 @@ export class GuardianService {
       codeOwnersSource,
       scannerConfigured: Boolean(config)
     };
+  }
+
+  private async loadIndexedReviewContext(
+    input: IndexedReviewContextInput
+  ): Promise<LoadedIndexReviewContext> {
+    const repositoryIndexService = this.options.repositoryIndexService;
+    if (!repositoryIndexService) {
+      return {
+        candidates: [],
+        partial: true,
+        warning: "exact-base repository index context was unavailable because indexing is not configured"
+      };
+    }
+    if (!/^[a-f0-9]{40}$/.test(input.baseSha)) {
+      return {
+        candidates: [],
+        partial: true,
+        warning: "exact-base repository index context was unavailable because the base SHA was invalid"
+      };
+    }
+    try {
+      const index = await repositoryIndexService.loadExactRepositoryIndex(
+        input.repositoryId,
+        input.baseSha
+      );
+      if (!index) {
+        return {
+          candidates: [],
+          partial: true,
+          warning: `exact-base repository index context was unavailable for ${input.baseSha.slice(0, 12)}`
+        };
+      }
+      if (
+        index.repository !== input.repositoryFullName ||
+        index.repositoryScope !== `github:${input.repositoryId}` ||
+        index.visibility !== input.visibility ||
+        index.commitSha !== input.baseSha
+      ) {
+        return {
+          candidates: [],
+          partial: true,
+          warning: "repository index context was rejected by repository isolation checks"
+        };
+      }
+      const result = await retrieveRepositoryContext({
+        index,
+        repositoryScope: `github:${input.repositoryId}`,
+        commitSha: input.baseSha,
+        changes: buildIndexChanges(input.files),
+        query: input.query,
+        limit: REPOSITORY_CONTEXT_LIMIT,
+        primaryPolicy: {
+          repositoryScope: `github:${input.repositoryId}`,
+          visibility: input.visibility,
+          allowedRelatedRepositories: []
+        },
+        related: []
+      });
+      const adapted = retrievalToReviewContextCandidates(result);
+      const candidates = adapted.map((candidate, contextIndex) => {
+        const metadata = result.contexts[contextIndex]!;
+        return {
+          ...candidate,
+          id: [
+            "repository-index",
+            metadata.repositoryScope,
+            metadata.commitSha,
+            metadata.id,
+            metadata.contentSha256
+          ].join(":"),
+          content: redactUntrustedText(candidate.content).slice(0, 12_000)
+        };
+      });
+      const warnings: string[] = [];
+      if (result.scope.partial) {
+        warnings.push(
+          `repository index retrieval used security-sensitive clusters for ${result.scope.selectedPaths.length}/${result.scope.totalFiles} changed files`
+        );
+      }
+      if (result.droppedContextCount > 0) {
+        warnings.push(
+          `repository index retrieval omitted ${result.droppedContextCount} lower-ranked context chunk(s)`
+        );
+      }
+      return {
+        candidates,
+        partial: result.partial,
+        warning: warnings.length ? warnings.join("; ") : undefined
+      };
+    } catch {
+      return {
+        candidates: [],
+        partial: true,
+        warning: "exact-base repository index context failed validation or retrieval and was omitted"
+      };
+    }
   }
 
   private async publishUnavailable(
@@ -1447,6 +1703,43 @@ function computeBackoffMs(attempt: number): number {
   return Math.min(30_000 * 2 ** Math.max(0, attempt - 1), 30 * 60_000);
 }
 
+function repositoryVisibility(repository: any): RepositoryVisibility {
+  const visibility = String(repository?.visibility ?? "").toLowerCase();
+  if (
+    visibility === "public" ||
+    visibility === "private" ||
+    visibility === "internal"
+  ) {
+    return visibility;
+  }
+  return repository?.private ? "private" : "public";
+}
+
+function buildIndexChanges(files: GitHubPullFile[]): IndexChangedFile[] {
+  const changes = new Map<string, IndexChangedFile>();
+  for (const file of files) {
+    const path =
+      file.status === "renamed" && file.previous_filename
+        ? file.previous_filename
+        : file.filename;
+    const additions = file.additions ?? countPatchLines(file.patch ?? "", "+");
+    const deletions = file.deletions ?? countPatchLines(file.patch ?? "", "-");
+    const patch = file.patch?.slice(0, 20_000);
+    const existing = changes.get(path);
+    if (!existing) {
+      changes.set(path, { path, additions, deletions, patch });
+      continue;
+    }
+    existing.additions = Math.min(Number.MAX_SAFE_INTEGER, existing.additions + additions);
+    existing.deletions = Math.min(Number.MAX_SAFE_INTEGER, existing.deletions + deletions);
+    existing.patch = [existing.patch, patch]
+      .filter((value): value is string => Boolean(value))
+      .join("\n")
+      .slice(0, 20_000) || undefined;
+  }
+  return [...changes.values()];
+}
+
 function filePriority(file: GitHubPullFile): number {
   const sensitive = HIGH_RISK_PATH.test(file.filename) ? 10_000 : 0;
   const additions = file.additions ?? countPatchLines(file.patch ?? "", "+");
@@ -1725,10 +2018,12 @@ function buildPartialWarning(
   unavailablePatchPaths: string[],
   bundleDrops: number,
   backendPartial: boolean,
-  scopePartialReason?: string
+  scopePartialReason?: string,
+  indexWarning?: string
 ): string {
   const reasons: string[] = [];
   if (scopePartialReason) reasons.push(scopePartialReason);
+  if (indexWarning) reasons.push(indexWarning);
   if (
     selected.totalFiles > REVIEW_FILE_LIMIT ||
     selected.totalChangedLines > REVIEW_LINE_LIMIT

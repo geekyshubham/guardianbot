@@ -19,6 +19,8 @@ class FakeGitHub {
   treeRefs: string[] = [];
   fileReads: Array<{ path: string; ref: string }> = [];
   permission = "write";
+  failIssueCreations = 0;
+  failConfigFileReads = 0;
 
   constructor(
     private readonly options: {
@@ -48,6 +50,10 @@ class FakeGitHub {
   ): Promise<{ content: string; sha: string } | undefined> {
     this.fileReads.push({ path, ref });
     if (path === ".guardianbot/config.yml" && this.options.config) {
+      if (this.failConfigFileReads > 0) {
+        this.failConfigFileReads -= 1;
+        throw new Error("GitHub GET config returned 503: transient");
+      }
       return { content: this.options.config, sha: "config-sha" };
     }
     if (path === ".github/CODEOWNERS" && this.options.codeowners) {
@@ -57,6 +63,10 @@ class FakeGitHub {
   }
 
   async createIssue(owner: string, repo: string, title: string, body: string) {
+    if (this.failIssueCreations > 0) {
+      this.failIssueCreations -= 1;
+      throw new Error("GitHub POST issue returned 503: transient");
+    }
     this.issues.push({ owner, repo, title, body });
     return { html_url: "https://example.test/issues/1", number: this.issues.length };
   }
@@ -72,6 +82,12 @@ class FakeGitHub {
   }
 
   async request<T>(method: string, path: string, body?: any): Promise<T> {
+    if (method === "GET" && /\/issues\?/.test(path)) {
+      return this.issues.map((issue) => ({
+        title: issue.title,
+        body: issue.body
+      })) as T;
+    }
     if (method === "GET" && /\/git\/ref\/heads\//.test(path)) {
       return { object: { sha: this.options.refSha ?? "a".repeat(40) } } as T;
     }
@@ -170,6 +186,20 @@ class FakeBackend {
   async review(request: ReviewRequest) {
     this.requests.push(request);
     return this.resultFactory(request);
+  }
+}
+
+class FailOnceRepositoryIndexService extends RepositoryIndexService {
+  attempts = 0;
+
+  override async refreshDefaultBranchIndex(
+    input: Parameters<RepositoryIndexService["refreshDefaultBranchIndex"]>[0]
+  ) {
+    this.attempts += 1;
+    if (this.attempts === 1) {
+      throw new Error("simulated transient index failure");
+    }
+    return super.refreshDefaultBranchIndex(input);
   }
 }
 
@@ -321,6 +351,91 @@ test("enqueue is idempotent and discovery succeeds once", async () => {
   assert.equal(job?.status, "succeeded");
 });
 
+test("onboarding issue creation retries after a transient failure and remains idempotent", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  github.failIssueCreations = 1;
+  let nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [{
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    }]
+  };
+
+  await service.enqueue("installation", event, "onboarding-retry");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.issues.length, 0);
+  assert.ok(await store.getRepository(99));
+  assert.equal((await store.getWebhook("onboarding-retry"))?.status, "pending");
+
+  nowMs += 60_000;
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.issues.length, 1);
+  assert.equal((await store.getWebhook("onboarding-retry"))?.status, "succeeded");
+
+  await service.enqueue("installation", event, "onboarding-repeat");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.issues.length, 1);
+});
+
+test("an index refresh retry cannot duplicate or suppress the onboarding issue", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({
+    tree: ["src/a.ts"],
+    refSha: "0".repeat(40),
+    contents: { "src/a.ts": Buffer.from("export const a = true;\n") }
+  });
+  const repositoryIndexService = new FailOnceRepositoryIndexService(store);
+  let nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      repositoryIndexService,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [{
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    }]
+  };
+
+  await service.enqueue("installation", event, "onboarding-index-retry");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.issues.length, 1);
+  assert.equal((await store.getWebhook("onboarding-index-retry"))?.status, "pending");
+
+  nowMs += 60_000;
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.issues.length, 1);
+  assert.equal(repositoryIndexService.attempts, 2);
+  assert.equal((await store.getWebhook("onboarding-index-retry"))?.status, "succeeded");
+});
+
 test("default-branch push refreshes the exact repository index without affecting other refs", async () => {
   const store = new MemoryStore();
   const github = new FakeGitHub({
@@ -380,6 +495,86 @@ test("default-branch push refreshes the exact repository index without affecting
   );
   assert.equal(await service.processNextWebhook("worker-1"), true);
   assert.equal(github.treeRefs.length, 1);
+});
+
+test("discovery and default-branch pushes derive scanner state from immutable configuration", async () => {
+  const store = new MemoryStore();
+  const githubOptions = {
+    tree: [".guardianbot/config.yml", "src/a.ts"],
+    refSha: "1".repeat(40),
+    config: VALID_INCREMENTAL_CONFIG,
+    contents: {
+      "src/a.ts": Buffer.from("export const a = true;\n")
+    }
+  };
+  const github = new FakeGitHub(githubOptions);
+  const repositoryIndexService = new RepositoryIndexService(store);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      repositoryIndexService
+    },
+    store
+  );
+  const repository = {
+    id: 99,
+    full_name: "Geekyshubham/guardianbot",
+    default_branch: "main",
+    private: false,
+    visibility: "public"
+  };
+
+  await service.enqueue(
+    "installation",
+    { action: "created", installation: { id: 1 }, repositories: [repository] },
+    "scanner-state-discovery"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getRepository(99))?.scannerState, "report-only");
+  assert.ok(
+    github.fileReads.some(
+      (read) =>
+        read.path === ".guardianbot/config.yml" &&
+        read.ref === "1".repeat(40)
+    )
+  );
+
+  githubOptions.refSha = "2".repeat(40);
+  githubOptions.config = VALID_INCREMENTAL_CONFIG.replace(
+    "mode: report-only",
+    "mode: enforce"
+  );
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/main",
+      deleted: false,
+      repository
+    },
+    "scanner-state-enforce"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getRepository(99))?.scannerState, "enforced");
+
+  githubOptions.refSha = "3".repeat(40);
+  githubOptions.config = VALID_INCREMENTAL_CONFIG;
+  github.failConfigFileReads = 1;
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/main",
+      deleted: false,
+      repository
+    },
+    "scanner-state-transient"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getRepository(99))?.scannerState, "enforced");
 });
 
 test("failing jobs retry and dead-letter after the max attempt budget", async () => {
@@ -578,6 +773,151 @@ test("review requests use bounded hashed untrusted blocks and post P0-P2 through
   assert.equal(github.reviews[0]?.commit_id, "head-sha");
   assert.match(github.reviews[0]?.comments[0].body ?? "", /```suggestion/);
   assert.match(github.updates.at(-1)?.body ?? "", /@​guardian-team/);
+});
+
+test("reviews retrieve redacted context only from the exact immutable base index", async () => {
+  const baseSha = "a".repeat(40);
+  const store = new MemoryStore();
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", "test/auth.test.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(role) {\n  const token = \"repository-secret\";\n  return role === 'admin';\n}\nexport function handler(role) { return authorize(role); }\n"
+      ),
+      "test/auth.test.ts": Buffer.from(
+        "import { authorize } from '../src/auth';\ntest('authorize', () => authorize('admin'));\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+    patch: "@@ -2 +2 @@\n-  const token = \"old\";\n+  const token = \"repository-secret\";"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 2 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", event, "review-index-context");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(backend.requests.length, 1);
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  assert.ok(indexed.length > 0);
+  assert.ok(indexed.every((context) => context.path === "src/auth.ts" || context.path === "test/auth.test.ts"));
+  assert.ok(indexed.every((context) => context.content.startsWith("[guardianbot-untrusted-data ")));
+  assert.equal(indexed.some((context) => context.content.includes("repository-secret")), false);
+  assert.ok(indexed.some((context) => context.content.includes("[REDACTED]")));
+  assert.doesNotMatch(github.updates.at(-1)?.body ?? "", /Partial review/);
+});
+
+test("a visibility-mismatched base index is isolated and degrades the review explicitly", async () => {
+  const baseSha = "b".repeat(40);
+  const store = new MemoryStore();
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/a.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/a.ts": Buffer.from("export const publicOnly = true;\n")
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  const event = createPullEvent();
+  event.repository.private = true;
+  event.repository.visibility = "private";
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n-export const publicOnly = true;\n+export const publicOnly = false;"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/a.ts", startLine: 1 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", event, "review-index-isolation");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(backend.requests.length, 1);
+  assert.equal(
+    backend.requests[0]!.contexts.some((context) =>
+      context.id.startsWith("repository-index:")
+    ),
+    false
+  );
+  assert.match(
+    github.updates.at(-1)?.body ?? "",
+    /repository index context was rejected by repository isolation checks/
+  );
+  assert.match(github.updates.at(-1)?.body ?? "", /Partial review/);
 });
 
 test("a mismatched context hash is unavailable and permanently rejected", async () => {

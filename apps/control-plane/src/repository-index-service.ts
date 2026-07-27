@@ -7,12 +7,19 @@ import type { RepositoryIndexStorageMode, Store } from "./store.js";
 
 const SOURCE_EXTENSION_PRIORITY = new Map<string, number>([
   [".py", 20],
+  [".pyi", 20],
   [".js", 20],
   [".jsx", 20],
+  [".mjs", 20],
+  [".cjs", 20],
   [".ts", 20],
   [".tsx", 20],
+  [".mts", 20],
+  [".cts", 20],
   [".swift", 20],
-  [".rb", 20]
+  [".rb", 20],
+  [".rake", 20],
+  [".gemspec", 20]
 ]);
 
 const MAX_INDEXED_FILES = 256;
@@ -50,15 +57,11 @@ export interface RepositoryIndexRefreshResult {
   };
 }
 
-interface RepositoryFileContent {
-  path: string;
-  content: string;
-}
-
 interface RepositoryFileRead {
   path: string;
   status: "loaded" | "oversized" | "binary" | "missing" | "fetch-failed" | "byte-budget";
   content?: string;
+  byteLength?: number;
 }
 
 interface GitHubRefResponse {
@@ -93,7 +96,13 @@ export class RepositoryIndexService {
       commitSha
     );
     const storageMode = await this.store.getRepositoryIndexStorageMode();
-    if (existing) {
+    if (
+      existing &&
+      existing.repository === input.fullName &&
+      existing.repositoryScope === repositoryScope &&
+      existing.visibility === input.visibility &&
+      existing.commitSha === commitSha
+    ) {
       await this.store.replaceRepositoryIndex(
         input.repositoryId,
         existing,
@@ -161,7 +170,6 @@ export class RepositoryIndexService {
       commitSha,
       indexedFileCount: index.files.length,
       partial:
-        skipped.unsupported > 0 ||
         skipped.tooMany > 0 ||
         skipped.oversized > 0 ||
         skipped.binary > 0 ||
@@ -206,7 +214,6 @@ export class RepositoryIndexService {
   ): Promise<RepositoryFileRead[]> {
     const results = new Array<RepositoryFileRead>(paths.length);
     let nextIndex = 0;
-    let usedBytes = 0;
     const workerCount = Math.min(FETCH_CONCURRENCY, Math.max(paths.length, 1));
     await Promise.all(
       Array.from({ length: workerCount }, async () => {
@@ -215,17 +222,24 @@ export class RepositoryIndexService {
           nextIndex += 1;
           if (current >= paths.length) return;
           const path = paths[current]!;
-          const response = await this.readIndexedFile(github, owner, repo, path, ref, usedBytes);
-          results[current] = response.read;
-          if (response.read.status === "loaded") {
-            usedBytes += Buffer.byteLength(response.read.content ?? "", "utf8");
-          } else if (response.read.status === "byte-budget") {
-            usedBytes = MAX_TOTAL_BYTES;
-          }
+          results[current] = await this.readIndexedFile(github, owner, repo, path, ref);
         }
       })
     );
-    return results;
+
+    // Apply the aggregate budget after concurrent fetches, in candidate order.
+    // This makes reservation atomic and deterministic instead of allowing every
+    // in-flight request to observe the same stale byte count.
+    let usedBytes = 0;
+    return results.map((read) => {
+      if (read.status !== "loaded") return read;
+      const byteLength = read.byteLength ?? Buffer.byteLength(read.content ?? "", "utf8");
+      if (usedBytes + byteLength > MAX_TOTAL_BYTES) {
+        return { path: read.path, status: "byte-budget" };
+      }
+      usedBytes += byteLength;
+      return read;
+    });
   }
 
   private async readIndexedFile(
@@ -233,43 +247,36 @@ export class RepositoryIndexService {
     owner: string,
     repo: string,
     path: string,
-    ref: string,
-    usedBytes: number
-  ): Promise<{ read: RepositoryFileRead; file?: RepositoryFileContent }> {
+    ref: string
+  ): Promise<RepositoryFileRead> {
     try {
       const response = await github.request<GitHubContentsResponse>(
         "GET",
         `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`
       );
       if (response.type !== "file") {
-        return { read: { path, status: "missing" } };
+        return { path, status: "missing" };
       }
       if (
         Number.isSafeInteger(response.size) &&
         Number(response.size) > MAX_FILE_BYTES
       ) {
-        return { read: { path, status: "oversized" } };
+        return { path, status: "oversized" };
       }
       const bytes = decodeContent(response);
       if (bytes.length > MAX_FILE_BYTES) {
-        return { read: { path, status: "oversized" } };
-      }
-      if (usedBytes + bytes.length > MAX_TOTAL_BYTES) {
-        return { read: { path, status: "byte-budget" } };
+        return { path, status: "oversized" };
       }
       if (looksBinary(bytes)) {
-        return { read: { path, status: "binary" } };
+        return { path, status: "binary" };
       }
       const content = bytes.toString("utf8");
-      return {
-        read: { path, status: "loaded", content },
-        file: { path, content }
-      };
+      return { path, status: "loaded", content, byteLength: bytes.length };
     } catch (error) {
       if (String(error).includes("returned 404")) {
-        return { read: { path, status: "missing" } };
+        return { path, status: "missing" };
       }
-      return { read: { path, status: "fetch-failed" } };
+      return { path, status: "fetch-failed" };
     }
   }
 }
@@ -286,7 +293,11 @@ function classifyIndexCandidate(path: string): number | undefined {
   if (/^(?:\.github\/CODEOWNERS|CODEOWNERS|docs\/CODEOWNERS)$/i.test(path)) return 0;
   if (/^\.guardianbot\/config\.ya?ml$/i.test(path)) return 1;
   if (/^\.github\/workflows\/[^/]+\.(?:ya?ml)$/i.test(path)) return 2;
-  if (/^(?:Dockerfile(?:\.[^/]+)?|docker-compose[^/]*\.(?:ya?ml))$/i.test(path)) return 3;
+  if (
+    /(?:^|\/)(?:Dockerfile(?:\.[^/]+)?|docker-compose[^/]*\.(?:ya?ml))$/i.test(path)
+  ) {
+    return 3;
+  }
   if (/(?:^|\/)(openapi|swagger|schemas?)(?:\/|[._-])/i.test(path)) return 4;
 
   const dot = path.lastIndexOf(".");
@@ -295,7 +306,7 @@ function classifyIndexCandidate(path: string): number | undefined {
 
   const fileName = path.slice(path.lastIndexOf("/") + 1);
   if (
-    /^(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|pyproject\.toml|requirements[^/]*\.txt|Gemfile(?:\.lock)?|Package\.swift|Podfile(?:\.lock)?)$/i.test(
+    /^(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|pyproject\.toml|requirements[^/]*\.txt|Gemfile(?:\.lock)?|Rakefile|Package\.swift|Podfile(?:\.lock)?)$/i.test(
       fileName
     )
   ) {
@@ -303,6 +314,12 @@ function classifyIndexCandidate(path: string): number | undefined {
   }
   if (/\.(?:json|ya?ml|toml|ini|graphql|prisma)$/i.test(fileName) && /(config|schema|openapi|swagger)/i.test(path)) {
     return 6;
+  }
+  if (
+    /\.(?:md|mdx|markdown|txt|text|rst|adoc)$/i.test(fileName) ||
+    /^(?:README|SECURITY|CONTRIBUTING|CHANGELOG|LICENSE|NOTICE)(?:\.[^/]*)?$/i.test(fileName)
+  ) {
+    return 30;
   }
   return undefined;
 }

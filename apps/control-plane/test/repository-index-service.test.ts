@@ -21,7 +21,8 @@ class FakeGitHub {
   constructor(
     private refSha: string,
     private readonly tree: string[],
-    private readonly contents: Record<string, { size?: number; content: Buffer } | "missing" | "error">
+    private readonly contents: Record<string, { size?: number; content: Buffer } | "missing" | "error">,
+    private readonly delays: Record<string, number> = {}
   ) {}
 
   setRefSha(refSha: string): void {
@@ -41,6 +42,10 @@ class FakeGitHub {
     if (method === "GET" && path.includes("/contents/")) {
       const encodedPath = path.split("/contents/")[1]?.split("?")[0];
       const repositoryPath = decodeURIComponent(encodedPath ?? "");
+      const delay = this.delays[repositoryPath] ?? 0;
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
       const entry = this.contents[repositoryPath];
       if (!entry || entry === "missing") {
         throw new Error(`GitHub GET ${path} returned 404: missing`);
@@ -159,6 +164,101 @@ test("refresh is repository-isolated and idempotent for an already persisted com
   assert.equal(secondIndex?.repository, "Acme/Other");
 });
 
+test("cached indexes are reused only when repository identity and visibility still match", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const github = new FakeGitHub("9".repeat(40), ["src/a.ts"], {
+    "src/a.ts": { content: Buffer.from("export function a() { return 1; }\n") }
+  });
+  const service = new RepositoryIndexService(store);
+
+  await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+  await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Renamed",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+  await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Renamed",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  const requestsAfterRebuilds = github.treeRefs.length;
+  await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Renamed",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+
+  assert.equal(requestsAfterRebuilds, 3);
+  assert.equal(github.treeRefs.length, requestsAfterRebuilds);
+  const index = await store.getRepositoryIndex(42, "github:42", "9".repeat(40));
+  assert.equal(index?.repository, "Acme/Renamed");
+  assert.equal(index?.visibility, "public");
+});
+
+test("indexes extended source, nested container, and documentation candidates without treating unrelated files as partial", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const paths = [
+    "README.md",
+    "docs/guide.rst",
+    "typings/model.pyi",
+    "scripts/entry.mjs",
+    "scripts/legacy.cjs",
+    "src/module.mts",
+    "src/common.cts",
+    "tasks/build.rake",
+    "pkg/widget.gemspec",
+    "Gemfile",
+    "Rakefile",
+    "ops/api/Dockerfile.runtime",
+    "assets/logo.png"
+  ];
+  const contents = Object.fromEntries(
+    paths
+      .filter((path) => path !== "assets/logo.png")
+      .map((path) => [
+        path,
+        { content: Buffer.from(`# indexed ${path}\nexport const value = true;\n`) }
+      ])
+  );
+  const github = new FakeGitHub("8".repeat(40), paths, contents);
+
+  const result = await new RepositoryIndexService(store).refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+
+  assert.equal(result.partial, false);
+  assert.equal(result.skipped.unsupported, 1);
+  assert.equal(result.indexedFileCount, 12);
+  const index = await store.getRepositoryIndex(42, "github:42", "8".repeat(40));
+  assert.ok(index?.files.some((file) => file.path === "README.md"));
+  assert.ok(index?.files.some((file) => file.path === "ops/api/Dockerfile.runtime"));
+  assert.ok(index?.symbols.some((symbol) => symbol.path === "docs/guide.rst"));
+});
+
 test("refresh skips oversized, binary, and over-limit files without mixing successful content", async () => {
   const store = new MemoryStore();
   await store.upsertRepository(defaultRepository);
@@ -208,6 +308,47 @@ test("refresh skips oversized, binary, and over-limit files without mixing succe
   assert.ok(index);
   assert.equal(index?.files.length, 254);
   assert.ok(index?.files.every((file) => file.path.startsWith("src/file-")));
+});
+
+test("concurrent reads reserve the aggregate byte budget deterministically", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const paths = Array.from(
+    { length: 20 },
+    (_, index) => `docs/${String(index).padStart(2, "0")}.md`
+  );
+  const contents = Object.fromEntries(
+    paths.map((path, index) => [
+      path,
+      {
+        content: Buffer.from(
+          `${path}\n${String(index).padStart(2, "0")}${"x".repeat(240 * 1024 - path.length - 4)}`
+        )
+      }
+    ])
+  );
+  const delays = Object.fromEntries(
+    paths.map((path, index) => [path, paths.length - index])
+  );
+  const github = new FakeGitHub("7".repeat(40), paths, contents, delays);
+
+  const result = await new RepositoryIndexService(store).refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+
+  assert.equal(result.partial, true);
+  assert.equal(result.skipped.byteBudget, 3);
+  assert.equal(result.indexedFileCount, 17);
+  const index = await store.getRepositoryIndex(42, "github:42", "7".repeat(40));
+  assert.deepEqual(
+    index?.files.map((file) => file.path),
+    paths.slice(0, 17)
+  );
 });
 
 test("refresh rejects malformed branch resolution before indexing", async () => {
