@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-07-27
+
+### Fixed
+
+- Upgrade pull requests now bind scanner policy, suppressions, and baselines to
+  the immutable base commit while validating the proposed workflow identity
+  from the head configuration. The head pin must still equal GitHub's exact
+  called-workflow SHA before any scanner runs.
+
 ## [0.2.9] - 2026-07-27
 
 ### Fixed

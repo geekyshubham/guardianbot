@@ -117,6 +117,14 @@ test("scanner config parsing preserves the private evidence directory contract",
     workflow,
     /\(\.scanners\.suppressions \/\/ \[\]\) \|\s+all\(/
   );
+  assert.match(
+    workflow,
+    /'\.workflowVersion' "\/work\/\$\{config_path\}"/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /'\.workflowVersion' "\/work\/\$\{effective_config\}"/
+  );
   assert.match(workflow, /id: rule_pack/);
   assert.match(
     workflow,

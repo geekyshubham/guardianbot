@@ -112,8 +112,12 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "baseline-path=$effective_baseline" >> "$GITHUB_OUTPUT"
           echo "config-source=$config_source" >> "$GITHUB_OUTPUT"
+          # Policy remains bound to the immutable base commit, while the
+          # workflow identity must come from the proposed caller/config pair.
+          # The next step independently requires this head pin to equal the
+          # exact GitHub-resolved reusable workflow SHA.
           workflow_version="$(docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
-            '.workflowVersion' "/work/${effective_config}")"
+            '.workflowVersion' "/work/${config_path}")"
           echo "workflow-version=$workflow_version" >> "$GITHUB_OUTPUT"
 
       - name: Check out immutable GuardianBot rule pack
