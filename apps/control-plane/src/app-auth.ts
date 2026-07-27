@@ -20,13 +20,14 @@ export function createAppJwt(appId: string, privateKey: string, now = Date.now()
 export async function installationClient(
   appId: string,
   privateKey: string,
-  installationId: number
+  installationId: number,
+  repositoryIds?: number[]
 ): Promise<GitHubClient> {
   const appClient = new GitHubClient(createAppJwt(appId, privateKey));
   const token = await appClient.request<{ token: string }>(
     "POST",
     `/app/installations/${installationId}/access_tokens`,
-    { repositories: undefined }
+    repositoryIds?.length ? { repository_ids: repositoryIds } : {}
   );
   return new GitHubClient(token.token);
 }
