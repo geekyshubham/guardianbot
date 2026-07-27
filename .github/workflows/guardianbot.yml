@@ -20,6 +20,6 @@ jobs:
       contents: read
       security-events: write
       actions: read
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@441ca4877d0a934f2a076971e4b2a6763093be67
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@323344d998e7a3f8d2a828efc212a036650810c2
     with:
       config-path: .guardianbot/config.yml
