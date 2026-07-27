@@ -83,10 +83,10 @@ jobs:
             fi
           fi
 
-          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '.schemaVersion == "1.0.0" and (.workflowVersion | test("^[a-f0-9]{40}$"))' \
             "/work/${effective_config}" | grep -qx true
-          mode="$(docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+          mode="$(docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '.scanners.mode' "/work/${effective_config}")"
           case "$mode" in advisory|report-only|enforce) ;; *) exit 1 ;; esac
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ] &&
@@ -95,10 +95,10 @@ jobs:
             echo "The first onboarding pull request cannot enable enforcement."
             exit 1
           fi
-          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             '
               (.scanners.suppressions // []) |
-              all(
+              all_c(
                 (.fingerprint | type == "!!str") and
                 (.owner | type == "!!str") and
                 (.reason | type == "!!str") and
@@ -106,14 +106,18 @@ jobs:
                 ((.expiresAt | type) == "!!timestamp" or (.expiresAt | type) == "!!str")
               )
             ' "/work/${effective_config}" | grep -qx true
-          docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
             -o=json '.scanners.suppressions // []' \
             "/work/${effective_config}" > guardianbot-evidence/suppressions.json
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "baseline-path=$effective_baseline" >> "$GITHUB_OUTPUT"
           echo "config-source=$config_source" >> "$GITHUB_OUTPUT"
-          workflow_version="$(docker run --rm -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
-            '.workflowVersion' "/work/${effective_config}")"
+          # Policy remains bound to the immutable base commit, while the
+          # workflow identity must come from the proposed caller/config pair.
+          # The next step independently requires this head pin to equal the
+          # exact GitHub-resolved reusable workflow SHA.
+          workflow_version="$(docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work:ro" mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422 \
+            '.workflowVersion' "/work/${config_path}")"
           echo "workflow-version=$workflow_version" >> "$GITHUB_OUTPUT"
 
       - name: Check out immutable GuardianBot rule pack
@@ -125,6 +129,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify immutable GuardianBot rule pack
+        id: rule_pack
         env:
           CALLED_WORKFLOW_REF: ${{ job.workflow_ref }}
           CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
@@ -763,7 +768,7 @@ jobs:
           NODE
 
       - name: Attest evidence provenance
-        if: always()
+        if: always() && steps.config.outcome == 'success' && steps.rule_pack.outcome == 'success'
         env:
           EVIDENCE_ARTIFACT_TYPE: security
           EVIDENCE_DIRECTORY: guardianbot-evidence

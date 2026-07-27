@@ -36,13 +36,13 @@ deployment scripts described in [operations](operations.md).
 For an existing DigitalOcean App Platform app:
 
 ```sh
-mkdir guardianbot-release-v0.2.7
-gh release download v0.2.7 \
+mkdir guardianbot-release-v0.2.10
+gh release download v0.2.10 \
   --repo Geekyshubham/guardianbot \
-  --dir guardianbot-release-v0.2.7
+  --dir guardianbot-release-v0.2.10
 ./scripts/deploy-digitalocean-app-platform.sh \
   11111111-2222-4333-8444-555555555555 \
-  guardianbot-release-v0.2.7
+  guardianbot-release-v0.2.10
 ```
 
 For a dedicated DigitalOcean droplet, create Ubuntu with
@@ -55,7 +55,7 @@ cd /opt/guardianbot
 cp .env.example .env
 chmod 600 .env
 ./scripts/deploy-digitalocean.sh deploy \
-  /opt/guardianbot/releases/guardianbot-release-v0.2.7
+  /opt/guardianbot/releases/guardianbot-release-v0.2.10
 ./scripts/deploy-digitalocean.sh verify
 ```
 

@@ -7,6 +7,48 @@ reusable workflow commits remain immutable.
 
 ### Documentation
 
+- Recorded the live signed-digest `v0.2.10` DigitalOcean App Platform
+  deployment, authenticated annotated-tag/default-branch verification, exact
+  workflow trust pins, protected endpoint checks, and clean startup-log
+  evidence without publishing secrets.
+
+## [0.2.10] - 2026-07-27
+
+### Fixed
+
+- Upgrade pull requests now bind scanner policy, suppressions, and baselines to
+  the immutable base commit while validating the proposed workflow identity
+  from the head configuration. The head pin must still equal GitHub's exact
+  called-workflow SHA before any scanner runs.
+
+## [0.2.9] - 2026-07-27
+
+### Fixed
+
+- Suppression validation now uses `yq`'s condition-aware `all_c` operator.
+  The prior jq-style `all(condition)` expression was rejected by the pinned
+  `yq` release before Semgrep or Trivy could start.
+
+### Documentation
+
+- Recorded the live signed-digest `v0.2.8` DigitalOcean App Platform
+  deployment, exact workflow trust pins, database-backed readiness, protected
+  endpoint checks, and clean startup-log evidence without publishing secrets.
+
+## [0.2.8] - 2026-07-27
+
+### Fixed
+
+- Reusable scanner configuration parsing now runs the pinned read-only `yq`
+  container as the GitHub-hosted runner's UID and GID, preserving the
+  owner-only evidence directory while allowing base-commit policy files to be
+  validated on upgrade pull requests.
+- Scanner provenance attestation now starts only after configuration validation
+  and immutable rule-pack verification succeed, avoiding a misleading missing
+  checkout error when an earlier setup step fails.
+
+### Documentation
+
 - Recorded the live signed-digest `v0.2.7` DigitalOcean App Platform
   deployment, database-backed readiness, protected endpoint checks, and
   rollback evidence without publishing credentials or database connection

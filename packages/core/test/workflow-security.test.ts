@@ -93,3 +93,41 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.match(dast, /guardianbot-dast-evidence is a reserved workflow path/);
   assert.match(dast, /fs\.mkdirSync\("guardianbot-dast-evidence", \{ mode: 0o700 \}\)/);
 });
+
+test("scanner config parsing preserves the private evidence directory contract", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const yqImage =
+    "mikefarah/yq:4.44.6@sha256:b1d117c609ba990436ad1649299e2f6c378f62cb562caf30b6f2fb6144713422";
+  const yqInvocations = workflow
+    .split("\n")
+    .filter((line) => line.includes(yqImage));
+
+  assert.equal(yqInvocations.length, 5);
+  for (const invocation of yqInvocations) {
+    assert.match(
+      invocation,
+      /docker run --rm --user "\$\(id -u\):\$\(id -g\)" -v "\$PWD:\/work:ro" /
+    );
+  }
+  assert.match(
+    workflow,
+    /\(\.scanners\.suppressions \/\/ \[\]\) \|\s+all_c\(/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /\(\.scanners\.suppressions \/\/ \[\]\) \|\s+all\(/
+  );
+  assert.match(
+    workflow,
+    /'\.workflowVersion' "\/work\/\$\{config_path\}"/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /'\.workflowVersion' "\/work\/\$\{effective_config\}"/
+  );
+  assert.match(workflow, /id: rule_pack/);
+  assert.match(
+    workflow,
+    /if: always\(\) && steps\.config\.outcome == 'success' && steps\.rule_pack\.outcome == 'success'/
+  );
+});
