@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -291,6 +292,10 @@ test("release assets use one exact checksummed allowlist", async () => {
 test("release workflow pins every action and grants write permissions only to publish", async () => {
   const workflowPath = path.resolve(".github/workflows/release.yml");
   const source = await readFile(workflowPath, "utf8");
+  const sourceVerifier = await readFile(
+    path.resolve("scripts/verify-release-source.sh"),
+    "utf8"
+  );
   const workflow = YAML.parse(source);
   const uses = [...source.matchAll(/^\s*uses:\s*(\S+)\s*(?:#.*)?$/gm)].map(
     (match) => match[1]
@@ -316,10 +321,17 @@ test("release workflow pins every action and grants write permissions only to pu
   assert.equal(workflow.jobs.publish_release.needs, "publish_image");
   assert.equal(workflow.jobs.publish_release["timeout-minutes"], 15);
   assert.deepEqual(workflow.on.push.tags, ["v*.*.*"]);
-  assert.match(
-    source,
-    /repos\/\$\{RELEASE_REPOSITORY\}\/compare\/\$\{RELEASE_SHA\}\.\.\.\$\{RELEASE_DEFAULT_BRANCH\}/
+  assert.equal(
+    source.match(/bash scripts\/verify-release-source\.sh/g)?.length,
+    2
   );
+  assert.match(
+    sourceVerifier,
+    /compare\/\$\{RELEASE_SHA\}\.\.\.\$\{default_branch_sha\}/
+  );
+  assert.match(sourceVerifier, /git\/ref\/tags\/\$\{RELEASE_TAG\}/);
+  assert.match(sourceVerifier, /git\/tags\/\$\{remote_tag_object_sha\}/);
+  assert.match(sourceVerifier, /defaultBranchRef/);
   assert.doesNotMatch(source, /refs\/remotes\/origin\/main/);
   assert.match(source, /--certificate-identity "\$\{WORKFLOW_IDENTITY\}"/);
   assert.match(
@@ -331,6 +343,69 @@ test("release workflow pins every action and grants write permissions only to pu
     /> release-evidence\/github-provenance-oci-verification\.json/
   );
   assert.doesNotMatch(source, /certificate-identity-regexp/);
+});
+
+test("remote release-source verification requires an annotated exact tag", async () => {
+  const directory = await temporaryDirectory();
+  const fakeBin = path.join(directory, "bin");
+  await mkdir(fakeBin);
+  const fakeGit = path.join(fakeBin, "git");
+  const fakeGh = path.join(fakeBin, "gh");
+  await writeFile(
+    fakeGit,
+    `#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "rev-parse" && "$2" == "HEAD" ]]
+printf '%s\\n' "\${FAKE_RELEASE_SHA}"
+`
+  );
+  await writeFile(
+    fakeGh,
+    `#!/usr/bin/env bash
+set -euo pipefail
+arguments="$*"
+if [[ "\${arguments}" == *"/git/ref/tags/"* ]]; then
+  printf 'refs/tags/%s\\t%s\\t%s\\n' \
+    "\${RELEASE_TAG}" "\${FAKE_REF_TYPE:-tag}" "\${FAKE_TAG_OBJECT_SHA}"
+elif [[ "\${arguments}" == *"/git/tags/"* ]]; then
+  printf '%s\\tcommit\\t%s\\n' "\${RELEASE_TAG}" "\${RELEASE_SHA}"
+elif [[ "\${arguments}" == *"graphql"* ]]; then
+  printf '%s\\t%s\\n' "\${RELEASE_DEFAULT_BRANCH}" "\${FAKE_DEFAULT_SHA}"
+elif [[ "\${arguments}" == *"/compare/"* ]]; then
+  printf '%s\\n' "\${FAKE_COMPARE_STATUS:-identical}"
+else
+  exit 2
+fi
+`
+  );
+  await chmod(fakeGit, 0o755);
+  await chmod(fakeGh, 0o755);
+  const releaseSha = "1".repeat(40);
+  const environment = {
+    ...process.env,
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    GH_TOKEN: "test-token",
+    RELEASE_DEFAULT_BRANCH: "main",
+    RELEASE_REF: "refs/tags/v1.2.3",
+    RELEASE_REPOSITORY: "Geekyshubham/guardianbot",
+    RELEASE_SHA: releaseSha,
+    RELEASE_TAG: "v1.2.3",
+    FAKE_RELEASE_SHA: releaseSha,
+    FAKE_TAG_OBJECT_SHA: "2".repeat(40),
+    FAKE_DEFAULT_SHA: "3".repeat(40)
+  };
+  const verifier = path.resolve("scripts/verify-release-source.sh");
+  const accepted = spawnSync("bash", [verifier], {
+    encoding: "utf8",
+    env: environment
+  });
+  assert.equal(accepted.status, 0, accepted.stderr);
+
+  const lightweight = spawnSync("bash", [verifier], {
+    encoding: "utf8",
+    env: { ...environment, FAKE_REF_TYPE: "commit" }
+  });
+  assert.equal(lightweight.status, 1);
 });
 
 test("stable tags are attached only after candidate trust evidence is verified", async () => {
@@ -372,6 +447,12 @@ test("stable tags are attached only after candidate trust evidence is verified",
 });
 
 test("every release shell block passes Bash syntax validation", async () => {
+  const sourceVerifier = spawnSync(
+    "bash",
+    ["-n", path.resolve("scripts/verify-release-source.sh")],
+    { encoding: "utf8" }
+  );
+  assert.equal(sourceVerifier.status, 0, sourceVerifier.stderr);
   const workflow = YAML.parse(
     await readFile(path.resolve(".github/workflows/release.yml"), "utf8")
   );

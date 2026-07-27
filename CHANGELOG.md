@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-27
+
+### Fixed
+
+- Release verification now resolves the remote annotated tag object and default
+  branch commit through authenticated GitHub APIs, so detached tag checkouts do
+  not depend on locally materialized tag or remote-tracking references.
+
 ## [0.2.1] - 2026-07-27
 
 ### Fixed

@@ -38,16 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/release-evidence.mjs validate
-          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
-          test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
-          [[ "${RELEASE_DEFAULT_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ ]]
-          compare_status="$(
-            gh api \
-              "repos/${RELEASE_REPOSITORY}/compare/${RELEASE_SHA}...${RELEASE_DEFAULT_BRANCH}" \
-              --jq '.status'
-          )"
-          [[ "${compare_status}" == "identical" ||
-             "${compare_status}" == "ahead" ]]
+          bash scripts/verify-release-source.sh
       - name: Install locked dependencies
         run: npm ci
       - name: Test release policy
@@ -90,16 +81,7 @@ jobs:
           mkdir -p release-evidence
           node scripts/release-evidence.mjs validate \
             > release-evidence/release-input.json
-          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
-          test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
-          [[ "${RELEASE_DEFAULT_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ ]]
-          compare_status="$(
-            gh api \
-              "repos/${RELEASE_REPOSITORY}/compare/${RELEASE_SHA}...${RELEASE_DEFAULT_BRANCH}" \
-              --jq '.status'
-          )"
-          [[ "${compare_status}" == "identical" ||
-             "${compare_status}" == "ahead" ]]
+          bash scripts/verify-release-source.sh
           image="ghcr.io/${RELEASE_REPOSITORY,,}"
           version="${RELEASE_TAG#v}"
           candidate_tag="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
