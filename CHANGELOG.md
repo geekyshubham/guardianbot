@@ -7,6 +7,10 @@ reusable workflow commits remain immutable.
 
 ### Documentation
 
+- Prepared the GuardianBot repository's own report-only configuration and
+  immutable `v0.2.10` caller for verification through the same generated
+  onboarding path used by consumer repositories.
+
 - Recorded the live signed-digest `v0.2.10` DigitalOcean App Platform
   deployment, authenticated annotated-tag/default-branch verification, exact
   workflow trust pins, protected endpoint checks, and clean startup-log
