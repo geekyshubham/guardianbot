@@ -5,6 +5,12 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recorded the live signed-digest `v0.2.8` DigitalOcean App Platform
+  deployment, exact workflow trust pins, database-backed readiness, protected
+  endpoint checks, and clean startup-log evidence without publishing secrets.
+
 ## [0.2.8] - 2026-07-27
 
 ### Fixed
