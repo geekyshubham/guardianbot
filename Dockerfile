@@ -3,6 +3,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY packages/protocol/package.json packages/protocol/package.json
 COPY packages/core/package.json packages/core/package.json
+COPY packages/defectdojo/package.json packages/defectdojo/package.json
+COPY packages/monitoring/package.json packages/monitoring/package.json
 COPY packages/guardianctl/package.json packages/guardianctl/package.json
 COPY apps/control-plane/package.json apps/control-plane/package.json
 RUN npm ci

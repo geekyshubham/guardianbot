@@ -10,6 +10,8 @@
   "workspaces": [
     "packages/protocol",
     "packages/core",
+    "packages/defectdojo",
+    "packages/monitoring",
     "packages/guardianctl",
     "apps/control-plane"
   ],
