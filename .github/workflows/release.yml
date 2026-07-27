@@ -44,7 +44,11 @@ jobs:
       - name: Test release policy
         run: node --test scripts/release-evidence.test.mjs
       - name: Run schema, contract, documentation, and package checks
-        run: npm run check
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCS_DIFF_BASE="$(git rev-parse "${RELEASE_SHA}^")"
+          npm run check
 
   publish_image:
     name: Publish signed linux/amd64 image

@@ -347,6 +347,15 @@ test("release workflow pins every action and grants write permissions only to pu
   assert.equal(workflow.jobs.publish_release.needs, "publish_image");
   assert.equal(workflow.jobs.publish_release["timeout-minutes"], 15);
   assert.deepEqual(workflow.on.push.tags, ["v*.*.*"]);
+  const releaseCheck = workflow.jobs.verify_source.steps.find(
+    (step) =>
+      step.name ===
+      "Run schema, contract, documentation, and package checks"
+  );
+  assert.match(
+    releaseCheck.run,
+    /DOCS_DIFF_BASE="\$\(git rev-parse "\$\{RELEASE_SHA\}\^"\)"/
+  );
   assert.equal(
     source.match(/bash scripts\/verify-release-source\.sh/g)?.length,
     2

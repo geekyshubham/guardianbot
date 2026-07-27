@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-27
+
+### Fixed
+
+- Tag-triggered release checks now supply the immutable release commit's first
+  parent as the documentation policy diff base, preserving fail-closed release
+  notes without depending on pull-request-only event fields.
+
 ## [0.2.3] - 2026-07-27
 
 ### Fixed
