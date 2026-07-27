@@ -316,6 +316,11 @@ test("release workflow pins every action and grants write permissions only to pu
   assert.equal(workflow.jobs.publish_release.needs, "publish_image");
   assert.equal(workflow.jobs.publish_release["timeout-minutes"], 15);
   assert.deepEqual(workflow.on.push.tags, ["v*.*.*"]);
+  assert.match(
+    source,
+    /repos\/\$\{RELEASE_REPOSITORY\}\/compare\/\$\{RELEASE_SHA\}\.\.\.\$\{RELEASE_DEFAULT_BRANCH\}/
+  );
+  assert.doesNotMatch(source, /refs\/remotes\/origin\/main/);
   assert.match(source, /--certificate-identity "\$\{WORKFLOW_IDENTITY\}"/);
   assert.match(
     source,

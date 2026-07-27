@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-27
+
+### Fixed
+
+- Release source ancestry is now proven with GitHub's authenticated compare API
+  instead of assuming that a tag checkout creates a local
+  `refs/remotes/origin/main` reference.
+
 ## [0.2.0] - 2026-07-27
 
 ### Added

@@ -16,6 +16,7 @@ env:
   RELEASE_SHA: ${{ github.sha }}
   RELEASE_REF: ${{ github.ref }}
   RELEASE_REPOSITORY: ${{ github.repository }}
+  RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
 jobs:
   verify_source:
@@ -31,13 +32,22 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Validate immutable release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           node scripts/release-evidence.mjs validate
           test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
           test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
-          git merge-base --is-ancestor "${RELEASE_SHA}" refs/remotes/origin/main
+          [[ "${RELEASE_DEFAULT_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ ]]
+          compare_status="$(
+            gh api \
+              "repos/${RELEASE_REPOSITORY}/compare/${RELEASE_SHA}...${RELEASE_DEFAULT_BRANCH}" \
+              --jq '.status'
+          )"
+          [[ "${compare_status}" == "identical" ||
+             "${compare_status}" == "ahead" ]]
       - name: Install locked dependencies
         run: npm ci
       - name: Test release policy
@@ -72,6 +82,8 @@ jobs:
           persist-credentials: false
       - name: Resolve and validate release metadata
         id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +92,14 @@ jobs:
             > release-evidence/release-input.json
           test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
           test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "${RELEASE_SHA}"
-          git merge-base --is-ancestor "${RELEASE_SHA}" refs/remotes/origin/main
+          [[ "${RELEASE_DEFAULT_BRANCH}" =~ ^[A-Za-z0-9._/-]+$ ]]
+          compare_status="$(
+            gh api \
+              "repos/${RELEASE_REPOSITORY}/compare/${RELEASE_SHA}...${RELEASE_DEFAULT_BRANCH}" \
+              --jq '.status'
+          )"
+          [[ "${compare_status}" == "identical" ||
+             "${compare_status}" == "ahead" ]]
           image="ghcr.io/${RELEASE_REPOSITORY,,}"
           version="${RELEASE_TAG#v}"
           candidate_tag="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
