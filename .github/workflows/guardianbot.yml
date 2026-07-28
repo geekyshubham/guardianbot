@@ -16,11 +16,37 @@ permissions:
 jobs:
   guardianbot-security-gate:
     name: guardianbot/security-gate
+    if: github.event_name != 'schedule' || github.event.schedule == '23 2 * * *'
     permissions:
       contents: read
       security-events: write
       actions: read
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@323344d998e7a3f8d2a828efc212a036650810c2
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@bf0c2310b9dfe3b565554a3ec31f83a0ac967cd9
     with:
       config-path: .guardianbot/config.yml
+
+  guardianbot-image:
+    name: guardianbot/image-security
+    if: github.event_name != 'schedule' || github.event.schedule == '23 2 * * *'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@bf0c2310b9dfe3b565554a3ec31f83a0ac967cd9
+    with:
+      dockerfile: "Dockerfile"
+      context: "."
+      image-name: "ghcr.io/geekyshubham/guardianbot"
+      health-path: "/api/v1/health/"
+      readiness-path: "/ready"
+      container-port: 8000
+      dependent-services: "postgres,redis"
+      ephemeral-env-keys: ""
+      runtime-env: |
+          # No runtime environment values configured.
+      migration-command: ""
+      smoke-command: ""
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+
