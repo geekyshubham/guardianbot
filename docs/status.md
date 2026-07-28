@@ -1,7 +1,7 @@
 # Capability status
 
-Release: `0.2.11`
-Last verified: 2026-07-28
+Release: `0.2.12`
+Last verified: 2026-07-29
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
@@ -17,7 +17,7 @@ DigitalOcean integration is live.
 | Documentation quality gates | Working | Tracked repository documentation | [documentation gate tests](../scripts/check-docs.test.mjs) | None | Normal CI validates external URL structure; live external reachability is opt-in |
 | Repository detection and configuration generation | Working | Python, Node, Swift, Ruby, Docker, OpenAPI, and documentation repositories | [detection tests](../packages/core/test/detection-contract.test.ts) | Repository read access | Detection is bounded and heuristic; it does not execute discovered commands |
 | `guardianctl onboard`, `doctor`, `enforce`, `upgrade`, `inventory`, and `offboard` | Working | Authenticated GitHub repositories | [CLI tests](../packages/guardianctl/test/cli.test.ts) | Operator GitHub authorization and immutable workflow SHA | Live App, ruleset, and workflow evidence must remain reachable |
-| GitHub App discovery and onboarding issue | Beta | Selected App installations | [control-plane service tests](../apps/control-plane/test/service.test.ts) | App permissions and subscribed events | The new Geekyshubham App has not yet been created and installed |
+| GitHub App discovery and onboarding issue | Beta | Selected or all-repository App installations | [control-plane service tests](../apps/control-plane/test/service.test.ts) and live Geekyshubham installation `149675182` webhook acceptance | App permissions and subscribed events | The App is installed across 13 Geekyshubham repositories; successful post-release discovery and onboarding-issue creation are still being verified |
 | Advisory PR placeholder and grouped review | Beta | Ready pull requests | [control-plane service tests](../apps/control-plane/test/service.test.ts) | Active repository record and approved bridge | Inline finding publication and live end-to-end App evidence remain incomplete |
 | Incremental stable-fingerprint lifecycle | Partial | Persisted PR review records | [store tests](../apps/control-plane/test/store.test.ts) | Active repository | Resolved/superseded presentation and full feedback analytics remain planned |
 | Semgrep and full-class Trivy gate | Beta | Code, dependency, configuration, secret, and license evidence | [scanner tests](../packages/core/test/core.test.ts), [zero-result sanitizer tests](../packages/core/test/trivy-sanitizer.test.ts), and [workflow security tests](../packages/core/test/workflow-security.test.ts) | Generated caller; reviewed baseline for enforce mode | License findings stay report-only; live consumer runs against the 0.2.11 workflow SHA remain to be verified |

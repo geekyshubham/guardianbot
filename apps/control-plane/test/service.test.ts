@@ -30,6 +30,7 @@ class FakeGitHub {
       codeowners?: string;
       refSha?: string;
       contents?: Record<string, Buffer>;
+      repositoryDetails?: Record<string, any>;
     } = {}
   ) {}
 
@@ -82,6 +83,12 @@ class FakeGitHub {
   }
 
   async request<T>(method: string, path: string, body?: any): Promise<T> {
+    if (method === "GET" && /^\/repositories\/\d+$/.test(path)) {
+      if (!this.options.repositoryDetails) {
+        throw new Error(`GitHub GET ${path} returned 404: missing`);
+      }
+      return this.options.repositoryDetails as T;
+    }
     if (method === "GET" && /\/issues\?/.test(path)) {
       return this.issues.map((issue) => ({
         title: issue.title,
@@ -351,6 +358,46 @@ test("enqueue is idempotent and discovery succeeds once", async () => {
   assert.equal(repository?.repositoryState, "active");
   const job = await store.getWebhook("delivery-1");
   assert.equal(job?.status, "succeeded");
+});
+
+test("installation discovery hydrates compact webhook repository metadata", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({
+    repositoryDetails: {
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    }
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github
+    },
+    store
+  );
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [
+      {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        private: false
+      }
+    ]
+  };
+
+  await service.enqueue("installation", event, "compact-installation");
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+
+  assert.deepEqual(github.treeRefs, ["main"]);
+  assert.equal(github.issues.length, 1);
+  assert.equal((await store.getRepository(99))?.defaultBranch, "main");
+  assert.equal((await store.getWebhook("compact-installation"))?.status, "succeeded");
 });
 
 test("onboarding issue creation retries after a transient failure and remains idempotent", async () => {

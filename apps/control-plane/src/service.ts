@@ -408,26 +408,42 @@ export class GuardianService {
 
   private async discover(event: GitHubEvent, repository: any): Promise<void> {
     const github = await this.client(event, [repository.id]);
-    const [owner, name] = repository.full_name.split("/");
-    const files = await github.getTree(owner, name, repository.default_branch);
+    const repositoryDetails =
+      typeof repository.default_branch === "string" &&
+      repository.default_branch.length > 0 &&
+      typeof repository.private === "boolean"
+        ? repository
+        : await github.request<any>("GET", `/repositories/${repository.id}`);
+    if (
+      repositoryDetails.id !== repository.id ||
+      typeof repositoryDetails.full_name !== "string" ||
+      repositoryDetails.full_name.toLowerCase() !== String(repository.full_name).toLowerCase() ||
+      typeof repositoryDetails.default_branch !== "string" ||
+      repositoryDetails.default_branch.length === 0 ||
+      typeof repositoryDetails.private !== "boolean"
+    ) {
+      throw new Error("GitHub repository metadata did not match the installation event");
+    }
+    const [owner, name] = repositoryDetails.full_name.split("/");
+    const files = await github.getTree(owner, name, repositoryDetails.default_branch);
     const languages = await github.getLanguages(owner, name);
-    const visibility = repositoryVisibility(repository);
+    const visibility = repositoryVisibility(repositoryDetails);
     const snapshot = {
       owner,
       name,
-      defaultBranch: repository.default_branch,
+      defaultBranch: repositoryDetails.default_branch,
       visibility: visibility === "internal" ? ("restricted" as const) : visibility,
       files,
       languages
     };
     const detection = detectRepository(snapshot);
-    const existing = await this.store.getRepository(repository.id);
+    const existing = await this.store.getRepository(repositoryDetails.id);
     await this.store.upsertRepository({
       installationId: event.installation.id,
-      repositoryId: repository.id,
-      fullName: repository.full_name,
+      repositoryId: repositoryDetails.id,
+      fullName: repositoryDetails.full_name,
       visibility,
-      defaultBranch: repository.default_branch,
+      defaultBranch: repositoryDetails.default_branch,
       indexSha: existing?.indexSha,
       indexUpdatedAt: existing?.indexUpdatedAt,
       scannerState: existing?.scannerState ?? "not-configured",
@@ -436,27 +452,27 @@ export class GuardianService {
     });
     await this.ensureOnboardingIssue(
       github,
-      repository.id,
+      repositoryDetails.id,
       owner,
       name,
       onboardingIssue(
-        repository.full_name,
+        repositoryDetails.full_name,
         [...detection.languages, ...detection.packageManagers],
         detection.notes
       )
     );
     const refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
       github,
-      repositoryId: repository.id,
+      repositoryId: repositoryDetails.id,
       installationId: event.installation.id,
-      fullName: repository.full_name,
-      defaultBranch: repository.default_branch,
+      fullName: repositoryDetails.full_name,
+      defaultBranch: repositoryDetails.default_branch,
       visibility
     });
     if (refresh) {
       await this.refreshScannerStateFromConfig(
         github,
-        repository.id,
+        repositoryDetails.id,
         owner,
         name,
         refresh.commitSha

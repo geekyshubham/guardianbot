@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-29
+
+### Fixed
+
+- GitHub App installation discovery now hydrates compact repository objects
+  through the installation-scoped repository endpoint before reading the
+  default branch. Fresh all-repository installations no longer attempt to
+  resolve an `undefined` Git tree.
+
 ### Documentation
 
 - Recorded the live signed-digest `v0.2.11` DigitalOcean App Platform
