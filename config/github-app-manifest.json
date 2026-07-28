@@ -1,0 +1,28 @@
+{
+  "name": "GuardianBot",
+  "url": "https://github.com/Geekyshubham/guardianbot",
+  "hook_attributes": {
+    "url": "https://YOUR_GUARDIANBOT_HOST/webhooks/github",
+    "active": true
+  },
+  "redirect_url": "https://YOUR_GUARDIANBOT_HOST/github/setup-callback",
+  "setup_url": "https://YOUR_GUARDIANBOT_HOST/github/setup",
+  "public": false,
+  "default_permissions": {
+    "actions": "read",
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  },
+  "default_events": [
+    "installation",
+    "installation_repositories",
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "push",
+    "repository",
+    "workflow_run"
+  ]
+}

@@ -57,7 +57,8 @@ node packages/guardianctl/dist/cli.js onboard OWNER/REPOSITORY --dry-run
 Production-like setup starts with [getting started](docs/getting-started.md).
 See [what is verified](docs/status.md), [how it works](docs/how-it-works.md),
 [configuration](docs/repository-configuration.md), and the
-[security model](docs/security-model.md).
+[security model](docs/security-model.md). GitHub App creation and least-
+privilege settings are documented in [docs/github-app.md](docs/github-app.md).
 
 ## Repository layout
 
