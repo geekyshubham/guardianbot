@@ -5,6 +5,13 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recorded the live signed-digest `v0.2.13` DigitalOcean deployment and the
+  successful all-repository GitHub App replay: 13 repository records, 13
+  immutable indexes, 13 onboarding issues, live monitoring snapshots, and the
+  measured 4 GB memory requirement for Swift Tree-sitter indexing.
+
 ## [0.2.13] - 2026-07-29
 
 ### Fixed
