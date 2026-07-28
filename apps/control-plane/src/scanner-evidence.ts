@@ -217,6 +217,32 @@ function parseDefectDojoSettings(
   return { baseUrlRef, apiTokenRef };
 }
 
+function defectDojoEngagementDates(startedAt?: string): {
+  targetStart: string;
+  targetEnd: string;
+} {
+  if (!startedAt) {
+    throw new Error("DefectDojo import requires the trusted workflow start time");
+  }
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(
+      startedAt
+    )
+  ) {
+    throw new Error("DefectDojo import workflow start time is invalid");
+  }
+  const start = new Date(startedAt);
+  if (!Number.isFinite(start.getTime())) {
+    throw new Error("DefectDojo import workflow start time is invalid");
+  }
+  const end = new Date(start);
+  end.setUTCFullYear(end.getUTCFullYear() + 1);
+  return {
+    targetStart: start.toISOString().slice(0, 10),
+    targetEnd: end.toISOString().slice(0, 10)
+  };
+}
+
 function normalizeRepository(fullName: string): string {
   return fullName.trim().toLowerCase();
 }
@@ -446,6 +472,8 @@ function parseZapStatus(report: unknown): {
   zapExitCode: number;
   profile: "authenticated-baseline" | "authenticated-full";
   minutes: number;
+  deploymentEnvironment: string;
+  deployedDigest: string;
 } {
   const root = asRecord(report);
   if (!root) throw new Error("scan-status.json is invalid");
@@ -455,6 +483,10 @@ function parseZapStatus(report: unknown): {
     root.schemaVersion !== "1.0.0" ||
     (root.profile !== "authenticated-baseline" &&
       root.profile !== "authenticated-full") ||
+    typeof root.deploymentEnvironment !== "string" ||
+    !/^[a-z][a-z0-9-]{0,62}$/.test(root.deploymentEnvironment) ||
+    typeof root.deployedDigest !== "string" ||
+    !/^sha256:[a-f0-9]{64}$/.test(root.deployedDigest) ||
     minutes < 5 ||
     minutes > 45 ||
     (root.profile === "authenticated-baseline" && minutes > 15) ||
@@ -467,7 +499,9 @@ function parseZapStatus(report: unknown): {
   return {
     zapExitCode,
     profile: root.profile,
-    minutes
+    minutes,
+    deploymentEnvironment: root.deploymentEnvironment,
+    deployedDigest: root.deployedDigest
   };
 }
 
@@ -1026,12 +1060,15 @@ async function maybeImportToDefectDojo(
     runId: number;
     runAttempt: number;
     headSha: string;
+    startedAt?: string;
     artifactType: string;
     scanType: string;
     fileName: string;
     report: Uint8Array;
     contentType: string;
     evidenceKey?: string;
+    digest?: string;
+    environment?: string;
   }
 ): Promise<void> {
   if (!settings) return;
@@ -1045,6 +1082,7 @@ async function maybeImportToDefectDojo(
   const profile = input.artifactType === "dast" ? "dast" : input.artifactType.startsWith("image") ? "image" : "security";
   const branch = input.headBranch;
   const isDefaultBranch = branch === input.defaultBranch;
+  const engagementDates = defectDojoEngagementDates(input.startedAt);
   const tags = buildDefectDojoTags({
     repositoryId: input.repositoryId,
     repositorySlug: input.repositoryFullName,
@@ -1054,11 +1092,16 @@ async function maybeImportToDefectDojo(
     workflowAttempt: String(input.runAttempt),
     branch,
     profile,
-    scanType: input.scanType
+    scanType: input.scanType,
+    environment: input.environment,
+    imageDigest: input.digest
   });
   try {
     const ensured = (await client.ensureImportContext({
-      productType: { name: "GitHub Repositories" },
+      productType: {
+        name: "GitHub Repositories",
+        description: "Repositories whose scanner evidence is managed by GuardianBot"
+      },
       product: {
         name: input.repositoryFullName,
         description: "GuardianBot imported GitHub Actions evidence",
@@ -1066,13 +1109,15 @@ async function maybeImportToDefectDojo(
       },
       engagement: {
         name: `${branch}/${profile}`,
+        status: "In Progress",
+        targetStart: engagementDates.targetStart,
+        targetEnd: engagementDates.targetEnd,
         branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
         tags
       },
       test: {
-        engagementId: 0,
         scanType: input.scanType,
         title: `${branch}/${profile}`,
         branchTag: branch,
@@ -1124,6 +1169,8 @@ async function maybeImportToDefectDojo(
         source: "defectdojo",
         status: "success",
         observedAt: new Date().toISOString(),
+        digest: input.digest,
+        environment: input.environment,
         details: `${input.scanType} ${imported.mode}`,
         payload: {
           mode: imported.mode,
@@ -1147,6 +1194,8 @@ async function maybeImportToDefectDojo(
         source: "defectdojo",
         status: "failure",
         observedAt: new Date().toISOString(),
+        digest: input.digest,
+        environment: input.environment,
         details: error instanceof Error ? error.message : String(error)
       }
     );
@@ -1160,7 +1209,7 @@ async function processSecurityArtifact(
   store: Store,
   archive: ParsedArtifactArchive,
   artifact: ScannerArtifactRecord,
-  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch">,
+  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch" | "startedAt">,
   repositoryFullName: string,
   repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
@@ -1300,6 +1349,7 @@ async function processSecurityArtifact(
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
       headSha: run.headSha,
+      startedAt: run.startedAt,
       artifactType: artifact.artifactType,
       scanType: "Semgrep JSON Report",
       fileName: "semgrep.json",
@@ -1318,6 +1368,7 @@ async function processSecurityArtifact(
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
       headSha: run.headSha,
+      startedAt: run.startedAt,
       artifactType: artifact.artifactType,
       scanType: "Trivy Scan",
       fileName: "trivy.json",
@@ -1502,7 +1553,7 @@ async function processImageArtifact(
   defaultBranch: string,
   run: Pick<
     ScannerWorkflowRunRecord,
-    "headSha" | "headBranch" | "workflowPath" | "workflowRef" | "event"
+    "headSha" | "headBranch" | "workflowPath" | "workflowRef" | "event" | "startedAt"
   >,
   trustPolicy: EvidenceTrustPolicy,
   env: Record<string, string | undefined>,
@@ -1654,6 +1705,7 @@ async function processImageArtifact(
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
       headSha: run.headSha,
+      startedAt: run.startedAt,
       artifactType: artifact.artifactType,
       scanType: "Trivy Scan",
       fileName: "trivy-image.json",
@@ -1670,7 +1722,7 @@ async function processDastArtifact(
   repositoryFullName: string,
   repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
-  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch">,
+  run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch" | "startedAt">,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
 ): Promise<void> {
@@ -1697,12 +1749,16 @@ async function processDastArtifact(
     source: "zap",
     status: exit.zapExitCode >= 3 ? "failure" : "success",
     observedAt: new Date().toISOString(),
+    digest: exit.deployedDigest,
+    environment: exit.deploymentEnvironment,
     details: `zap exit code: ${exit.zapExitCode}`,
     payload: {
       exitCode: exit.zapExitCode,
       profile: exit.profile,
       minutes: exit.minutes,
-      findings: findings.length
+      findings: findings.length,
+      deployedDigest: exit.deployedDigest,
+      deploymentEnvironment: exit.deploymentEnvironment
     }
   });
   for (const finding of findings) {
@@ -1712,6 +1768,8 @@ async function processDastArtifact(
       source: "zap",
       status: "success",
       observedAt: new Date().toISOString(),
+      digest: exit.deployedDigest,
+      environment: exit.deploymentEnvironment,
       fingerprint: finding.fingerprint,
       path: finding.path,
       line: finding.line,
@@ -1734,13 +1792,16 @@ async function processDastArtifact(
       runId: artifact.runId,
       runAttempt: artifact.runAttempt,
       headSha: run.headSha,
+      startedAt: run.startedAt,
       artifactType: artifact.artifactType,
       scanType: "ZAP Scan",
       evidenceKey:
         `defectdojo-import:ZAP Scan:${isNightly ? "nightly" : "smoke"}`,
       fileName: "zap.json",
       report: zapBytes,
-      contentType: "application/json"
+      contentType: "application/json",
+      digest: exit.deployedDigest,
+      environment: exit.deploymentEnvironment
     });
   }
 }

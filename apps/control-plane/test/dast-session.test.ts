@@ -11,6 +11,7 @@ import { MemoryStore } from "../src/store.js";
 const NOW = new Date("2026-07-27T12:00:00.000Z");
 const HEAD_SHA = "a".repeat(40);
 const DAST_SHA = "d".repeat(40);
+const DEPLOYED_DIGEST = `sha256:${"b".repeat(64)}`;
 const REPOSITORY = "geekyshubham/service";
 const REPOSITORY_ID = 99;
 
@@ -67,6 +68,7 @@ function exchangeEnvironment(): Record<string, string> {
         repository: REPOSITORY,
         repositoryId: REPOSITORY_ID,
         origin: "https://staging.example.com",
+        deploymentEnvironment: "staging",
         sessionAssertionPath: "/api/session",
         headerName: "Cookie",
         ttlSeconds: 300,
@@ -88,6 +90,47 @@ async function seededStore(): Promise<MemoryStore> {
     scannerState: "report-only",
     repositoryState: "active",
     automaticReviewPaused: false
+  });
+  await store.upsertScannerWorkflowRun({
+    repositoryId: REPOSITORY_ID,
+    runId: 400,
+    runAttempt: 1,
+    headSha: HEAD_SHA,
+    headBranch: "main",
+    event: "push",
+    startedAt: "2026-07-27T11:30:00.000Z",
+    completedAt: "2026-07-27T11:45:00.000Z",
+    workflowPath: ".github/workflows/guardianbot.yml",
+    conclusion: "success",
+    status: "completed",
+    validationStatus: "accepted",
+    referencedWorkflows: []
+  });
+  await store.upsertScannerArtifact({
+    repositoryId: REPOSITORY_ID,
+    runId: 400,
+    runAttempt: 1,
+    artifactId: 401,
+    artifactName: "guardianbot-image-promotion-400-1",
+    artifactType: "image-promotion",
+    sizeBytes: 1,
+    expired: false,
+    validationStatus: "accepted"
+  });
+  await store.upsertScannerEvidence({
+    repositoryId: REPOSITORY_ID,
+    runId: 400,
+    runAttempt: 1,
+    artifactId: 401,
+    artifactType: "image-promotion",
+    evidenceKey: "deployment:staging",
+    kind: "deployment",
+    source: "digitalocean",
+    status: "success",
+    observedAt: "2026-07-27T11:45:00.000Z",
+    digest: DEPLOYED_DIGEST,
+    environment: "staging",
+    payload: { origin: "https://staging.example.com" }
   });
   return store;
 }
@@ -111,6 +154,9 @@ test("exchanges and returns one run-scoped session exactly once", async () => {
         (init?.headers as Record<string, string>).authorization,
         "Bearer exchange-secret-value"
       );
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      assert.equal(body.deploymentEnvironment, "staging");
+      assert.equal(body.deployedDigest, DEPLOYED_DIGEST);
       return Response.json({
         schemaVersion: "1.0.0",
         credential: "session=short-lived",
@@ -123,6 +169,8 @@ test("exchanges and returns one run-scoped session exactly once", async () => {
   assert.deepEqual(result, {
     schemaVersion: "1.0.0",
     origin: "https://staging.example.com",
+    deploymentEnvironment: "staging",
+    deployedDigest: DEPLOYED_DIGEST,
     sessionAssertionPath: "/api/session",
     headerName: "Cookie",
     headerValue: "session=short-lived",
@@ -179,6 +227,59 @@ test("rejects repository input or workflow identity that differs from the profil
   );
 });
 
+test("rejects DAST before credential exchange unless exact-head deployment evidence exists", async () => {
+  const store = await seededStore();
+  await store.upsertScannerWorkflowRun({
+    repositoryId: REPOSITORY_ID,
+    runId: 400,
+    runAttempt: 1,
+    headSha: "c".repeat(40),
+    headBranch: "main",
+    event: "push",
+    workflowPath: ".github/workflows/guardianbot.yml",
+    conclusion: "success",
+    status: "completed",
+    validationStatus: "accepted",
+    referencedWorkflows: []
+  });
+  let exchangeCalls = 0;
+  const service = createDastSessionService({
+    store,
+    environment: exchangeEnvironment(),
+    now: () => NOW,
+    oidcVerifier: { verify: async () => oidc() },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () => {
+      exchangeCalls += 1;
+      throw new Error("must not exchange");
+    }) as typeof fetch
+  });
+  await assert.rejects(
+    () => service.issue("Bearer github-oidc", request()),
+    (error: unknown) =>
+      error instanceof DastSessionError && error.statusCode === 403
+  );
+  assert.equal(exchangeCalls, 0);
+});
+
+test("rejects push-triggered DAST even when deployment evidence exists", async () => {
+  const service = createDastSessionService({
+    store: await seededStore(),
+    environment: exchangeEnvironment(),
+    now: () => NOW,
+    oidcVerifier: { verify: async () => oidc({ event_name: "push" }) },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () => {
+      throw new Error("must not exchange");
+    }) as typeof fetch
+  });
+  await assert.rejects(
+    () => service.issue("Bearer github-oidc", request()),
+    (error: unknown) =>
+      error instanceof DastSessionError && error.statusCode === 401
+  );
+});
+
 test("releases a failed exchange lease so the same attempt can retry", async () => {
   const store = await seededStore();
   let fail = true;
@@ -218,6 +319,7 @@ test("static credentials are explicit PoC-only and report lower assurance", asyn
     repository: REPOSITORY,
     repositoryId: REPOSITORY_ID,
     origin: "https://staging.example.com",
+    deploymentEnvironment: "staging",
     sessionAssertionPath: "/api/session",
     headerName: "Authorization",
     ttlSeconds: 300,

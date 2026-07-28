@@ -48,7 +48,6 @@ ${runtimeEnvironment || "          # No runtime environment values configured."}
   guardianbot-dast-smoke:
     name: guardianbot/dast-smoke
     if: >-
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'schedule' && github.event.schedule == '${dastSmokeSchedule}')
     permissions:

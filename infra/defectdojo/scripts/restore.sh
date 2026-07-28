@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/lib.sh"
 require_root
 require_command flock
 require_command sha256sum
+verify_stack_definition installed
 "${SCRIPT_DIR}/preflight.sh"
 
 backup_id="${1:-}"
@@ -47,6 +48,7 @@ cmp --silent "${STACK_DIR}/release-manifest.json" "${backup_dir}/release-manifes
   printf 'Backup release differs from the installed release. Restore the matching immutable release definition first.\n' >&2
   exit 1
 }
+verify_stack_definition installed
 
 printf 'Creating a safety backup before destructive restore.\n'
 "${SCRIPT_DIR}/backup.sh" --no-prune

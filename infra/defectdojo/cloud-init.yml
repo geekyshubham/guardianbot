@@ -1,0 +1,84 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - fail2ban
+  - git
+  - jq
+  - openssl
+  - unattended-upgrades
+  - ufw
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-guardianbot-defectdojo.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PermitRootLogin prohibit-password
+      MaxAuthTries 3
+      X11Forwarding no
+      AllowAgentForwarding no
+      AllowTcpForwarding no
+  - path: /etc/apt/apt.conf.d/52guardianbot-unattended-upgrades
+    owner: root:root
+    permissions: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      Unattended-Upgrade::Automatic-Reboot "false";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "live-restore": true,
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "5"
+        }
+      }
+  - path: /etc/fail2ban/jail.d/guardianbot-defectdojo.local
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      banaction = ufw
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+
+runcmd:
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo ${UBUNTU_CODENAME:-$VERSION_CODENAME}) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - sshd -t
+  - systemctl reload ssh
+  - systemctl restart docker
+  - systemctl enable --now unattended-upgrades
+  - systemctl enable --now fail2ban
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw limit 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw allow 443/udp
+  - ufw --force enable
+  - install -d -m 0755 -o root -g root /opt/guardianbot-defectdojo
+  - install -d -m 0700 -o root -g root /etc/guardianbot
+  - install -d -m 0700 -o root -g root /var/backups/guardianbot/defectdojo
+
+# Root key-based SSH intentionally remains available until an operator creates
+# and validates a separate sudo-capable account. Only then may an operator set
+# PermitRootLogin no in a separately reviewed host-hardening change.

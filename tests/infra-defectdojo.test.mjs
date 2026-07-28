@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import {
+  appendFile,
+  cp,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -27,6 +35,28 @@ test("the DefectDojo deployment is immutable and DigitalOcean-only", async () =>
   ]);
 });
 
+test("stack-definition validation rejects a changed operational file", async () => {
+  const temporaryRoot = await mkdtemp(
+    path.join(tmpdir(), "guardianbot-defectdojo-definition-"),
+  );
+  const copyPath = path.join(temporaryRoot, "defectdojo");
+  try {
+    await cp(STACK, copyPath, { recursive: true });
+    const manifestPath = path.join(copyPath, "release-manifest.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.guardianbotSource.commit = "0".repeat(40);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await validateDefectDojoConfig(copyPath);
+    await appendFile(path.join(copyPath, "Caddyfile"), "\n# drift\n");
+    await assert.rejects(
+      () => validateDefectDojoConfig(copyPath),
+      /must match its release-manifest checksum/,
+    );
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("operator shell scripts parse successfully", async () => {
   const scriptsDirectory = path.join(STACK, "scripts");
   const scripts = [
@@ -39,6 +69,7 @@ test("operator shell scripts parse successfully", async () => {
     "preflight.sh",
     "pull-and-verify-images.sh",
     "restore.sh",
+    "verify-stack-definition.sh",
     "wait-ready.sh",
   ];
   for (const script of scripts) {

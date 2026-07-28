@@ -1,6 +1,6 @@
 {
   "name": "@guardianbot/defectdojo",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,6 +12,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "conformance:live": "npm run build && node scripts/live-conformance.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/**/*.test.ts"
   }

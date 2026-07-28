@@ -187,6 +187,17 @@ export interface DeploymentPromotionClaim {
   leaseExpiresAt: string;
 }
 
+export interface SuccessfulDeploymentEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  headSha: string;
+  environment: string;
+  imageDigest: string;
+  observedAt: string;
+  origin: string;
+}
+
 export interface StoreLock {
   release(): Promise<void>;
 }
@@ -274,6 +285,12 @@ export interface Store {
     issuanceKey: string,
     leaseId: string
   ): Promise<boolean>;
+  getSuccessfulDeploymentEvidence(
+    repositoryId: number,
+    environment: string,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<SuccessfulDeploymentEvidence | undefined>;
   claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean>;
@@ -751,6 +768,66 @@ export class MemoryStore implements Store {
       return false;
     }
     return this.dastSessionIssuances.delete(issuanceKey);
+  }
+
+  async getSuccessfulDeploymentEvidence(
+    repositoryId: number,
+    environment: string,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<SuccessfulDeploymentEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.evidenceKey === `deployment:${environment}` &&
+          evidence.kind === "deployment" &&
+          evidence.source === "digitalocean" &&
+          evidence.status === "success" &&
+          evidence.environment === environment &&
+          evidence.fingerprint === undefined &&
+          typeof evidence.digest === "string" &&
+          /^sha256:[a-f0-9]{64}$/.test(evidence.digest)
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const evidence of candidates) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      if (
+        !run ||
+        run.headSha !== headSha ||
+        run.headBranch !== defaultBranch ||
+        run.event !== "push" ||
+        run.conclusion !== "success" ||
+        run.validationStatus !== "accepted" ||
+        artifact?.artifactType !== "image-promotion" ||
+        artifact.validationStatus !== "accepted"
+      ) {
+        continue;
+      }
+      const origin = evidence.payload?.origin;
+      if (typeof origin !== "string") continue;
+      return {
+        repositoryId,
+        runId: evidence.runId,
+        runAttempt: evidence.runAttempt,
+        headSha,
+        environment,
+        imageDigest: evidence.digest!,
+        observedAt: evidence.observedAt,
+        origin
+      };
+    }
+    return undefined;
   }
 
   async claimDeploymentPromotion(
@@ -1883,6 +1960,72 @@ export class PostgresStore implements Store {
       [issuanceKey, leaseId]
     );
     return result.rowCount === 1;
+  }
+
+  async getSuccessfulDeploymentEvidence(
+    repositoryId: number,
+    environment: string,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<SuccessfulDeploymentEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT evidence.run_id,
+              evidence.run_attempt,
+              evidence.digest,
+              evidence.observed_at,
+              evidence.payload->>'origin' AS origin
+       FROM scanner_evidence AS evidence
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=evidence.repository_id
+        AND runs.run_id=evidence.run_id
+        AND runs.run_attempt=evidence.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=evidence.repository_id
+        AND artifacts.run_id=evidence.run_id
+        AND artifacts.run_attempt=evidence.run_attempt
+        AND artifacts.artifact_id=evidence.artifact_id
+       WHERE evidence.repository_id=$1
+         AND evidence.evidence_key=$2
+         AND evidence.kind='deployment'
+         AND evidence.source='digitalocean'
+         AND evidence.status='success'
+         AND evidence.environment=$3
+         AND evidence.fingerprint IS NULL
+         AND evidence.digest ~ '^sha256:[a-f0-9]{64}$'
+         AND runs.head_sha=$4
+         AND runs.head_branch=$5
+         AND runs.event='push'
+         AND runs.conclusion='success'
+         AND runs.validation_status='accepted'
+         AND artifacts.artifact_type='image-promotion'
+         AND artifacts.validation_status='accepted'
+         AND jsonb_typeof(evidence.payload)='object'
+         AND jsonb_typeof(evidence.payload->'origin')='string'
+       ORDER BY evidence.observed_at DESC,
+                evidence.updated_at DESC,
+                evidence.run_id DESC,
+                evidence.run_attempt DESC
+       LIMIT 1`,
+      [
+        repositoryId,
+        `deployment:${environment}`,
+        environment,
+        headSha,
+        defaultBranch
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId,
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      headSha,
+      environment,
+      imageDigest: String(row.digest),
+      observedAt: new Date(row.observed_at).toISOString(),
+      origin: String(row.origin)
+    };
   }
 
   async claimDeploymentPromotion(

@@ -9,13 +9,18 @@ normalized failures suitable for control-plane handling.
 
 ## What is implemented
 
-- `resolveDefectDojoConfig(...)` loads `DEFECTDOJO_URL` and `DEFECTDOJO_API_TOKEN`
-  by reference name, not by embedding values in repository configuration.
+- `resolveDefectDojoConfig(...)` loads an HTTPS base URL and API token by
+  environment-variable reference name, not by embedding values in repository
+  configuration.
 - `DefectDojoClient` supports authenticated GET/POST/PATCH requests with timeout,
   idempotent request IDs, pagination, retries, exponential backoff, and
   `Retry-After` handling.
-- Product type, product, engagement, and test discovery/upsert flows are
-  deterministic and safe to replay.
+- Product type, product, and engagement upserts are deterministic and safe to
+  replay. Engagement creation always supplies the target dates required by the
+  DefectDojo API; an existing engagement keeps its original lifecycle dates.
+- Test lookup is read-only. GuardianBot never manually creates an incomplete
+  Test record: the first report uses DefectDojo's official `import-scan`
+  endpoint, and only a discovered existing Test ID may use `reimport-scan`.
 - Scan submission chooses `import-scan` or `reimport-scan` explicitly based on the
   discovered test identity instead of relying on ambiguous latest-test selection.
 - `buildDefectDojoTags(...)` and `buildImmutableScanIdentity(...)` create stable
@@ -61,6 +66,44 @@ when the engagement/scan/title tuple has not been seen before.
 GuardianBot fingerprints remain useful for local policy and suppression handling,
 but DefectDojo ownership stays tied to scanner-native imports, tests, and import
 history.
+
+## Control-plane configuration
+
+DefectDojo is disabled unless both reference variables are configured. Keep all
+four values only in encrypted DigitalOcean control-plane configuration:
+
+```text
+GUARDIANBOT_DEFECTDOJO_BASE_URL_REF=GUARDIANBOT_DEFECTDOJO_BASE_URL
+GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF=GUARDIANBOT_DEFECTDOJO_API_TOKEN
+GUARDIANBOT_DEFECTDOJO_BASE_URL=https://defectdojo.example.com
+GUARDIANBOT_DEFECTDOJO_API_TOKEN=CONTROL_PLANE_ONLY_TOKEN
+```
+
+The base URL must use HTTPS outside loopback development. The API token must
+belong to a dedicated automation user with only the product hierarchy, test
+lookup, import, and reimport permissions needed by GuardianBot.
+
+## Live conformance command
+
+The checked-in `semgrep-empty.json` fixture contains no credentials or
+repository source. After building the package, an operator can prove the actual
+DefectDojo API contract with an isolated engagement:
+
+```sh
+export GUARDIANBOT_DEFECTDOJO_BASE_URL_REF=GUARDIANBOT_DEFECTDOJO_BASE_URL
+export GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF=GUARDIANBOT_DEFECTDOJO_API_TOKEN
+export GUARDIANBOT_DEFECTDOJO_BASE_URL=https://defectdojo.example.com
+export GUARDIANBOT_DEFECTDOJO_API_TOKEN=CONTROL_PLANE_ONLY_TOKEN
+npm run conformance:live --workspace @guardianbot/defectdojo -- \
+  --run-id 20260727T120000Z \
+  --confirm guardianbot-defectdojo-live-conformance
+```
+
+This is an explicit live mutation. It creates one uniquely named conformance
+engagement, imports the fixture through `import-scan`, reimports it through
+`reimport-scan`, and fails unless both operations return the same Test ID. Reuse
+of a run ID is rejected so a stale Test cannot make a first-import check pass.
+The command never prints the API token.
 
 ## Failure behavior
 

@@ -5,6 +5,35 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-28
+
+### Added
+
+- DigitalOcean deployment profiles can atomically promote an allowlisted mix of
+  App Platform services, workers, and jobs to one exact signed GHCR digest.
+- DAST sessions now require accepted DigitalOcean deployment evidence for the
+  same default-branch SHA, environment, origin, and immutable digest. The
+  deployed digest is carried through the target credential exchange, ZAP
+  evidence, monitoring, and DefectDojo tags.
+- The DefectDojo droplet definition now binds every operational stack file to a
+  SHA-256 manifest and exact GuardianBot source commit, with cloud-init SSH/UFW
+  hardening and runtime drift verification.
+- A guarded live DefectDojo import/reimport conformance command uses a
+  non-secret empty Semgrep fixture.
+
+### Fixed
+
+- Empty Trivy filesystem results now normalize to a valid schema-v2 report
+  while malformed reports and scanner failures remain fail-closed.
+- Generated image runtime environments now ignore blank and comment-only lines
+  without accepting malformed entries.
+- DAST no longer runs on a default-branch push before deployment. Scheduled and
+  manual runs retain only `GET`, `HEAD`, and `OPTIONS` operations, remove
+  webhooks, and constrain all OpenAPI/Swagger servers to the exact staging
+  origin.
+- DefectDojo engagement creation supplies validated target dates and first
+  imports no longer create incomplete Test records manually.
+
 ### Documentation
 
 - Recorded the live signed-digest `v0.2.10` DigitalOcean App Platform

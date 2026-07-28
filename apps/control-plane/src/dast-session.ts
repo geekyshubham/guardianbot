@@ -6,7 +6,7 @@ import {
   type GitHubOidcClaims,
   type GitHubOidcVerifier
 } from "./github-oidc.js";
-import type { Store } from "./store.js";
+import type { Store, SuccessfulDeploymentEvidence } from "./store.js";
 
 export const DAST_SESSION_OIDC_AUDIENCE = "guardianbot-dast-session";
 const DAST_WORKFLOW_PATH = ".github/workflows/reusable-dast.yml";
@@ -25,6 +25,7 @@ interface CommonDastProfile {
   repository: string;
   repositoryId: number;
   origin: string;
+  deploymentEnvironment: string;
   sessionAssertionPath: string;
   headerName: string;
   ttlSeconds: number;
@@ -65,6 +66,8 @@ export interface DastSessionRequest {
 export interface DastSessionResponse {
   schemaVersion: "1.0.0";
   origin: string;
+  deploymentEnvironment: string;
+  deployedDigest: string;
   sessionAssertionPath: string;
   headerName: string;
   headerValue: string;
@@ -132,6 +135,16 @@ function positiveSafeInteger(value: unknown, label: string): number {
     throw new Error(`${label} must be a positive safe integer`);
   }
   return Number(value);
+}
+
+function safeSlug(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" ||
+    !/^[a-z][a-z0-9-]{0,62}$/.test(value)
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
 }
 
 function exactSha(value: unknown, label: string): string {
@@ -286,6 +299,7 @@ function parseProfile(
     "repository",
     "repositoryId",
     "origin",
+    "deploymentEnvironment",
     "sessionAssertionPath",
     "headerName",
     "ttlSeconds"
@@ -322,6 +336,10 @@ function parseProfile(
       `DAST profile ${id} repositoryId`
     ),
     origin,
+    deploymentEnvironment: safeSlug(
+      profile.deploymentEnvironment,
+      `DAST profile ${id} deploymentEnvironment`
+    ),
     sessionAssertionPath: safeRequestPath(
       profile.sessionAssertionPath,
       `DAST profile ${id} sessionAssertionPath`
@@ -485,7 +503,7 @@ function validateOidcIdentity(
     exactSha(oidc.sha, "OIDC sha") !== request.headSha ||
     exactSha(oidc.workflow_sha, "OIDC workflow_sha") !== request.headSha ||
     oidc.ref !== defaultRef ||
-    !["schedule", "workflow_dispatch", "push"].includes(String(oidc.event_name ?? "")) ||
+    !["schedule", "workflow_dispatch"].includes(String(oidc.event_name ?? "")) ||
     oidc.runner_environment !== "github-hosted" ||
     callerWorkflow.repository !== request.repository ||
     callerWorkflow.workflowPath !== CALLER_WORKFLOW_PATH ||
@@ -522,6 +540,7 @@ function issuanceKey(request: DastSessionRequest, profile: DastProfile): string 
 async function exchangeCredential(
   profile: ExchangeDastProfile,
   request: DastSessionRequest,
+  deployment: SuccessfulDeploymentEvidence,
   environment: Record<string, string | undefined>,
   fetchImpl: typeof fetch,
   now: Date
@@ -547,6 +566,8 @@ async function exchangeCredential(
         runId: request.runId,
         runAttempt: request.runAttempt,
         headSha: request.headSha,
+        deploymentEnvironment: deployment.environment,
+        deployedDigest: deployment.imageDigest,
         ttlSeconds: profile.ttlSeconds
       }),
       redirect: "error",
@@ -683,12 +704,30 @@ export function createDastSessionService(
       }
 
       try {
+        const deployment =
+          await options.store.getSuccessfulDeploymentEvidence(
+            request.repositoryId,
+            profile.deploymentEnvironment,
+            request.headSha,
+            repository.defaultBranch
+          );
+        if (
+          !deployment ||
+          deployment.origin !== profile.origin ||
+          !/^sha256:[a-f0-9]{64}$/.test(deployment.imageDigest)
+        ) {
+          throw new DastSessionError(
+            "DAST requires a successful exact-head deployment for the approved environment and origin",
+            403
+          );
+        }
         let credential: { value: string; expiresAt: string };
         let assurance: DastSessionResponse["assurance"];
         if (profile.mode === "exchange") {
           credential = await exchangeCredential(
             profile,
             request,
+            deployment,
             environment,
             fetchImpl,
             issuedAt
@@ -731,6 +770,8 @@ export function createDastSessionService(
         return {
           schemaVersion: "1.0.0",
           origin: profile.origin,
+          deploymentEnvironment: deployment.environment,
+          deployedDigest: deployment.imageDigest,
           sessionAssertionPath: profile.sessionAssertionPath,
           headerName: profile.headerName,
           headerValue: credential.value,

@@ -36,13 +36,13 @@ deployment scripts described in [operations](operations.md).
 For an existing DigitalOcean App Platform app:
 
 ```sh
-mkdir guardianbot-release-v0.2.10
-gh release download v0.2.10 \
+mkdir guardianbot-release-v0.2.11
+gh release download v0.2.11 \
   --repo Geekyshubham/guardianbot \
-  --dir guardianbot-release-v0.2.10
+  --dir guardianbot-release-v0.2.11
 ./scripts/deploy-digitalocean-app-platform.sh \
   11111111-2222-4333-8444-555555555555 \
-  guardianbot-release-v0.2.10
+  guardianbot-release-v0.2.11
 ```
 
 For a dedicated DigitalOcean droplet, create Ubuntu with
@@ -55,7 +55,7 @@ cd /opt/guardianbot
 cp .env.example .env
 chmod 600 .env
 ./scripts/deploy-digitalocean.sh deploy \
-  /opt/guardianbot/releases/guardianbot-release-v0.2.10
+  /opt/guardianbot/releases/guardianbot-release-v0.2.11
 ./scripts/deploy-digitalocean.sh verify
 ```
 
@@ -107,13 +107,16 @@ Before enabling image deployment or DAST for a repository, configure:
 - a DigitalOcean App Platform allowlist profile in
   `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON`;
 - a one-time staging authentication profile in
-  `GUARDIANBOT_DAST_PROFILES_JSON`; and
+  `GUARDIANBOT_DAST_PROFILES_JSON`, including its matching DigitalOcean
+  deployment environment; and
 - the referenced DigitalOcean and target-exchange secrets only in the control
   plane.
 
 See [image security](image-security.md) and [DAST](dast.md). Repositories
 without a Dockerfile report image coverage as not applicable. Repositories
 without a DAST profile do not receive a missing-DAST failure.
+DAST begins only after the same default-branch SHA has successful
+image-promotion and DigitalOcean deployment evidence.
 
 ## 5. Onboard a repository
 

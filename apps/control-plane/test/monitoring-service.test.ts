@@ -602,6 +602,159 @@ test("image monitoring requires deployment evidence for the exact signed digest"
   assert.equal(weekly?.report.monitoring.missingEvidenceDigests, 0);
 });
 
+test("DAST monitoring requires the signed deployed digest and environment", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store);
+  const configIndex = await store.getRepositoryIndex(
+    20,
+    "github:20",
+    "a".repeat(40)
+  );
+  assert.ok(configIndex);
+  const configSymbol = configIndex.symbols.find(
+    (symbol) => symbol.path === ".guardianbot/config.yml"
+  );
+  assert.ok(configSymbol);
+  const config = JSON.parse(configSymbol.content) as GuardianConfig;
+  config.image = {
+    name: "acme/service",
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64",
+    registry: "ghcr.io/acme/service",
+    healthPath: "/healthz",
+    sbomFormat: "cyclonedx-json",
+    deployment: {
+      environment: "staging",
+      requireImmutableDigest: true,
+      requireSignature: true,
+      requireSbom: true
+    }
+  };
+  config.dast = {
+    allowedOrigin: "https://staging.example.com",
+    openapi: "openapi.json",
+    openapiSource: "repository-file",
+    authenticationProfile: "control-plane://profiles/service-staging",
+    sessionAssertionPath: "/api/session"
+  };
+  const updatedIndex = await indexRepositorySyntaxAware({
+    repository: "acme/service",
+    repositoryId: 20,
+    repositoryScope: "github:20",
+    visibility: "private",
+    commitSha: "a".repeat(40),
+    files: { ".guardianbot/config.yml": JSON.stringify(config) }
+  });
+  await store.replaceRepositoryIndex(
+    20,
+    updatedIndex,
+    toPersistedVectorRows(updatedIndex),
+    new Date("2026-07-27T11:50:00.000Z")
+  );
+  for (const run of [
+    scannerRun({ runId: 500 }),
+    scannerRun({ runId: 501, event: "push" }),
+    scannerRun({ runId: 502 }),
+    scannerRun({ runId: 503 })
+  ]) {
+    await store.upsertScannerWorkflowRun(run);
+  }
+  const signedDigest = `sha256:${"d".repeat(64)}`;
+  const wrongDigest = `sha256:${"e".repeat(64)}`;
+  const requiredEvidence = [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import"),
+    evidence("image-trivy-summary", "trivy", "success", {
+      artifactId: 701,
+      artifactType: "image-validation"
+    }),
+    evidence("sbom", "sbom", "success", {
+      artifactId: 701,
+      artifactType: "image-validation"
+    }),
+    evidence("signature", "signature", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest
+    }),
+    evidence("deployment:staging", "deployment", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest,
+      environment: "staging"
+    })
+  ];
+  const dastEvidence = (digest: string) => [
+    evidence("zap-smoke-summary", "zap-smoke", "success", {
+      runId: 502,
+      artifactId: 703,
+      artifactType: "dast",
+      digest,
+      environment: "staging"
+    }),
+    evidence("defectdojo-import:ZAP Scan:smoke", "defectdojo-import", "success", {
+      runId: 502,
+      artifactId: 703,
+      artifactType: "dast",
+      digest,
+      environment: "staging"
+    }),
+    evidence("zap-nightly-summary", "zap-nightly", "success", {
+      runId: 503,
+      artifactId: 704,
+      artifactType: "dast",
+      digest,
+      environment: "staging"
+    }),
+    evidence("defectdojo-import:ZAP Scan:nightly", "defectdojo-import", "success", {
+      runId: 503,
+      artifactId: 704,
+      artifactType: "dast",
+      digest,
+      environment: "staging"
+    })
+  ];
+  for (const record of [...requiredEvidence, ...dastEvidence(wrongDigest)]) {
+    await store.upsertScannerEvidence(record);
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  let snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-smoke")?.status,
+    "failing"
+  );
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-nightly")?.status,
+    "failing"
+  );
+
+  for (const record of dastEvidence(signedDigest)) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-smoke")?.status,
+    "passing"
+  );
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-zap-nightly")?.status,
+    "passing"
+  );
+  assert.equal(snapshot?.overallStatus, "passing");
+});
+
 test("missing immutable configuration is explicit and cannot produce a healthy snapshot", async () => {
   const store = new MemoryStore();
   await store.upsertRepository(repository({ scannerState: "not-configured" }));

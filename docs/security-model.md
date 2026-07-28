@@ -62,10 +62,16 @@ observe the same active digest and successful health/readiness probes.
 
 DAST requires an exact public HTTPS origin, a safe repository or same-origin
 OpenAPI document, a protected environment, and a one-time OIDC-bound session.
+The broker also requires accepted deployment evidence for the same current
+default-branch SHA, administratively selected DigitalOcean environment, exact
+origin, and immutable image digest. Scheduled/manual DAST is rejected until
+that evidence exists; push-triggered DAST is prohibited to avoid a
+pre-promotion race.
 The normal broker mode exchanges a central secret at a same-origin target
 endpoint for a short-lived credential. Static credentials require an explicit
 PoC-only switch. The workflow proves protected access fails without the
-credential before testing authenticated routes.
+credential before testing authenticated routes, removes all mutating OpenAPI
+operations, and records the deployed digest in trusted evidence.
 
 Production, localhost, link-local, private-address, cross-origin, redirected,
 destructive, and explicitly excluded routes are prohibited.

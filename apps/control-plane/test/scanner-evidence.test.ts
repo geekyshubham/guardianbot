@@ -479,8 +479,19 @@ function createFetchStub(options: FetchStubOptions) {
       if (method === "GET") {
         return new Response(JSON.stringify({ results: [] }), { status: 200 });
       }
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      assert.equal(payload.target_start, "2026-07-27");
+      assert.equal(payload.target_end, "2027-07-27");
+      assert.equal(payload.status, "In Progress");
+      assert.equal(payload.branch_tag, "feature");
       return new Response(
-        JSON.stringify({ id: 3, name: "feature/security", product: 2 }),
+        JSON.stringify({
+          id: 3,
+          name: "feature/security",
+          product: 2,
+          target_start: "2026-07-27",
+          target_end: "2027-07-27"
+        }),
         { status: 201 }
       );
     }
@@ -488,15 +499,7 @@ function createFetchStub(options: FetchStubOptions) {
       if (method === "GET") {
         return new Response(JSON.stringify({ results: [] }), { status: 200 });
       }
-      return new Response(
-        JSON.stringify({
-          id: 4,
-          engagement: 3,
-          scan_type: "Semgrep JSON Report",
-          title: "feature/security"
-        }),
-        { status: 201 }
-      );
+      throw new Error("GuardianBot must not create DefectDojo tests manually");
     }
     if (
       url.startsWith("https://dojo.example/api/v2/import-scan/") ||
@@ -945,6 +948,8 @@ test("keeps DAST smoke and nightly evidence as distinct trusted profiles", async
         "scan-status.json": {
           schemaVersion: "1.0.0",
           profile: entry.profile,
+          deploymentEnvironment: "staging",
+          deployedDigest: `sha256:${"f".repeat(64)}`,
           minutes: entry.minutes,
           zapExitCode: 0
         },
@@ -976,6 +981,8 @@ test("keeps DAST smoke and nightly evidence as distinct trusted profiles", async
         (record) => record.evidenceKey === entry.evidenceKey
       );
       assert.equal(summary?.kind, entry.kind);
+      assert.equal(summary?.environment, "staging");
+      assert.equal(summary?.digest, `sha256:${"f".repeat(64)}`);
       assert.equal(summary?.payload?.profile, entry.profile);
       assert.equal(summary?.payload?.minutes, entry.minutes);
     });
@@ -1233,12 +1240,22 @@ test("persists DefectDojo reconciliation failure without mutating the completed 
   assert.equal(run?.validationStatus, "failed");
   assert.equal(run?.processedAt, undefined);
   const importRequest = bodies.find((entry) =>
-    entry.url.includes("import-scan/")
+    entry.url.endsWith("/api/v2/import-scan/")
   );
   const form = importRequest?.body as
     | { get(name: string): FormDataEntryValue | null }
     | undefined;
   assert.equal(typeof form?.get, "function");
+  assert.equal(form?.get("engagement"), "3");
+  assert.equal(form?.get("test"), null);
   assert.equal(form?.get("branch_tag"), "feature");
   assert.equal(form?.get("close_old_findings"), "false");
+  assert.equal(
+    bodies.some(
+      (entry) =>
+        entry.method === "POST" &&
+        entry.url.startsWith("https://dojo.example/api/v2/tests/")
+    ),
+    false
+  );
 });

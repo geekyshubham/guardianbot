@@ -53,8 +53,10 @@
 - No image coverage: this is `not applicable` unless `image` is configured.
 - DAST stops before scanning: confirm the `guardianbot-dast` environment permits
   run; the control plane trusts the exact DAST workflow SHA; the selected
-  `GUARDIANBOT_DAST_PROFILES_JSON` entry matches the repository ID, origin, and
-  assertion path; and the one-time OIDC request has not already been consumed.
+  `GUARDIANBOT_DAST_PROFILES_JSON` entry matches the repository ID, origin,
+  deployment environment, and assertion path; accepted image-promotion
+  evidence exists for the same default-branch SHA and exact deployed digest;
+  and the one-time OIDC request has not already been consumed.
   The target must return 401/403 before authentication and 2xx afterward.
   Exchange mode also requires a same-origin exchange endpoint to return a
   credential whose expiry is within the approved TTL.

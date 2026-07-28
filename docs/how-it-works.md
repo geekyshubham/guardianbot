@@ -87,6 +87,7 @@ sequenceDiagram
   participant W as "Pinned DAST workflow"
   participant O as "GitHub OIDC"
   participant C as "GuardianBot session broker"
+  participant E as "Accepted deployment evidence"
   participant S as "Exact staging origin"
   participant Z as "ZAP"
   W->>S: "Protected assertion without credential"
@@ -94,13 +95,15 @@ sequenceDiagram
   W->>O: "OIDC token for guardianbot-dast-session"
   W->>C: "One-time session request"
   C->>C: "Verify repo, run, commit, workflow SHA, runner, environment"
+  C->>E: "Require same-SHA DigitalOcean deployment"
+  E-->>C: "Exact active digest and origin"
   C->>S: "Exchange for short-lived credential"
   S-->>C: "Credential and bounded expiry"
-  C-->>W: "Masked one-time header"
+  C-->>W: "Masked one-time header and deployed digest"
   W->>S: "Protected assertion with credential"
   S-->>W: "2xx"
   W->>Z: "Safe same-origin OpenAPI and exact origin"
-  Z-->>W: "Scrubbed smoke or nightly report"
+  Z-->>W: "Scrubbed, digest-bound smoke or nightly report"
 ```
 
 The 15-minute smoke and nightly authenticated scans use distinct evidence and

@@ -20,15 +20,22 @@ The broker verifies all of the following before it returns a credential:
 - the caller is `.github/workflows/guardianbot.yml`;
 - the called workflow is `.github/workflows/reusable-dast.yml` at the exact
   trusted GuardianBot commit;
-- the runner is GitHub-hosted and the event is `schedule`,
-  `workflow_dispatch`, or `push`;
+- the runner is GitHub-hosted and the event is `schedule` or
+  `workflow_dispatch`; push-triggered DAST is rejected to avoid racing image
+  promotion;
 - the protected environment and OIDC subject are exactly
   `guardianbot-dast`; and
-- the profile origin and protected assertion path exactly match the request.
+- the profile origin and protected assertion path exactly match the request;
+  and
+- accepted image-promotion evidence proves that the same default-branch SHA is
+  active and healthy in the profile's DigitalOcean environment at the exact
+  approved origin.
 
 Each repository, run attempt, profile, commit, and origin can obtain a session
 only once. Issuance leases are durable in PostgreSQL, and the response is
-returned with `Cache-Control: no-store`.
+returned with `Cache-Control: no-store`. The response binds the session to the
+deployed `sha256:` image digest and environment; both values are retained in
+the signed DAST evidence and DefectDojo tags.
 
 Configure profiles centrally in `GUARDIANBOT_DAST_PROFILES_JSON`. The normal
 `exchange` mode asks a same-origin staging endpoint for a short-lived
@@ -41,6 +48,7 @@ credential; only the control plane knows the exchange authorization value:
     "repository": "Geekyshubham/RouteLens",
     "repositoryId": 123456789,
     "origin": "https://routelens-staging.example.com",
+    "deploymentEnvironment": "staging",
     "sessionAssertionPath": "/api/v1/protected-session/",
     "headerName": "Authorization",
     "ttlSeconds": 600,
@@ -50,9 +58,10 @@ credential; only the control plane knows the exchange authorization value:
 }
 ```
 
-The exchange endpoint must return only `schemaVersion`, `credential`, and
-`expiresAt`. Its credential must remain valid for more than 30 seconds and no
-longer than the requested profile TTL.
+The exchange request includes the exact `deploymentEnvironment` and
+`deployedDigest`. The exchange endpoint must return only `schemaVersion`,
+`credential`, and `expiresAt`. Its credential must remain valid for more than
+30 seconds and no longer than the requested profile TTL.
 
 Static mode is a lower-assurance PoC escape hatch. It is rejected unless the
 individual profile contains `pocStaticCredential: true` and the control plane
@@ -69,8 +78,11 @@ Before ZAP, the reusable workflow:
 4. accepts an OpenAPI file from the exact checked-out commit or a same-origin
    live schema endpoint;
 5. rejects remote references, cross-origin servers, unsafe redirects, private
-   targets, and routes excluded by configuration; and
-6. destroys the temporary credential file and publishes only scrubbed evidence.
+   targets, and routes excluded by configuration;
+6. removes every operation except `GET`, `HEAD`, and `OPTIONS`, and fails when
+   no safe operation remains; and
+7. destroys the temporary credential file and publishes only scrubbed,
+   digest-bound evidence.
 
 The `guardianbot-dast` environment should require reviewers. Consumer
 repositories do not store a DAST session secret and do not pass `secrets:
@@ -79,7 +91,7 @@ inherit`.
 The generated caller distinguishes:
 
 - `authenticated-baseline` smoke scans, capped at 15 minutes and normally
-  scheduled every 15 minutes; and
+  scheduled every 15 minutes (or started manually after promotion); and
 - `authenticated-full` nightly scans, requiring at least 30 minutes and capped
   at 45 minutes.
 
@@ -89,10 +101,11 @@ requirement.
 
 ## Failure behavior
 
-An unauthorized origin, failed unauthenticated assertion, unavailable broker,
-replayed issuance, invalid OpenAPI document, missing ZAP output, or failed
-required import leaves DAST evidence missing or failed. AI review continues to
-be advisory, but a configured deterministic DAST requirement does not pass.
+An unauthorized origin, missing exact-head deployment, digest mismatch, failed
+unauthenticated assertion, unavailable broker, replayed issuance, invalid
+OpenAPI document, missing ZAP output, or failed required import leaves DAST
+evidence missing or failed. AI review continues to be advisory, but a
+configured deterministic DAST requirement does not pass.
 
 RouteLens and AstraNull use this same generic contract. Their exact origins,
 repository IDs, exchange endpoints, and protected assertion paths will be added

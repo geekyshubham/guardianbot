@@ -24,10 +24,10 @@ requires Docker with Compose.
 Download a complete release to a new operator-controlled directory:
 
 ```sh
-mkdir guardianbot-release-v0.2.10
-gh release download v0.2.10 \
+mkdir guardianbot-release-v0.2.11
+gh release download v0.2.11 \
   --repo Geekyshubham/guardianbot \
-  --dir guardianbot-release-v0.2.10
+  --dir guardianbot-release-v0.2.11
 ```
 
 The deployment scripts verify:
@@ -46,7 +46,7 @@ For the existing `guardianbot-prod` app:
 ```sh
 ./scripts/deploy-digitalocean-app-platform.sh \
   11111111-2222-4333-8444-555555555555 \
-  guardianbot-release-v0.2.10
+  guardianbot-release-v0.2.11
 ```
 
 The script refuses an unexpected app name or image source, updates only the
@@ -63,7 +63,8 @@ App-level environment configuration must include:
   `GUARDIANBOT_DATABASE_CA_CERT=${guardianbot-db.CA_CERT}` for the managed
   DigitalOcean database binding;
 - model bridge URL/token, when a bridge is enabled;
-- `GUARDIANBOT_DAST_PROFILES_JSON` and its referenced exchange-secret
+- `GUARDIANBOT_DAST_PROFILES_JSON`, including the exact DigitalOcean
+  deployment environment for each target, and its referenced exchange-secret
   environment variables; and
 - `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` and the centrally referenced
   DigitalOcean API token.
@@ -71,6 +72,9 @@ App-level environment configuration must include:
 The profile JSON documents contain identifiers and environment-variable names,
 not secret values. Keep each actual secret in encrypted App Platform
 configuration.
+The DAST broker reads accepted deployment evidence from the durable store and
+will not issue a session until the scheduled/manual run SHA matches the
+healthy deployed digest and origin.
 
 To roll back App Platform, run the same verified script with the retained asset
 directory for the previous release. Database rollback is a separate,
@@ -90,7 +94,7 @@ Before a deployment:
 cd /opt/guardianbot
 ./scripts/backup-postgres.sh
 ./scripts/deploy-digitalocean.sh deploy \
-  /opt/guardianbot/releases/guardianbot-release-v0.2.10
+  /opt/guardianbot/releases/guardianbot-release-v0.2.11
 ./scripts/deploy-digitalocean.sh verify
 ```
 

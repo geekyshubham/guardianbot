@@ -7,6 +7,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 
 require_root
+verify_stack_definition installed
 "${SCRIPT_DIR}/preflight.sh"
 
 printf 'Creating the required pre-upgrade backup.\n'

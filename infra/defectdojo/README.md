@@ -31,6 +31,10 @@ official service entrypoints and initialization behavior.
   not to uWSGI or Celery.
 - Backups preserve the immutable release manifest and checksums. Restore refuses
   a backup from a different release definition.
+- Every installed Compose, proxy, operator-script, cloud-init, and systemd file
+  is SHA-256-bound to `release-manifest.json`; installation resolves and records
+  the exact clean GuardianBot source commit, and operational commands reject
+  stack or unit drift.
 
 ## Pinned release
 
@@ -147,7 +151,8 @@ and change it.
 
 Create a dedicated DefectDojo automation user and API token at `/api/key-v2`.
 Store that token only in the GuardianBot control-plane environment as
-`DEFECTDOJO_API_TOKEN`; never put it in a consumer repository.
+`GUARDIANBOT_DEFECTDOJO_API_TOKEN`, referenced by
+`GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF`; never put it in a consumer repository.
 
 ## Day-two operations
 

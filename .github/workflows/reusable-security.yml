@@ -304,6 +304,10 @@ jobs:
 
           const raw = JSON.parse(fs.readFileSync(inputPath, "utf8"));
           const report = asRecord(raw);
+          const results =
+            report?.Results === undefined || report.Results === null
+              ? []
+              : report.Results;
           if (
             !report ||
             report.SchemaVersion !== 2 ||
@@ -311,7 +315,7 @@ jobs:
             !report.ArtifactName ||
             typeof report.ArtifactType !== "string" ||
             !report.ArtifactType ||
-            !Array.isArray(report.Results)
+            !Array.isArray(results)
           ) {
             throw new Error("Trivy report is incomplete");
           }
@@ -320,7 +324,7 @@ jobs:
             SchemaVersion: 2,
             ArtifactName: report.ArtifactName,
             ArtifactType: report.ArtifactType,
-            Results: report.Results
+            Results: results
               .map((entry) => asRecord(entry))
               .filter(Boolean)
               .map((entry) =>
@@ -333,7 +337,8 @@ jobs:
                   Secrets: sanitizeSecrets(entry.Secrets),
                   Licenses: sanitizeLicenses(entry.Licenses)
                 })
-              )
+              ),
+            scanner_error: false
           };
 
           fs.writeFileSync(outputPath, JSON.stringify(sanitized, null, 2));

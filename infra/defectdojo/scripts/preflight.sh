@@ -10,6 +10,8 @@ require_root
 require_command docker
 require_command openssl
 require_command stat
+require_command ufw
+verify_stack_definition installed
 
 [[ "$(uname -m)" == "x86_64" ]] || {
   printf 'This release is pinned to linux/amd64 and requires an x86_64 host.\n' >&2
@@ -129,5 +131,19 @@ if compose config --services | grep -qx postgres; then
   printf 'A local PostgreSQL service is prohibited for this deployment.\n' >&2
   exit 1
 fi
+
+ufw_status="$(LC_ALL=C ufw status)"
+grep -Eq '^Status:[[:space:]]+active$' <<<"${ufw_status}" || {
+  printf 'UFW must be active before DefectDojo starts.\n' >&2
+  exit 1
+}
+for public_rule in 443/tcp 443/udp; do
+  grep -Eq "^${public_rule}[[:space:]]+ALLOW[[:space:]]+Anywhere" \
+    <<<"${ufw_status}" || {
+    printf 'UFW must explicitly allow %s; DigitalOcean Cloud Firewall must match it.\n' \
+      "${public_rule}" >&2
+    exit 1
+  }
+done
 
 printf 'DefectDojo preflight passed without exposing secret values.\n'

@@ -123,8 +123,12 @@ export interface DefectDojoEngagementInput {
   productId: number;
   name: string;
   status?: string;
-  targetStart?: string;
-  targetEnd?: string;
+  /**
+   * Required by DefectDojo's Engagement serializer when the engagement is
+   * created. Existing engagement lifecycle dates are intentionally preserved.
+   */
+  targetStart: string;
+  targetEnd: string;
   branchTag?: string;
   buildId?: string;
   commitHash?: string;
@@ -147,7 +151,7 @@ export interface DefectDojoEnsureImportContextInput {
   productType: DefectDojoProductTypeInput;
   product: Omit<DefectDojoProductInput, "productTypeId">;
   engagement: Omit<DefectDojoEngagementInput, "productId">;
-  test: DefectDojoTestInput;
+  test: Omit<DefectDojoTestInput, "engagementId">;
 }
 
 export interface DefectDojoEnsureImportContextResult {
@@ -294,14 +298,20 @@ function normalizeDate(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
   }
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  const normalized = value.trim();
+  const milliseconds = Date.parse(`${normalized}T00:00:00.000Z`);
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(normalized) ||
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString().slice(0, 10) !== normalized
+  ) {
     throw new DefectDojoError({
       kind: "validation",
       path: "config",
       message: `invalid ISO date '${value}'`
     });
   }
-  return value;
+  return normalized;
 }
 
 function truncateBody(text: string): string | undefined {
@@ -552,14 +562,23 @@ export class DefectDojoClient {
     const existing = candidates.find(
       (engagement) => engagement.product === input.productId && engagement.name === input.name
     );
+    const targetStart = normalizeDate(input.targetStart);
+    const targetEnd = normalizeDate(input.targetEnd);
+    if (!targetStart || !targetEnd || targetStart > targetEnd) {
+      throw new DefectDojoError({
+        kind: "validation",
+        path: "engagement",
+        message: "DefectDojo engagement targetStart must not be after targetEnd"
+      });
+    }
     const tags = sortStrings(input.tags);
     const payload: Record<string, unknown> = {
       product: input.productId,
-      name: input.name
+      name: input.name,
+      target_start: targetStart,
+      target_end: targetEnd
     };
     maybeSet(payload, "status", input.status);
-    maybeSet(payload, "target_start", normalizeDate(input.targetStart));
-    maybeSet(payload, "target_end", normalizeDate(input.targetEnd));
     maybeSet(payload, "branch_tag", input.branchTag);
     maybeSet(payload, "build_id", input.buildId);
     maybeSet(payload, "commit_hash", input.commitHash);
@@ -577,8 +596,6 @@ export class DefectDojoClient {
     const patch: Record<string, unknown> = {};
     const mappings: Array<[keyof DefectDojoEngagement, string, string | undefined]> = [
       ["status", "status", input.status],
-      ["target_start", "target_start", normalizeDate(input.targetStart)],
-      ["target_end", "target_end", normalizeDate(input.targetEnd)],
       ["branch_tag", "branch_tag", input.branchTag],
       ["build_id", "build_id", input.buildId],
       ["commit_hash", "commit_hash", input.commitHash],
@@ -598,50 +615,18 @@ export class DefectDojoClient {
     return this.patchJson(`/api/v2/engagements/${existing.id}/`, patch, `engagement:${existing.id}`);
   }
 
+  /**
+   * Compatibility alias for read-only test discovery. Tests are created only
+   * by DefectDojo's import-scan endpoint, never through POST /api/v2/tests/.
+   */
   async ensureTest(
     input: DefectDojoTestInput
-  ): Promise<DefectDojoTest | DefectDojoDryRunOperation> {
-    const existing = await this.findLatestTest({
+  ): Promise<DefectDojoTest | null> {
+    return this.findLatestTest({
       engagementId: input.engagementId,
       scanType: input.scanType,
       title: input.title
     });
-    const tags = sortStrings(input.tags);
-    const payload: Record<string, unknown> = {
-      engagement: input.engagementId,
-      scan_type: input.scanType,
-      title: input.title
-    };
-    maybeSet(payload, "version", input.version);
-    maybeSet(payload, "branch_tag", input.branchTag);
-    maybeSet(payload, "build_id", input.buildId);
-    maybeSet(payload, "commit_hash", input.commitHash);
-    if (tags?.length) {
-      payload.tags = tags;
-    }
-    if (!existing) {
-      return this.createJson("/api/v2/tests/", payload, `test:${input.engagementId}:${input.scanType}:${input.title}`);
-    }
-    const patch: Record<string, unknown> = {};
-    const mappings: Array<[keyof DefectDojoTest, string, string | undefined]> = [
-      ["title", "title", input.title],
-      ["version", "version", input.version],
-      ["branch_tag", "branch_tag", input.branchTag],
-      ["build_id", "build_id", input.buildId],
-      ["commit_hash", "commit_hash", input.commitHash]
-    ];
-    for (const [currentKey, patchKey, nextValue] of mappings) {
-      if ((existing[currentKey] ?? undefined) !== nextValue) {
-        maybeSet(patch, patchKey, nextValue);
-      }
-    }
-    if (!stableArrayEqual(existing.tags, tags)) {
-      patch.tags = tags ?? [];
-    }
-    if (!Object.keys(patch).length) {
-      return existing;
-    }
-    return this.patchJson(`/api/v2/tests/${existing.id}/`, patch, `test:${existing.id}`);
   }
 
   async ensureImportContext(
@@ -665,18 +650,11 @@ export class DefectDojoClient {
     if ("dryRun" in engagement) {
       return [productTypeToDryRun(productType), productToDryRun(product), engagement];
     }
-    const test = await this.ensureTest({
-      ...input.test,
-      engagementId: engagement.id
+    const test = await this.findLatestTest({
+      engagementId: engagement.id,
+      scanType: input.test.scanType,
+      title: input.test.title
     });
-    if ("dryRun" in test) {
-      return [
-        productTypeToDryRun(productType),
-        productToDryRun(product),
-        engagementToDryRun(engagement),
-        test
-      ];
-    }
     return {
       productType,
       product,
@@ -1009,13 +987,5 @@ function productToDryRun(product: DefectDojoProduct): DefectDojoDryRunOperation 
     dryRun: true,
     method: "GET",
     path: `/api/v2/products/${product.id}/`
-  };
-}
-
-function engagementToDryRun(engagement: DefectDojoEngagement): DefectDojoDryRunOperation {
-  return {
-    dryRun: true,
-    method: "GET",
-    path: `/api/v2/engagements/${engagement.id}/`
   };
 }

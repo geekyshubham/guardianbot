@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/lib.sh"
 require_root
 require_command flock
 require_command sha256sum
+verify_stack_definition installed
 "${SCRIPT_DIR}/preflight.sh"
 
 retention_days=14

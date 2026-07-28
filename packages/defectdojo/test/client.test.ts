@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   buildDefectDojoTags,
@@ -17,6 +18,18 @@ function createJsonResponse(body: unknown, init: ResponseInit = {}): Response {
     }
   });
 }
+
+test("the live conformance fixture is non-secret empty Semgrep JSON", async () => {
+  const fixture = JSON.parse(
+    await readFile(new URL("../fixtures/semgrep-empty.json", import.meta.url), "utf8")
+  ) as Record<string, unknown>;
+  assert.deepEqual(fixture.results, []);
+  assert.deepEqual(fixture.errors, []);
+  assert.equal(
+    /token|password|secret|credential/i.test(JSON.stringify(fixture)),
+    false
+  );
+});
 
 test("resolves environment references without exposing secret values", () => {
   const config = resolveDefectDojoConfig(
@@ -149,6 +162,10 @@ test("retries on Retry-After and upserts product hierarchy before importing", as
           return createJsonResponse({ count: 0, next: null, results: [] });
         }
         if (url.includes("/api/v2/engagements/") && init?.method === "POST") {
+          const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+          assert.equal(payload.target_start, "2026-07-27");
+          assert.equal(payload.target_end, "2027-07-27");
+          assert.equal(payload.branch_tag, "main");
           return createJsonResponse({ id: 31, name: "main:nightly", product: 21 }, { status: 201 });
         }
         if (url.includes("/api/v2/tests/") && init?.method === "GET") {
@@ -182,8 +199,13 @@ test("retries on Retry-After and upserts product hierarchy before importing", as
   const context = await client.ensureImportContext({
     productType: { name: "GitHub Repositories" },
     product: { name: "guardianbot", tags: ["b", "a"] },
-    engagement: { name: "main:nightly", branchTag: "main" },
-    test: { engagementId: 0, scanType: "Semgrep JSON Report", title: "main/nightly" }
+    engagement: {
+      name: "main:nightly",
+      targetStart: "2026-07-27",
+      targetEnd: "2027-07-27",
+      branchTag: "main"
+    },
+    test: { scanType: "Semgrep JSON Report", title: "main/nightly" }
   });
   assert.ok(!Array.isArray(context));
   assert.equal(context.product.id, 21);
@@ -256,6 +278,185 @@ test("creates a new test import when no prior matching test exists", async () =>
     assert.equal(result.testId, 55);
   }
   assert.equal(calls.some((call) => call.includes("/api/v2/import-scan/")), true);
+});
+
+test("discovers tests and uses import-scan before reimport-scan without manually creating a test", async () => {
+  const calls: Array<{ url: string; method: string; body?: BodyInit | null }> = [];
+  let imported = false;
+  const client = new DefectDojoClient(
+    resolveDefectDojoConfig(
+      {
+        DEFECTDOJO_URL: "https://dojo.example.com",
+        DEFECTDOJO_API_TOKEN: "token"
+      },
+      {
+        baseUrlRef: "DEFECTDOJO_URL",
+        apiTokenRef: "DEFECTDOJO_API_TOKEN"
+      }
+    ),
+    {
+      fetch: async (input, init) => {
+        const url = input instanceof URL ? input.toString() : String(input);
+        const method = init?.method ?? "GET";
+        calls.push({ url, method, body: init?.body });
+        if (url.includes("/api/v2/product_types/")) {
+          return createJsonResponse({
+            count: 1,
+            next: null,
+            results: [{ id: 11, name: "GitHub Repositories", description: "" }]
+          });
+        }
+        if (url.includes("/api/v2/products/")) {
+          return createJsonResponse({
+            count: 1,
+            next: null,
+            results: [{ id: 21, name: "guardianbot", prod_type: 11, tags: [] }]
+          });
+        }
+        if (url.includes("/api/v2/engagements/")) {
+          return createJsonResponse({
+            count: 1,
+            next: null,
+            results: [{
+              id: 31,
+              name: "main/security",
+              product: 21,
+              target_start: "2026-07-27",
+              target_end: "2027-07-27",
+              branch_tag: "main",
+              tags: []
+            }]
+          });
+        }
+        if (url.includes("/api/v2/tests/")) {
+          return createJsonResponse({
+            count: imported ? 1 : 0,
+            next: null,
+            results: imported
+              ? [{
+                  id: 41,
+                  engagement: 31,
+                  scan_type: "Semgrep JSON Report",
+                  title: "main/security"
+                }]
+              : []
+          });
+        }
+        if (url.includes("/api/v2/import-scan/")) {
+          const form = init?.body as FormData;
+          assert.equal(form.get("engagement"), "31");
+          assert.equal(form.get("test"), null);
+          imported = true;
+          return createJsonResponse({ test: 41 }, { status: 201 });
+        }
+        if (url.includes("/api/v2/reimport-scan/")) {
+          const form = init?.body as FormData;
+          assert.equal(form.get("test"), "41");
+          assert.equal(form.get("engagement"), null);
+          return createJsonResponse({ test: 41 }, { status: 201 });
+        }
+        throw new Error(`Unexpected request ${method} ${url}`);
+      }
+    }
+  );
+
+  const context = await client.ensureImportContext({
+    productType: { name: "GitHub Repositories" },
+    product: { name: "guardianbot" },
+    engagement: {
+      name: "main/security",
+      targetStart: "2026-08-01",
+      targetEnd: "2027-08-01",
+      branchTag: "main"
+    },
+    test: {
+      scanType: "Semgrep JSON Report",
+      title: "main/security"
+    }
+  });
+  assert.ok(!Array.isArray(context));
+  assert.equal(context.test, null);
+  assert.equal(
+    calls.some(
+      ({ url, method }) =>
+        method === "PATCH" && url.includes("/api/v2/engagements/")
+    ),
+    false
+  );
+
+  const first = await client.importScan({
+    scanType: "Semgrep JSON Report",
+    testTitle: "main/security",
+    fileName: "semgrep.json",
+    contentType: "application/json",
+    report: new TextEncoder().encode("{\"results\":[]}"),
+    engagementId: context.engagement.id
+  });
+  assert.ok(!("dryRun" in first));
+  if ("dryRun" in first) return;
+  assert.equal(first.mode, "import");
+  assert.equal(first.testId, 41);
+
+  const existing = await client.ensureTest({
+    engagementId: context.engagement.id,
+    scanType: "Semgrep JSON Report",
+    title: "main/security"
+  });
+  assert.equal(existing?.id, 41);
+
+  const second = await client.importScan({
+    scanType: "Semgrep JSON Report",
+    testTitle: "main/security",
+    fileName: "semgrep.json",
+    contentType: "application/json",
+    report: new TextEncoder().encode("{\"results\":[]}"),
+    engagementId: context.engagement.id,
+    existingTestId: existing?.id
+  });
+  assert.ok(!("dryRun" in second));
+  if ("dryRun" in second) return;
+  assert.equal(second.mode, "reimport");
+  assert.equal(second.testId, 41);
+  assert.equal(
+    calls.some(({ url, method }) => method === "POST" && url.includes("/api/v2/tests/")),
+    false
+  );
+});
+
+test("rejects invalid or reversed engagement dates before mutation", async () => {
+  const client = new DefectDojoClient(
+    resolveDefectDojoConfig(
+      {
+        DEFECTDOJO_URL: "https://dojo.example.com",
+        DEFECTDOJO_API_TOKEN: "token"
+      },
+      { baseUrlRef: "DEFECTDOJO_URL", apiTokenRef: "DEFECTDOJO_API_TOKEN" }
+    ),
+    {
+      fetch: async () => createJsonResponse({ count: 0, next: null, results: [] })
+    }
+  );
+
+  await assert.rejects(
+    () =>
+      client.ensureEngagement({
+        productId: 1,
+        name: "invalid",
+        targetStart: "2026-02-30",
+        targetEnd: "2027-02-28"
+      }),
+    /invalid ISO date/
+  );
+  await assert.rejects(
+    () =>
+      client.ensureEngagement({
+        productId: 1,
+        name: "reversed",
+        targetStart: "2027-07-27",
+        targetEnd: "2026-07-27"
+      }),
+    /must not be after/
+  );
 });
 
 test("supports dry-run planning for mutating requests", async () => {

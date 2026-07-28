@@ -155,5 +155,11 @@ test("onboarding generates the complete reusable contract and explains coverage"
   );
   assert.match(generated.workflow, /authentication-profile: "control-plane:\/\/profiles\/service-staging"/);
   assert.match(generated.workflow, /cron: "\*\/15 \* \* \* \*"/);
+  const smokeJob = generated.workflow.slice(
+    generated.workflow.indexOf("  guardianbot-dast-smoke:"),
+    generated.workflow.indexOf("  guardianbot-dast-nightly:")
+  );
+  assert.doesNotMatch(smokeJob, /github\.event_name == 'push'/);
+  assert.match(smokeJob, /github\.event_name == 'workflow_dispatch'/);
   assert.doesNotMatch(generated.workflow, /secrets:|session_cookie|GUARDIANBOT_DAST/);
 });

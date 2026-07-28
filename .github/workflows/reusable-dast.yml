@@ -21,10 +21,8 @@ jobs:
     # Credentials are issued once by the control plane from an administrative
     # profile. No repository or environment secret is copied into the caller.
     if: >-
-      github.event_name != 'pull_request' &&
-      github.event_name != 'pull_request_target' &&
-      (github.event_name != 'push' ||
-       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     environment: guardianbot-dast
     runs-on: ubuntu-24.04
     timeout-minutes: 55
@@ -256,12 +254,17 @@ jobs:
             const session = await readJsonLimited(sessionResponse, 16 * 1024);
             const allowedKeys = [
               "schemaVersion", "origin", "sessionAssertionPath", "headerName",
-              "headerValue", "expiresAt", "assurance"
+              "headerValue", "expiresAt", "assurance", "deploymentEnvironment",
+              "deployedDigest"
             ];
             if (!session || typeof session !== "object" ||
                 Object.keys(session).some((key) => !allowedKeys.includes(key)) ||
                 session.schemaVersion !== "1.0.0" ||
                 session.origin !== contract.origin ||
+                typeof session.deploymentEnvironment !== "string" ||
+                !/^[a-z][a-z0-9-]{0,62}$/.test(session.deploymentEnvironment) ||
+                typeof session.deployedDigest !== "string" ||
+                !/^sha256:[a-f0-9]{64}$/.test(session.deployedDigest) ||
                 session.sessionAssertionPath !== contract.sessionAssertionPath ||
                 typeof session.headerName !== "string" ||
                 typeof session.headerValue !== "string" || !session.headerValue ||
@@ -314,13 +317,16 @@ jobs:
           import os
           import sys
           from urllib.parse import urljoin, urlparse
-          import yaml
-
           source_path, output_path, contract_path = sys.argv[1:]
           with open(contract_path, "r", encoding="utf-8") as handle:
               contract = json.load(handle)
           with open(source_path, "r", encoding="utf-8") as handle:
-              document = yaml.safe_load(handle)
+              source = handle.read()
+          try:
+              document = json.loads(source)
+          except json.JSONDecodeError:
+              import yaml
+              document = yaml.safe_load(source)
           if not isinstance(document, dict):
               raise SystemExit("OpenAPI document must be an object")
           version = document.get("openapi") or document.get("swagger")
@@ -341,14 +347,100 @@ jobs:
 
           list(walk(document))
           expected_origin = urlparse(contract["origin"])
-          for server in document.get("servers", []):
-              if not isinstance(server, dict) or not isinstance(server.get("url"), str):
-                  raise SystemExit("OpenAPI server entry is invalid")
-              resolved = urlparse(urljoin(contract["origin"], server["url"]))
-              if (resolved.scheme, resolved.netloc) != (
-                  expected_origin.scheme, expected_origin.netloc
+          exact_origin = (
+              f"{expected_origin.scheme}://{expected_origin.netloc}"
+          )
+
+          def validate_servers(servers):
+              if not isinstance(servers, list) or not servers:
+                  raise SystemExit("OpenAPI server list is invalid")
+              for server in servers:
+                  if not isinstance(server, dict) or not isinstance(
+                      server.get("url"), str
+                  ):
+                      raise SystemExit("OpenAPI server entry is invalid")
+                  resolved = urlparse(urljoin(f"{exact_origin}/", server["url"]))
+                  if (
+                      (resolved.scheme, resolved.netloc) != (
+                          expected_origin.scheme, expected_origin.netloc
+                      )
+                      or resolved.username
+                      or resolved.password
+                      or resolved.query
+                      or resolved.fragment
+                  ):
+                      raise SystemExit(
+                          "OpenAPI server escapes the exact staging origin"
+                      )
+
+          if "servers" in document:
+              validate_servers(document["servers"])
+
+          swagger_document = "swagger" in document and "openapi" not in document
+          if swagger_document:
+              host = document.get("host")
+              if host is not None and (
+                  not isinstance(host, str) or host != expected_origin.netloc
               ):
-                  raise SystemExit("OpenAPI server escapes the exact staging origin")
+                  raise SystemExit(
+                      "OpenAPI server escapes the exact staging origin"
+                  )
+              schemes = document.get("schemes")
+              if schemes is not None and (
+                  not isinstance(schemes, list)
+                  or not schemes
+                  or any(scheme != "https" for scheme in schemes)
+              ):
+                  raise SystemExit(
+                      "OpenAPI server escapes the exact staging origin"
+                  )
+              base_path = document.get("basePath")
+              if base_path is not None and (
+                  not isinstance(base_path, str)
+                  or not base_path.startswith("/")
+                  or base_path.startswith("//")
+                  or "?" in base_path
+                  or "#" in base_path
+              ):
+                  raise SystemExit("Swagger basePath is invalid")
+              document["host"] = expected_origin.netloc
+              document["schemes"] = ["https"]
+              document.pop("servers", None)
+          else:
+              document["servers"] = [{"url": exact_origin}]
+
+          def validate_operation_server_overrides(path_item):
+              if "servers" in path_item:
+                  validate_servers(path_item["servers"])
+              for value in path_item.values():
+                  if isinstance(value, dict) and "servers" in value:
+                      validate_servers(value["servers"])
+
+          safe_methods = ("get", "head", "options")
+          retained_metadata = ("summary", "description", "parameters")
+
+          def safe_path_item(path_item):
+              if not isinstance(path_item, dict):
+                  raise SystemExit("OpenAPI path item must be an object")
+              validate_operation_server_overrides(path_item)
+              safe_item = {
+                  key: path_item[key]
+                  for key in retained_metadata
+                  if key in path_item
+              }
+              retained_methods = 0
+              for method in safe_methods:
+                  if method not in path_item:
+                      continue
+                  operation = path_item[method]
+                  if not isinstance(operation, dict):
+                      raise SystemExit("OpenAPI operation must be an object")
+                  operation = dict(operation)
+                  operation.pop("servers", None)
+                  operation.pop("schemes", None)
+                  safe_item[method] = operation
+                  retained_methods += 1
+              return safe_item if retained_methods else None
 
           paths = document.get("paths")
           if not isinstance(paths, dict):
@@ -357,18 +449,27 @@ jobs:
               route if route == "/" else route.rstrip("/")
               for route in contract["excludedRoutes"]
           )
-          document["paths"] = {
-              route: operations
-              for route, operations in paths.items()
-              if isinstance(route, str)
-              and route.startswith("/")
-              and not any(
+          safe_paths = {}
+          for route, operations in paths.items():
+              if not isinstance(route, str) or not route.startswith("/"):
+                  continue
+              if any(
                   route == blocked or (
                       blocked != "/" and route.startswith(f"{blocked}/")
                   )
                   for blocked in excluded
+              ):
+                  continue
+              safe_operations = safe_path_item(operations)
+              if safe_operations is not None:
+                  safe_paths[route] = safe_operations
+
+          if not safe_paths:
+              raise SystemExit(
+                  "OpenAPI contains no safe, non-excluded operations"
               )
-          }
+          document["paths"] = safe_paths
+          document.pop("webhooks", None)
           with open(output_path, "w", encoding="utf-8") as handle:
               json.dump(document, handle, separators=(",", ":"), sort_keys=True)
           os.chmod(output_path, 0o600)
@@ -445,11 +546,15 @@ jobs:
           set -e
           jq -n \
             --arg profile "$(jq -r '.scanProfile' "$CONTRACT_PATH")" \
+            --arg deploymentEnvironment "$(jq -r '.deploymentEnvironment' "$session_file")" \
+            --arg deployedDigest "$(jq -r '.deployedDigest' "$session_file")" \
             --argjson minutes "$scan_minutes" \
             --argjson zapExitCode "$zap_exit" \
             '{
               schemaVersion: "1.0.0",
               profile: $profile,
+              deploymentEnvironment: $deploymentEnvironment,
+              deployedDigest: $deployedDigest,
               minutes: $minutes,
               zapExitCode: $zapExitCode
             }' > guardianbot-dast-evidence/scan-status.json

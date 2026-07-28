@@ -1,13 +1,41 @@
 {
+  "schemaVersion": "1.0.0",
   "defectdojoRelease": "3.1.200",
   "upstreamTagObject": "6f149c48f47778d9c9e017a401445a0dc893d9fe",
   "upstreamCommit": "f2163b4f7618847ae6f61df336623d37548fdbfc",
   "platform": "linux/amd64",
+  "guardianbotSource": {
+    "repository": "https://github.com/geekyshubham/guardianbot",
+    "commit": "$Format:%H$"
+  },
   "images": {
     "django": "defectdojo/defectdojo-django:3.1.200@sha256:b2b7b00ef0d53b6a7dd0b12ed2f645bef42263aeef674144bddead2d78cf65ad",
     "nginx": "defectdojo/defectdojo-nginx:3.1.200@sha256:322fc39b1dfcdb78a3bcbdc9b3b413e4e74b8853ff8ca484922289f58d3e1468",
     "valkey": "valkey/valkey:9.1.0-alpine@sha256:a35428eba9043cc0b79dbe54100f0c92784f2de00ad09b01182bfb1c5c83d1bd",
     "caddy": "caddy:2.11.4-alpine@sha256:98eb57d882ccd5213d1688764db10c1ca2c58a1ca3a6717a3411ad798f7a423a",
     "postgresTools": "postgres:18.4-alpine@sha256:1b1689b20d16a014a3d195653381cf2caa75a41a92d93b255a9d6ea29fd353aa"
+  },
+  "stackDefinition": {
+    "algorithm": "sha256",
+    "files": {
+      "Caddyfile": "073e3b7c73f82d44fbd374a8515bd7a2309ae51e3431e622d35d5ae4463be0d6",
+      "cloud-init.yml": "ef036e3ba29e5a36418b90b5f349ad6b2da8e24491a7bf72588adee7d64c8411",
+      "compose.yml": "2ba73c58f4f4b789cf7aa12162bf82f63eb5235cedd3affc0a51c1d520a76951",
+      "scripts/apply-release.sh": "6b554f1330127e2e11cf905a65d31c421c2439ebfe03c17620761ce2166d2734",
+      "scripts/backup.sh": "f71575fd1791f7dd0ea70c7f291b05b9d742c2ab9b909ae1f3be4940d5075da4",
+      "scripts/doctor.sh": "7ba273fb953ee6bfb877051a3261a7a134b617fef3022a2cda2e7927c0eca94d",
+      "scripts/generate-env.sh": "5bfd6573431d15130d87d3ff5abc0ddeb5937275c93e6c630f26d41227e2770b",
+      "scripts/install-host.sh": "0b3b6dfef80c0b60925e1439d77a15f5f59b8d38cdeb6e4194e899681bf16dd9",
+      "scripts/lib.sh": "a0614c5ab28bddf6e9602f128ef07dcd92eb09172def8074a49c6b970b30d8a3",
+      "scripts/preflight.sh": "bb6ac1f548234ecc32c89f703f013df335b444b6406c8dec5bc28d733f19153d",
+      "scripts/pull-and-verify-images.sh": "40fc70853e0430576c8cf2da1952f1926a523d11a4d8ab17af74104f95206247",
+      "scripts/restore-volume.py": "f32dd337d1a1ed30317323caa3a3b3399516589c6ab3fc7c1e0d77d659f311bf",
+      "scripts/restore.sh": "bede45a248cf1408d9453374fd26bf5a1c3da9582a38452a8adc5a50d292f8cc",
+      "scripts/verify-stack-definition.sh": "b6ec4d2f3a1b466e58b895d0cdb1f1c45d6f98c9e091d51edd37b5f3f7d2a65b",
+      "scripts/wait-ready.sh": "60a06af55ddfadbd53d8eff9b13a557f2d625fae0ab66fdc3c377bc8b4f7d350",
+      "systemd/guardianbot-defectdojo-backup.service": "ec33f783a9c6469fc0dc43cb81daca51b0b812e15fbfb07023852e7b28a7ff33",
+      "systemd/guardianbot-defectdojo-backup.timer": "1634019be6c6880debb60a827b80a199a34697032032959cf57f8f75cd5dd4e2",
+      "systemd/guardianbot-defectdojo.service": "94d1d261b83620535662b5c775c621ff9a2681a42558ce8568122350636e99d8"
+    }
   }
 }

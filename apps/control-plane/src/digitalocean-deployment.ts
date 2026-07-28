@@ -14,13 +14,20 @@ const FAILED_DEPLOYMENT_PHASES = new Set([
   "SUPERSEDED"
 ]);
 
+type DigitalOceanComponentKind = "service" | "worker" | "job";
+
+interface DigitalOceanDeploymentComponent {
+  kind: DigitalOceanComponentKind;
+  name: string;
+}
+
 interface DigitalOceanDeploymentProfile {
   id: string;
   repository: string;
   repositoryId: number;
   appId: string;
   appName: string;
-  serviceNames: string[];
+  components: DigitalOceanDeploymentComponent[];
   imageName: string;
   environment: string;
   origin: string;
@@ -226,6 +233,7 @@ function parseProfile(
       "appId",
       "appName",
       "serviceNames",
+      "components",
       "imageName",
       "environment",
       "origin",
@@ -237,19 +245,83 @@ function parseProfile(
     `DigitalOcean deployment profile ${id}`
   );
   if (
-    !Array.isArray(profile.serviceNames) ||
-    profile.serviceNames.length < 1 ||
-    profile.serviceNames.length > 10 ||
-    profile.serviceNames.some(
-      (name) =>
-        typeof name !== "string" ||
-        !/^[a-z][a-z0-9-]{0,62}$/.test(name)
-    ) ||
-    new Set(profile.serviceNames).size !== profile.serviceNames.length
+    (profile.serviceNames === undefined) ===
+    (profile.components === undefined)
   ) {
     throw new Error(
-      `DigitalOcean deployment profile ${id} serviceNames is invalid`
+      `DigitalOcean deployment profile ${id} must define exactly one of serviceNames or components`
     );
+  }
+  let components: DigitalOceanDeploymentComponent[];
+  if (profile.serviceNames !== undefined) {
+    if (
+      !Array.isArray(profile.serviceNames) ||
+      profile.serviceNames.length < 1 ||
+      profile.serviceNames.length > 10 ||
+      profile.serviceNames.some(
+        (name) =>
+          typeof name !== "string" || !/^[a-z][a-z0-9-]{0,62}$/.test(name)
+      ) ||
+      new Set(profile.serviceNames).size !== profile.serviceNames.length
+    ) {
+      throw new Error(
+        `DigitalOcean deployment profile ${id} serviceNames is invalid`
+      );
+    }
+    components = profile.serviceNames.map((name) => ({
+      kind: "service",
+      name
+    }));
+  } else {
+    if (
+      !Array.isArray(profile.components) ||
+      profile.components.length < 1 ||
+      profile.components.length > 10
+    ) {
+      throw new Error(
+        `DigitalOcean deployment profile ${id} components is invalid`
+      );
+    }
+    components = profile.components.map((value, index) => {
+      const component = asRecord(value);
+      if (!component) {
+        throw new Error(
+          `DigitalOcean deployment profile ${id} components[${index}] is invalid`
+        );
+      }
+      onlyKeys(
+        component,
+        ["kind", "name"],
+        `DigitalOcean deployment profile ${id} components[${index}]`
+      );
+      if (
+        component.kind !== "service" &&
+        component.kind !== "worker" &&
+        component.kind !== "job"
+      ) {
+        throw new Error(
+          `DigitalOcean deployment profile ${id} components[${index}].kind is invalid`
+        );
+      }
+      if (
+        typeof component.name !== "string" ||
+        !/^[a-z][a-z0-9-]{0,62}$/.test(component.name)
+      ) {
+        throw new Error(
+          `DigitalOcean deployment profile ${id} components[${index}].name is invalid`
+        );
+      }
+      return {
+        kind: component.kind,
+        name: component.name
+      };
+    });
+    const componentKeys = components.map(({ kind, name }) => `${kind}:${name}`);
+    if (new Set(componentKeys).size !== componentKeys.length) {
+      throw new Error(
+        `DigitalOcean deployment profile ${id} components contains duplicates`
+      );
+    }
   }
   const imageName = String(profile.imageName ?? "").toLowerCase();
   if (!/^ghcr\.io\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(imageName)) {
@@ -299,7 +371,7 @@ function parseProfile(
       profile.appName,
       `DigitalOcean deployment profile ${id} appName`
     ),
-    serviceNames: [...profile.serviceNames] as string[],
+    components,
     imageName,
     environment: safeSlug(
       profile.environment,
@@ -379,39 +451,47 @@ function appFromResponse(
   ) {
     throw new Error("DigitalOcean returned an unexpected app");
   }
-  validateTargetServices(spec, profile);
+  validateTargetComponents(spec, profile);
   return app;
 }
 
-function validateTargetServices(
+function componentCollection(
+  spec: Record<string, unknown>,
+  kind: DigitalOceanComponentKind
+): Record<string, unknown>[] {
+  const collectionName =
+    kind === "service" ? "services" : kind === "worker" ? "workers" : "jobs";
+  const collection = spec[collectionName];
+  return Array.isArray(collection)
+    ? collection
+        .map((component) => asRecord(component))
+        .filter((component): component is Record<string, unknown> =>
+          Boolean(component)
+        )
+    : [];
+}
+
+function validateTargetComponents(
   spec: Record<string, unknown>,
   profile: DigitalOceanDeploymentProfile
 ): Record<string, unknown>[] {
-  const services = Array.isArray(spec.services)
-    ? spec.services
-        .map((service) => asRecord(service))
-        .filter(
-          (service): service is Record<string, unknown> => Boolean(service)
-        )
-    : [];
-  const targets = profile.serviceNames.map((name) =>
-    services.find((service) => service.name === name)
+  const targets = profile.components.map(({ kind, name }) =>
+    componentCollection(spec, kind).find((component) => component.name === name)
   );
-  if (targets.some((service) => !service)) {
-    throw new Error("DigitalOcean app is missing an approved service");
+  if (targets.some((component) => !component)) {
+    throw new Error("DigitalOcean app is missing an approved component");
   }
-  for (const service of targets as Record<string, unknown>[]) {
-    const image = asRecord(service.image);
+  const [, expectedRegistry, expectedRepository] = profile.imageName.split("/");
+  for (const component of targets as Record<string, unknown>[]) {
+    const image = asRecord(component.image);
     if (
       !image ||
       image.registry_type !== "GHCR" ||
-      String(image.registry ?? "").toLowerCase() !==
-        profile.imageName.split("/")[1] ||
-      String(image.repository ?? "").toLowerCase() !==
-        profile.imageName.split("/")[2]
+      String(image.registry ?? "").toLowerCase() !== expectedRegistry ||
+      String(image.repository ?? "").toLowerCase() !== expectedRepository
     ) {
       throw new Error(
-        "DigitalOcean app service uses an unexpected image source"
+        "DigitalOcean app component uses an unexpected image source"
       );
     }
   }
@@ -427,8 +507,8 @@ function deploymentUsesDigest(
   const spec = asRecord(record?.spec);
   if (!record || record.phase !== "ACTIVE" || !spec) return false;
   try {
-    return validateTargetServices(spec, profile).every((service) => {
-      const image = asRecord(service.image);
+    return validateTargetComponents(spec, profile).every((component) => {
+      const image = asRecord(component.image);
       return image?.digest === imageDigest && image.tag === undefined;
     });
   } catch {
@@ -444,9 +524,9 @@ function updatedAppSpec(
   const original = asRecord(app.spec);
   if (!original) throw new Error("DigitalOcean app spec is unavailable");
   const spec = structuredClone(original);
-  const targets = validateTargetServices(spec, profile);
-  for (const service of targets) {
-    const image = asRecord(service.image);
+  const targets = validateTargetComponents(spec, profile);
+  for (const component of targets) {
+    const image = asRecord(component.image);
     if (!image) throw new Error("DigitalOcean app image is unavailable");
     image.digest = imageDigest;
     delete image.tag;
@@ -675,8 +755,11 @@ export function createDigitalOceanDeploymentService(
           const inProgressSpec = asRecord(inProgress?.spec);
           const inProgressUsesDigest =
             inProgressSpec !== undefined &&
-            validateTargetServices(inProgressSpec, profile).every(
-              (service) => asRecord(service.image)?.digest === imageDigest
+            validateTargetComponents(inProgressSpec, profile).every(
+              (component) => {
+                const image = asRecord(component.image);
+                return image?.digest === imageDigest && image.tag === undefined;
+              }
             );
           if (!inProgressUsesDigest) {
             await requestJson(

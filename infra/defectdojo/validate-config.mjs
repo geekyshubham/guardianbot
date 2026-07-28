@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { promisify } from "node:util";
 import YAML from "yaml";
 
 const STACK_DIR = path.dirname(fileURLToPath(import.meta.url));
+const execFileAsync = promisify(execFile);
+const SOURCE_COMMIT_PLACEHOLDER = "$Format:%H$";
 
 const EXPECTED_IMAGES = Object.freeze({
   django:
@@ -41,6 +46,31 @@ const DJANGO_SERVICES = Object.freeze([
   "operator",
 ]);
 
+const STACK_DEFINITION_FILES = Object.freeze([
+  "Caddyfile",
+  "cloud-init.yml",
+  "compose.yml",
+  "scripts/apply-release.sh",
+  "scripts/backup.sh",
+  "scripts/doctor.sh",
+  "scripts/generate-env.sh",
+  "scripts/install-host.sh",
+  "scripts/lib.sh",
+  "scripts/preflight.sh",
+  "scripts/pull-and-verify-images.sh",
+  "scripts/restore-volume.py",
+  "scripts/restore.sh",
+  "scripts/verify-stack-definition.sh",
+  "scripts/wait-ready.sh",
+  "systemd/guardianbot-defectdojo-backup.service",
+  "systemd/guardianbot-defectdojo-backup.timer",
+  "systemd/guardianbot-defectdojo.service",
+]);
+
+async function sha256(filePath) {
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
 function assertImmutableAmd64Image(serviceName, service) {
   assert.equal(service.platform, "linux/amd64", `${serviceName} must force linux/amd64`);
   assert.match(
@@ -67,13 +97,24 @@ function hasCaMount(service) {
 export async function validateDefectDojoConfig(stackDir = STACK_DIR) {
   const composePath = path.join(stackDir, "compose.yml");
   const caddyPath = path.join(stackDir, "Caddyfile");
+  const cloudInitPath = path.join(stackDir, "cloud-init.yml");
   const manifestPath = path.join(stackDir, "release-manifest.json");
-  const [composeSource, caddySource, manifestSource] = await Promise.all([
+  const attributesPath = path.join(stackDir, ".gitattributes");
+  const [
+    composeSource,
+    caddySource,
+    cloudInitSource,
+    manifestSource,
+    attributesSource,
+  ] = await Promise.all([
     readFile(composePath, "utf8"),
     readFile(caddyPath, "utf8"),
+    readFile(cloudInitPath, "utf8"),
     readFile(manifestPath, "utf8"),
+    readFile(attributesPath, "utf8"),
   ]);
   const compose = YAML.parse(composeSource, { merge: true });
+  const cloudInit = YAML.parse(cloudInitSource);
   const manifest = JSON.parse(manifestSource);
 
   assert.deepEqual(Object.keys(compose.services).sort(), [...REQUIRED_SERVICES].sort());
@@ -150,8 +191,58 @@ export async function validateDefectDojoConfig(stackDir = STACK_DIR) {
   );
 
   assert.equal(manifest.defectdojoRelease, "3.1.200");
+  assert.equal(manifest.schemaVersion, "1.0.0");
   assert.equal(manifest.platform, "linux/amd64");
   assert.deepEqual(manifest.images, EXPECTED_IMAGES);
+  assert.deepEqual(manifest.guardianbotSource?.repository,
+    "https://github.com/geekyshubham/guardianbot");
+  assert.match(
+    manifest.guardianbotSource?.commit,
+    /^(?:\$Format:%H\$|[0-9a-f]{40})$/,
+  );
+  assert.equal(manifest.stackDefinition?.algorithm, "sha256");
+  assert.deepEqual(
+    Object.keys(manifest.stackDefinition?.files ?? {}).sort(),
+    [...STACK_DEFINITION_FILES].sort(),
+  );
+  for (const relativePath of STACK_DEFINITION_FILES) {
+    const expected = manifest.stackDefinition.files[relativePath];
+    assert.match(expected, /^[0-9a-f]{64}$/);
+    assert.equal(
+      await sha256(path.join(stackDir, relativePath)),
+      expected,
+      `${relativePath} must match its release-manifest checksum`,
+    );
+  }
+  assert.equal(
+    attributesSource.trim(),
+    "release-manifest.json export-subst",
+    "git archives must substitute the exact GuardianBot source commit",
+  );
+  let sourceCommit = manifest.guardianbotSource.commit;
+  if (sourceCommit === SOURCE_COMMIT_PLACEHOLDER) {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", stackDir, "rev-parse", "HEAD"],
+      { encoding: "utf8" },
+    );
+    sourceCommit = stdout.trim();
+  }
+  assert.match(sourceCommit, /^[0-9a-f]{40}$/);
+
+  const sshHardening = cloudInit.write_files.find(
+    (entry) =>
+      entry.path ===
+      "/etc/ssh/sshd_config.d/99-guardianbot-defectdojo.conf",
+  );
+  assert.ok(sshHardening, "cloud-init must install the SSH hardening drop-in");
+  assert.match(sshHardening.content, /^PermitRootLogin prohibit-password$/m);
+  assert.doesNotMatch(sshHardening.content, /^PermitRootLogin no$/m);
+  assert.notEqual(cloudInit.disable_root, true);
+  assert.ok(cloudInit.runcmd.includes("ufw allow 443/tcp"));
+  assert.ok(cloudInit.runcmd.includes("ufw allow 443/udp"));
+  assert.ok(cloudInit.runcmd.includes("ufw --force enable"));
+
   assert.ok(!composeSource.includes("defectdojo:defectdojo"));
   assert.ok(!composeSource.includes("DD_DATABASE_URL"));
   assert.ok(!composeSource.includes("ghp_"));
@@ -176,6 +267,7 @@ export async function validateDefectDojoConfig(stackDir = STACK_DIR) {
     "preflight.sh",
     "pull-and-verify-images.sh",
     "restore.sh",
+    "verify-stack-definition.sh",
     "wait-ready.sh",
   ];
   for (const script of scripts) {
@@ -185,6 +277,7 @@ export async function validateDefectDojoConfig(stackDir = STACK_DIR) {
 
   return {
     release: manifest.defectdojoRelease,
+    guardianbotSourceCommit: sourceCommit,
     services: Object.keys(compose.services),
     images: manifest.images,
   };

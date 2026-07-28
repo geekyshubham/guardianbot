@@ -843,13 +843,23 @@ function buildEvidenceRequirements(
     }
   }
   if (config.dast) {
+    const dastBinding =
+      config.image?.deployment && signedImageDigest
+        ? {
+            digest: signedImageDigest,
+            environment: config.image.deployment.environment
+          }
+        : {};
     add(
       "scanner-zap-smoke",
       "zap-smoke",
       "dast",
       ZAP_SMOKE_EVIDENCE_KEY,
       "ZAP deploy smoke",
-      { maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS) }
+      {
+        maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS),
+        ...dastBinding
+      }
     );
     add(
       "scanner-zap-smoke-import",
@@ -857,21 +867,26 @@ function buildEvidenceRequirements(
       "dast",
       ZAP_SMOKE_IMPORT_EVIDENCE_KEY,
       "ZAP deploy smoke DefectDojo import",
-      { maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS) }
+      {
+        maxAgeMs: Math.min(maxAgeMs, DAST_SMOKE_MAX_AGE_MS),
+        ...dastBinding
+      }
     );
     add(
       "scanner-zap-nightly",
       "zap-nightly",
       "dast",
       ZAP_NIGHTLY_EVIDENCE_KEY,
-      "ZAP nightly"
+      "ZAP nightly",
+      dastBinding
     );
     add(
       "scanner-zap-nightly-import",
       "defectdojo-import",
       "dast",
       ZAP_NIGHTLY_IMPORT_EVIDENCE_KEY,
-      "ZAP nightly DefectDojo import"
+      "ZAP nightly DefectDojo import",
+      dastBinding
     );
   }
   return requirements;

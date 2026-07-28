@@ -99,7 +99,8 @@ jobs:
           fi
           install -m 600 /dev/null guardianbot-runtime.env
           while IFS= read -r line; do
-            [ -z "$line" ] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            [[ "$line" =~ ^[[:space:]]*\# ]] && continue
             [[ "$line" =~ ^[A-Z_][A-Z0-9_]*=.*$ ]] || { echo "Invalid runtime environment key"; exit 1; }
             printf '%s\n' "$line" >> guardianbot-runtime.env
           done <<< "$INPUT_RUNTIME_ENV"

@@ -92,6 +92,17 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.match(security, /trivy_raw="guardianbot-evidence\/trivy-raw\.json"/);
   assert.match(dast, /guardianbot-dast-evidence is a reserved workflow path/);
   assert.match(dast, /fs\.mkdirSync\("guardianbot-dast-evidence", \{ mode: 0o700 \}\)/);
+  assert.match(
+    dast,
+    /github\.event_name == 'schedule' \|\|\s+github\.event_name == 'workflow_dispatch'/
+  );
+  assert.doesNotMatch(
+    dast.slice(0, dast.indexOf("steps:")),
+    /github\.event_name (?:==|!=) 'push'/
+  );
+  assert.match(dast, /deploymentEnvironment/);
+  assert.match(dast, /deployedDigest/);
+  assert.match(dast, /\^sha256:\[a-f0-9\]\{64\}\$/);
 });
 
 test("scanner config parsing preserves the private evidence directory contract", () => {
@@ -130,4 +141,156 @@ test("scanner config parsing preserves the private evidence directory contract",
     workflow,
     /if: always\(\) && steps\.config\.outcome == 'success' && steps\.rule_pack\.outcome == 'success'/
   );
+});
+
+test("DAST OpenAPI sanitization keeps only safe, exact-origin operations", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const {
+    mkdtempSync,
+    readFileSync: readLocalFile,
+    rmSync,
+    writeFileSync
+  } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const workflow = repositoryFile(".github/workflows/reusable-dast.yml");
+  const stepStart = workflow.indexOf(
+    "- name: Prepare bounded same-origin OpenAPI"
+  );
+  const heredocStart = workflow.indexOf("<<'PY'\n", stepStart);
+  const heredocEnd = workflow.indexOf("\n          PY", heredocStart);
+  assert.ok(stepStart >= 0 && heredocStart > stepStart && heredocEnd > heredocStart);
+  const sanitizer = workflow
+    .slice(heredocStart + "<<'PY'\n".length, heredocEnd)
+    .split("\n")
+    .map((line) => {
+      if (line.length === 0) return line;
+      assert.match(line, /^ {10}/);
+      return line.slice(10);
+    })
+    .join("\n");
+
+  const directory = mkdtempSync(join(tmpdir(), "guardianbot-dast-openapi-"));
+  const runSanitizer = (
+    name: string,
+    document: Record<string, unknown>,
+    excludedRoutes: string[] = []
+  ) => {
+    const sourcePath = join(directory, `${name}.input.json`);
+    const outputPath = join(directory, `${name}.output.json`);
+    const contractPath = join(directory, `${name}.contract.json`);
+    writeFileSync(sourcePath, JSON.stringify(document));
+    writeFileSync(
+      contractPath,
+      JSON.stringify({
+        origin: "https://staging.example.com",
+        excludedRoutes
+      })
+    );
+    const result = spawnSync(
+      "python3",
+      ["-", sourcePath, outputPath, contractPath],
+      { encoding: "utf8", input: sanitizer }
+    );
+    return { outputPath, result };
+  };
+
+  try {
+    const mixed = runSanitizer(
+      "mixed",
+      {
+        openapi: "3.1.0",
+        info: { title: "mixed operations", version: "1.0.0" },
+        servers: [{ url: "/legacy-prefix" }],
+        paths: {
+          "/mixed": {
+            summary: "Read and mutate one resource",
+            servers: [{ url: "https://staging.example.com/path-override" }],
+            get: {
+              responses: { "200": { description: "ok" } },
+              servers: [{ url: "/operation-override" }]
+            },
+            head: { responses: { "200": { description: "ok" } } },
+            options: { responses: { "204": { description: "ok" } } },
+            post: { responses: { "201": { description: "created" } } },
+            put: { responses: { "200": { description: "updated" } } },
+            patch: { responses: { "200": { description: "updated" } } },
+            delete: { responses: { "204": { description: "deleted" } } },
+            trace: { responses: { "200": { description: "trace" } } },
+            connect: { responses: { "200": { description: "connected" } } }
+          },
+          "/unsafe-only": {
+            post: { responses: { "200": { description: "mutated" } } }
+          },
+          "/admin": {
+            get: { responses: { "200": { description: "excluded" } } }
+          },
+          "/admin/audit": {
+            get: { responses: { "200": { description: "excluded child" } } }
+          }
+        },
+        webhooks: {
+          "/callback": {
+            post: { responses: { "200": { description: "callback" } } }
+          }
+        }
+      },
+      ["/admin"]
+    );
+    assert.equal(mixed.result.status, 0, mixed.result.stderr);
+    const sanitized = JSON.parse(
+      readLocalFile(mixed.outputPath, "utf8")
+    ) as {
+      paths: Record<string, Record<string, unknown>>;
+      servers: Array<{ url: string }>;
+      webhooks?: unknown;
+    };
+    assert.deepEqual(Object.keys(sanitized.paths), ["/mixed"]);
+    assert.deepEqual(sanitized.servers, [
+      { url: "https://staging.example.com" }
+    ]);
+    assert.equal(sanitized.webhooks, undefined);
+    assert.deepEqual(
+      Object.keys(sanitized.paths["/mixed"] ?? {}).sort(),
+      ["get", "head", "options", "summary"]
+    );
+    assert.equal(
+      (sanitized.paths["/mixed"]?.get as { servers?: unknown }).servers,
+      undefined
+    );
+
+    const crossOrigin = runSanitizer("cross-origin", {
+      openapi: "3.1.0",
+      paths: {
+        "/safe": {
+          get: {
+            servers: [{ url: "https://attacker.example.com" }],
+            responses: { "200": { description: "unsafe target" } }
+          }
+        }
+      }
+    });
+    assert.notEqual(crossOrigin.result.status, 0);
+    assert.match(
+      crossOrigin.result.stderr,
+      /OpenAPI server escapes the exact staging origin/
+    );
+
+    const unsafeOnly = runSanitizer("unsafe-only", {
+      openapi: "3.1.0",
+      paths: {
+        "/write": {
+          post: { responses: { "200": { description: "mutated" } } }
+        }
+      }
+    });
+    assert.notEqual(unsafeOnly.result.status, 0);
+    assert.match(
+      unsafeOnly.result.stderr,
+      /OpenAPI contains no safe, non-excluded operations/
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
