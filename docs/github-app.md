@@ -9,7 +9,10 @@ DefectDojo credentials.
 
 Use the settings in [`config/github-app-manifest.json`](../config/github-app-manifest.json).
 Replace `YOUR_GUARDIANBOT_HOST` with the HTTPS DigitalOcean origin before
-creating the App. The webhook URL is:
+creating the App. The manifest intentionally does not configure a setup or
+redirect URL because the current control plane has no browser setup callback;
+installation is completed through GitHub's installation page and webhook
+events. The webhook URL is:
 
 ```text
 https://YOUR_GUARDIANBOT_HOST/webhooks/github

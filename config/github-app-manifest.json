@@ -5,8 +5,6 @@
     "url": "https://YOUR_GUARDIANBOT_HOST/webhooks/github",
     "active": true
   },
-  "redirect_url": "https://YOUR_GUARDIANBOT_HOST/github/setup-callback",
-  "setup_url": "https://YOUR_GUARDIANBOT_HOST/github/setup",
   "public": false,
   "default_permissions": {
     "actions": "read",
