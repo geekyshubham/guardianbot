@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-07-29
+
+### Fixed
+
+- Repository indexing now deduplicates identical content-derived symbols
+  emitted by overlapping parser queries. Generated and minified JavaScript can
+  no longer produce duplicate PostgreSQL vector conflict keys during
+  all-repository GitHub App discovery.
+
 ## [0.2.12] - 2026-07-29
 
 ### Fixed

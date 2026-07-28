@@ -180,6 +180,7 @@ function prepareIndex(
   });
   const files: IndexedFile[] = [];
   const symbols: SymbolDraft[] = [];
+  const seenSymbolIds = new Set<string>();
   const imports: IndexedImport[] = [];
   const pendingCalls: Array<{
     path: string;
@@ -217,6 +218,12 @@ function prepareIndex(
         ].join("\u0000")
       );
       symbolIdsByLocalId.set(symbol.localId, id);
+      // Some parsers can report the same declaration through overlapping
+      // grammar queries (notably generated/minified JavaScript). Keep the
+      // local-id mapping for graph edges, but persist one canonical symbol per
+      // content-derived identity so PostgreSQL vector upserts remain unique.
+      if (seenSymbolIds.has(id)) continue;
+      seenSymbolIds.add(id);
       symbols.push({
         id,
         repository: identity.fullName,

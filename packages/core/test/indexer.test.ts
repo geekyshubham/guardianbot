@@ -154,6 +154,50 @@ test("fails individual parser errors to an explicitly labeled text fallback", as
   assert.equal(index.embedding.kind, "lexical-fallback");
 });
 
+test("deduplicates identical parser symbols before vector persistence", async () => {
+  const duplicateParser: RepositorySourceParser = {
+    id: "duplicate-symbols",
+    async parse(path, content) {
+      const duplicate = {
+        name: "authorize",
+        qualifiedName: "authorize",
+        kind: "function" as const,
+        line: 1,
+        endLine: 1,
+        content
+      };
+      return {
+        path,
+        language: "typescript",
+        parser: "tree-sitter",
+        parserId: this.id,
+        contentSha256: "b".repeat(64),
+        lineCount: 1,
+        symbols: [
+          { ...duplicate, localId: "query-a" },
+          { ...duplicate, localId: "query-b" }
+        ],
+        imports: [],
+        calls: []
+      };
+    }
+  };
+  const index = await indexRepositorySyntaxAware(
+    {
+      repository: "Acme/Duplicates",
+      repositoryId: 44,
+      commitSha,
+      files: {
+        "src/auth.ts": "export function authorize() { return true; }"
+      }
+    },
+    { parser: duplicateParser }
+  );
+
+  assert.equal(index.symbols.length, 1);
+  assert.equal(toPersistedVectorRows(index).length, 1);
+});
+
 test("retrieves changed symbols, graph neighbors, tests, config, schemas, ownership, and history", async () => {
   const index = await indexRepositorySyntaxAware({
     repository: "Acme/Service",
