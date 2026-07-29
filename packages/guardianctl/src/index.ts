@@ -437,7 +437,7 @@ export async function generateOnboarding(
     );
   }
   const report = [
-    renderOnboardingReport(repository, detection).trimEnd(),
+    renderOnboardingReport(repository, detection, configObject.scanners.mode).trimEnd(),
     renderConfigurationCoverage(configObject, detection)
   ].join("\n\n");
   return {

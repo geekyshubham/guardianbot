@@ -9,6 +9,7 @@ import {
   indexRepository,
   normalizeSemgrep,
   normalizeTrivy,
+  renderOnboardingReport,
   retrieveContext,
   scoreChangeRisk,
   validateGuardianConfig,
@@ -45,6 +46,25 @@ test("detects a reusable repository configuration", () => {
   assert.deepEqual(validateGuardianConfig(config), []);
   assert.equal(config.scanners.mode, "report-only");
   assert.ok(config.image);
+});
+
+test("onboarding report states the effective scanner mode", () => {
+  const detection = {
+    languages: [],
+    packageManagers: [],
+    lockfiles: [],
+    dockerfiles: [],
+    openapi: [],
+    notes: ["No application source files were detected."]
+  };
+  assert.match(
+    renderOnboardingReport("Geekyshubham/docs", detection, "advisory"),
+    /Scanner mode starts as \*\*advisory\*\*/
+  );
+  assert.match(
+    renderOnboardingReport("Geekyshubham/service", detection, "report-only"),
+    /Scanner mode starts as \*\*report-only\*\*/
+  );
 });
 
 test("generates an immutable reusable workflow caller", () => {
