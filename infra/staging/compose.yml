@@ -156,6 +156,7 @@ services:
       start_period: 90s
       retries: 6
     networks:
+      - edge
       - astranull
     mem_limit: 768m
     security_opt:

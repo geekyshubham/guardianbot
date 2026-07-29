@@ -41,7 +41,10 @@ test("only Caddy is public and repository data planes stay isolated", () => {
   assert.deepEqual(compose.services.routelens.networks, ["routelens"]);
   assert.deepEqual(compose.services["routelens-postgres"].networks, ["routelens"]);
   assert.deepEqual(compose.services["routelens-redis"].networks, ["routelens"]);
-  assert.deepEqual(compose.services.astranull.networks, ["astranull"]);
+  assert.deepEqual(
+    new Set(compose.services.astranull.networks),
+    new Set(["edge", "astranull"])
+  );
   assert.deepEqual(compose.services["astranull-postgres"].networks, ["astranull"]);
   assert.deepEqual(
     new Set(compose.services.caddy.networks),

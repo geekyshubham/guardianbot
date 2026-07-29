@@ -11,7 +11,8 @@ reusable workflow commits remain immutable.
   13/13 active and indexed repository inventory, all 13 onboarding issues, and
   the successful RouteLens and AstraNull exact-image validation, SBOM,
   keyless-signing, immutable GHCR promotion, exact-digest staging, protected
-  route, and cross-repository isolation evidence.
+  route, positive authentication, OIDC role/tenant/MFA, and cross-repository
+  isolation evidence.
 
 ## [0.2.14] - 2026-07-29
 
