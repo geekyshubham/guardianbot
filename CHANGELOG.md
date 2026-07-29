@@ -5,6 +5,21 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.32] - 2026-07-30
+
+### Fixed
+
+- Documentation-only onboarding reports now state their effective `advisory`
+  scanner mode instead of incorrectly describing the rollout as
+  `report-only`.
+
+### Evidence
+
+- Added live fresh-repository acceptance evidence for generic Python, Node,
+  Swift, Ruby, Docker, and documentation-only onboarding, including App
+  discovery, generated PRs, deterministic scans, advisory failure isolation,
+  exact-image validation, first-run timing, and the 19-repository inventory.
+
 ## [0.2.31] - 2026-07-30
 
 ### Fixed

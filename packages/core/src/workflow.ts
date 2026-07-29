@@ -128,7 +128,8 @@ export function renderOnboardingReport(
     dockerfiles: string[];
     openapi: string[];
     notes: string[];
-  }
+  },
+  scannerMode: GuardianConfig["scanners"]["mode"]
 ): string {
   const list = (values: string[]) =>
     values.length ? values.map((value) => `\`${value}\``).join(", ") : "None detected";
@@ -146,7 +147,7 @@ Repository: \`${repository}\`
 
 ### Rollout
 
-- Scanner mode starts as **report-only**.
+- Scanner mode starts as **${scannerMode}**.
 - Existing findings form the initial baseline.
 - Enforcement is enabled separately after the observation period.
 - GuardianBot infrastructure and model credentials are not copied into this repository.
