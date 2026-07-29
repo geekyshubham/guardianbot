@@ -5,6 +5,20 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-07-29
+
+### Fixed
+
+- Keyless image signing now verifies Cosign signatures and CycloneDX
+  attestations against the actual immutable reusable-workflow certificate
+  identity (`reusable-image.yml@SHA`), matching GitHub Actions OIDC behavior.
+- The signing step enables strict shell and pipeline failure handling and
+  explicitly rejects empty verification arrays. A failed Cosign identity check
+  can no longer be masked by a successful downstream `jq` process.
+- Control-plane promotion validation independently requires the same
+  administratively trusted reusable-workflow SHA in both the certificate
+  evidence and promotion manifest.
+
 ## [0.2.17] - 2026-07-29
 
 ### Fixed

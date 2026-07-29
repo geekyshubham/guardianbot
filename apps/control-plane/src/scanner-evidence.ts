@@ -1472,9 +1472,6 @@ function verifySbomAttestationEvidence(
 
 function validatePromotionEvidence(
   archive: ParsedArtifactArchive,
-  repositoryFullName: string,
-  callerWorkflowPath: string,
-  callerWorkflowRef: string | undefined,
   trustPolicy: EvidenceTrustPolicy
 ): {
   imageDigest: string;
@@ -1489,13 +1486,7 @@ function validatePromotionEvidence(
     "sbom-attestation-verification.json"
   );
   const sbomBytes = archive.selectedFiles.get("sbom.cdx.json");
-  if (
-    !promotionBytes ||
-    !cosignBytes ||
-    !attestationBytes ||
-    !sbomBytes ||
-    !callerWorkflowRef
-  ) {
+  if (!promotionBytes || !cosignBytes || !attestationBytes || !sbomBytes) {
     throw new Error("image promotion evidence is incomplete");
   }
   const promotion = asRecord(parseJsonFile(promotionBytes, "promotion.json"));
@@ -1505,17 +1496,16 @@ function validatePromotionEvidence(
   const imageDigest = String(promotion.imageDigest ?? "").toLowerCase();
   const imageReference = String(promotion.imageReference ?? "");
   const certificateIdentity = String(promotion.certificateIdentity ?? "");
-  const expectedIdentity =
-    `https://github.com/${repositoryFullName}/${callerWorkflowPath}@${callerWorkflowRef}`;
   const expectedJobWorkflowRef =
     `${trustPolicy.repository}/.github/workflows/reusable-image.yml@` +
     trustPolicy.workflows["image-promotion"].sha;
+  const jobWorkflowRef = String(promotion.jobWorkflowRef ?? "");
+  const expectedIdentity = `https://github.com/${jobWorkflowRef}`;
   if (
     !/^sha256:[a-f0-9]{64}$/.test(imageDigest) ||
     !imageReference.endsWith(`@${imageDigest}`) ||
     certificateIdentity !== expectedIdentity ||
-    String(promotion.jobWorkflowRef ?? "").toLowerCase() !==
-      expectedJobWorkflowRef.toLowerCase() ||
+    jobWorkflowRef.toLowerCase() !== expectedJobWorkflowRef.toLowerCase() ||
     promotion.sbomSha256 !==
       createHash("sha256").update(sbomBytes).digest("hex")
   ) {
@@ -1632,9 +1622,6 @@ async function processImageArtifact(
     }
     const promotion = validatePromotionEvidence(
       archive,
-      repositoryFullName,
-      run.workflowPath,
-      expectedCallerWorkflowRef,
       trustPolicy
     );
     await recordEvidence(store, base, {

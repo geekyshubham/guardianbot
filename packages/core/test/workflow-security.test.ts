@@ -58,6 +58,19 @@ test("image workflow masks generated runtime values and never dumps container lo
   assert.doesNotMatch(workflow, /docker logs guardianbot-smoke/);
   assert.match(
     workflow,
+    /certificate_identity="https:\/\/github\.com\/\$\{JOB_WORKFLOW_REF\}"/
+  );
+  assert.match(workflow, /set -euo pipefail/);
+  assert.match(
+    workflow,
+    /cosign-verification\.json >\/dev\/null/
+  );
+  assert.match(
+    workflow,
+    /sbom-attestation-verification\.json >\/dev\/null/
+  );
+  assert.match(
+    workflow,
     /shred -u guardianbot-runtime\.env 2>\/dev\/null \|\| rm -f guardianbot-runtime\.env/
   );
   assert.doesNotMatch(workflow, /aquasec\/trivy:0\.64\.1/);

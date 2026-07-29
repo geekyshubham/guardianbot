@@ -268,8 +268,8 @@ function validPromotionReports(): Record<string, unknown> {
   const digestHex = "2".repeat(64);
   const digest = `sha256:${digestHex}`;
   const identity =
-    "https://github.com/Geekyshubham/guardianbot-consumer/" +
-    ".github/workflows/guardianbot.yml@refs/heads/main";
+    "https://github.com/Geekyshubham/guardianbot/" +
+    `.github/workflows/reusable-image.yml@${IMAGE_SHA}`;
   const statement = {
     _type: "https://in-toto.io/Statement/v0.1",
     predicateType: "https://cyclonedx.org/bom",

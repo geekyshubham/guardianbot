@@ -448,10 +448,11 @@ jobs:
           INPUT_IMAGE_NAME: ${{ inputs.image-name }}
           JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
         run: |
+          set -euo pipefail
           digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${INPUT_IMAGE_NAME}:${GITHUB_SHA}")"
           test -n "$digest"
           image_digest="${digest##*@}"
-          certificate_identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          certificate_identity="https://github.com/${JOB_WORKFLOW_REF}"
           cosign sign --yes "$digest"
           cosign attest --yes --type cyclonedx \
             --predicate guardianbot-image-evidence/sbom.cdx.json "$digest"
@@ -460,11 +461,15 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             | jq -s '[.[] | if type == "array" then .[] else . end]' \
             > guardianbot-image-evidence/cosign-verification.json
+          jq -e 'type == "array" and length > 0' \
+            guardianbot-image-evidence/cosign-verification.json >/dev/null
           cosign verify-attestation --output json --type cyclonedx "$digest" \
             --certificate-identity "$certificate_identity" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             | jq -s '[.[] | if type == "array" then .[] else . end]' \
             > guardianbot-image-evidence/sbom-attestation-verification.json
+          jq -e 'type == "array" and length > 0' \
+            guardianbot-image-evidence/sbom-attestation-verification.json >/dev/null
           sbom_sha="$(sha256sum guardianbot-image-evidence/sbom.cdx.json | cut -d' ' -f1)"
           jq -n \
             --arg imageReference "$digest" \
