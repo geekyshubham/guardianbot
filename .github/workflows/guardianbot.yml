@@ -22,7 +22,7 @@ jobs:
       security-events: write
       actions: read
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@10e9b42cc42f73ff7c307d0415adb9ec26c3916a
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@6c9c063fdec60c0a94758a453bb3612a7175e2ab
     with:
       config-path: .guardianbot/config.yml
 
@@ -33,7 +33,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@10e9b42cc42f73ff7c307d0415adb9ec26c3916a
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@6c9c063fdec60c0a94758a453bb3612a7175e2ab
     with:
       dockerfile: "Dockerfile"
       context: "."
@@ -48,4 +48,4 @@ jobs:
           NODE_ENV=test
       migration-command: ""
       smoke-command: ""
-      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      push: false
