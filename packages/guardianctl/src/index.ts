@@ -448,6 +448,7 @@ export async function generateOnboarding(
       guardianRepository: context.guardianRepository,
       workflowSha: context.workflowSha,
       defaultBranch: snapshot.defaultBranch,
+      scannerMode: configObject.scanners.mode,
       image: configObject.image,
       dast: configObject.dast
     }),
@@ -1744,6 +1745,7 @@ async function doctorInternal(
       guardianRepository: context.guardianRepository,
       workflowSha: effectiveWorkflowSha,
       defaultBranch: metadata.default_branch,
+      scannerMode: parsedConfig.scanners.mode,
       image: parsedConfig.image,
       dast: parsedConfig.dast
     });
@@ -2175,6 +2177,7 @@ export async function upgrade(
     guardianRepository: context.guardianRepository,
     workflowSha: context.workflowSha,
     defaultBranch: metadata.default_branch,
+    scannerMode: config.scanners.mode,
     image: config.image,
     dast: config.dast
   });

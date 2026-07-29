@@ -123,6 +123,12 @@ test("image workflow masks generated runtime values and never dumps container lo
     workflow,
     /for attempt in \$\(seq 1 60\); do\n\s+curl --fail --silent "http:\/\/127\.0\.0\.1:\$\{INPUT_CONTAINER_PORT\}\$\{INPUT_READINESS_PATH\}" && break/
   );
+  assert.match(
+    workflow,
+    /if \[ "\$critical_count" -ne 0 \] && \[ "\$INPUT_POLICY_MODE" = "enforce" \]/
+  );
+  assert.match(workflow, /scanner_error.*exit 1/s);
+  assert.match(workflow, /advisory\|report-only\|enforce/);
 });
 
 test("scanner and DAST workflows reject repository-controlled evidence paths", () => {

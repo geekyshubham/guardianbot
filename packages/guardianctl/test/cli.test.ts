@@ -85,6 +85,7 @@ function workflowFor(config: GuardianConfig, workflowSha = WORKFLOW_SHA): string
     guardianRepository: "Acme/guardianbot",
     workflowSha,
     defaultBranch: "main",
+    scannerMode: config.scanners.mode,
     image: config.image,
     dast: config.dast
   });

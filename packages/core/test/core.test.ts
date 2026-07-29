@@ -51,7 +51,8 @@ test("generates an immutable reusable workflow caller", () => {
   const workflow = generateCallerWorkflow({
     guardianRepository: "Geekyshubham/guardianbot",
     workflowSha: "b".repeat(40),
-    defaultBranch: "main"
+    defaultBranch: "main",
+    scannerMode: "report-only"
   });
   assert.match(workflow, new RegExp(`@${"b".repeat(40)}`));
   assert.match(workflow, /reusable-security\.yml/);
@@ -66,6 +67,7 @@ test("generates ephemeral runtime key references without repository-side values"
     guardianRepository: "Geekyshubham/guardianbot",
     workflowSha: "b".repeat(40),
     defaultBranch: "main",
+    scannerMode: "report-only",
     image: {
       dockerfile: "Dockerfile",
       context: ".",
@@ -77,6 +79,8 @@ test("generates ephemeral runtime key references without repository-side values"
     }
   });
   assert.match(workflow, /ephemeral-env-keys: "APPLICATION_SMOKE_SECRET"/);
+  assert.match(workflow, /policy-mode: "report-only"/);
+  assert.match(workflow, /push: false/);
   assert.doesNotMatch(workflow, /APPLICATION_SMOKE_SECRET=/);
   assert.match(workflow, /guardianbot-image:[\s\S]*permissions:\n      contents: read\n      packages: write\n      id-token: write/);
   assert.doesNotMatch(workflow, /attestations: write/);

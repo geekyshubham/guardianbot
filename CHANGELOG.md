@@ -5,6 +5,17 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.30] - 2026-07-30
+
+### Fixed
+
+- Generated image callers now pass the repository scanner mode explicitly.
+  Advisory and report-only validation retains and attests Critical image
+  findings as warnings without publishing the image; enforcement mode keeps
+  Critical findings blocking.
+- Scanner failure, runtime smoke failure, missing SBOM, and missing evidence
+  remain blocking in every mode.
+
 ## [0.2.29] - 2026-07-30
 
 ### Fixed
