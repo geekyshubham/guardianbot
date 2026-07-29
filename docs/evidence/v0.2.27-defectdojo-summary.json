@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "guardianbot.live-evidence.v1",
+  "verifiedAt": "2026-07-29",
+  "scope": "digitalocean-defectdojo-live-conformance",
+  "digitalOcean": {
+    "dropletId": "588506366",
+    "databaseId": "8f943d0e-015c-4c70-8b29-a14d8c8f2680",
+    "firewallId": "eae50b49-acff-4111-a26b-892019d8c56d",
+    "reservedIp": "146.190.9.50",
+    "controlPlaneDeploymentId": "1fb5e3bb-f9bd-4b96-b0c7-9668aa24e0a6"
+  },
+  "stack": {
+    "guardianbotCommit": "91c43a6ed6d0294ef87157e459fc01d525be4183",
+    "doctor": "passed",
+    "publicTlsStatus": 200,
+    "postgresTls": true,
+    "backupId": "20260729T180227Z",
+    "backupChecksums": true
+  },
+  "conformance": {
+    "runId": "20260729T1805Z",
+    "testId": 1,
+    "import": "passed",
+    "reimport": "passed",
+    "sameTestId": true
+  },
+  "controlPlane": {
+    "healthz": "passed",
+    "readyz": "passed",
+    "runtimeSecretConfigured": true
+  },
+  "remaining": [
+    "live repository workflow imports",
+    "least-privilege automation permissions",
+    "restore drill",
+    "high availability"
+  ]
+}

@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.27] - 2026-07-29
+
 ### Fixed
 
 - The hardened DefectDojo Valkey service now starts directly as the
@@ -25,6 +27,10 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Added live v0.2.27 DigitalOcean DefectDojo evidence for the dedicated
+  Droplet, private managed PostgreSQL TLS, public HTTPS doctor check, consistent
+  backup, central runtime secret connection, and same-Test-ID API
+  import/reimport.
 - Added live v0.2.26 AstraNull evidence for the generic upgrade PR, canonical
   declarative runtime contract, exact signed-digest DigitalOcean deployment,
   control-plane-issued one-time viewer session, bounded three-operation
