@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.29] - 2026-07-30
+
 ### Fixed
 
 - Repository detection now rejects arbitrary tokens such as status constants as
