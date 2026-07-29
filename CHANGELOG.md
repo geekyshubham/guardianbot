@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-07-29
+
+### Fixed
+
+- Trivy misconfiguration normalization now falls back from an empty `AVDID` to
+  the populated `ID`, matching the reusable policy engine. Live Trivy 0.70
+  Dockerfile findings such as `DS-0002` can no longer cause a passing
+  deterministic gate artifact to be rejected during control-plane ingestion.
+
 ## [0.2.15] - 2026-07-29
 
 ### Fixed

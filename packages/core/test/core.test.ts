@@ -166,7 +166,8 @@ test("normalizes every Trivy class without retaining secret material", () => {
         ],
         Misconfigurations: [
           {
-            AVDID: "AVD-CLOUD-1",
+            AVDID: "",
+            ID: "AVD-CLOUD-1",
             Severity: "HIGH",
             Title: "Public resource",
             CauseMetadata: { Resource: "bucket", StartLine: 8, EndLine: 9 }
@@ -200,6 +201,10 @@ test("normalizes every Trivy class without retaining secret material", () => {
     ["vulnerability", "misconfiguration", "secret", "license"]
   );
   assert.equal(JSON.stringify(findings).includes("must-not-survive"), false);
+  assert.equal(
+    findings.find((finding) => finding.scannerClass === "misconfiguration")?.ruleId,
+    "AVD-CLOUD-1"
+  );
   const decision = evaluateGate({
     findings,
     baselineFingerprints: new Set(),

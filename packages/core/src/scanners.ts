@@ -128,7 +128,10 @@ export function normalizeTrivy(report: unknown): NormalizedFinding[] {
     for (const misconfiguration of misconfigurations) {
       const causeMetadata = asRecord(misconfiguration.CauseMetadata);
       const ruleId = String(
-        misconfiguration.AVDID ?? misconfiguration.ID ?? misconfiguration.Type ?? "unknown"
+        misconfiguration.AVDID ||
+          misconfiguration.ID ||
+          misconfiguration.Type ||
+          "unknown"
       );
       const line = normalizedLine(causeMetadata?.StartLine);
       const title = boundedText(
