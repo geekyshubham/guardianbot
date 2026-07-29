@@ -5,6 +5,18 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-07-29
+
+### Fixed
+
+- The reusable DAST workflow now runs the pinned ZAP image as its built-in
+  non-root `zap` user so ZAP can write its required home and startup files.
+- ZAP runtime output is isolated from uploaded evidence. Only a regular,
+  valid, non-empty JSON report below 50 MiB is copied into the private evidence
+  directory, and the temporary work directory is removed after every run.
+- Workflow-security coverage now prevents runner-UID ZAP execution, direct
+  evidence-directory mounts, unsafe report copying, and missing cleanup.
+
 ## [0.2.22] - 2026-07-29
 
 ### Fixed

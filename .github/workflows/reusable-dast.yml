@@ -533,9 +533,19 @@ jobs:
           with open(os.path.join(os.environ["RUNNER_TEMP"], "guardianbot-zap-options"), "w", encoding="utf-8") as handle:
             handle.write(" ".join(shlex.quote(option) for option in options))
           PY
+          zap_work_dir="${RUNNER_TEMP}/guardianbot-zap-work"
+          if [ -e "$zap_work_dir" ] || [ -L "$zap_work_dir" ]; then
+            echo "Reserved ZAP work path already exists."
+            exit 1
+          fi
+          install -d -m 700 "$zap_work_dir"
+          # The pinned ZAP image owns /zap and /home/zap as its non-root
+          # `zap` user (uid/gid 1000). Keep its potentially sensitive runtime
+          # logs outside the uploaded evidence directory.
+          sudo chown 1000:1000 "$zap_work_dir"
           set +e
-          docker run --rm --user "$(id -u):$(id -g)" \
-            -v "$PWD/guardianbot-dast-evidence:/zap/wrk:rw" \
+          docker run --rm --user zap \
+            -v "$zap_work_dir:/zap/wrk:rw" \
             -v "${RUNNER_TEMP}/guardianbot-openapi-safe.json:/zap/input/openapi-safe.json:ro" \
             ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 zap-api-scan.py \
             -t /zap/input/openapi-safe.json -f openapi \
@@ -544,6 +554,20 @@ jobs:
             -z "$(cat "$options_file")"
           zap_exit="$?"
           set -e
+          sudo chown -R --no-dereference "$(id -u):$(id -g)" "$zap_work_dir"
+          zap_report="${zap_work_dir}/zap.json"
+          if [ -f "$zap_report" ] && [ ! -L "$zap_report" ]; then
+            zap_size="$(stat --format='%s' "$zap_report")"
+            if [ "$zap_size" -le 0 ] || [ "$zap_size" -gt 52428800 ]; then
+              echo "ZAP report is empty or exceeds the 50 MiB evidence limit."
+              exit 1
+            fi
+            jq empty "$zap_report"
+            install -m 600 "$zap_report" guardianbot-dast-evidence/zap.json
+          elif [ "$zap_exit" -lt 3 ]; then
+            echo "ZAP completed without producing its required JSON report."
+            exit 1
+          fi
           jq -n \
             --arg profile "$(jq -r '.scanProfile' "$CONTRACT_PATH")" \
             --arg deploymentEnvironment "$(jq -r '.deploymentEnvironment' "$session_file")" \
@@ -584,11 +608,17 @@ jobs:
           for file in \
             "${RUNNER_TEMP}/guardianbot-dast-session.json" \
             "${RUNNER_TEMP}/guardianbot-zap-options" \
+            "${RUNNER_TEMP}/guardianbot-zap-work/zap.json" \
             "${RUNNER_TEMP}/guardianbot-openapi-input" \
             "${RUNNER_TEMP}/guardianbot-openapi-safe.json" \
             "${RUNNER_TEMP}/guardianbot-dast-contract.json"; do
             [ ! -f "$file" ] || shred -u "$file" 2>/dev/null || rm -f "$file"
           done
+          zap_work_dir="${RUNNER_TEMP}/guardianbot-zap-work"
+          if [ -d "$zap_work_dir" ] && [ ! -L "$zap_work_dir" ]; then
+            find "$zap_work_dir" -depth -mindepth 1 -delete
+            rmdir "$zap_work_dir"
+          fi
 
       - name: Attest DAST evidence provenance
         if: always()

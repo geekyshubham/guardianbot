@@ -116,6 +116,32 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.match(dast, /deploymentEnvironment/);
   assert.match(dast, /deployedDigest/);
   assert.match(dast, /\^sha256:\[a-f0-9\]\{64\}\$/);
+  assert.ok(dast.includes("docker run --rm --user zap \\\n"));
+  assert.ok(dast.includes('-v "$zap_work_dir:/zap/wrk:rw" \\\n'));
+  assert.doesNotMatch(
+    dast,
+    new RegExp(
+      String.raw`docker run --rm --user "\$\(id -u\):\$\(id -g\)"[\s\S]{0,200}/zap/wrk:rw`
+    )
+  );
+  assert.match(dast, /sudo chown 1000:1000 "\$zap_work_dir"/);
+  assert.match(
+    dast,
+    /sudo chown -R --no-dereference "\$\(id -u\):\$\(id -g\)" "\$zap_work_dir"/
+  );
+  assert.match(
+    dast,
+    /if \[ -f "\$zap_report" \] && \[ ! -L "\$zap_report" \]; then/
+  );
+  assert.match(dast, /\[ "\$zap_size" -gt 52428800 \]/);
+  assert.match(
+    dast,
+    /install -m 600 "\$zap_report" guardianbot-dast-evidence\/zap\.json/
+  );
+  assert.doesNotMatch(
+    dast,
+    /-v "\$PWD\/guardianbot-dast-evidence:\/zap\/wrk:rw"/
+  );
 });
 
 test("scanner config parsing preserves the private evidence directory contract", () => {
