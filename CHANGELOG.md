@@ -12,7 +12,7 @@ reusable workflow commits remain immutable.
   the successful RouteLens and AstraNull exact-image validation, SBOM,
   keyless-signing, immutable GHCR promotion, exact-digest staging, protected
   route, positive authentication, OIDC role/tenant/MFA, and cross-repository
-  isolation evidence.
+  isolation evidence, plus pinned authenticated ZAP passive-smoke results.
 
 ## [0.2.14] - 2026-07-29
 

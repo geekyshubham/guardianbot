@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "1.0.0",
+  "verifiedAt": "2026-07-29",
+  "scanner": {
+    "name": "OWASP ZAP",
+    "image": "ghcr.io/zaproxy/zaproxy@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2",
+    "profile": "authenticated passive baseline",
+    "spiderMinutes": 1
+  },
+  "targets": [
+    {
+      "repository": "Geekyshubham/RouteLens",
+      "origin": "https://routelens.168.144.217.141.sslip.io",
+      "startPath": "/api/targets/",
+      "authentication": "ephemeral read-scoped bearer API key",
+      "urlsObserved": 13,
+      "operationalFailures": 0,
+      "alerts": {
+        "high": 0,
+        "medium": 3,
+        "low": 3,
+        "informational": 4
+      }
+    },
+    {
+      "repository": "Geekyshubham/AstraNull",
+      "origin": "https://astranull.168.144.217.141.sslip.io",
+      "startPath": "/v1/checks",
+      "authentication": "one-hour bundled-staging OIDC JWT",
+      "urlsObserved": 6,
+      "operationalFailures": 0,
+      "alerts": {
+        "high": 0,
+        "medium": 3,
+        "low": 4,
+        "informational": 4
+      }
+    }
+  ],
+  "limitations": [
+    "This is a manually initiated authenticated passive smoke, not control-plane-issued one-time DAST evidence.",
+    "The scheduled authenticated-full profile and DefectDojo import remain unverified.",
+    "Medium and lower passive findings require triage and are not represented as remediated."
+  ]
+}
