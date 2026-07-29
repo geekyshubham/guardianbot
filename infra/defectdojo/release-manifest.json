@@ -20,7 +20,7 @@
     "files": {
       "Caddyfile": "073e3b7c73f82d44fbd374a8515bd7a2309ae51e3431e622d35d5ae4463be0d6",
       "cloud-init.yml": "ef036e3ba29e5a36418b90b5f349ad6b2da8e24491a7bf72588adee7d64c8411",
-      "compose.yml": "2ba73c58f4f4b789cf7aa12162bf82f63eb5235cedd3affc0a51c1d520a76951",
+      "compose.yml": "53a7f24bfd523ff0c52d5e4a1b4682ad23ac29b318a41b17b8ce7c76d047a584",
       "scripts/apply-release.sh": "6b554f1330127e2e11cf905a65d31c421c2439ebfe03c17620761ce2166d2734",
       "scripts/backup.sh": "f71575fd1791f7dd0ea70c7f291b05b9d742c2ab9b909ae1f3be4940d5075da4",
       "scripts/doctor.sh": "7ba273fb953ee6bfb877051a3261a7a134b617fef3022a2cda2e7927c0eca94d",

@@ -5,6 +5,13 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Fixed
+
+- The hardened DefectDojo Valkey service now restores only `CHOWN`, `SETGID`,
+  and `SETUID` after dropping all capabilities. This lets the pinned official
+  entrypoint repair its persistent-volume ownership and drop privileges without
+  restoring the default container capability set.
+
 ### Evidence
 
 - Added live v0.2.26 AstraNull evidence for the generic upgrade PR, canonical

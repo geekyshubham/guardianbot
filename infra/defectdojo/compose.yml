@@ -341,6 +341,14 @@ services:
     read_only: true
     cap_drop:
       - ALL
+    # The official entrypoint starts as root only long enough to repair the
+    # persistent data-directory ownership, then drops to the valkey account.
+    # Keep that transition explicit instead of restoring the default broad
+    # container capability set.
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     tmpfs:

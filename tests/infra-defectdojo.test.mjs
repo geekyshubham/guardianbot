@@ -35,6 +35,14 @@ test("the DefectDojo deployment is immutable and DigitalOcean-only", async () =>
   ]);
 });
 
+test("Valkey can initialize its persistent volume with only its required capabilities", async () => {
+  const compose = await readFile(path.join(STACK, "compose.yml"), "utf8");
+  assert.match(
+    compose,
+    /valkey:[\s\S]*?cap_drop:\s*-\s*ALL[\s\S]*?cap_add:\s*-\s*CHOWN\s*-\s*SETGID\s*-\s*SETUID[\s\S]*?no-new-privileges:true/,
+  );
+});
+
 test("stack-definition validation rejects a changed operational file", async () => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "guardianbot-defectdojo-definition-"),
