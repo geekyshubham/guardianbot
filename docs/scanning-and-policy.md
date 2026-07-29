@@ -15,6 +15,12 @@ and the repository contains a reviewed `.guardianbot/baseline.json` fingerprint
 document. Scanner execution, invalid baseline documents, or missing evidence remain
 visible failures in every mode.
 
+The same mode is passed explicitly to image validation. Image builds, runtime
+smoke, Trivy, SBOM generation, and evidence attestation must succeed in every
+mode. Existing Critical image findings are retained in the signed policy
+evidence and emitted as warnings during `advisory` and `report-only`; they become
+blocking when the repository is promoted to `enforce`.
+
 Enforcement may block:
 
 - new mapped High/Critical Semgrep findings;

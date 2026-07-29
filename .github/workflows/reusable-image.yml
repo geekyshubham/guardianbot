@@ -14,6 +14,7 @@ on:
       dependent-services: { required: false, type: string, default: "" }
       runtime-env: { required: false, type: string, default: "" }
       ephemeral-env-keys: { required: false, type: string, default: "" }
+      policy-mode: { required: false, type: string, default: "enforce" }
       push: { required: false, type: boolean, default: false }
 
 permissions:
@@ -188,7 +189,16 @@ jobs:
             "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
       - name: Enforce Critical image policy
+        env:
+          INPUT_POLICY_MODE: ${{ inputs.policy-mode }}
         run: |
+          case "$INPUT_POLICY_MODE" in
+            advisory|report-only|enforce) ;;
+            *)
+              echo "Image policy mode is invalid."
+              exit 1
+              ;;
+          esac
           critical_count="$(
             jq '[.Results[]? |
               ((.Vulnerabilities // []) + (.Misconfigurations // []) + (.Secrets // []))[]? |
@@ -199,15 +209,24 @@ jobs:
           jq -n \
             --argjson criticalFindings "$critical_count" \
             --argjson scannerError "$scanner_error" \
-            '{criticalFindings: $criticalFindings, scannerError: $scannerError}' \
+            --arg mode "$INPUT_POLICY_MODE" \
+            '{
+              criticalFindings: $criticalFindings,
+              scannerError: $scannerError,
+              mode: $mode,
+              enforced: ($mode == "enforce")
+            }' \
             > guardianbot-image-evidence/policy.json
           if [ "$scanner_error" = "true" ]; then
             echo "Image policy blocked because Trivy failed operationally."
             exit 1
           fi
-          if [ "$critical_count" -ne 0 ]; then
+          if [ "$critical_count" -ne 0 ] && [ "$INPUT_POLICY_MODE" = "enforce" ]; then
             echo "Image policy blocked ${critical_count} Critical finding(s)."
             exit 1
+          fi
+          if [ "$critical_count" -ne 0 ]; then
+            echo "::warning::Image scan found ${critical_count} Critical finding(s); ${INPUT_POLICY_MODE} mode retains evidence without blocking."
           fi
       - name: Upload exact image transfer
         if: inputs.push

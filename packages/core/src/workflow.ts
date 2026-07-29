@@ -4,6 +4,7 @@ export interface CallerWorkflowOptions {
   guardianRepository: string;
   workflowSha: string;
   defaultBranch: string;
+  scannerMode: GuardianConfig["scanners"]["mode"];
   image?: GuardianConfig["image"];
   dast?: GuardianConfig["dast"];
 }
@@ -38,11 +39,12 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
       container-port: ${image.containerPort ?? 8000}
       dependent-services: ${JSON.stringify((image.dependentServices ?? []).join(","))}
       ephemeral-env-keys: ${JSON.stringify((image.ephemeralEnvironment ?? []).join(","))}
+      policy-mode: ${JSON.stringify(options.scannerMode)}
       runtime-env: |
 ${runtimeEnvironment || "          # No runtime environment values configured."}
       migration-command: ${JSON.stringify(image.migrationCommand ?? "")}
       smoke-command: ${JSON.stringify(image.testCommand ?? "")}
-      push: \${{ github.event_name == 'push' && github.ref == 'refs/heads/${options.defaultBranch}' }}
+      push: ${options.scannerMode === "enforce" ? `\${{ github.event_name == 'push' && github.ref == 'refs/heads/${options.defaultBranch}' }}` : "false"}
 ` : "";
   const dastJobs = dast ? `
   guardianbot-dast-smoke:

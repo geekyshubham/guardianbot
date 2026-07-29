@@ -6,6 +6,11 @@ which the workflow boots the image, checks health and readiness, runs Trivy, and
 creates a CycloneDX SBOM. Qualifying Critical findings, smoke failure, missing
 scan evidence, or a missing SBOM stop promotion.
 
+In `advisory` and `report-only` modes, image findings are retained and attested
+without failing the validation check, but the generated caller disables image
+publication. Promotion is enabled only after `guardianctl enforce` changes the
+repository to `enforce`; Critical findings then fail the check.
+
 ## Validation and promotion
 
 The reusable workflow can create disposable PostgreSQL and Redis containers on
@@ -13,8 +18,8 @@ an isolated Docker network. Declarative build, test, migration, and runtime
 settings come from `.guardianbot/config.yml`; credentials are generated in the
 runner and are never committed to the consumer repository.
 
-Pull requests run only validation, with no package-publish or OIDC permission.
-Default-branch promotion restores the exact validated image artifact, pushes it
+Pull requests run only validation, with no package-publish permission.
+Enforced default-branch promotion restores the exact validated image artifact, pushes it
 to GHCR, signs the registry digest keylessly with Cosign, attaches the CycloneDX
 SBOM attestation, and verifies the expected GitHub workflow identity. Evidence
 paths are runner-controlled; a repository-created path or symlink fails closed.
