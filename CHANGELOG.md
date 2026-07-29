@@ -5,6 +5,12 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Added live v0.2.25 RouteLens evidence for the generic upgrade PR, exact
+  signed-digest DigitalOcean deployment, control-plane-issued one-time DAST
+  session, bounded authenticated-baseline ZAP run, and attested scanner output.
+
 ## [0.2.25] - 2026-07-29
 
 ### Fixed

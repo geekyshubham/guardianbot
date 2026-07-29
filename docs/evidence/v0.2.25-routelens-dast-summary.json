@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "1.0.0",
+  "verifiedAt": "2026-07-29",
+  "repository": "Geekyshubham/RouteLens",
+  "guardianbotRelease": "0.2.25",
+  "guardianbotWorkflowSha": "6e241a4355d84e375be3322fd5ca03970b5f7459",
+  "workflowRunId": 30444468264,
+  "jobId": 90551338692,
+  "artifactId": 8720887086,
+  "profile": "authenticated-baseline",
+  "deploymentEnvironment": "staging",
+  "deployedDigest": "sha256:f67828a8dd7d146258f177ab42fb220ba9cb9c39912c3cdf511fc3f721a6857f",
+  "zapExitCode": 2,
+  "operationalFailures": 0,
+  "durationSeconds": 167,
+  "alerts": {
+    "critical": 0,
+    "high": 0,
+    "medium": 1,
+    "low": 6,
+    "informational": 5
+  },
+  "evidence": {
+    "scanStatusSha256": "c864114b7bb39fc21e2f36162097cadfd8f2fb50d87d28246bf8ac5364f0cda0",
+    "zapReportSha256": "531b709b0a2bfcbaaf209340accaac9b89c18067236219c8e3e5d869ebfc332c"
+  },
+  "limitations": [
+    "The authenticated-full nightly active-scan profile remains unverified.",
+    "AstraNull has not yet completed the deployment-bound workflow.",
+    "DefectDojo import and reimport remain unverified."
+  ]
+}
