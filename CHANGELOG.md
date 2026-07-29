@@ -5,6 +5,13 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Added live RouteLens v0.2.28 evidence for the generic upgrade PR, atomic
+  reusable-workflow trust rotation, exact signed-digest staging deployment,
+  provenance-attested ZAP JSON/XML artifact, and same-Test-ID DefectDojo XML
+  reimport with scanner-native findings.
+
 ## [0.2.28] - 2026-07-29
 
 ### Fixed

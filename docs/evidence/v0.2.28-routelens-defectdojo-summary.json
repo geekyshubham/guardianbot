@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "guardianbot.live-evidence.v1",
+  "verifiedAt": "2026-07-29",
+  "scope": "routelens-defectdojo-zap-xml-reimport",
+  "guardianbot": {
+    "release": "v0.2.28",
+    "commit": "10e9b42cc42f73ff7c307d0415adb9ec26c3916a",
+    "releaseRunId": 30480720277,
+    "imageDigest": "sha256:b3f3f4d087f2418c4ec298f86e99ec4c310dfed23bbb94c3294e4f2954fb55c8",
+    "digitalOceanDeploymentId": "fb9f8f64-13b8-47d4-92a5-8ae20c2a5185",
+    "healthz": 200,
+    "readyz": 200
+  },
+  "routeLens": {
+    "upgradePullRequest": 69,
+    "mergeCommit": "f256e7e18b862bfa0567632b6b45ec9f92f99b52",
+    "promotionRunId": 30481642550,
+    "imageDigest": "sha256:907d25e90c047d3f690043802401ba2cc87786e1c931ec13ecbb9a913e9d36f6",
+    "digitalOceanDeploymentId": "270ba8ad-c58f-44e6-b69b-efd0e0f595d3",
+    "dastRunId": 30482063609,
+    "dastArtifactId": 8736154746,
+    "zapExitCode": 2,
+    "zapXmlSha256": "78c9b455379c85737922c0afc3d9ab4f5fb639f41717a41b090b525295482ebf"
+  },
+  "defectDojo": {
+    "productId": 2,
+    "engagementId": 4,
+    "testId": 5,
+    "sameTestId": true,
+    "buildId": "30482063609/1",
+    "findings": {
+      "medium": 1,
+      "low": 6,
+      "info": 5,
+      "total": 12
+    }
+  },
+  "remaining": [
+    "RouteLens authenticated-full nightly",
+    "AstraNull DefectDojo import",
+    "least-privilege automation permissions",
+    "restore drill",
+    "high availability"
+  ]
+}
