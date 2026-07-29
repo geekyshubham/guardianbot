@@ -7,6 +7,9 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Added live AstraNull v0.2.28 evidence for the generic upgrade PR, exact
+  signed-digest DigitalOcean deployment, provenance-attested ZAP JSON/XML
+  artifact, and stable same-Test-ID DefectDojo reimport.
 - Added live RouteLens v0.2.28 evidence for the generic upgrade PR, atomic
   reusable-workflow trust rotation, exact signed-digest staging deployment,
   provenance-attested ZAP JSON/XML artifact, and same-Test-ID DefectDojo XML

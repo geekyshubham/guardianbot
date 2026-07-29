@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "guardianbot.live-evidence.v1",
+  "verifiedAt": "2026-07-29",
+  "scope": "astranull-image-dast-defectdojo-reimport",
+  "guardianbot": {
+    "release": "v0.2.28",
+    "commit": "10e9b42cc42f73ff7c307d0415adb9ec26c3916a"
+  },
+  "astraNull": {
+    "upgradePullRequest": 7,
+    "mergeCommit": "b3989d27409bb512821b60149fe0a20f81f41b11",
+    "promotionRunId": 30482719437,
+    "promotionArtifactId": 8736374844,
+    "imageDigest": "sha256:4409369b4202d69055646df4dce5b9589052edaae8da69a10ba8790db07db0a3",
+    "sbomSha256": "19b0ee50bdebd69a9abc5d210dc51f33dd0a3d3484845fdc5441bf061d76fb44",
+    "digitalOceanDeploymentId": "e220064c-4928-4b5b-95bb-4dc3ca74037e",
+    "dastRunId": 30483110737,
+    "dastArtifactId": 8736511062,
+    "reimportRunId": 30483273544,
+    "reimportArtifactId": 8736581611,
+    "zapExitCode": 2,
+    "zapXmlSha256": "a50050b914aa07318a8e6f9b0bfd697a16de900472fe291fbb0a64bc9e424d39",
+    "doctorStatus": "ready",
+    "enforcementReady": false,
+    "reportOnlyAgeDays": 0.59
+  },
+  "defectDojo": {
+    "productId": 3,
+    "engagementId": 5,
+    "testId": 6,
+    "sameTestId": true,
+    "buildId": "30483273544/1",
+    "findings": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 5,
+      "info": 4,
+      "total": 9
+    }
+  },
+  "remaining": [
+    "authenticated-full nightly",
+    "seven-day report-only observation",
+    "reviewed enforcement baseline",
+    "least-privilege automation permissions",
+    "restore drill",
+    "high availability"
+  ]
+}
