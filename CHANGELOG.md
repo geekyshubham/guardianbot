@@ -5,6 +5,13 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recorded the signed `v0.2.14` DigitalOcean control-plane deployment, the
+  13/13 active and indexed repository inventory, all 13 onboarding issues, and
+  the successful RouteLens and AstraNull exact-image validation, SBOM,
+  keyless-signing, and immutable GHCR promotion evidence.
+
 ## [0.2.14] - 2026-07-29
 
 ### Fixed
