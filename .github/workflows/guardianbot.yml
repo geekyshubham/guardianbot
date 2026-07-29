@@ -38,10 +38,10 @@ jobs:
       dockerfile: "Dockerfile"
       context: "."
       image-name: "ghcr.io/geekyshubham/guardianbot"
-      health-path: "/api/v1/health/"
-      readiness-path: "/ready"
-      container-port: 8000
-      dependent-services: "postgres,redis"
+      health-path: "/healthz"
+      readiness-path: "/readyz"
+      container-port: 3000
+      dependent-services: ""
       ephemeral-env-keys: ""
       runtime-env: |
           # No runtime environment values configured.

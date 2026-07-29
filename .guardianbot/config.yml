@@ -51,10 +51,9 @@ image:
   context: .
   platform: linux/amd64
   registry: ghcr.io/geekyshubham/guardianbot
-  healthPath: /api/v1/health/
-  readinessPath: /ready
+  healthPath: /healthz
+  readinessPath: /readyz
+  containerPort: 3000
   sbomFormat: cyclonedx-json
-  dependentServices:
-    - postgres
-    - redis
+  dependentServices: []
 dast: null

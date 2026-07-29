@@ -7,6 +7,9 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Corrected GuardianBot's own generated image-smoke profile to use the
+  control plane's `/healthz` and `/readyz` endpoints on port 3000 without
+  unrelated PostgreSQL or Redis test dependencies.
 - Added live AstraNull v0.2.28 evidence for the generic upgrade PR, exact
   signed-digest DigitalOcean deployment, provenance-attested ZAP JSON/XML
   artifact, and stable same-Test-ID DefectDojo reimport.
