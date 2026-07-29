@@ -116,7 +116,11 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.match(dast, /deploymentEnvironment/);
   assert.match(dast, /deployedDigest/);
   assert.match(dast, /\^sha256:\[a-f0-9\]\{64\}\$/);
-  assert.ok(dast.includes("docker run --rm --user zap \\\n"));
+  assert.ok(
+    dast.includes(
+      'docker run --rm --user zap --cidfile "$zap_cid_file" \\\n'
+    )
+  );
   assert.ok(dast.includes('-v "$zap_work_dir:/zap/wrk:rw" \\\n'));
   assert.doesNotMatch(
     dast,
@@ -145,7 +149,10 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
     dast,
     /if \[ -f "\$zap_report" \] && \[ ! -L "\$zap_report" \]; then/
   );
-  assert.match(dast, /\[ "\$zap_size" -gt 52428800 \]/);
+  assert.match(
+    dast,
+    /\[ "\$zap_size" -gt 0 \] && \[ "\$zap_size" -le 52428800 \]/
+  );
   assert.match(
     dast,
     /install -m 600 "\$zap_report" guardianbot-dast-evidence\/zap\.json/
@@ -354,4 +361,37 @@ test("DAST OpenAPI sanitization keeps only safe, exact-origin operations", async
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("DAST profiles are bounded and preserve operational failure evidence", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-dast.yml");
+
+  assert.match(
+    workflow,
+    /if \[ "\$scan_profile" = "authenticated-baseline" \]; then[\s\S]*zap_mode_args=\(-S\)/
+  );
+  assert.match(workflow, /-J zap\.json -T "\$scan_minutes"/);
+  assert.doesNotMatch(workflow, /-J zap\.json -m "\$scan_minutes"/);
+  assert.match(
+    workflow,
+    /scanner\.maxScanDurationInMins=\{os\.environ\['GUARDIANBOT_SCAN_MINUTES'\]\}/
+  );
+  assert.match(
+    workflow,
+    /scanner\.maxRuleDurationInMins=\{os\.environ\['GUARDIANBOT_SCAN_MINUTES'\]\}/
+  );
+  assert.match(
+    workflow,
+    /timeout --signal=TERM --kill-after=30s "\$\{wall_seconds\}s"/
+  );
+  assert.match(workflow, /124\)[\s\S]*failure_kind="wall_clock_timeout"/);
+  assert.match(
+    workflow,
+    /status: "operational_failure",[\s\S]*failureKind: \$failureKind/
+  );
+  assert.match(workflow, /zap_exit=3/);
+  assert.match(
+    workflow,
+    /EVIDENCE_FILES: scan-status\.json,zap\.json/
+  );
 });

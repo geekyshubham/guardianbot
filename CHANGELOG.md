@@ -5,6 +5,19 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.25] - 2026-07-29
+
+### Fixed
+
+- Deploy-smoke DAST now invokes ZAP API scan in passive safe mode, while the
+  nightly authenticated-full profile retains active scanning.
+- ZAP receives its supported passive-scan timeout and verified active-scan
+  duration limits, and the container is additionally bounded by a runner-side
+  wall-clock timeout with forced cleanup.
+- Timeouts, operational failures, missing reports, and invalid reports now
+  produce canonical, attestable failure evidence instead of hanging until the
+  job timeout or failing provenance because `zap.json` is absent.
+
 ## [0.2.24] - 2026-07-29
 
 ### Fixed
