@@ -27,6 +27,8 @@ function repositoryClient(): {
     "Package.resolved",
     "Gemfile",
     "Gemfile.lock",
+    ".github/workflows/deploy.yml",
+    "Dockerfile",
     "Containerfile",
     "src/server.ts",
     "Sources/Library/Library.swift",
@@ -51,6 +53,8 @@ function repositoryClient(): {
     ["Package.resolved", "{}"],
     ["Gemfile", "source \"https://rubygems.org\"\n"],
     ["Gemfile.lock", "GEM\n"],
+    [".github/workflows/deploy.yml", "dockerfile: Containerfile\n"],
+    ["Dockerfile", "FROM node:22-alpine\nEXPOSE 3000\n"],
     ["Containerfile", "FROM node:22-alpine\nEXPOSE 8080\n"],
     ["src/server.ts", "app.get('/health', handler)\n"],
     ["Sources/Library/Library.swift", "public struct Library {}\n"],
@@ -162,4 +166,25 @@ test("onboarding generates the complete reusable contract and explains coverage"
   assert.doesNotMatch(smokeJob, /github\.event_name == 'push'/);
   assert.match(smokeJob, /github\.event_name == 'workflow_dispatch'/);
   assert.doesNotMatch(generated.workflow, /secrets:|session_cookie|GUARDIANBOT_DAST/);
+});
+
+test("Dockerfile override also scopes generated image ports", async () => {
+  const { github } = repositoryClient();
+  const generated = await generateOnboarding(
+    {
+      github,
+      guardianRepository: "acme/guardianbot",
+      workflowSha: WORKFLOW_SHA,
+      dryRun: true,
+      overrides: { dockerfile: "Dockerfile" }
+    },
+    "acme/service"
+  );
+  const config = parseGuardianConfig(generated.config);
+
+  assert.equal(config.image?.dockerfile, "Dockerfile");
+  assert.equal(config.image?.containerPort, 3000);
+  assert.deepEqual(config.image?.ports, [
+    { name: "http", containerPort: 3000, protocol: "tcp" }
+  ]);
 });

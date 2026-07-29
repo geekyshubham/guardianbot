@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Fixed
+
+- Dockerfile auto-detection now matches exact repository-relative paths instead
+  of treating a basename such as `Dockerfile` as a reference inside
+  `ops/digitalocean/Dockerfile`.
+- Generated image ports are now scoped to the selected Dockerfile, including a
+  `guardianctl onboard --dockerfile` override, so unrelated container
+  definitions cannot replace the runtime port.
+
 ### Documentation
 
 - Recorded the live signed-digest `v0.2.13` DigitalOcean deployment and the

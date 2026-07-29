@@ -362,14 +362,14 @@ export async function generateOnboarding(
   assertImmutableWorkflowSha(context.workflowSha);
   const snapshot = await inspectRepository(context.github, repository);
   const detection = detectRepository(snapshot);
-  const configObject = generateGuardianConfig(snapshot, detection, context.workflowSha);
   const override = context.overrides;
-  if (override?.dockerfile && configObject.image) {
+  if (override?.dockerfile) {
     if (!detection.dockerfiles.includes(override.dockerfile)) {
       throw new Error(`Requested Dockerfile was not detected: ${override.dockerfile}`);
     }
-    configObject.image.dockerfile = override.dockerfile;
+    detection.preferredDockerfile = override.dockerfile;
   }
+  const configObject = generateGuardianConfig(snapshot, detection, context.workflowSha);
   if (override?.healthPath && configObject.image) configObject.image.healthPath = override.healthPath;
   if (override?.readinessPath && configObject.image) {
     configObject.image.readinessPath = override.readinessPath;

@@ -18,6 +18,7 @@ export interface DetectionResult {
   buildCommands: string[];
   migrationCommands: string[];
   dockerfiles: string[];
+  dockerfilePorts: Record<string, number[]>;
   preferredDockerfile?: string;
   openapi: string[];
   codeowners?: string;
@@ -71,6 +72,10 @@ const DEFAULT_EXCLUDED_PATHS = [
 
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function unique(values: Iterable<string>): string[] {
@@ -630,7 +635,11 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     if (!/\.github\/workflows\/|deploy|digitalocean|compose/i.test(path)) continue;
     const weight = 1 + (/deploy/i.test(path) ? 2 : 0) + (/digitalocean/i.test(path) ? 4 : 0);
     for (const dockerfile of dockerfiles) {
-      if (content.includes(dockerfile)) {
+      const exactReference = new RegExp(
+        `(?:^|[^A-Za-z0-9_./-])${escapeRegExp(dockerfile)}(?:$|[^A-Za-z0-9_./-])`,
+        "m"
+      );
+      if (exactReference.test(content)) {
         dockerfileReferences.set(
           dockerfile,
           (dockerfileReferences.get(dockerfile) ?? 0) + weight
@@ -645,16 +654,16 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     dockerfiles.find((path) => path.toLowerCase() === "dockerfile") ??
     dockerfiles.find((path) => path.toLowerCase() === "containerfile") ??
     dockerfiles[0];
-  const orderedDockerfiles = primaryDockerfile
-    ? [primaryDockerfile, ...dockerfiles.filter((path) => path !== primaryDockerfile)]
+  const dockerfilePorts = Object.fromEntries(
+    dockerfiles.map((dockerfile) => [
+      dockerfile,
+      portsFromDockerfile(contentByPath.get(dockerfile) ?? "")
+    ])
+  );
+  const containerPorts = primaryDockerfile
+    ? [...(dockerfilePorts[primaryDockerfile] ?? [])]
     : [];
-  const containerPorts: number[] = [];
-  for (const dockerfile of orderedDockerfiles) {
-    for (const port of portsFromDockerfile(contentByPath.get(dockerfile) ?? "")) {
-      if (!containerPorts.includes(port)) containerPorts.push(port);
-    }
-  }
-  if (dockerfiles.length && !containerPorts.length) containerPorts.push(8000);
+  if (primaryDockerfile && !containerPorts.length) containerPorts.push(8000);
 
   const codeowners = [
     ".github/CODEOWNERS",
@@ -726,6 +735,7 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     buildCommands,
     migrationCommands,
     dockerfiles,
+    dockerfilePorts,
     preferredDockerfile,
     openapi: unique(openapi),
     codeowners,
@@ -751,6 +761,9 @@ export function generateGuardianConfig(
     detection.preferredDockerfile ??
     detection.dockerfiles.find((path) => path === "Dockerfile") ??
     detection.dockerfiles[0];
+  const containerPorts = primaryDockerfile
+    ? detection.dockerfilePorts[primaryDockerfile] ?? []
+    : [];
   const healthPath = detection.healthPaths[0] ?? "/health";
 
   return {
@@ -837,8 +850,8 @@ export function generateGuardianConfig(
           registry: `ghcr.io/${snapshot.owner.toLowerCase()}/${snapshot.name.toLowerCase()}`,
           healthPath,
           readinessPath: detection.healthPaths.find((path) => /ready/i.test(path)),
-          containerPort: detection.containerPorts[0] ?? 8000,
-          ports: (detection.containerPorts.length ? detection.containerPorts : [8000]).map(
+          containerPort: containerPorts[0] ?? 8000,
+          ports: (containerPorts.length ? containerPorts : [8000]).map(
             (containerPort, index) => ({
               name: index === 0 ? "http" : `port-${containerPort}`,
               containerPort,

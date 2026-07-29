@@ -109,6 +109,9 @@ test("generates the extended reusable config from content-aware repository detec
   const detection = detectRepository(repository);
   assert.deepEqual(detection.packageManagers, ["pnpm"]);
   assert.deepEqual(detection.containerPorts, [8080, 9090]);
+  assert.deepEqual(detection.dockerfilePorts, {
+    Containerfile: [8080, 9090]
+  });
   assert.deepEqual(detection.migrationCommands, ["pnpm run migrate"]);
   assert.deepEqual(detection.openapi, ["docs/api-contract.yaml"]);
   assert.equal(detection.codeowners, ".github/CODEOWNERS");
@@ -166,6 +169,41 @@ test("generates the extended reusable config from content-aware repository detec
     requireSbom: true
   });
   assert.equal(config.dast, null);
+});
+
+test("keeps container ports scoped to the selected Dockerfile", () => {
+  const repository = snapshot(
+    [
+      ".github/workflows/deploy.yml",
+      "Dockerfile",
+      "ops/digitalocean/Dockerfile"
+    ],
+    {
+      Dockerfile: "FROM node:22-alpine\nEXPOSE 3000\n",
+      "ops/digitalocean/Dockerfile": [
+        "FROM node:22-alpine",
+        "ENV PORT=8080",
+        "EXPOSE 8080"
+      ].join("\n"),
+      ".github/workflows/deploy.yml":
+        "dockerfile: ops/digitalocean/Dockerfile\n# digitalocean deploy"
+    }
+  );
+
+  const detection = detectRepository(repository);
+  assert.equal(detection.preferredDockerfile, "ops/digitalocean/Dockerfile");
+  assert.deepEqual(detection.containerPorts, [8080]);
+  assert.deepEqual(detection.dockerfilePorts, {
+    Dockerfile: [3000],
+    "ops/digitalocean/Dockerfile": [8080]
+  });
+
+  const config = generateGuardianConfig(repository, detection, "a".repeat(40));
+  assert.equal(config.image?.dockerfile, "ops/digitalocean/Dockerfile");
+  assert.equal(config.image?.containerPort, 8080);
+  assert.deepEqual(config.image?.ports, [
+    { name: "http", containerPort: 8080, protocol: "tcp" }
+  ]);
 });
 
 test("detects Python, Swift, and Ruby manifests and useful migration commands", () => {
