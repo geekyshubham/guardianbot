@@ -124,10 +124,22 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
       String.raw`docker run --rm --user "\$\(id -u\):\$\(id -g\)"[\s\S]{0,200}/zap/wrk:rw`
     )
   );
-  assert.match(dast, /sudo chown 1000:1000 "\$zap_work_dir"/);
   assert.match(
     dast,
-    /sudo chown -R --no-dereference "\$\(id -u\):\$\(id -g\)" "\$zap_work_dir"/
+    /install -m 600 "\$openapi_file" "\$zap_input_dir\/openapi-safe\.json"/
+  );
+  assert.ok(dast.includes('-v "$zap_input_dir:/zap/input:ro" \\\n'));
+  assert.doesNotMatch(
+    dast,
+    /guardianbot-openapi-safe\.json:\/zap\/input\/openapi-safe\.json:ro/
+  );
+  assert.match(
+    dast,
+    /sudo chown -R --no-dereference 1000:1000 "\$zap_work_dir" "\$zap_input_dir"/
+  );
+  assert.match(
+    dast,
+    /sudo chown -R --no-dereference "\$\(id -u\):\$\(id -g\)" "\$zap_work_dir" "\$zap_input_dir"/
   );
   assert.match(
     dast,
@@ -141,6 +153,12 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.doesNotMatch(
     dast,
     /-v "\$PWD\/guardianbot-dast-evidence:\/zap\/wrk:rw"/
+  );
+  assert.ok(
+    dast.includes('"${RUNNER_TEMP}/guardianbot-zap-input/openapi-safe.json"')
+  );
+  assert.ok(
+    dast.includes('"${RUNNER_TEMP}/guardianbot-zap-input"; do')
   );
 });
 

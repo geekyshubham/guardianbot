@@ -5,6 +5,17 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-07-29
+
+### Fixed
+
+- The reusable DAST workflow now copies only the sanitized OpenAPI document
+  into a private ZAP-owned input directory and mounts that directory read-only.
+  The non-root ZAP process can read the schema without making the runner's
+  original temporary file broadly readable.
+- Cleanup and workflow-security coverage now include both the isolated ZAP
+  runtime directory and the isolated sanitized-input directory.
+
 ## [0.2.23] - 2026-07-29
 
 ### Fixed
