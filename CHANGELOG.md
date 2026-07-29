@@ -11,6 +11,16 @@ reusable workflow commits remain immutable.
   signed-digest DigitalOcean deployment, control-plane-issued one-time DAST
   session, bounded authenticated-baseline ZAP run, and attested scanner output.
 
+## [0.2.26] - 2026-07-29
+
+### Fixed
+
+- Evidence and DAST-session workflows now retry GitHub OIDC requests on only
+  transient `429` and `5xx` responses, plus network failures, with four bounded
+  exponential-backoff attempts.
+- Permanent GitHub OIDC `4xx` responses still fail immediately, and all
+  workflows continue to fail closed when the bounded retry budget is exhausted.
+
 ## [0.2.25] - 2026-07-29
 
 ### Fixed

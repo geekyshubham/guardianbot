@@ -218,9 +218,37 @@ jobs:
               throw new Error("GuardianBot evidence endpoint is invalid");
             }
             const sessionEndpoint = new URL("/dast/session", evidenceEndpoint);
+            const fetchGithubOidc = async (url, init) => {
+              let lastFailure = "unknown failure";
+              for (let attempt = 1; attempt <= 4; attempt += 1) {
+                try {
+                  const response = await fetch(url, init);
+                  if (
+                    response.ok ||
+                    (response.status !== 429 && response.status < 500) ||
+                    attempt === 4
+                  ) {
+                    return response;
+                  }
+                  lastFailure = `HTTP ${response.status}`;
+                  await response.arrayBuffer().catch(() => undefined);
+                } catch (error) {
+                  lastFailure = error instanceof Error ? error.message : String(error);
+                  if (attempt === 4) {
+                    throw new Error(
+                      `GitHub OIDC request failed after ${attempt} attempts: ${lastFailure}`
+                    );
+                  }
+                }
+                await new Promise((resolve) =>
+                  setTimeout(resolve, 500 * (2 ** (attempt - 1)))
+                );
+              }
+              throw new Error(`GitHub OIDC request failed: ${lastFailure}`);
+            };
             const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
             oidcUrl.searchParams.set("audience", "guardianbot-dast-session");
-            const oidcResponse = await fetch(oidcUrl, {
+            const oidcResponse = await fetchGithubOidc(oidcUrl, {
               headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
               redirect: "error"
             });
@@ -801,9 +829,37 @@ jobs:
             }
             return JSON.parse(Buffer.concat(chunks).toString("utf8"));
           };
+          const fetchGithubOidc = async (url, init) => {
+            let lastFailure = "unknown failure";
+            for (let attempt = 1; attempt <= 4; attempt += 1) {
+              try {
+                const response = await fetch(url, init);
+                if (
+                  response.ok ||
+                  (response.status !== 429 && response.status < 500) ||
+                  attempt === 4
+                ) {
+                  return response;
+                }
+                lastFailure = `HTTP ${response.status}`;
+                await response.arrayBuffer().catch(() => undefined);
+              } catch (error) {
+                lastFailure = error instanceof Error ? error.message : String(error);
+                if (attempt === 4) {
+                  throw new Error(
+                    `GitHub OIDC request failed after ${attempt} attempts: ${lastFailure}`
+                  );
+                }
+              }
+              await new Promise((resolve) =>
+                setTimeout(resolve, 500 * (2 ** (attempt - 1)))
+              );
+            }
+            throw new Error(`GitHub OIDC request failed: ${lastFailure}`);
+          };
           const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
           oidcUrl.searchParams.set("audience", "guardianbot-evidence");
-          const oidcResponse = await fetch(oidcUrl, {
+          const oidcResponse = await fetchGithubOidc(oidcUrl, {
             headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
             redirect: "error"
           });

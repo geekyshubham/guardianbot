@@ -43,6 +43,30 @@ test("reusable workflows resolve attestation only from the exact workflow releas
   });
 });
 
+test("reusable workflows retry only transient GitHub OIDC failures", () => {
+  const workflows = new Map([
+    [".github/workflows/reusable-security.yml", 1],
+    [".github/workflows/reusable-image.yml", 2],
+    [".github/workflows/reusable-dast.yml", 2]
+  ]);
+
+  for (const [path, expectedRequests] of workflows) {
+    const workflow = repositoryFile(path);
+    assert.equal(
+      workflow.match(/const fetchGithubOidc = async/g)?.length,
+      expectedRequests
+    );
+    assert.equal(
+      workflow.match(/const oidcResponse = await fetchGithubOidc/g)?.length,
+      expectedRequests
+    );
+    assert.doesNotMatch(workflow, /const oidcResponse = await fetch\(/);
+    assert.match(workflow, /response\.status !== 429 && response\.status < 500/);
+    assert.match(workflow, /attempt <= 4/);
+    assert.match(workflow, /500 \* \(2 \*\* \(attempt - 1\)\)/);
+  }
+});
+
 test("image workflow masks generated runtime values and never dumps container logs", () => {
   const workflow = repositoryFile(".github/workflows/reusable-image.yml");
   const generatedAt = workflow.indexOf(
