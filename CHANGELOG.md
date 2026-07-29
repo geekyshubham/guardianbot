@@ -11,6 +11,9 @@ reusable workflow commits remain immutable.
   and `SETUID` after dropping all capabilities. This lets the pinned official
   entrypoint repair its persistent-volume ownership and drop privileges without
   restoring the default container capability set.
+- The DefectDojo uWSGI health probe now sends the configured public host and
+  trusted HTTPS proxy scheme while connecting only over the container loopback,
+  avoiding a false `DisallowedHost` failure without allowlisting localhost.
 
 ### Evidence
 

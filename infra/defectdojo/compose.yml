@@ -191,7 +191,7 @@ services:
         - CMD
         - python3
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/login?force_login_form', timeout=8).read(1)"
+        - "import os, urllib.request; request = urllib.request.Request('http://127.0.0.1:8081/login?force_login_form', headers={'Host': os.environ['DD_ALLOWED_HOSTS'], 'X-Forwarded-Proto': 'https'}); urllib.request.urlopen(request, timeout=8).read(1)"
       interval: 20s
       timeout: 10s
       retries: 10

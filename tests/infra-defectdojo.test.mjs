@@ -43,6 +43,14 @@ test("Valkey can initialize its persistent volume with only its required capabil
   );
 });
 
+test("the uWSGI health check uses the configured host and trusted proxy scheme", async () => {
+  const compose = await readFile(path.join(STACK, "compose.yml"), "utf8");
+  assert.match(
+    compose,
+    /127\.0\.0\.1:8081\/login\?force_login_form[\s\S]*?'Host': os\.environ\['DD_ALLOWED_HOSTS'\][\s\S]*?'X-Forwarded-Proto': 'https'/,
+  );
+});
+
 test("stack-definition validation rejects a changed operational file", async () => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "guardianbot-defectdojo-definition-"),
