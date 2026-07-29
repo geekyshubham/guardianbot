@@ -5,6 +5,12 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Changed
+
+- `guardianctl upgrade` now applies the same validated image and DAST override
+  contract as onboarding, so existing repositories can enable DAST through one
+  generated configuration-and-caller PR.
+
 ### Documentation
 
 - Recorded the signed `v0.2.14` DigitalOcean control-plane deployment, the

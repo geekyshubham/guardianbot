@@ -30,6 +30,21 @@ guardianctl inventory
 guardianctl offboard OWNER/REPOSITORY
 ```
 
+`upgrade` applies the same validated image and DAST overrides to an
+already-onboarded repository. It opens one generated PR containing the
+configuration and caller changes:
+
+```sh
+guardianctl upgrade OWNER/REPOSITORY \
+  --dast-origin https://staging.example.com \
+  --openapi /openapi.json \
+  --auth-profile control-plane://profiles/example-staging \
+  --session-path /api/protected
+```
+
+All four DAST options are required together. Partial profiles are rejected, and
+no credential or backend URL is written to the consumer repository.
+
 `doctor` validates:
 
 - operator repository access and GuardianBot App access when the operator token can

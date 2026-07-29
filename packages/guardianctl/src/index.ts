@@ -57,6 +57,62 @@ export interface GeneratedOnboarding {
   report: string;
 }
 
+function applyConfigurationOverrides(
+  config: GuardianConfig,
+  override: CommandContext["overrides"]
+): void {
+  if (!override) return;
+  if (override.dockerfile) {
+    if (!config.image) {
+      throw new Error("Dockerfile override requires configured image coverage");
+    }
+    config.image.dockerfile = override.dockerfile;
+  }
+  if (override.healthPath) {
+    if (!config.image) {
+      throw new Error("health-path override requires configured image coverage");
+    }
+    config.image.healthPath = override.healthPath;
+  }
+  if (override.readinessPath) {
+    if (!config.image) {
+      throw new Error("readiness-path override requires configured image coverage");
+    }
+    config.image.readinessPath = override.readinessPath;
+  }
+  if (
+    override.dastOrigin ||
+    override.openapi ||
+    override.authenticationProfile ||
+    override.sessionAssertionPath
+  ) {
+    if (
+      !override.dastOrigin ||
+      !override.openapi ||
+      !override.authenticationProfile ||
+      !override.sessionAssertionPath
+    ) {
+      throw new Error("DAST overrides require origin, OpenAPI, auth profile, and session assertion");
+    }
+    config.dast = {
+      allowedOrigin: override.dastOrigin,
+      allowedOrigins: [override.dastOrigin],
+      openapi: override.openapi,
+      openapiSource:
+        override.openapi.startsWith("/") || /^https:/i.test(override.openapi)
+          ? "live-endpoint"
+          : "repository-file",
+      authenticationProfile: override.authenticationProfile,
+      sessionAssertionPath: override.sessionAssertionPath,
+      profiles: {
+        deploySmoke: "authenticated-baseline",
+        nightly: "authenticated-full"
+      },
+      excludedRoutes: []
+    };
+  }
+}
+
 export type DoctorCheckState =
   | "ok"
   | "missing"
@@ -370,41 +426,10 @@ export async function generateOnboarding(
     detection.preferredDockerfile = override.dockerfile;
   }
   const configObject = generateGuardianConfig(snapshot, detection, context.workflowSha);
-  if (override?.healthPath && configObject.image) configObject.image.healthPath = override.healthPath;
-  if (override?.readinessPath && configObject.image) {
-    configObject.image.readinessPath = override.readinessPath;
-  }
-  if (
-    override?.dastOrigin ||
-    override?.openapi ||
-    override?.authenticationProfile ||
-    override?.sessionAssertionPath
-  ) {
-    if (
-      !override.dastOrigin ||
-      !override.openapi ||
-      !override.authenticationProfile ||
-      !override.sessionAssertionPath
-    ) {
-      throw new Error("DAST overrides require origin, OpenAPI, auth profile, and session assertion");
-    }
-    configObject.dast = {
-      allowedOrigin: override.dastOrigin,
-      allowedOrigins: [override.dastOrigin],
-      openapi: override.openapi,
-      openapiSource:
-        override.openapi.startsWith("/") || /^https:/i.test(override.openapi)
-          ? "live-endpoint"
-          : "repository-file",
-      authenticationProfile: override.authenticationProfile,
-      sessionAssertionPath: override.sessionAssertionPath,
-      profiles: {
-        deploySmoke: "authenticated-baseline",
-        nightly: "authenticated-full"
-      },
-      excludedRoutes: []
-    };
-  }
+  applyConfigurationOverrides(configObject, {
+    ...override,
+    dockerfile: undefined
+  });
   const configurationErrors = validateGuardianConfig(configObject);
   if (configurationErrors.length) {
     throw new Error(
@@ -2135,8 +2160,17 @@ export async function upgrade(
   );
   if (!configFile || !workflowFile) throw new Error("Repository is not onboarded");
   const config = parseGuardianConfig(configFile.content);
-  const configChanged = config.workflowVersion !== context.workflowSha;
+  const originalConfig = serializeGuardianConfig(config);
   config.workflowVersion = context.workflowSha;
+  applyConfigurationOverrides(config, context.overrides);
+  const configurationErrors = validateGuardianConfig(config);
+  if (configurationErrors.length) {
+    throw new Error(
+      `Updated GuardianBot configuration is invalid:\n${configurationErrors.join("\n")}`
+    );
+  }
+  const serializedConfig = serializeGuardianConfig(config);
+  const configChanged = serializedConfig !== originalConfig;
   const workflow = generateCallerWorkflow({
     guardianRepository: context.guardianRepository,
     workflowSha: context.workflowSha,
@@ -2156,7 +2190,7 @@ export async function upgrade(
       CONFIG_PATH,
       branch,
       "chore(guardianbot): upgrade schema and workflow",
-      serializeGuardianConfig(config),
+      serializedConfig,
       configFile.sha
     );
   }

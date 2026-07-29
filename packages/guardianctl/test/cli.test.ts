@@ -964,6 +964,68 @@ test("upgrade updates both configuration and caller when moving to a new immutab
   assert.doesNotMatch(workflowWrite.content, new RegExp(`@${OLD_WORKFLOW_SHA}`));
 });
 
+test("upgrade enables DAST through the same public override contract as onboarding", async () => {
+  const github = new MockGitHub();
+  github.add(healthyState());
+
+  const result = await upgrade(
+    commandContext(github, {
+      overrides: {
+        dastOrigin: "https://staging.example.com",
+        openapi: "/openapi.json",
+        authenticationProfile: "control-plane://profiles/example-staging",
+        sessionAssertionPath: "/api/protected"
+      }
+    }),
+    "acme/service"
+  );
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(
+    github.writes.map((write) => write.path).sort(),
+    [CALLER_WORKFLOW_PATH, CONFIG_PATH].sort()
+  );
+  const configWrite = github.writes.find((write) => write.path === CONFIG_PATH)!;
+  const updated = parseGuardianConfig(configWrite.content);
+  assert.deepEqual(updated.dast, {
+    allowedOrigin: "https://staging.example.com",
+    allowedOrigins: ["https://staging.example.com"],
+    openapi: "/openapi.json",
+    openapiSource: "live-endpoint",
+    authenticationProfile: "control-plane://profiles/example-staging",
+    sessionAssertionPath: "/api/protected",
+    profiles: {
+      deploySmoke: "authenticated-baseline",
+      nightly: "authenticated-full"
+    },
+    excludedRoutes: []
+  });
+  const workflowWrite = github.writes.find(
+    (write) => write.path === CALLER_WORKFLOW_PATH
+  )!;
+  assert.match(workflowWrite.content, /guardianbot-dast-smoke:/);
+  assert.match(workflowWrite.content, /guardianbot-dast-nightly:/);
+});
+
+test("upgrade rejects partial DAST override contracts without opening a branch", async () => {
+  const github = new MockGitHub();
+  github.add(healthyState());
+
+  await assert.rejects(
+    upgrade(
+      commandContext(github, {
+        overrides: {
+          dastOrigin: "https://staging.example.com"
+        }
+      }),
+      "acme/service"
+    ),
+    /DAST overrides require origin, OpenAPI, auth profile, and session assertion/
+  );
+  assert.equal(github.branches.length, 0);
+  assert.equal(github.writes.length, 0);
+});
+
 test("upgrade --all consumes every GitHub repository page", async (t) => {
   const config = guardianConfig();
   const workflow = workflowFor(config);
