@@ -5,6 +5,14 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-07-29
+
+### Added
+
+- The DAST session endpoint now emits bounded structured rejection telemetry
+  containing only the failure class and HTTP status. OIDC tokens, exchange
+  credentials, minted session values, and request bodies are never logged.
+
 ## [0.2.19] - 2026-07-29
 
 ### Fixed

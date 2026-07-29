@@ -237,6 +237,17 @@ async function start() {
       } catch (error) {
         const status =
           error instanceof DastSessionError ? error.statusCode : 400;
+        const failure =
+          error instanceof DastSessionError
+            ? error.message
+            : "invalid DAST session request";
+        console.warn(
+          JSON.stringify({
+            event: "guardianbot.dast_session_rejected",
+            status,
+            failure
+          })
+        );
         response
           .writeHead(status, {
             "cache-control": "no-store, max-age=0",
@@ -245,10 +256,7 @@ async function start() {
           })
           .end(
             JSON.stringify({
-              error:
-                error instanceof DastSessionError
-                  ? error.message
-                  : "invalid DAST session request"
+              error: failure
             })
           );
       }

@@ -1,6 +1,6 @@
 # Capability status
 
-Release: `0.2.19`
+Release: `0.2.20`
 Last verified: 2026-07-29
 
 This matrix is the authoritative distinction between implemented behavior and
