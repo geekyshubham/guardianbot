@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-07-29
+
 ### Fixed
 
 - Dockerfile auto-detection now matches exact repository-relative paths instead
