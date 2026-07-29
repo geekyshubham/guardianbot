@@ -5,6 +5,17 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.31] - 2026-07-30
+
+### Fixed
+
+- Onboarding-issue creation is now serialized per GitHub repository with a
+  database-wide advisory lock. Concurrent webhook workers recheck the
+  idempotency marker after taking the lock instead of creating duplicate
+  inventory issues.
+- The in-memory store implements the same queued lock handoff, with regression
+  coverage for concurrent service instances.
+
 ## [0.2.30] - 2026-07-30
 
 ### Fixed
