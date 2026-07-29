@@ -14,6 +14,9 @@ reusable workflow commits remain immutable.
 - The DefectDojo uWSGI health probe now sends the configured public host and
   trusted HTTPS proxy scheme while connecting only over the container loopback,
   avoiding a false `DisallowedHost` failure without allowlisting localhost.
+- The internal Nginx health probe now preserves the same public host and HTTPS
+  proxy scheme, preventing false redirects or host rejections before Caddy is
+  started.
 
 ### Evidence
 

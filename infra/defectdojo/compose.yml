@@ -150,7 +150,9 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/uwsgi_health"]
+      test:
+        - CMD-SHELL
+        - 'wget -q -O - --header="Host: ${DEFECTDOJO_DOMAIN:?DEFECTDOJO_DOMAIN is required}" --header="X-Forwarded-Proto: https" http://127.0.0.1:8080/uwsgi_health'
       interval: 20s
       timeout: 10s
       retries: 10

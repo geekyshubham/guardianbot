@@ -51,6 +51,14 @@ test("the uWSGI health check uses the configured host and trusted proxy scheme",
   );
 });
 
+test("the Nginx health check preserves the public host and HTTPS proxy scheme", async () => {
+  const compose = await readFile(path.join(STACK, "compose.yml"), "utf8");
+  assert.match(
+    compose,
+    /wget -q -O - --header="Host: \$\{DEFECTDOJO_DOMAIN:\?DEFECTDOJO_DOMAIN is required\}" --header="X-Forwarded-Proto: https" http:\/\/127\.0\.0\.1:8080\/uwsgi_health/,
+  );
+});
+
 test("stack-definition validation rejects a changed operational file", async () => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "guardianbot-defectdojo-definition-"),
