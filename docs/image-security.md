@@ -78,15 +78,15 @@ deployment, timeout, or failed probe cannot be reported as protected.
 
 ## RouteLens and AstraNull
 
-The generated onboarding branches currently describe RouteLens's root
-multi-stage Dockerfile and AstraNull's `ops/digitalocean/Dockerfile`. Local
-hardening work is in progress for RouteLens web/worker/beat coverage and for
-AstraNull's frozen production dependency install. Those changes are not
-reported as working until their PR heads and public workflow evidence verify
-them.
+RouteLens and AstraNull were onboarded through the same generated configuration
+and reusable workflows as any future repository. Their default-branch runs
+built, tested, migrated, runtime-smoked, scanned, SBOM-attested, keylessly
+signed, and promoted exact images. Those digests are deployed on the
+DigitalOcean-only [`infra/staging`](../infra/staging/README.md) stack with
+separate internal networks and PostgreSQL databases.
 
-Both repositories must pass the same public onboarding, image, signing,
-DigitalOcean promotion, and DAST contracts as every future repository. Their
-earlier images correctly stopped before promotion because of blocking findings;
-isolated live staging, signed digest deployment, and authenticated ZAP remain
-unverified.
+The [live v0.2.14 evidence](evidence/v0.2.14-live-poc.md) records the immutable
+image identities, HTTPS health/readiness, protected-route rejection, and
+cross-repository database isolation. Deployment-bound GuardianBot
+reconciliation, authenticated ZAP, and DefectDojo remain unverified and are not
+implied by the staging health evidence.

@@ -1,0 +1,175 @@
+name: guardianbot-app-staging
+
+services:
+  caddy:
+    image: caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      ROUTELENS_HOST: ${ROUTELENS_HOST:?required}
+      ASTRANULL_HOST: ${ASTRANULL_HOST:?required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - edge
+      - routelens
+      - astranull
+    mem_limit: 192m
+    security_opt:
+      - no-new-privileges:true
+
+  routelens-postgres:
+    image: postgres@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: routelens
+      POSTGRES_PASSWORD: ${ROUTELENS_POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: routelens
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U routelens -d routelens"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - routelens-postgres:/var/lib/postgresql/data
+    networks:
+      - routelens
+    mem_limit: 384m
+    security_opt:
+      - no-new-privileges:true
+
+  routelens-redis:
+    image: redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - routelens
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+
+  routelens:
+    image: ghcr.io/geekyshubham/routelens@sha256:ed954dbddadff7b27e390786f05a4e9f4af5cb817caa2e3c661ed355b9f93332
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      routelens-postgres:
+        condition: service_healthy
+      routelens-redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://routelens:${ROUTELENS_POSTGRES_PASSWORD}@routelens-postgres:5432/routelens
+      REDIS_URL: redis://routelens-redis:6379/0
+      DJANGO_SECRET_KEY: ${ROUTELENS_DJANGO_SECRET_KEY:?required}
+      DJANGO_DEBUG: "false"
+      ALLOWED_HOSTS: ${ROUTELENS_HOST:?required},localhost,127.0.0.1
+      CORS_ALLOWED_ORIGINS: https://${ROUTELENS_HOST:?required}
+      CSRF_TRUSTED_ORIGINS: https://${ROUTELENS_HOST:?required}
+      SECURE_SSL_REDIRECT: "true"
+      EMAIL_BACKEND: django.core.mail.backends.smtp.EmailBackend
+      EMAIL_HOST: smtp.guardianbot.invalid
+      EMAIL_HOST_USER: guardianbot-staging
+      EMAIL_HOST_PASSWORD: ${ROUTELENS_EMAIL_HOST_PASSWORD:?required}
+      PORT: "8080"
+      RAILWAY_SERVICE_ROLE: web
+      RAILWAY_EMBED_WORKERS: "false"
+      GUNICORN_WORKERS: "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health/', timeout=4)"
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 6
+    networks:
+      - routelens
+    mem_limit: 1400m
+    security_opt:
+      - no-new-privileges:true
+
+  astranull-postgres:
+    image: postgres@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: astranull
+      POSTGRES_PASSWORD: ${ASTRANULL_POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: astranull
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astranull -d astranull"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - astranull-postgres:/var/lib/postgresql/data
+    networks:
+      - astranull
+    mem_limit: 384m
+    security_opt:
+      - no-new-privileges:true
+
+  astranull:
+    image: ghcr.io/geekyshubham/astranull@sha256:a6d675fea8fe6ee362c36227c38b1daba91a21e7fdda8fcd061c63f5bd3ebbd0
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      astranull-postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      ASTRANULL_DATABASE_URL: postgresql://astranull:${ASTRANULL_POSTGRES_PASSWORD}@astranull-postgres:5432/astranull?sslmode=disable
+      ASTRANULL_PUBLIC_BASE_URL: https://${ASTRANULL_HOST:?required}
+      ASTRANULL_PERSISTENCE_MODE: postgres
+      ASTRANULL_DEPLOYMENT_PROFILE: hosted-staging
+      ASTRANULL_BUNDLED_STAGING_OIDC: "1"
+      ASTRANULL_AUTH_MODE: oidc-jwt
+      ASTRANULL_OIDC_ISSUER: https://${ASTRANULL_HOST:?required}/staging-oidc
+      ASTRANULL_OIDC_JWKS_URL: https://${ASTRANULL_HOST:?required}/.well-known/jwks.json
+      ASTRANULL_PUBLIC_LOGIN_URL: /login
+      ASTRANULL_PROBE_MODE: signed-worker
+      ASTRANULL_HIGH_SCALE_ADAPTER_MODE: disabled
+      ASTRANULL_AGENT_IDENTITY_MODE: bearer
+      ASTRANULL_WAF_POSTURE_ENABLED: "1"
+      ASTRANULL_CONNECTORS_ENABLED: "0"
+      ASTRANULL_SECRET_ENCRYPTION_KEY: ${ASTRANULL_SECRET_ENCRYPTION_KEY:?required}
+      ASTRANULL_PROBE_WORKER_SECRET: ${ASTRANULL_PROBE_WORKER_SECRET:?required}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 6
+    networks:
+      - astranull
+    mem_limit: 768m
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  edge:
+  routelens:
+    internal: true
+  astranull:
+    internal: true
+
+volumes:
+  caddy-data:
+  caddy-config:
+  routelens-postgres:
+  astranull-postgres:

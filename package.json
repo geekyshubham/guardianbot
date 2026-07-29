@@ -23,7 +23,7 @@
     "lint": "npm run typecheck && npm run docs:check",
     "docs:build-cli": "npm run build --workspace @guardianbot/protocol && npm run build --workspace @guardianbot/core && npm run build --workspace @guardianbot/guardianctl",
     "docs:test": "node --test scripts/check-docs.test.mjs",
-    "scripts:test": "node --test scripts/release-evidence.test.mjs scripts/deployment-security.test.mjs",
+    "scripts:test": "node --test scripts/release-evidence.test.mjs scripts/deployment-security.test.mjs tests/infra-defectdojo.test.mjs tests/infra-staging.test.mjs",
     "docs:check": "npm run docs:build-cli && npm run docs:test && node scripts/check-docs.mjs",
     "docs:check:external": "npm run docs:build-cli && npm run docs:test && node scripts/check-docs.mjs --external",
     "schemas:generate": "npm run build --workspace @guardianbot/protocol && node scripts/export-protocol-schemas.mjs",
