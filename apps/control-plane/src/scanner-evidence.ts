@@ -1619,11 +1619,22 @@ async function processImageArtifact(
     payload: sbomSummary
   });
   if (artifact.artifactType === "image-promotion") {
+    const expectedCallerWorkflowRef = `refs/heads/${defaultBranch}`;
+    if (
+      run.event !== "push" ||
+      run.headBranch !== defaultBranch ||
+      (run.workflowRef !== undefined &&
+        run.workflowRef !== expectedCallerWorkflowRef)
+    ) {
+      throw new Error(
+        "image promotion evidence is not bound to the default-branch push workflow"
+      );
+    }
     const promotion = validatePromotionEvidence(
       archive,
       repositoryFullName,
       run.workflowPath,
-      run.workflowRef,
+      expectedCallerWorkflowRef,
       trustPolicy
     );
     await recordEvidence(store, base, {
@@ -1636,62 +1647,57 @@ async function processImageArtifact(
       details: "Cosign signature and CycloneDX attestation verified",
       payload: promotion
     });
-    if (
-      run.event === "push" &&
-      run.headBranch === defaultBranch
-    ) {
-      try {
-        const deployment = await deploymentService.promote({
-          repository: repositoryFullName,
-          repositoryId: artifact.repositoryId,
-          runId: artifact.runId,
-          runAttempt: artifact.runAttempt,
-          headSha: run.headSha,
-          imageReference: promotion.imageReference
-        });
-        if (deployment) {
-          await recordEvidence(store, base, {
-            evidenceKey: `deployment:${deployment.environment}`,
-            kind: "deployment",
-            source: "digitalocean",
-            status: "success",
-            observedAt: deployment.observedAt,
-            digest: deployment.imageDigest,
-            environment: deployment.environment,
-            details: "Exact signed digest is active and healthy on DigitalOcean",
-            payload: {
-              profileId: deployment.profileId,
-              appId: deployment.appId,
-              deploymentId: deployment.deploymentId,
-              origin: deployment.origin,
-              updated: deployment.updated
-            }
-          });
-        }
-      } catch (error) {
-        const environment =
-          error instanceof DigitalOceanDeploymentError
-            ? error.environment
-            : "unknown";
+    try {
+      const deployment = await deploymentService.promote({
+        repository: repositoryFullName,
+        repositoryId: artifact.repositoryId,
+        runId: artifact.runId,
+        runAttempt: artifact.runAttempt,
+        headSha: run.headSha,
+        imageReference: promotion.imageReference
+      });
+      if (deployment) {
         await recordEvidence(store, base, {
-          evidenceKey: `deployment:${environment}`,
+          evidenceKey: `deployment:${deployment.environment}`,
           kind: "deployment",
           source: "digitalocean",
-          status: "failure",
-          observedAt: new Date().toISOString(),
-          digest: promotion.imageDigest,
-          environment,
-          details:
-            error instanceof DigitalOceanDeploymentError
-              ? error.message
-              : "DigitalOcean deployment reconciliation failed"
+          status: "success",
+          observedAt: deployment.observedAt,
+          digest: deployment.imageDigest,
+          environment: deployment.environment,
+          details: "Exact signed digest is active and healthy on DigitalOcean",
+          payload: {
+            profileId: deployment.profileId,
+            appId: deployment.appId,
+            deploymentId: deployment.deploymentId,
+            origin: deployment.origin,
+            updated: deployment.updated
+          }
         });
-        throw new RetryableScannerEvidenceError(
+      }
+    } catch (error) {
+      const environment =
+        error instanceof DigitalOceanDeploymentError
+          ? error.environment
+          : "unknown";
+      await recordEvidence(store, base, {
+        evidenceKey: `deployment:${environment}`,
+        kind: "deployment",
+        source: "digitalocean",
+        status: "failure",
+        observedAt: new Date().toISOString(),
+        digest: promotion.imageDigest,
+        environment,
+        details:
           error instanceof DigitalOceanDeploymentError
             ? error.message
             : "DigitalOcean deployment reconciliation failed"
-        );
-      }
+      });
+      throw new RetryableScannerEvidenceError(
+        error instanceof DigitalOceanDeploymentError
+          ? error.message
+          : "DigitalOcean deployment reconciliation failed"
+      );
     }
   }
   if (artifact.artifactType === "image-validation") {

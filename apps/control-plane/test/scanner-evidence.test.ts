@@ -355,7 +355,10 @@ function trustedWorkflowRun(
     conclusion: "success",
     head_sha: HEAD_SHA,
     head_branch: "main",
-    path: ".github/workflows/guardianbot.yml@refs/heads/main",
+    // GitHub's workflow-run API returns the workflow path without the
+    // GITHUB_WORKFLOW_REF suffix. Promotion validation derives the only
+    // permitted identity from the verified default-branch push metadata.
+    path: ".github/workflows/guardianbot.yml",
     repository: {
       id: 99,
       full_name: "Geekyshubham/guardianbot-consumer"

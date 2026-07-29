@@ -5,6 +5,18 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-07-29
+
+### Fixed
+
+- Image-promotion evidence now derives the Cosign caller identity from the
+  independently verified default-branch push metadata. GitHub's workflow-run
+  API returns `.github/workflows/guardianbot.yml` without an `@ref` suffix, so
+  valid signed promotion artifacts are no longer rejected as incomplete.
+- Promotion evidence from any non-push event, non-default branch, or conflicting
+  embedded workflow ref fails closed before signature evidence or a
+  DigitalOcean deployment can be recorded.
+
 ### Changed
 
 - `guardianctl upgrade` now applies the same validated image and DAST override
