@@ -23,6 +23,10 @@ normalized failures suitable for control-plane handling.
   endpoint, and only a discovered existing Test ID may use `reimport-scan`.
 - Scan submission chooses `import-scan` or `reimport-scan` explicitly based on the
   discovered test identity instead of relying on ambiguous latest-test selection.
+- The reusable DAST workflow emits one provenance-bound artifact containing
+  both `zap.json` and `zap.xml`. The control plane normalizes findings from JSON
+  and submits XML to DefectDojo's `ZAP Scan` parser. Legacy JSON-only artifacts
+  remain valid evidence but do not claim a successful DefectDojo ZAP import.
 - `buildDefectDojoTags(...)` and `buildImmutableScanIdentity(...)` create stable
   repository/run metadata for tagging and audit trails.
 - Dry-run mode returns planned API mutations without contacting DefectDojo, which
@@ -116,14 +120,17 @@ The command never prints the API token.
 
 ## Verification status
 
-The client package and deployment definition are implemented and locally
-validated. They are not evidence of a live production deployment. Full
-DefectDojo coverage remains unverified until the DigitalOcean deployment passes
-its live doctor, backup/restore drill, and an authenticated GuardianBot
-import/reimport fixture. The control plane now ingests trusted workflow evidence
-and schedules reconciliation, including distinct ZAP smoke and nightly import
-identities, but that automated contract is not a substitute for the missing live
-DefectDojo evidence.
+The dedicated DigitalOcean deployment has passed its public HTTPS doctor,
+managed PostgreSQL TLS check, consistent backup, and isolated live
+import/reimport conformance run. RouteLens workflow evidence has also created
+and reimported stable Semgrep and Trivy Test IDs. That workflow run exposed a
+format mismatch in the DAST path: DefectDojo 3.1.200 requires XML for `ZAP Scan`,
+while GuardianBot originally submitted ZAP JSON. v0.2.28 fixes the artifact and
+ingestion contracts with regression coverage. Live XML reimport, a destructive
+restore drill, least-privilege automation permissions, and HA remain unverified.
+
+See [v0.2.27 live evidence](evidence/v0.2.27-defectdojo.md) for the exact
+DigitalOcean resources and bounded verification claims.
 
 Deployment and operations details:
 

@@ -171,7 +171,7 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   );
   assert.match(
     dast,
-    /if \[ -f "\$zap_report" \] && \[ ! -L "\$zap_report" \]; then/
+    /if \[ -f "\$zap_report" \] && \[ ! -L "\$zap_report" \] &&\s+\[ -f "\$zap_xml_report" \] && \[ ! -L "\$zap_xml_report" \]; then/
   );
   assert.match(
     dast,
@@ -180,6 +180,10 @@ test("scanner and DAST workflows reject repository-controlled evidence paths", (
   assert.match(
     dast,
     /install -m 600 "\$zap_report" guardianbot-dast-evidence\/zap\.json/
+  );
+  assert.match(
+    dast,
+    /install -m 600 "\$zap_xml_report" guardianbot-dast-evidence\/zap\.xml/
   );
   assert.doesNotMatch(
     dast,
@@ -394,7 +398,7 @@ test("DAST profiles are bounded and preserve operational failure evidence", () =
     workflow,
     /if \[ "\$scan_profile" = "authenticated-baseline" \]; then[\s\S]*zap_mode_args=\(-S\)/
   );
-  assert.match(workflow, /-J zap\.json -T "\$scan_minutes"/);
+  assert.match(workflow, /-J zap\.json -x zap\.xml -T "\$scan_minutes"/);
   assert.doesNotMatch(workflow, /-J zap\.json -m "\$scan_minutes"/);
   assert.match(
     workflow,
@@ -416,6 +420,6 @@ test("DAST profiles are bounded and preserve operational failure evidence", () =
   assert.match(workflow, /zap_exit=3/);
   assert.match(
     workflow,
-    /EVIDENCE_FILES: scan-status\.json,zap\.json/
+    /EVIDENCE_FILES: scan-status\.json,zap\.json,zap\.xml/
   );
 });

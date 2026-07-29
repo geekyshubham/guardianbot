@@ -5,6 +5,21 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.28] - 2026-07-29
+
+### Fixed
+
+- The reusable DAST workflow now generates and provenance-attests both ZAP JSON
+  and ZAP XML reports. GuardianBot continues to normalize the bounded JSON
+  report, while DefectDojo receives the XML format required by its `ZAP Scan`
+  parser.
+- DAST ingestion accepts the exact legacy two-report manifest as well as the
+  new three-report manifest, so upgrading the control plane does not invalidate
+  evidence from repositories still pinned to an older reusable workflow.
+- A successful legacy DAST artifact explicitly records that its DefectDojo ZAP
+  import needs a v0.2.28-or-newer workflow instead of retrying an incompatible
+  JSON payload indefinitely.
+
 ## [0.2.27] - 2026-07-29
 
 ### Fixed

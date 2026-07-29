@@ -27,10 +27,21 @@
   "controlPlane": {
     "healthz": "passed",
     "readyz": "passed",
-    "runtimeSecretConfigured": true
+    "runtimeSecretConfigured": true,
+    "routeLensWorkflowRuns": [
+      30479251070,
+      30479594355
+    ],
+    "stableReimportTestIds": {
+      "semgrep": 2,
+      "trivyFilesystem": 3,
+      "trivyImage": 4
+    },
+    "zapTestId": 5,
+    "zapReimport": "format-mismatch-fixed-in-v0.2.28"
   },
   "remaining": [
-    "live repository workflow imports",
+    "live ZAP XML workflow reimport",
     "least-privilege automation permissions",
     "restore drill",
     "high availability"

@@ -65,7 +65,8 @@ const IMAGE_FILES = new Set([
   ...IMAGE_PROMOTION_REPORT_FILES,
   ...PROVENANCE_FILES
 ]);
-const DAST_REPORT_FILES = ["scan-status.json", "zap.json"] as const;
+const LEGACY_DAST_REPORT_FILES = ["scan-status.json", "zap.json"] as const;
+const DAST_REPORT_FILES = ["scan-status.json", "zap.json", "zap.xml"] as const;
 const DAST_FILES = new Set([...DAST_REPORT_FILES, ...PROVENANCE_FILES]);
 
 interface ScannerEvidenceHandlerOptions {
@@ -936,6 +937,15 @@ function reportFilesForArtifact(
   return IMAGE_VALIDATION_REPORT_FILES;
 }
 
+function reportFileSetsForArtifact(
+  artifactType: EvidenceArtifactType
+): readonly (readonly string[])[] {
+  if (artifactType === "dast") {
+    return [DAST_REPORT_FILES, LEGACY_DAST_REPORT_FILES];
+  }
+  return [reportFilesForArtifact(artifactType)];
+}
+
 function validateArtifactProvenance(
   archive: ParsedArtifactArchive,
   artifactType: EvidenceArtifactType,
@@ -970,11 +980,16 @@ function validateArtifactProvenance(
   ) {
     throw new Error("artifact provenance manifest identity does not match the workflow run");
   }
-  const expectedFiles = [...reportFilesForArtifact(artifactType)].sort();
-  if (
-    manifest.files.length !== expectedFiles.length ||
-    manifest.files.some((file, index) => file.path !== expectedFiles[index])
-  ) {
+  const hasExactReportSet = reportFileSetsForArtifact(artifactType).some(
+    (reportFiles) => {
+      const expectedFiles = [...reportFiles].sort();
+      return (
+        manifest.files.length === expectedFiles.length &&
+        manifest.files.every((file, index) => file.path === expectedFiles[index])
+      );
+    }
+  );
+  if (!hasExactReportSet) {
     throw new Error("artifact provenance manifest does not contain the exact report set");
   }
   for (const file of manifest.files) {
@@ -1726,6 +1741,7 @@ async function processDastArtifact(
     artifactId: artifact.artifactId
   };
   const zapBytes = archive.selectedFiles.get("zap.json");
+  const zapXmlBytes = archive.selectedFiles.get("zap.xml");
   const statusBytes = archive.selectedFiles.get("scan-status.json");
   if (!zapBytes || !statusBytes) {
     throw new Error("DAST evidence artifact is missing a required trusted report");
@@ -1775,6 +1791,22 @@ async function processDastArtifact(
     });
   }
   if (exit.zapExitCode < 3) {
+    if (defectDojoSettings && !zapXmlBytes) {
+      await recordEvidence(store, base, {
+        evidenceKey:
+          `defectdojo-import:ZAP Scan:${isNightly ? "nightly" : "smoke"}`,
+        kind: "defectdojo-import",
+        source: "defectdojo",
+        status: "failure",
+        observedAt: new Date().toISOString(),
+        digest: exit.deployedDigest,
+        environment: exit.deploymentEnvironment,
+        details:
+          "DefectDojo ZAP import requires the XML report emitted by GuardianBot v0.2.28 or newer"
+      });
+      return;
+    }
+    if (!zapXmlBytes) return;
     await maybeImportToDefectDojo(store, env, defectDojoSettings, {
       repositoryId: artifact.repositoryId,
       repositoryFullName,
@@ -1790,9 +1822,9 @@ async function processDastArtifact(
       scanType: "ZAP Scan",
       evidenceKey:
         `defectdojo-import:ZAP Scan:${isNightly ? "nightly" : "smoke"}`,
-      fileName: "zap.json",
-      report: zapBytes,
-      contentType: "application/json",
+      fileName: "zap.xml",
+      report: zapXmlBytes,
+      contentType: "application/xml",
       digest: exit.deployedDigest,
       environment: exit.deploymentEnvironment
     });

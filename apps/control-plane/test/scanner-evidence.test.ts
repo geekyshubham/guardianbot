@@ -73,6 +73,10 @@ interface FetchStubOptions {
   artifactPages?: Array<Array<Record<string, unknown>>>;
   zipByArtifactId?: Record<number, Buffer>;
   dojoFailure?: boolean;
+  dojoEngagement?: {
+    branch: string;
+    profile: string;
+  };
 }
 
 function createRepository(): RepositoryRecord {
@@ -512,15 +516,19 @@ function createFetchStub(options: FetchStubOptions) {
       if (method === "GET") {
         return new Response(JSON.stringify({ results: [] }), { status: 200 });
       }
+      const expectedEngagement = options.dojoEngagement ?? {
+        branch: "feature",
+        profile: "security"
+      };
       const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
       assert.equal(payload.target_start, "2026-07-27");
       assert.equal(payload.target_end, "2027-07-27");
       assert.equal(payload.status, "In Progress");
-      assert.equal(payload.branch_tag, "feature");
+      assert.equal(payload.branch_tag, expectedEngagement.branch);
       return new Response(
         JSON.stringify({
           id: 3,
-          name: "feature/security",
+          name: `${expectedEngagement.branch}/${expectedEngagement.profile}`,
           product: 2,
           target_start: "2026-07-27",
           target_end: "2027-07-27"
@@ -1071,6 +1079,130 @@ test("accepts scheduled DAST evidence when scanner and image caller jobs were sk
   assert.equal(
     scannerEvidence(store).some((record) => record.source === "zap"),
     true
+  );
+});
+
+test("imports the attested ZAP XML report into DefectDojo while normalizing JSON evidence", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const zapXml = Buffer.from(
+    '<?xml version="1.0"?><OWASPZAPReport version="2.16.1" generated="test"></OWASPZAPReport>',
+    "utf8"
+  );
+  const dastZip = buildProvenanceZip("dast", {
+    "scan-status.json": {
+      schemaVersion: "1.0.0",
+      profile: "authenticated-baseline",
+      deploymentEnvironment: "staging",
+      deployedDigest: `sha256:${"f".repeat(64)}`,
+      minutes: 15,
+      zapExitCode: 0
+    },
+    "zap.json": { site: [] },
+    "zap.xml": zapXml
+  });
+  const { fetchStub, bodies } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA }
+    ]),
+    jobs: [
+      {
+        name: "guardianbot-dast / authenticated staging DAST",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(518, "guardianbot-dast-evidence-500-2", dastZip)
+    ]],
+    zipByArtifactId: { 518: dastZip },
+    dojoEngagement: { branch: "main", profile: "dast" }
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchStub;
+  try {
+    await createHandler(store, fetchStub, {
+      ...TEST_ENV,
+      GUARDIANBOT_DEFECTDOJO_BASE_URL_REF:
+        "GUARDIANBOT_DEFECTDOJO_BASE_URL",
+      GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF:
+        "GUARDIANBOT_DEFECTDOJO_API_TOKEN",
+      GUARDIANBOT_DEFECTDOJO_BASE_URL: "https://dojo.example",
+      GUARDIANBOT_DEFECTDOJO_API_TOKEN: "token"
+    })(handlerInput());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  const importRequest = bodies.find((entry) =>
+    entry.url.endsWith("/api/v2/import-scan/")
+  );
+  const form = importRequest?.body as FormData | undefined;
+  assert.equal(form?.get("scan_type"), "ZAP Scan");
+  const report = form?.get("file");
+  assert.ok(report instanceof File);
+  assert.equal(report.name, "zap.xml");
+  assert.equal(report.type, "application/xml");
+  assert.equal(await report.text(), zapXml.toString("utf8"));
+  assert.equal(
+    scannerEvidence(store).find(
+      (entry) => entry.evidenceKey === "defectdojo-import:ZAP Scan:smoke"
+    )?.status,
+    "success"
+  );
+});
+
+test("accepts legacy JSON-only DAST evidence and reports that DefectDojo needs an upgraded workflow", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const legacyZip = buildProvenanceZip("dast", {
+    "scan-status.json": {
+      schemaVersion: "1.0.0",
+      profile: "authenticated-baseline",
+      deploymentEnvironment: "staging",
+      deployedDigest: `sha256:${"f".repeat(64)}`,
+      minutes: 15,
+      zapExitCode: 0
+    },
+    "zap.json": { site: [] }
+  });
+  const { fetchStub, calls } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA }
+    ]),
+    jobs: [
+      {
+        name: "guardianbot-dast / authenticated staging DAST",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(519, "guardianbot-dast-evidence-500-2", legacyZip)
+    ]],
+    zipByArtifactId: { 519: legacyZip }
+  });
+  await createHandler(store, fetchStub, {
+    ...TEST_ENV,
+    GUARDIANBOT_DEFECTDOJO_BASE_URL_REF:
+      "GUARDIANBOT_DEFECTDOJO_BASE_URL",
+    GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF:
+      "GUARDIANBOT_DEFECTDOJO_API_TOKEN",
+    GUARDIANBOT_DEFECTDOJO_BASE_URL: "https://dojo.example",
+    GUARDIANBOT_DEFECTDOJO_API_TOKEN: "token"
+  })(handlerInput());
+
+  const evidence = scannerEvidence(store).find(
+    (entry) => entry.evidenceKey === "defectdojo-import:ZAP Scan:smoke"
+  );
+  assert.equal(evidence?.status, "failure");
+  assert.match(evidence?.details ?? "", /v0\.2\.28 or newer/);
+  assert.equal(
+    calls.some((call) => call.includes("dojo.example/api/v2/")),
+    false
+  );
+  assert.equal(
+    (await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus,
+    "accepted"
   );
 });
 

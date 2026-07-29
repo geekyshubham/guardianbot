@@ -599,7 +599,7 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 zap-api-scan.py \
             -t /zap/input/openapi-safe.json -f openapi \
             -O "$target_origin" \
-            -J zap.json -T "$scan_minutes" \
+            -J zap.json -x zap.xml -T "$scan_minutes" \
             "${zap_mode_args[@]}" \
             -z "$(cat "$options_file")"
           raw_zap_exit="$?"
@@ -621,18 +621,30 @@ jobs:
           esac
           sudo chown -R --no-dereference "$(id -u):$(id -g)" "$zap_work_dir" "$zap_input_dir"
           zap_report="${zap_work_dir}/zap.json"
+          zap_xml_report="${zap_work_dir}/zap.xml"
           report_is_valid=false
-          if [ -f "$zap_report" ] && [ ! -L "$zap_report" ]; then
+          if [ -f "$zap_report" ] && [ ! -L "$zap_report" ] &&
+             [ -f "$zap_xml_report" ] && [ ! -L "$zap_xml_report" ]; then
             zap_size="$(stat --format='%s' "$zap_report")"
+            zap_xml_size="$(stat --format='%s' "$zap_xml_report")"
             if [ "$zap_size" -gt 0 ] && [ "$zap_size" -le 52428800 ] &&
-               jq empty "$zap_report" >/dev/null 2>&1; then
+               [ "$zap_xml_size" -gt 0 ] && [ "$zap_xml_size" -le 52428800 ] &&
+               jq empty "$zap_report" >/dev/null 2>&1 &&
+               python3 - "$zap_xml_report" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          ET.parse(sys.argv[1])
+          PY
+            then
               report_is_valid=true
             fi
           fi
           if [ "$report_is_valid" = true ]; then
             install -m 600 "$zap_report" guardianbot-dast-evidence/zap.json
+            install -m 600 "$zap_xml_report" guardianbot-dast-evidence/zap.xml
           else
-            if [ -e "$zap_report" ]; then
+            if [ -e "$zap_report" ] || [ -e "$zap_xml_report" ]; then
               failure_kind="invalid_report"
             elif [ -z "$failure_kind" ]; then
               failure_kind="missing_report"
@@ -645,6 +657,9 @@ jobs:
                 failureKind: $failureKind
               }
             }' > guardianbot-dast-evidence/zap.json
+            printf '%s\n' \
+              '<OWASPZAPReport version="guardianbot-operational-failure" generated="unknown"></OWASPZAPReport>' \
+              > guardianbot-dast-evidence/zap.xml
           fi
           jq -n \
             --arg profile "$scan_profile" \
@@ -691,6 +706,7 @@ jobs:
             "${RUNNER_TEMP}/guardianbot-zap-options" \
             "${RUNNER_TEMP}/guardianbot-zap.cid" \
             "${RUNNER_TEMP}/guardianbot-zap-work/zap.json" \
+            "${RUNNER_TEMP}/guardianbot-zap-work/zap.xml" \
             "${RUNNER_TEMP}/guardianbot-zap-input/openapi-safe.json" \
             "${RUNNER_TEMP}/guardianbot-openapi-input" \
             "${RUNNER_TEMP}/guardianbot-openapi-safe.json" \
@@ -711,7 +727,7 @@ jobs:
         env:
           EVIDENCE_ARTIFACT_TYPE: dast
           EVIDENCE_DIRECTORY: guardianbot-dast-evidence
-          EVIDENCE_FILES: scan-status.json,zap.json
+          EVIDENCE_FILES: scan-status.json,zap.json,zap.xml
           GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
           JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
           JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
