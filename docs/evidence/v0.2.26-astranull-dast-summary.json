@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "1.0.0",
+  "verifiedAt": "2026-07-29",
+  "repository": "Geekyshubham/AstraNull",
+  "repositoryId": 1287322655,
+  "guardianbotRelease": "0.2.26",
+  "guardianbotWorkflowSha": "70df177cd0cbdadf97f819bcdfc13a1e16216ce5",
+  "imagePromotionRunId": 30474859843,
+  "workflowRunId": 30475277077,
+  "jobId": 90655342911,
+  "artifactId": 8733364316,
+  "profile": "authenticated-baseline",
+  "deploymentEnvironment": "staging",
+  "deployedDigest": "sha256:9b34a59d56427f0ad74fb2d47ad5c7924440ba7f6a4778189784a0ed0194e6ae",
+  "zapExitCode": 2,
+  "operationalFailures": 0,
+  "durationSeconds": 65,
+  "alerts": {
+    "critical": 0,
+    "high": 0,
+    "medium": 0,
+    "low": 5,
+    "informational": 4
+  },
+  "evidence": {
+    "scanStatusSha256": "bcec254f11165aa9b74c50838de0d81ff4ff3eb2a688619577baf9ba7459700b",
+    "zapReportSha256": "b7066d16d1d17b608450c1edf699d629a1ac778375b2b00d237761946d8371ac",
+    "provenanceManifestSha256": "6d66076e1f82297e653e66f3b1fc9d8d15fd8cf056b78bc0dc845f8236f6090e"
+  },
+  "limitations": [
+    "The authenticated-full nightly active-scan profile remains unverified.",
+    "DefectDojo import and reimport remain unverified.",
+    "Low and informational alerts remain advisory and require normal triage."
+  ]
+}

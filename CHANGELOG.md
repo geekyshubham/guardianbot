@@ -7,6 +7,10 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Added live v0.2.26 AstraNull evidence for the generic upgrade PR, canonical
+  declarative runtime contract, exact signed-digest DigitalOcean deployment,
+  control-plane-issued one-time viewer session, bounded three-operation
+  authenticated-baseline ZAP run, and attested scanner output.
 - Added live v0.2.25 RouteLens evidence for the generic upgrade PR, exact
   signed-digest DigitalOcean deployment, control-plane-issued one-time DAST
   session, bounded authenticated-baseline ZAP run, and attested scanner output.
