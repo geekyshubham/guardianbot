@@ -1,7 +1,7 @@
 # Capability status
 
-Release: `0.2.28`
-Last verified: 2026-07-29
+Release: `0.2.29`
+Last verified: 2026-07-30
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
