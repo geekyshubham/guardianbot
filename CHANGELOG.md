@@ -5,6 +5,16 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-07-29
+
+### Fixed
+
+- The reusable DAST workflow now attaches stdin to the pinned sanitizer
+  container so its heredoc Python program actually runs and produces the
+  bounded same-origin OpenAPI document.
+- Workflow-security coverage now requires the sanitizer's interactive stdin
+  attachment, preventing a silent empty-output regression before ZAP starts.
+
 ## [0.2.21] - 2026-07-29
 
 ### Fixed

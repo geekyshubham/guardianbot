@@ -168,6 +168,10 @@ test("DAST OpenAPI sanitization keeps only safe, exact-origin operations", async
   const { join } = await import("node:path");
 
   const workflow = repositoryFile(".github/workflows/reusable-dast.yml");
+  assert.match(
+    workflow,
+    /docker run --rm --interactive --user "\$\(id -u\):\$\(id -g\)" --entrypoint python3/
+  );
   const stepStart = workflow.indexOf(
     "- name: Prepare bounded same-origin OpenAPI"
   );

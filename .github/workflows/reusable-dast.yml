@@ -307,7 +307,7 @@ jobs:
           test -s "$input_file"
           test "$(wc -c < "$input_file")" -le 2097152
           chmod 600 "$input_file"
-          docker run --rm --user "$(id -u):$(id -g)" --entrypoint python3 \
+          docker run --rm --interactive --user "$(id -u):$(id -g)" --entrypoint python3 \
             -v "${RUNNER_TEMP}:/guardian-input:rw" \
             ghcr.io/zaproxy/zaproxy:stable@sha256:8d387b1a63e3425beef4846e39719f5af2a787753af2d8b6558c6257d7a577a2 \
             - /guardian-input/guardianbot-openapi-input \
