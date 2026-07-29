@@ -21,6 +21,7 @@ class FakeGitHub {
   permission = "write";
   failIssueCreations = 0;
   failConfigFileReads = 0;
+  issueCreationDelayMs = 0;
 
   constructor(
     private readonly options: {
@@ -64,6 +65,9 @@ class FakeGitHub {
   }
 
   async createIssue(owner: string, repo: string, title: string, body: string) {
+    if (this.issueCreationDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.issueCreationDelayMs));
+    }
     if (this.failIssueCreations > 0) {
       this.failIssueCreations -= 1;
       throw new Error("GitHub POST issue returned 503: transient");
@@ -440,6 +444,41 @@ test("onboarding issue creation retries after a transient failure and remains id
   await service.enqueue("installation", event, "onboarding-repeat");
   await service.processNextWebhook("worker-1");
   assert.equal(github.issues.length, 1);
+});
+
+test("concurrent service instances serialize onboarding issue creation by repository", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  github.issueCreationDelayMs = 25;
+  const options = {
+    appId: "1",
+    privateKey: "private",
+    webhookSecret: "secret",
+    githubClientFactory: async () => github
+  };
+  const firstService = new GuardianService(options, store);
+  const secondService = new GuardianService(options, store);
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [{
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    }]
+  };
+
+  await firstService.enqueue("installation", event, "concurrent-onboarding-a");
+  await secondService.enqueue("installation", event, "concurrent-onboarding-b");
+  await Promise.all([
+    firstService.processNextWebhook("worker-1"),
+    secondService.processNextWebhook("worker-2")
+  ]);
+
+  assert.equal(github.issues.length, 1);
+  assert.equal((await store.getWebhook("concurrent-onboarding-a"))?.status, "succeeded");
+  assert.equal((await store.getWebhook("concurrent-onboarding-b"))?.status, "succeeded");
 });
 
 test("an index refresh retry cannot duplicate or suppress the onboarding issue", async () => {

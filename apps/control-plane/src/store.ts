@@ -13,6 +13,7 @@ export type RepositoryIndexStorageMode = "memory" | "pgvector" | "json-array-fal
 // Fixed two-int32 namespace/key pair for the database-wide monitoring scheduler lock.
 const MONITORING_LOCK_NAMESPACE = 1_196_572_738;
 const MONITORING_LOCK_KEY = 1_297_046_866;
+const ONBOARDING_ISSUE_LOCK_NAMESPACE = 1_196_572_739;
 
 export interface RepositoryRecord {
   installationId: number;
@@ -304,6 +305,7 @@ export interface Store {
   ): Promise<boolean>;
   listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]>;
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
+  acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
 }
 
@@ -376,6 +378,8 @@ export class MemoryStore implements Store {
   private monitoringWeeklyReports = new Map<string, MonitoringWeeklyReportRecord>();
   private dastSessionIssuances = new Map<string, DastSessionIssuanceRecord>();
   private deploymentPromotions = new Map<string, DeploymentPromotionClaim>();
+  private onboardingIssueLocks = new Set<number>();
+  private onboardingIssueLockWaiters = new Map<number, Array<() => void>>();
   private monitoringLockHeld = false;
 
   async ping(): Promise<void> {}
@@ -883,6 +887,35 @@ export class MemoryStore implements Store {
         resolvedAt: timestamp
       });
     }
+  }
+
+  async acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock> {
+    if (this.onboardingIssueLocks.has(repositoryId)) {
+      await new Promise<void>((resolve) => {
+        const waiters = this.onboardingIssueLockWaiters.get(repositoryId) ?? [];
+        waiters.push(resolve);
+        this.onboardingIssueLockWaiters.set(repositoryId, waiters);
+      });
+    } else {
+      this.onboardingIssueLocks.add(repositoryId);
+    }
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        const waiters = this.onboardingIssueLockWaiters.get(repositoryId);
+        const next = waiters?.shift();
+        if (waiters?.length === 0) {
+          this.onboardingIssueLockWaiters.delete(repositoryId);
+        }
+        if (next) {
+          next();
+        } else {
+          this.onboardingIssueLocks.delete(repositoryId);
+        }
+      }
+    };
   }
 
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {
@@ -2114,6 +2147,44 @@ export class PostgresStore implements Store {
          )`,
       [observedAt]
     );
+  }
+
+  async acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock> {
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+      throw new Error("repositoryId must be a positive safe integer");
+    }
+    const lockKey = repositoryId % 2_147_483_647;
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        "SELECT pg_advisory_lock($1, $2)",
+        [ONBOARDING_ISSUE_LOCK_NAMESPACE, lockKey]
+      );
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          const result = await client.query<{ released: boolean }>(
+            "SELECT pg_advisory_unlock($1, $2) AS released",
+            [ONBOARDING_ISSUE_LOCK_NAMESPACE, lockKey]
+          );
+          if (!result.rows[0]?.released) {
+            throw new Error("PostgreSQL onboarding issue advisory lock was not held");
+          }
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+    };
   }
 
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {

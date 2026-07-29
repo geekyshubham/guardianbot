@@ -492,7 +492,13 @@ export class GuardianService {
       await pending;
       return;
     }
-    const operation = this.ensureOnboardingIssueOnce(github, owner, repo, body);
+    const operation = this.ensureOnboardingIssueWithLock(
+      github,
+      repositoryId,
+      owner,
+      repo,
+      body
+    );
     this.onboardingIssuePromises.set(repositoryId, operation);
     try {
       await operation;
@@ -500,6 +506,21 @@ export class GuardianService {
       if (this.onboardingIssuePromises.get(repositoryId) === operation) {
         this.onboardingIssuePromises.delete(repositoryId);
       }
+    }
+  }
+
+  private async ensureOnboardingIssueWithLock(
+    github: GitHubClientLike,
+    repositoryId: number,
+    owner: string,
+    repo: string,
+    body: string
+  ): Promise<void> {
+    const lock = await this.store.acquireOnboardingIssueLock(repositoryId);
+    try {
+      await this.ensureOnboardingIssueOnce(github, owner, repo, body);
+    } finally {
+      await lock.release();
     }
   }
 
