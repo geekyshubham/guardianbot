@@ -543,7 +543,7 @@ async function exchangeCredential(
   deployment: SuccessfulDeploymentEvidence,
   environment: Record<string, string | undefined>,
   fetchImpl: typeof fetch,
-  now: Date
+  now: () => Date
 ): Promise<{ value: string; expiresAt: string }> {
   const exchangeCredential = boundedCredential(
     environment[profile.exchangeCredentialEnv],
@@ -594,10 +594,12 @@ async function exchangeCredential(
     if (result.schemaVersion !== "1.0.0") throw new Error("schemaVersion is invalid");
     const credential = boundedCredential(result.credential, "exchange credential");
     const expiry = Date.parse(String(result.expiresAt ?? ""));
-    const maximumExpiry = now.getTime() + profile.ttlSeconds * 1_000;
+    const responseReceivedAt = now();
+    const maximumExpiry =
+      responseReceivedAt.getTime() + profile.ttlSeconds * 1_000;
     if (
       !Number.isFinite(expiry) ||
-      expiry <= now.getTime() + 30_000 ||
+      expiry <= responseReceivedAt.getTime() + 30_000 ||
       expiry > maximumExpiry
     ) {
       throw new Error("exchange expiry is outside the approved TTL");
@@ -730,7 +732,7 @@ export function createDastSessionService(
             deployment,
             environment,
             fetchImpl,
-            issuedAt
+            now
           );
           assurance = "target-exchanged";
         } else {

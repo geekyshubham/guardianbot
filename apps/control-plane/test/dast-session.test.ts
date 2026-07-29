@@ -186,6 +186,34 @@ test("exchanges and returns one run-scoped session exactly once", async () => {
   assert.equal(exchangeCalls, 1);
 });
 
+test("accepts a full-TTL credential minted after exchange network latency", async () => {
+  const store = await seededStore();
+  const responseReceivedAt = new Date(NOW.getTime() + 5_000);
+  const expiresAt = new Date(responseReceivedAt.getTime() + 300_000);
+  let clockReads = 0;
+  const service = createDastSessionService({
+    store,
+    environment: exchangeEnvironment(),
+    now: () => {
+      clockReads += 1;
+      return clockReads === 1 ? NOW : responseReceivedAt;
+    },
+    oidcVerifier: { verify: async () => oidc() },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () =>
+      Response.json({
+        schemaVersion: "1.0.0",
+        credential: "session=full-ttl",
+        expiresAt: expiresAt.toISOString()
+      })) as typeof fetch
+  });
+
+  const result = await service.issue("Bearer github-oidc", request());
+  assert.equal(result.headerValue, "session=full-ttl");
+  assert.equal(result.expiresAt, expiresAt.toISOString());
+  assert.equal(clockReads, 2);
+});
+
 test("rejects repository input or workflow identity that differs from the profile", async () => {
   const service = createDastSessionService({
     store: await seededStore(),

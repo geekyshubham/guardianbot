@@ -5,6 +5,18 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-07-29
+
+### Fixed
+
+- Target-exchanged DAST credentials now validate their lifetime from the time
+  the exchange response is received. A target that mints the approved full TTL
+  no longer fails solely because network latency made its expiry slightly later
+  than the control plane's pre-request timestamp.
+- Added regression coverage for a full-TTL credential minted after exchange
+  network latency while retaining the minimum remaining-lifetime and maximum
+  configured-TTL checks.
+
 ## [0.2.20] - 2026-07-29
 
 ### Added
