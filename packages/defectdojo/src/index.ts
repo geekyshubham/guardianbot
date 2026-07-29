@@ -346,6 +346,15 @@ function stableArrayEqual(left: string[] | undefined, right: string[] | undefine
     leftSorted.every((value, index) => value === rightSorted[index]);
 }
 
+function normalizeDefectDojoTag(value: string): string | undefined {
+  const normalized = value
+    .trim()
+    .replace(/[\s,'"]+/gu, "-")
+    .replace(/-+/gu, "-")
+    .replace(/^-|-$/gu, "");
+  return normalized || undefined;
+}
+
 function maybeSet(
   payload: Record<string, unknown>,
   key: string,
@@ -456,8 +465,11 @@ export function buildDefectDojoTags(identity: DefectDojoScanIdentity): string[] 
     identity.environment ? `guardianbot:env:${identity.environment}` : undefined,
     identity.imageDigest ? `guardianbot:image:${identity.imageDigest}` : undefined,
     ...(identity.customTags ?? [])
-  ].filter((value): value is string => Boolean(value));
-  return sortStrings(tags) ?? [];
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map(normalizeDefectDojoTag)
+    .filter((value): value is string => Boolean(value));
+  return sortStrings([...new Set(tags)]) ?? [];
 }
 
 export function buildImmutableScanIdentity(identity: DefectDojoScanIdentity): string {

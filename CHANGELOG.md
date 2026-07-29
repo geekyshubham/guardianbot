@@ -19,6 +19,9 @@ reusable workflow commits remain immutable.
   started.
 - Caddy active upstream checks now set the configured public host and HTTPS
   proxy scheme, so a healthy Nginx/uWSGI path is not withdrawn as unavailable.
+- DefectDojo evidence tags now canonicalize spaces, commas, and quotes before
+  API submission, including scanner names and custom tags, while preserving a
+  stable sorted and de-duplicated identity.
 
 ### Evidence
 

@@ -529,7 +529,7 @@ test("builds stable immutable scan identities and sorted tags", () => {
     scanType: "Trivy Scan",
     environment: "staging",
     imageDigest: "sha256:deadbeef",
-    customTags: ["z", "a"]
+    customTags: ["z", "a", "release candidate, \"verified\""]
   });
   assert.deepEqual(tags, [
     "a",
@@ -542,8 +542,9 @@ test("builds stable immutable scan identities and sorted tags", () => {
     "guardianbot:repo-id:1",
     "guardianbot:repo:geekyshubham/guardianbot",
     "guardianbot:run:88",
-    "guardianbot:scan:Trivy Scan",
+    "guardianbot:scan:Trivy-Scan",
     "guardianbot:visibility:private",
+    "release-candidate-verified",
     "z"
   ]);
   assert.equal(
