@@ -119,6 +119,10 @@ test("image workflow masks generated runtime values and never dumps container lo
     /for reserved_path in guardianbot-image-evidence guardianbot-image-transfer/
   );
   assert.match(workflow, /install -d -m 700 guardianbot-image-evidence guardianbot-image-transfer/);
+  assert.match(
+    workflow,
+    /for attempt in \$\(seq 1 60\); do\n\s+curl --fail --silent "http:\/\/127\.0\.0\.1:\$\{INPUT_CONTAINER_PORT\}\$\{INPUT_READINESS_PATH\}" && break/
+  );
 });
 
 test("scanner and DAST workflows reject repository-controlled evidence paths", () => {

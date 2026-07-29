@@ -206,6 +206,49 @@ test("keeps container ports scoped to the selected Dockerfile", () => {
   ]);
 });
 
+test("scopes image context, health routes, and dependencies to image-related evidence", () => {
+  const repository = snapshot(
+    [
+      "README.md",
+      "scripts/outreach.py",
+      "web/Caddyfile",
+      "web/Dockerfile",
+      "web/package-lock.json",
+      "web/package.json",
+      "web/src/server.js"
+    ],
+    {
+      "README.md": "Optional PostgreSQL and Redis integrations are documented here.",
+      "scripts/outreach.py": "print('ALREADY_SENT')\n",
+      "web/Dockerfile": [
+        "FROM node:22-alpine",
+        "WORKDIR /app",
+        "COPY package.json package-lock.json ./",
+        "COPY Caddyfile /etc/caddy/Caddyfile",
+        "COPY src src",
+        "EXPOSE 9119",
+        "HEALTHCHECK CMD wget -qO- http://127.0.0.1:9119/healthz"
+      ].join("\n"),
+      "web/src/server.js": "app.get('/readyz', readiness)\n"
+    }
+  );
+
+  const detection = detectRepository(repository);
+  assert.deepEqual(detection.dockerfileContexts, {
+    "web/Dockerfile": "web"
+  });
+  assert.deepEqual(detection.healthPaths, ["/healthz", "/readyz"]);
+  assert.deepEqual(detection.dependentServices, []);
+  assert.equal(detection.healthPaths.includes("/ALREADY_SENT"), false);
+
+  const config = generateGuardianConfig(repository, detection, "c".repeat(40));
+  assert.equal(config.image?.context, "web");
+  assert.equal(config.image?.healthPath, "/healthz");
+  assert.equal(config.image?.readinessPath, "/readyz");
+  assert.equal(config.image?.containerPort, 9119);
+  assert.deepEqual(config.image?.dependentServices, []);
+});
+
 test("detects Python, Swift, and Ruby manifests and useful migration commands", () => {
   const detection = detectRepository(
     snapshot(

@@ -154,6 +154,10 @@ jobs:
           done
           curl --fail "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_HEALTH_PATH}"
           if [ -n "$INPUT_READINESS_PATH" ]; then
+            for attempt in $(seq 1 60); do
+              curl --fail --silent "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_READINESS_PATH}" && break
+              sleep 2
+            done
             curl --fail "http://127.0.0.1:${INPUT_CONTAINER_PORT}${INPUT_READINESS_PATH}"
           fi
       - name: Trivy image scan

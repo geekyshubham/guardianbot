@@ -19,6 +19,7 @@ export interface DetectionResult {
   migrationCommands: string[];
   dockerfiles: string[];
   dockerfilePorts: Record<string, number[]>;
+  dockerfileContexts: Record<string, string>;
   preferredDockerfile?: string;
   openapi: string[];
   codeowners?: string;
@@ -291,6 +292,94 @@ function portsFromDockerfile(content: string): number[] {
     }
   }
   return ports;
+}
+
+function repositoryDirectory(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "." : path.slice(0, index);
+}
+
+function normalizedCopySources(content: string): string[] {
+  const sources: string[] = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!/^COPY\s+/i.test(line) || /^COPY\s+--from(?:=|\s)/i.test(line)) continue;
+    const value = line.replace(/^COPY\s+/i, "").replace(/^--[^\s]+\s+/, "").trim();
+    if (value.startsWith("[")) {
+      try {
+        const items = JSON.parse(value) as unknown;
+        if (Array.isArray(items)) {
+          for (const item of items.slice(0, -1)) {
+            if (typeof item === "string") sources.push(item);
+          }
+        }
+      } catch {
+        // Invalid Dockerfile JSON is left to the image build.
+      }
+      continue;
+    }
+    const items = value.split(/\s+/);
+    sources.push(...items.slice(0, -1));
+  }
+  return sources
+    .map((source) => source.replace(/^\.\//, "").replace(/\/+$/, ""))
+    .filter(
+      (source) =>
+        Boolean(source) &&
+        source !== "." &&
+        !source.includes("$") &&
+        !source.includes("*") &&
+        !/^[a-z]+:\/\//i.test(source) &&
+        isSafeRepositoryPath(source)
+    );
+}
+
+function repositorySourceExists(
+  files: readonly string[],
+  source: string,
+  prefix = ""
+): boolean {
+  const candidate = prefix ? `${prefix}/${source}` : source;
+  return files.some((path) => path === candidate || path.startsWith(`${candidate}/`));
+}
+
+function inferDockerContext(
+  files: readonly string[],
+  dockerfile: string,
+  content: string
+): string {
+  const directory = repositoryDirectory(dockerfile);
+  if (directory === ".") return ".";
+  let repositoryMatches = 0;
+  let directoryMatches = 0;
+  for (const source of normalizedCopySources(content)) {
+    if (repositorySourceExists(files, source)) repositoryMatches += 1;
+    if (repositorySourceExists(files, source, directory)) directoryMatches += 1;
+  }
+  return directoryMatches > repositoryMatches ? directory : ".";
+}
+
+function validHealthPath(value: string): string | undefined {
+  if (
+    !/^\/(?!\/)[A-Za-z0-9_./-]+$/.test(value) ||
+    value.includes("..") ||
+    !/(?:^|\/)(?:healthz?|readyz?|readiness|liveness)(?:\/|$)/i.test(value)
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
+function healthPathsFromContent(content: string): string[] {
+  const quoted = [...content.matchAll(/["'`](\/[A-Za-z0-9_./-]+)["'`]/g)]
+    .map((match) => validHealthPath(match[1]!))
+    .filter((path): path is string => Boolean(path));
+  const urls = [
+    ...content.matchAll(/https?:\/\/[A-Za-z0-9_.:[\]-]+(\/[A-Za-z0-9_./-]+)/gi)
+  ]
+    .map((match) => validHealthPath(match[1]!))
+    .filter((path): path is string => Boolean(path));
+  return [...new Set([...quoted, ...urls])];
 }
 
 function normalizedImageNamePart(value: string): string {
@@ -660,6 +749,12 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
       portsFromDockerfile(contentByPath.get(dockerfile) ?? "")
     ])
   );
+  const dockerfileContexts = Object.fromEntries(
+    dockerfiles.map((dockerfile) => [
+      dockerfile,
+      inferDockerContext(files, dockerfile, contentByPath.get(dockerfile) ?? "")
+    ])
+  );
   const containerPorts = primaryDockerfile
     ? [...(dockerfilePorts[primaryDockerfile] ?? [])]
     : [];
@@ -673,27 +768,51 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     files.find((path) => path.toLowerCase() === candidate.toLowerCase())
   ).find((path): path is string => Boolean(path));
 
-  const joined = contentEntries.map(([, content]) => content).join("\n");
-  const extractedHealthPaths = [...joined.matchAll(
-    /["'`](\/?[A-Za-z0-9_./-]*(?:health|ready)[A-Za-z0-9_./-]*\/?)["'`]/gi
-  )]
-    .map((match) => match[1]!.startsWith("/") ? match[1]! : `/${match[1]}`)
-    .filter((path) => /^\/(?!\/)[A-Za-z0-9_./-]+$/.test(path) && !path.includes(".."));
-  const urlHealthPaths = [...joined.matchAll(
-    /https?:\/\/[A-Za-z0-9_.:[\]-]+(\/[A-Za-z0-9_./-]*(?:health|ready)[A-Za-z0-9_./-]*\/?)/gi
-  )].map((match) => match[1]!);
-  const healthPaths = [...new Set([
-    ...extractedHealthPaths,
-    ...urlHealthPaths,
-    ...["/health", "/ready", "/api/v1/health/"].filter((path) => joined.includes(path))
-  ])].sort((left, right) => {
-    const score = (path: string) => path === "/api/v1/health/" ? 3 :
-      path === "/health" ? 2 : path === "/ready" ? 1 : 0;
-    return score(right) - score(left);
-  });
+  const primaryHealthPaths = primaryDockerfile
+    ? healthPathsFromContent(contentByPath.get(primaryDockerfile) ?? "")
+    : [];
+  const applicationHealthPaths = contentEntries
+    .filter(
+      ([path]) =>
+        !/(^|\/)(?:docs?|examples?|fixtures?|node_modules|vendor|dist|build)\//i.test(path) &&
+        !/^\.guardianbot\//i.test(path) &&
+        (SOURCE_EXTENSION.test(path) ||
+          /(?:^|\/)(?:Dockerfile|Containerfile)(?:\.[^/]*)?$/i.test(path) ||
+          /(?:^|\/)(?:docker-)?compose[^/]*\.ya?ml$/i.test(path))
+    )
+    .flatMap(([, content]) => healthPathsFromContent(content));
+  const primaryHealthSet = new Set(primaryHealthPaths);
+  const healthPaths = [...new Set([...primaryHealthPaths, ...applicationHealthPaths])].sort(
+    (left, right) => {
+      const score = (path: string) =>
+        (primaryHealthSet.has(path) ? 100 : 0) +
+        (path === "/healthz"
+          ? 5
+          : path === "/health"
+            ? 4
+            : /\/health\/ready\/?$/.test(path)
+              ? 3
+              : /ready/i.test(path)
+                ? 2
+                : 1);
+      return score(right) - score(left) || compare(left, right);
+    }
+  );
+  const imageRelatedContent = primaryDockerfile
+    ? [
+        contentByPath.get(primaryDockerfile) ?? "",
+        ...contentEntries
+          .filter(
+            ([path]) =>
+              /(?:^|\/)(?:docker-)?compose[^/]*\.ya?ml$/i.test(path) ||
+              /(?:^|\/)(?:deploy|deployment)[^/]*\.ya?ml$/i.test(path)
+          )
+          .map(([, content]) => content)
+      ].join("\n")
+    : "";
   const dependentServices: Array<"postgres" | "redis"> = [];
-  if (/postgres|DATABASE_URL/i.test(joined)) dependentServices.push("postgres");
-  if (/redis|REDIS_URL/i.test(joined)) dependentServices.push("redis");
+  if (/postgres|DATABASE_URL/i.test(imageRelatedContent)) dependentServices.push("postgres");
+  if (/redis|REDIS_URL/i.test(imageRelatedContent)) dependentServices.push("redis");
 
   const sourcePaths = sourcePathGlobs(files);
   const testPaths = testPathGlobs(files);
@@ -736,6 +855,7 @@ export function detectRepository(snapshot: RepositorySnapshot): DetectionResult 
     migrationCommands,
     dockerfiles,
     dockerfilePorts,
+    dockerfileContexts,
     preferredDockerfile,
     openapi: unique(openapi),
     codeowners,
@@ -843,7 +963,7 @@ export function generateGuardianConfig(
       ? {
           name: `${normalizedImageNamePart(snapshot.owner)}/${normalizedImageNamePart(snapshot.name)}`,
           dockerfile: primaryDockerfile,
-          context: ".",
+          context: detection.dockerfileContexts[primaryDockerfile] ?? ".",
           platform: "linux/amd64",
           buildArguments: {},
           smokeProfile: detection.dependentServices.length ? "multi-service" : "http",
