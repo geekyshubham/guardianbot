@@ -17,6 +17,8 @@ reusable workflow commits remain immutable.
 - The internal Nginx health probe now preserves the same public host and HTTPS
   proxy scheme, preventing false redirects or host rejections before Caddy is
   started.
+- Caddy active upstream checks now set the configured public host and HTTPS
+  proxy scheme, so a healthy Nginx/uWSGI path is not withdrawn as unavailable.
 
 ### Evidence
 

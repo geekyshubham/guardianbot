@@ -35,6 +35,10 @@
 			health_uri /uwsgi_health
 			health_interval 30s
 			health_timeout 10s
+			health_headers {
+				Host {$DEFECTDOJO_DOMAIN}
+				X-Forwarded-Proto https
+			}
 			transport http {
 				dial_timeout 10s
 				response_header_timeout 30m

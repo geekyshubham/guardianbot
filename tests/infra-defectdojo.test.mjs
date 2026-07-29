@@ -59,6 +59,14 @@ test("the Nginx health check preserves the public host and HTTPS proxy scheme", 
   );
 });
 
+test("the Caddy active health check preserves the public host and HTTPS proxy scheme", async () => {
+  const caddyfile = await readFile(path.join(STACK, "Caddyfile"), "utf8");
+  assert.match(
+    caddyfile,
+    /health_headers \{\s*Host \{\$DEFECTDOJO_DOMAIN\}\s*X-Forwarded-Proto https\s*\}/,
+  );
+});
+
 test("stack-definition validation rejects a changed operational file", async () => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "guardianbot-defectdojo-definition-"),

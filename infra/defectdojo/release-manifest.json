@@ -18,7 +18,7 @@
   "stackDefinition": {
     "algorithm": "sha256",
     "files": {
-      "Caddyfile": "073e3b7c73f82d44fbd374a8515bd7a2309ae51e3431e622d35d5ae4463be0d6",
+      "Caddyfile": "02cdc5691a87dd25ffc4ec970268f0525588ef7d05d3a332ad7caf45b146bfb5",
       "cloud-init.yml": "ef036e3ba29e5a36418b90b5f349ad6b2da8e24491a7bf72588adee7d64c8411",
       "compose.yml": "a53c832c26b0a00fb394076a3f5f635c4fd3246a9694fbd9af54b8ce0497e7db",
       "scripts/apply-release.sh": "6b554f1330127e2e11cf905a65d31c421c2439ebfe03c17620761ce2166d2734",
