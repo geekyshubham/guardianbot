@@ -7,10 +7,10 @@ reusable workflow commits remain immutable.
 
 ### Fixed
 
-- The hardened DefectDojo Valkey service now restores only `CHOWN`, `SETGID`,
-  and `SETUID` after dropping all capabilities. This lets the pinned official
-  entrypoint repair its persistent-volume ownership and drop privileges without
-  restoring the default container capability set.
+- The hardened DefectDojo Valkey service now starts directly as the
+  digest-pinned image's non-root `999:1000` account with all capabilities
+  dropped. Fresh-volume persistence and graceful restart no longer depend on a
+  root entrypoint or filesystem-override and signal capabilities.
 - The DefectDojo uWSGI health probe now sends the configured public host and
   trusted HTTPS proxy scheme while connecting only over the container loopback,
   avoiding a false `DisallowedHost` failure without allowlisting localhost.

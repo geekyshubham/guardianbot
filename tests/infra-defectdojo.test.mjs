@@ -35,12 +35,15 @@ test("the DefectDojo deployment is immutable and DigitalOcean-only", async () =>
   ]);
 });
 
-test("Valkey can initialize its persistent volume with only its required capabilities", async () => {
+test("Valkey runs as its pinned non-root image account with zero capabilities", async () => {
   const compose = await readFile(path.join(STACK, "compose.yml"), "utf8");
+  const valkeyService = compose.match(/\n  valkey:\n([\s\S]*?)\n  operator:/)?.[1];
+  assert.ok(valkeyService);
   assert.match(
-    compose,
-    /valkey:[\s\S]*?cap_drop:\s*-\s*ALL[\s\S]*?cap_add:\s*-\s*CHOWN\s*-\s*SETGID\s*-\s*SETUID[\s\S]*?no-new-privileges:true/,
+    valkeyService,
+    /user: "999:1000"[\s\S]*?cap_drop:\s*-\s*ALL[\s\S]*?no-new-privileges:true/,
   );
+  assert.doesNotMatch(valkeyService, /cap_add:/);
 });
 
 test("the uWSGI health check uses the configured host and trusted proxy scheme", async () => {

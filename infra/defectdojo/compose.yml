@@ -319,6 +319,9 @@ services:
     image: valkey/valkey:9.1.0-alpine@sha256:a35428eba9043cc0b79dbe54100f0c92784f2de00ad09b01182bfb1c5c83d1bd
     platform: linux/amd64
     pull_policy: always
+    # The digest-pinned image owns /data as this account. Starting directly as
+    # that user avoids the root entrypoint's chown/setuid transition entirely.
+    user: "999:1000"
     command:
       - valkey-server
       - --appendonly
@@ -343,14 +346,6 @@ services:
     read_only: true
     cap_drop:
       - ALL
-    # The official entrypoint starts as root only long enough to repair the
-    # persistent data-directory ownership, then drops to the valkey account.
-    # Keep that transition explicit instead of restoring the default broad
-    # container capability set.
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
     security_opt:
       - no-new-privileges:true
     tmpfs:
