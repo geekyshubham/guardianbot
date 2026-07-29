@@ -15,8 +15,8 @@ reusable workflow commits remain immutable.
   Critical findings blocking.
 - Scanner failure, runtime smoke failure, missing SBOM, and missing evidence
   remain blocking in every mode.
-- GuardianBot's own generated caller is rotated to the currently trusted
-  v0.2.29 workflow identity with report-only image publication disabled.
+- GuardianBot's own generated caller is rotated to the v0.2.30 workflow
+  identity with report-only image publication disabled.
 
 ## [0.2.29] - 2026-07-30
 
