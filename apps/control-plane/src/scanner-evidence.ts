@@ -2136,6 +2136,13 @@ export function createScannerWorkflowRunHandler(
         reconciliationErrors.push(`${expectedName}: ${metadataErrors.join("; ")}`);
         continue;
       }
+      // Evidence rows have a foreign key to their artifact. Persist a
+      // non-terminal parent before any processor records normalized evidence;
+      // accepted is written only after the complete processor succeeds.
+      await options.store.upsertScannerArtifact({
+        ...artifactRecord,
+        validationStatus: "pending"
+      });
       const zipPath = await api.downloadArtifact(owner, repo, artifact.id);
       try {
         const downloaded = await sha256File(zipPath);

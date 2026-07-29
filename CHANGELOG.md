@@ -5,6 +5,17 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-07-29
+
+### Fixed
+
+- Scanner artifact ingestion now persists a non-terminal parent artifact before
+  writing normalized evidence. PostgreSQL foreign-key enforcement no longer
+  turns a valid first-pass promotion artifact into a retry solely because its
+  evidence row was inserted before the artifact row.
+- Artifact state remains `pending` during processing and becomes `accepted`
+  only after the complete evidence processor succeeds.
+
 ## [0.2.16] - 2026-07-29
 
 ### Fixed

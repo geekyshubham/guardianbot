@@ -37,7 +37,11 @@ export interface ReviewState {
 }
 
 export type ScannerWorkflowValidationStatus = "pending" | "accepted" | "rejected" | "failed";
-export type ScannerArtifactValidationStatus = "accepted" | "rejected" | "failed";
+export type ScannerArtifactValidationStatus =
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "failed";
 export type ScannerEvidenceStatus = "success" | "failure";
 export type ScannerWorkflowEvent =
   | "pull_request"

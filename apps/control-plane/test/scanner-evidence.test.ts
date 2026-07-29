@@ -10,7 +10,12 @@ import {
   type EvidenceProvenanceClaims
 } from "../src/evidence-attestation.js";
 import { createScannerWorkflowRunHandler } from "../src/scanner-evidence.js";
-import { MemoryStore, type RepositoryRecord } from "../src/store.js";
+import {
+  MemoryStore,
+  type RepositoryRecord,
+  type ScannerArtifactRecord,
+  type ScannerEvidenceRecord
+} from "../src/store.js";
 
 const SECURITY_SHA = "b".repeat(40);
 const IMAGE_SHA = "c".repeat(40);
@@ -25,6 +30,31 @@ const TEST_ENV = {
   GUARDIANBOT_TRUSTED_DAST_WORKFLOW_SHA: DAST_SHA,
   GUARDIANBOT_EVIDENCE_SIGNING_SECRET: SIGNING_SECRET
 };
+
+class ForeignKeyCheckingMemoryStore extends MemoryStore {
+  private readonly artifacts = new Set<string>();
+
+  override async upsertScannerArtifact(
+    record: ScannerArtifactRecord
+  ): Promise<void> {
+    this.artifacts.add(
+      `${record.repositoryId}:${record.runId}:${record.runAttempt}:${record.artifactId}`
+    );
+    await super.upsertScannerArtifact(record);
+  }
+
+  override async upsertScannerEvidence(
+    record: ScannerEvidenceRecord
+  ): Promise<void> {
+    assert.ok(
+      this.artifacts.has(
+        `${record.repositoryId}:${record.runId}:${record.runAttempt}:${record.artifactId}`
+      ),
+      "scanner evidence must never be persisted before its parent artifact"
+    );
+    await super.upsertScannerEvidence(record);
+  }
+}
 
 interface ZipEntryInput {
   name: string;
@@ -1032,7 +1062,7 @@ test("fails image evidence on scanner_error or a policy count that disagrees wit
 });
 
 test("requires structurally valid Cosign signature and CycloneDX attestation evidence for promotion", async () => {
-  const store = new MemoryStore();
+  const store = new ForeignKeyCheckingMemoryStore();
   await seedRepository(store);
   const validationZip = buildProvenanceZip(
     "image-validation",
