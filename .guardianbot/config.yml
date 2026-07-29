@@ -1,5 +1,5 @@
 schemaVersion: 1.0.0
-workflowVersion: 441ca4877d0a934f2a076971e4b2a6763093be67
+workflowVersion: 10e9b42cc42f73ff7c307d0415adb9ec26c3916a
 repository:
   defaultBranch: main
   releaseBranches:
@@ -51,10 +51,12 @@ image:
   context: .
   platform: linux/amd64
   registry: ghcr.io/geekyshubham/guardianbot
-  healthPath: /api/v1/health/
-  readinessPath: /ready
+  healthPath: /healthz
+  readinessPath: /readyz
+  containerPort: 3000
   sbomFormat: cyclonedx-json
-  dependentServices:
-    - postgres
-    - redis
+  dependentServices: []
+  runtimeEnvironment:
+    GUARDIANBOT_IMAGE_SMOKE: "1"
+    NODE_ENV: test
 dast: null

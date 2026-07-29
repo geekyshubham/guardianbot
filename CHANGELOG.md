@@ -5,8 +5,21 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Fixed
+
+- Repository detection now rejects arbitrary tokens such as status constants as
+  health routes, scopes dependency inference to image-related files, and
+  infers subdirectory Docker build contexts from `COPY` sources.
+- Image validation now polls readiness within the same bounded window as
+  liveness instead of failing on the first transient readiness response.
+- GuardianBot's exact control-plane image has a test-only, credential-free
+  smoke mode that exposes only liveness and readiness; production mode still
+  requires the complete GitHub App and database configuration.
+
 ### Evidence
 
+- Corrected GuardianBot's generated image-smoke profile to use `/healthz` and
+  `/readyz` on port 3000 without unrelated PostgreSQL or Redis dependencies.
 - Added live AstraNull v0.2.28 evidence for the generic upgrade PR, exact
   signed-digest DigitalOcean deployment, provenance-attested ZAP JSON/XML
   artifact, and stable same-Test-ID DefectDojo reimport.

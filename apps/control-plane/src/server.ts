@@ -11,6 +11,7 @@ import {
 } from "./dast-session.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
+import { startImageSmokeServer } from "./image-smoke.js";
 import {
   MonitoringService,
   monitoringOptionsFromEnvironment
@@ -44,6 +45,13 @@ async function createStore(): Promise<Store> {
 }
 
 async function start() {
+  if (process.env.GUARDIANBOT_IMAGE_SMOKE === "1") {
+    if (process.env.NODE_ENV !== "test") {
+      throw new Error("GUARDIANBOT_IMAGE_SMOKE requires NODE_ENV=test");
+    }
+    await startImageSmokeServer(Number(process.env.PORT ?? 3000));
+    return;
+  }
   const metrics = new GuardianMetrics();
   const store = await createStore();
   const monitoring = new MonitoringService(
