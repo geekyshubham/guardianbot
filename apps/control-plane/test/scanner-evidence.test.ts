@@ -958,6 +958,122 @@ test("accepts validation evidence without promotion only when the promotion job 
   );
 });
 
+test("ignores statically referenced reusable workflows when their caller jobs were skipped", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const securityZip = buildSecurityZip();
+  const imageZip = buildProvenanceZip(
+    "image-validation",
+    validImageReports()
+  );
+  const promotionZip = buildProvenanceZip(
+    "image-promotion",
+    validPromotionReports()
+  );
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA },
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA },
+      { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA }
+    ]),
+    jobs: [
+      ...defaultSecurityJobs(),
+      {
+        name: "guardianbot-image / image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "guardianbot-image / image push, sign, attest",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "guardianbot/dast-smoke",
+        status: "completed",
+        conclusion: "skipped"
+      },
+      {
+        name: "guardianbot/dast-nightly",
+        status: "completed",
+        conclusion: "skipped"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(511, "guardianbot-evidence-500-2", securityZip),
+      artifactRecord(512, "guardianbot-image-evidence-500-2", imageZip),
+      artifactRecord(513, "guardianbot-image-promotion-500-2", promotionZip)
+    ]],
+    zipByArtifactId: {
+      511: securityZip,
+      512: imageZip,
+      513: promotionZip
+    }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  assert.equal(
+    (await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus,
+    "accepted"
+  );
+  assert.equal(
+    scannerEvidence(store).some((record) => record.source === "zap"),
+    false
+  );
+});
+
+test("accepts scheduled DAST evidence when scanner and image caller jobs were skipped", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const dastZip = buildProvenanceZip("dast", {
+    "scan-status.json": {
+      schemaVersion: "1.0.0",
+      profile: "authenticated-baseline",
+      deploymentEnvironment: "staging",
+      deployedDigest: `sha256:${"f".repeat(64)}`,
+      minutes: 15,
+      zapExitCode: 0
+    },
+    "zap.json": { site: [] }
+  });
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA },
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA },
+      { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA }
+    ]),
+    jobs: [
+      {
+        name: "guardianbot/security-gate",
+        status: "completed",
+        conclusion: "skipped"
+      },
+      {
+        name: "guardianbot/image-security",
+        status: "completed",
+        conclusion: "skipped"
+      },
+      {
+        name: "guardianbot-dast / authenticated staging DAST",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(514, "guardianbot-dast-evidence-500-2", dastZip)
+    ]],
+    zipByArtifactId: { 514: dastZip }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  assert.equal(
+    (await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus,
+    "accepted"
+  );
+  assert.equal(
+    scannerEvidence(store).some((record) => record.source === "zap"),
+    true
+  );
+});
+
 test("keeps DAST smoke and nightly evidence as distinct trusted profiles", async (t) => {
   const cases = [
     {

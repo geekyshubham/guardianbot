@@ -5,6 +5,17 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-07-29
+
+### Fixed
+
+- Workflow-run reconciliation now distinguishes a statically referenced
+  reusable workflow from a reusable workflow call that actually executed.
+  Skipped caller jobs no longer make an otherwise complete security, image, or
+  DAST run retry for child-job metadata that GitHub does not create.
+- Added regression coverage for default-branch image promotion with skipped
+  DAST callers and scheduled DAST with skipped scanner and image callers.
+
 ## [0.2.18] - 2026-07-29
 
 ### Fixed

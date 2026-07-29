@@ -1833,6 +1833,19 @@ function workflowJob(
   });
 }
 
+function workflowCallWasSkipped(
+  jobs: readonly GitHubWorkflowJob[],
+  expectedNames: readonly string[]
+): boolean {
+  const callJobs = expectedNames
+    .map((expectedName) => workflowJob(jobs, expectedName))
+    .filter((job): job is GitHubWorkflowJob => job !== undefined);
+  return (
+    callJobs.length > 0 &&
+    callJobs.every((job) => job.conclusion === "skipped")
+  );
+}
+
 function expectedArtifactTypes(
   referencedWorkflows: readonly ParsedReferencedWorkflow[],
   jobs: readonly GitHubWorkflowJob[]
@@ -1842,31 +1855,45 @@ function expectedArtifactTypes(
   if (paths.has(".github/workflows/reusable-security.yml")) {
     const scannerJob = workflowJob(jobs, "deterministic scanners");
     if (!scannerJob) {
-      throw new RetryableScannerEvidenceError(
-        "trusted security reusable workflow job metadata is unavailable"
-      );
+      if (!workflowCallWasSkipped(jobs, ["guardianbot/security-gate"])) {
+        throw new RetryableScannerEvidenceError(
+          "trusted security reusable workflow job metadata is unavailable"
+        );
+      }
+    } else if (scannerJob.conclusion !== "skipped") {
+      types.push("security");
     }
-    if (scannerJob.conclusion !== "skipped") types.push("security");
   }
   if (paths.has(".github/workflows/reusable-image.yml")) {
     const validationJob = workflowJob(jobs, "image build, smoke, scan, SBOM");
     const promotionJob = workflowJob(jobs, "image push, sign, attest");
     if (!validationJob || !promotionJob) {
-      throw new RetryableScannerEvidenceError(
-        "trusted image reusable workflow job metadata is unavailable"
-      );
+      if (!workflowCallWasSkipped(jobs, ["guardianbot/image-security"])) {
+        throw new RetryableScannerEvidenceError(
+          "trusted image reusable workflow job metadata is unavailable"
+        );
+      }
+    } else {
+      if (validationJob.conclusion !== "skipped") types.push("image-validation");
+      if (promotionJob.conclusion !== "skipped") types.push("image-promotion");
     }
-    if (validationJob.conclusion !== "skipped") types.push("image-validation");
-    if (promotionJob.conclusion !== "skipped") types.push("image-promotion");
   }
   if (paths.has(".github/workflows/reusable-dast.yml")) {
     const dastJob = workflowJob(jobs, "authenticated staging DAST");
     if (!dastJob) {
-      throw new RetryableScannerEvidenceError(
-        "trusted DAST reusable workflow job metadata is unavailable"
-      );
+      if (
+        !workflowCallWasSkipped(jobs, [
+            "guardianbot/dast-smoke",
+            "guardianbot/dast-nightly"
+          ])
+      ) {
+        throw new RetryableScannerEvidenceError(
+          "trusted DAST reusable workflow job metadata is unavailable"
+        );
+      }
+    } else if (dastJob.conclusion !== "skipped") {
+      types.push("dast");
     }
-    if (dastJob.conclusion !== "skipped") types.push("dast");
   }
   return types;
 }
