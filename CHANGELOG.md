@@ -5,6 +5,12 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Changed
+
+- GuardianBot's own generated consumer caller and config are pinned to the
+  immutable v0.2.33 commit `6d04f85ef5cf1c6865300f0125ef8875c6c42afb`, with
+  report-only image publication remaining `enforce-only`.
+
 ## [0.2.33] - 2026-07-30
 
 ### Added
