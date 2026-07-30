@@ -10,6 +10,25 @@ reusable workflow commits remain immutable.
 - GuardianBot self-managed config/caller is upgraded to the immutable v0.2.36
   commit `152649be5a86862f619a86d60598fc25bafb0429`.
 
+### Evidence
+
+- Live GuardianBot v0.2.36 signed release and control-plane rotation (exact
+  digest `sha256:622fd2b0b0c30c64d57112317304025ed102c911ba0e3c329d0cbed5c5496b9a`,
+  ACTIVE deployment, `/healthz`/`/readyz`), generic fleet upgrade (18 merged
+  immutable-pin PRs), healthy final live target-SHA inventory (19 visible /
+  16 report-only / 2 advisory-only / 1 not-applicable fork / zero
+  misconfigured / zero missing-expected-runs), and RouteLens plus AstraNull
+  exact-digest generic promotions with ACTIVE DigitalOcean deployments and
+  health checks. See
+  [v0.2.36 live control-plane and fleet upgrade evidence](docs/evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md).
+  No production model credential or live AI-backed review, seven-day
+  observation completion, reviewed baseline, ruleset readiness, scanner
+  enforcement, scheduled authenticated-full DAST success, or new DefectDojo
+  import/reimport is claimed. career-ops retained 31 Critical image findings
+  report-only (not Critical-clean). Older RouteLens v0.2.34 scheduled
+  baseline/DefectDojo and v0.2.35 schedule baseline-only evidence remain
+  prior-release / baseline-only distinctions.
+
 ## [0.2.36] - 2026-07-30
 
 ### Security
