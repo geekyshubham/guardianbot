@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.36] - 2026-07-30
+
 ### Security
 
 - Enforce-mode non-PR scanner runs fail closed on a runtime readiness verifier
