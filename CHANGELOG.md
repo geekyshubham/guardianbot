@@ -10,6 +10,22 @@ reusable workflow commits remain immutable.
 - GuardianBot self-managed config/caller is pinned to the immutable v0.2.35
   release commit `9a898934fa62ad9fcaab290a83c0d287e2d35967`.
 
+### Evidence
+
+- Live GuardianBot v0.2.35 release/control-plane rotation, generic fleet
+  upgrade (18 merged immutable-pin PRs), RouteLens and AstraNull
+  Critical-clean `verified-default-branch` promotion with exact-digest ACTIVE
+  DigitalOcean deployments and health checks, post-upgrade inventory
+  (19 visible / 16 report-only / 2 advisory-only / 1 not-applicable fork /
+  zero misconfigured / zero missing-expected-runs), and doctor state
+  (healthy; ~1.35 days observed; baseline missing; `enforcementReady=false`).
+  See
+  [v0.2.35 live fleet and image promotion evidence](docs/evidence/v0.2.35-live-fleet-and-image-promotion.md).
+  No v0.2.35 scheduled DAST, authenticated-full DAST, new DefectDojo
+  import/reimport, production model credential, seven-day observation
+  completion, baseline, or scanner enforcement is claimed. Older v0.2.34
+  RouteLens scheduled baseline/DefectDojo evidence remains prior-release only.
+
 ## [0.2.35] - 2026-07-30
 
 ### Fixed
