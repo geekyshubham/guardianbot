@@ -69,7 +69,8 @@ eligibility remains enforced inside the reusable image workflow.
   fails closed and cannot reuse an older success. A scheduled run that actually
   emits a non-skipped failed gate also fails closed;
 - a reviewed `.guardianbot/baseline.json`, the first successful report-only
-  default-branch push or `workflow_dispatch` (scheduled runs never start the
+  default-branch push or `workflow_dispatch` whose exact run has a present,
+  non-skipped, successful security gate (scheduled runs never start the
   seven-day clock), and the elapsed observation period;
 - active rulesets or classic branch protection requiring the exact observed gate
   check when scanner mode is `enforce`.
@@ -128,17 +129,21 @@ canonical RFC3339 UTC `generatedAt` and valid source
 legacy baselines are rejected. Duplicate, malformed, or missing baseline documents
 are not ready for enforcement. The seven-day clock starts at the first successful
 default-branch push or `workflow_dispatch` after the current report-only
-configuration was committed—not when an onboarding PR was opened, and not from
-any scheduled run (including a security-bearing schedule). Onboarding normally
-starts the clock via the merge push that lands the generated caller.
+configuration was committed whose exact run has a present, non-skipped,
+successful security gate—not when an onboarding PR was opened, not from a
+missing/skipped/failed gate, and not from any scheduled run (including a
+security-bearing schedule). Onboarding normally starts the clock via the merge
+push that lands the generated caller.
 
 `doctor.status: ready` means the repository is healthy in its current mode.
 `doctor.enforcementReady` separately indicates that the baseline and observation
 prerequisites are complete. `guardianctl enforce` fails closed unless every
 promotion prerequisite passes. It then creates or repairs the strict required-check
 ruleset using the check name GitHub actually emitted and opens a draft PR changing
-scanner mode from `report-only` to `enforce`. Merge only after that PR's
-enforcement-mode check succeeds.
+scanner mode from `report-only` to `enforce`. Pull-request checks remain
+report-only because they bind the base-branch configuration; merge only after
+ordinary checks and human review. Immediately after merge, verify the first
+enforce-mode default-branch gate and revert or disable enforcement if it fails.
 
 The defaults can be tightened for an installation with
 `GUARDIANBOT_EXPECTED_RUN_MAX_AGE_HOURS` and

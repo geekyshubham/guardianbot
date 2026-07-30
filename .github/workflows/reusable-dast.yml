@@ -87,6 +87,12 @@ jobs:
                 process.env.SCAN_PROFILE)) {
             throw new Error("scan-profile is invalid");
           }
+          if (process.env.SCAN_PROFILE === "authenticated-baseline" && minutes > 15) {
+            throw new Error("authenticated-baseline DAST minutes must be at most 15");
+          }
+          if (process.env.SCAN_PROFILE === "authenticated-full" && minutes < 30) {
+            throw new Error("authenticated-full DAST minutes must be at least 30");
+          }
           let excludedRoutes;
           try {
             excludedRoutes = JSON.parse(process.env.EXCLUDED_ROUTES);
@@ -272,7 +278,8 @@ jobs:
                 repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
                 runId: Number(process.env.GITHUB_RUN_ID),
                 runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
-                headSha: process.env.GITHUB_SHA.toLowerCase()
+                headSha: process.env.GITHUB_SHA.toLowerCase(),
+                scanProfile: contract.scanProfile
               }),
               redirect: "error"
             });

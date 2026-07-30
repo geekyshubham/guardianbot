@@ -1194,6 +1194,291 @@ test("DAST-only schedules do not start report-only observation or satisfy enforc
   assert.equal(result.enforcementReady, false);
 });
 
+test("observation clock starts at first push with a successful non-skipped gate, not earlier missing/skipped ones", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("obs-gate-start"));
+  // Early successful pushes lack a usable gate; clock must start at the later
+  // push that has a completed successful security gate (3 days ago).
+  state.workflowRuns = [
+    {
+      id: 620,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(1),
+      html_url: "https://github.example/actions/runs/620"
+    },
+    {
+      id: 610,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: daysAgo(3),
+      html_url: "https://github.example/actions/runs/610"
+    },
+    {
+      id: 601,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: OLD_HEAD_SHA,
+      created_at: daysAgo(8),
+      html_url: "https://github.example/actions/runs/601"
+    },
+    {
+      id: 600,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: OLD_HEAD_SHA,
+      created_at: daysAgo(9),
+      html_url: "https://github.example/actions/runs/600"
+    }
+  ];
+  state.runJobs = new Map([
+    [
+      600,
+      [
+        {
+          name: "guardianbot/dast-smoke",
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ],
+    [
+      601,
+      [
+        {
+          name: "guardianbot/security-gate",
+          status: "completed",
+          conclusion: "skipped"
+        }
+      ]
+    ],
+    [
+      610,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ],
+    [
+      620,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ]
+  ]);
+  state.checkRuns = new Map([
+    [
+      HEAD_SHA,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "success",
+          details_url: "https://github.example/actions/runs/620/job/2"
+        }
+      ]
+    ],
+    [
+      OLD_HEAD_SHA,
+      [
+        {
+          name: "guardianbot/security-gate",
+          status: "completed",
+          conclusion: "skipped",
+          details_url: "https://github.example/actions/runs/601/job/1"
+        }
+      ]
+    ]
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/obs-gate-start");
+
+  assert.equal(result.facts.reportOnlySince, daysAgo(3));
+  assert.ok((result.facts.reportOnlyAgeDays ?? 0) < 7);
+  assert.equal(checkByCode(result, "report-only-observation").ok, false);
+  assert.match(
+    checkByCode(result, "report-only-observation").detail,
+    /3\.00 days since first successful report-only security run/
+  );
+  assert.doesNotMatch(
+    checkByCode(result, "report-only-observation").detail,
+    /9\.00 days|8\.00 days/
+  );
+});
+
+test("observation clock ignores successful pushes whose security gate failed", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("obs-failed-gate"));
+  state.workflowRuns = [
+    {
+      id: 710,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(1),
+      html_url: "https://github.example/actions/runs/710"
+    },
+    {
+      id: 700,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: OLD_HEAD_SHA,
+      created_at: daysAgo(10),
+      html_url: "https://github.example/actions/runs/700"
+    }
+  ];
+  state.runJobs = new Map([
+    [
+      700,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "failure"
+        }
+      ]
+    ],
+    [
+      710,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "failure"
+        }
+      ]
+    ]
+  ]);
+  state.checkRuns = new Map([
+    [
+      HEAD_SHA,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "failure",
+          details_url: "https://github.example/actions/runs/710/job/2"
+        }
+      ]
+    ],
+    [
+      OLD_HEAD_SHA,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "failure",
+          details_url: "https://github.example/actions/runs/700/job/1"
+        }
+      ]
+    ]
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/obs-failed-gate");
+
+  assert.equal(result.facts.reportOnlySince, undefined);
+  assert.equal(checkByCode(result, "report-only-observation").ok, false);
+  assert.match(
+    checkByCode(result, "report-only-observation").detail,
+    /successful non-skipped security gate|push or workflow_dispatch/
+  );
+  assert.doesNotMatch(
+    checkByCode(result, "report-only-observation").detail,
+    /10\.00 days|days since first successful/
+  );
+});
+
+test("successful scheduled security gates alone never start report-only observation", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("schedule-gate-observation"));
+  // Only schedules after config, and they have successful non-skipped gates.
+  state.workflowRuns = [
+    {
+      id: 810,
+      status: "completed",
+      conclusion: "success",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(1),
+      html_url: "https://github.example/actions/runs/810"
+    },
+    {
+      id: 800,
+      status: "completed",
+      conclusion: "success",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: daysAgo(10),
+      html_url: "https://github.example/actions/runs/800"
+    }
+  ];
+  state.runJobs = new Map([
+    [
+      800,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ],
+    [
+      810,
+      [
+        {
+          name: DEFAULT_SECURITY_GATE_CHECK,
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ]
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "success",
+      details_url: "https://github.example/actions/runs/810/job/1"
+    }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/schedule-gate-observation");
+
+  assert.equal(result.facts.reportOnlySince, undefined);
+  assert.equal(checkByCode(result, "report-only-observation").ok, false);
+  assert.match(
+    checkByCode(result, "report-only-observation").detail,
+    /scheduled runs do not start the clock|push or workflow_dispatch/
+  );
+  // Schedule gates can still satisfy freshness; they must not start observation.
+  assert.equal(checkByCode(result, "security-gate-check").ok, true);
+  assert.equal(result.enforcementReady, false);
+});
+
 test("doctor requires the observed gate check in enforced rulesets", async () => {
   const github = new MockGitHub();
   const state = github.add(healthyState("service", { mode: "enforce" }));
@@ -1277,6 +1562,18 @@ test("enforce creates the exact observed required check and opens a reviewed con
   assert.equal(github.pulls.length, 1);
   assert.match(github.pulls[0]!.input.body, /Reviewed baseline: 1 fingerprints/);
   assert.match(github.pulls[0]!.input.body, new RegExp(DEFAULT_SECURITY_GATE_CHECK.replace("/", "\\/")));
+  assert.match(
+    github.pulls[0]!.input.body,
+    /Pull-request checks stay report-only because they bind the base-branch configuration/
+  );
+  assert.match(
+    github.pulls[0]!.input.body,
+    /Immediately after merge, verify the first enforce-mode default-branch gate/
+  );
+  assert.doesNotMatch(
+    github.pulls[0]!.input.body,
+    /enforcement-mode pull request check/
+  );
 });
 
 test("enforce repairs only its named ruleset and dry-run remains side-effect free", async () => {

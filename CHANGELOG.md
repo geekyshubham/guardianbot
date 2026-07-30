@@ -7,6 +7,13 @@ reusable workflow commits remain immutable.
 
 ### Fixed
 
+- Internal GitHub repository visibility routes model reviews as `restricted`
+  (automated evidence only; no live production AI review is claimed).
+- `authenticated-full` DAST is schedule-only at the generated caller and the
+  session broker; `scanProfile` is request- and lease-bound; baseline (≤15 min)
+  and full (≥30 / ≤45 min) minute constraints fail early. Manual
+  `workflow_dispatch` remains baseline-only. Live scheduled full is still
+  pending.
 - `guardianctl doctor` / `inventory` select `guardianbot/security-gate` evidence
   from the most recent fresh GuardianBot run that actually emitted the gate,
   using Actions job metadata (or check-run URLs that reference that run id).
@@ -17,9 +24,15 @@ reusable workflow commits remain immutable.
   scheduled run with a non-skipped failed gate also fails closed; a
   non-skipped successful scheduled gate remains valid security evidence. Job
   and check-run listings are bounded to a safe page cap and fail closed if
-  exhausted. Report-only observation starts only from a successful
-  default-branch push or `workflow_dispatch` (scheduled runs never start the
-  seven-day clock; onboarding normally starts it via the merge push).
+  exhausted. Seven-day report-only observation starts only from a successful
+  default-branch `push` or `workflow_dispatch` whose exact run has a present,
+  non-skipped, successful security gate (scheduled runs never start the clock;
+  onboarding normally starts it via the merge push).
+- `guardianctl enforce` draft PR body no longer claims an enforcement-mode pull
+  request check. PR checks stay report-only because they bind base-branch
+  configuration; merge only after ordinary checks and human review, then verify
+  the first enforce-mode default-branch gate immediately and revert or disable
+  on failure.
 - `guardianctl inventory` no longer treats the all-zero CLI placeholder as an
   administrative workflow target. Without `GUARDIANBOT_WORKFLOW_SHA`, inventory
   derives the expected pin from each repository's validated config or consistent

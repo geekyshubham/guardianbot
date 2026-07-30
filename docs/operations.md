@@ -172,6 +172,30 @@ shorter than succeeded retention. Each cleanup batch is hard-capped (API and
 env) and multi-instance safe (`FOR UPDATE SKIP LOCKED` on PostgreSQL).
 Shutdown aborts the cleanup sleep so SIGTERM does not wait out the interval.
 
+## First live AI review checklist
+
+Use this only when enabling the first production AI-backed review. Do not treat
+local developer credentials as production secrets.
+
+1. Deploy the model bridge as an isolated service with its own config; keep
+   provider API keys only on the bridge process.
+2. Prefer the provider-neutral control-plane registry
+   (`GUARDIAN_REVIEW_REGISTRY_JSON` or legacy `GUARDIAN_MODEL_BACKEND_REGISTRY`)
+   that names only bridge endpoints, bearer-token env refs, allowed
+   classifications, and routes—never provider product names, model ids, or
+   upstream provider URLs.
+3. Confirm registry/bridge separation: the control plane holds bridge URL and
+   bridge bearer token only; adapter bindings and provider credentials exist
+   only on the bridge.
+4. Allowed classifications must include `private` for private repositories and
+   `restricted` for internal repositories, as applicable (internal visibility
+   is routed as `restricted`).
+5. Run bridge health and protocol conformance, then exercise one ready pull
+   request and confirm either a grounded review or advisory
+   `AI review unavailable` without leaking prompts, credentials, or provider
+   bodies.
+6. Keep cross-backend fallback off unless explicitly approved.
+
 ## Host and secret operations
 
 The droplet cloud-init profile enables UFW default-deny inbound policy,

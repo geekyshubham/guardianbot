@@ -20,9 +20,11 @@ The broker verifies all of the following before it returns a credential:
 - the caller is `.github/workflows/guardianbot.yml`;
 - the called workflow is `.github/workflows/reusable-dast.yml` at the exact
   trusted GuardianBot commit;
-- the runner is GitHub-hosted and the event is `schedule` or
-  `workflow_dispatch`; push-triggered DAST is rejected to avoid racing image
-  promotion;
+- the runner is GitHub-hosted and the event matches the requested scan profile:
+  `authenticated-baseline` allows `schedule` or `workflow_dispatch`;
+  `authenticated-full` allows only a genuine `schedule` event (manual dispatch
+  cannot obtain a full session). Push-triggered DAST is rejected to avoid
+  racing image promotion;
 - the protected environment and OIDC subject are exactly
   `guardianbot-dast`; and
 - the profile origin and protected assertion path exactly match the request;
@@ -88,16 +90,24 @@ The `guardianbot-dast` environment should require reviewers. Consumer
 repositories do not store a DAST session secret and do not pass `secrets:
 inherit`.
 
-The generated caller distinguishes:
+The generated caller and session broker both enforce profile binding:
 
-- `authenticated-baseline` smoke scans, capped at 15 minutes and normally
-  scheduled every 15 minutes (or started manually after promotion); and
-- `authenticated-full` nightly scans, requiring at least 30 minutes and capped
-  at 45 minutes.
+- `authenticated-baseline` smoke scans are capped at 15 minutes (and at least
+  5 minutes overall) and may run on the smoke schedule or on manual
+  `workflow_dispatch` after promotion;
+- `authenticated-full` nightly scans are schedule-only at the caller (`if:`
+  binds the nightly cron) and at the session broker; they require at least 30
+  minutes and are capped at 45 minutes; and
+- `scanProfile` is part of the session request and the one-time issuance lease,
+  so a baseline lease cannot be reused for full (or the reverse). Invalid
+  baseline/full minute constraints fail early in the reusable workflow before
+  ZAP runs.
 
-Smoke and nightly evidence use different keys and different DefectDojo import
-identities. A fresh smoke result therefore cannot satisfy the nightly
-requirement.
+Manual `workflow_dispatch` therefore remains baseline-only. GuardianBot
+evidence keys distinguish smoke and nightly, so smoke cannot satisfy nightly
+monitoring. The current DefectDojo reimport may use the same test identity with
+run/profile provenance, and independent nightly import evidence remains
+required.
 
 ## Failure behavior
 

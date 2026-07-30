@@ -51,6 +51,8 @@ export interface DastSessionRepositoryAuthorization {
   defaultBranch: string;
 }
 
+export type DastScanProfile = "authenticated-baseline" | "authenticated-full";
+
 export interface DastSessionRequest {
   schemaVersion: "1.0.0";
   profileRef: string;
@@ -61,6 +63,7 @@ export interface DastSessionRequest {
   runId: number;
   runAttempt: number;
   headSha: string;
+  scanProfile: DastScanProfile;
 }
 
 export interface DastSessionResponse {
@@ -410,6 +413,13 @@ function parseProfiles(
   return profiles;
 }
 
+function parseScanProfile(value: unknown): DastScanProfile {
+  if (value !== "authenticated-baseline" && value !== "authenticated-full") {
+    throw new Error("scanProfile is invalid");
+  }
+  return value;
+}
+
 function parseRequest(value: unknown): DastSessionRequest & { profileId: string } {
   const request = asRecord(value);
   if (!request) throw new Error("DAST session request must be an object");
@@ -424,7 +434,8 @@ function parseRequest(value: unknown): DastSessionRequest & { profileId: string 
       "repositoryId",
       "runId",
       "runAttempt",
-      "headSha"
+      "headSha",
+      "scanProfile"
     ],
     "DAST session request"
   );
@@ -444,7 +455,8 @@ function parseRequest(value: unknown): DastSessionRequest & { profileId: string 
     repositoryId: positiveSafeInteger(request.repositoryId, "repositoryId"),
     runId: positiveSafeInteger(request.runId, "runId"),
     runAttempt: positiveSafeInteger(request.runAttempt, "runAttempt"),
-    headSha: exactSha(request.headSha, "headSha")
+    headSha: exactSha(request.headSha, "headSha"),
+    scanProfile: parseScanProfile(request.scanProfile)
   };
 }
 
@@ -494,6 +506,11 @@ function validateOidcIdentity(
   const defaultRef = `refs/heads/${repository.defaultBranch}`;
   const jobWorkflow = parseJobWorkflowRef(oidc.job_workflow_ref);
   const callerWorkflow = parseCallerWorkflowRef(String(oidc.workflow_ref ?? ""));
+  const eventName = String(oidc.event_name ?? "");
+  const eventAllowed =
+    request.scanProfile === "authenticated-full"
+      ? eventName === "schedule"
+      : eventName === "schedule" || eventName === "workflow_dispatch";
   if (
     normalizedRepository !== request.repository ||
     normalizeRepository(repository.fullName, "authorized repository") !== request.repository ||
@@ -503,7 +520,7 @@ function validateOidcIdentity(
     exactSha(oidc.sha, "OIDC sha") !== request.headSha ||
     exactSha(oidc.workflow_sha, "OIDC workflow_sha") !== request.headSha ||
     oidc.ref !== defaultRef ||
-    !["schedule", "workflow_dispatch"].includes(String(oidc.event_name ?? "")) ||
+    !eventAllowed ||
     oidc.runner_environment !== "github-hosted" ||
     callerWorkflow.repository !== request.repository ||
     callerWorkflow.workflowPath !== CALLER_WORKFLOW_PATH ||
@@ -530,6 +547,7 @@ function issuanceKey(request: DastSessionRequest, profile: DastProfile): string 
         request.runId,
         request.runAttempt,
         request.headSha,
+        request.scanProfile,
         profile.id,
         profile.origin
       ].join("\u241f")
