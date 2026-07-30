@@ -22,7 +22,7 @@ jobs:
       security-events: write
       actions: read
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@ac52fb8123b5897d8c9f67b0d3ff8ca95289a5cb
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-security.yml@6d04f85ef5cf1c6865300f0125ef8875c6c42afb
     with:
       config-path: .guardianbot/config.yml
 
@@ -33,7 +33,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@ac52fb8123b5897d8c9f67b0d3ff8ca95289a5cb
+    uses: Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@6d04f85ef5cf1c6865300f0125ef8875c6c42afb
     with:
       dockerfile: "Dockerfile"
       context: "."
@@ -44,6 +44,7 @@ jobs:
       dependent-services: ""
       ephemeral-env-keys: ""
       policy-mode: "report-only"
+      promotion-mode: "enforce-only"
       runtime-env: |
           GUARDIANBOT_IMAGE_SMOKE=1
           NODE_ENV=test
