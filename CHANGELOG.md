@@ -5,6 +5,11 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Changed
+
+- GuardianBot self-managed config/caller is upgraded to the immutable v0.2.36
+  commit `152649be5a86862f619a86d60598fc25bafb0429`.
+
 ## [0.2.36] - 2026-07-30
 
 ### Security
