@@ -5,6 +5,28 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Security
+
+- Enforce-mode non-PR scanner runs fail closed on a runtime readiness verifier
+  before Semgrep. Authorization requires a strict `guardianbot.baseline.v1`
+  document with `source` (successful report-only gate that supplied current
+  fingerprints) and `observation` (first qualified report-only
+  `push`/`workflow_dispatch` gate that started the minimum seven-day clock,
+  including repository, headSha, runId, runAttempt, startedAt). Both
+  provenance runs are revalidated through GitHub API run-attempt metadata, the
+  exact successful deterministic scanner job, report-only config at each head
+  SHA, and exact `referenced_workflows` reusable-security identity pinned to
+  the immutable `workflowVersion`. Observation must be at least seven days old;
+  an active default-branch GuardianBot ruleset must strictly require
+  `guardianbot/security-gate / deterministic scanners`. Missing, invalid, or
+  unauthorized API evidence fails closed. The workflow uses only its scoped
+  GitHub token with `actions: read` (no consumer secret or control-plane
+  dependency). `guardianctl baseline` persists the independently verified first
+  observation-run proof and rejects an observation repository different from
+  the source repository. Automated focused tests pass; live seven-day
+  observation and reviewed enforce promotion remain pending (no production or
+  live enforcement claimed).
+
 ### Changed
 
 - GuardianBot self-managed config/caller is pinned to the immutable v0.2.35

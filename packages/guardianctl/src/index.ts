@@ -166,6 +166,10 @@ export interface DoctorFacts {
   baselineCount?: number;
   reportOnlySince?: string;
   reportOnlyAgeDays?: number;
+  /** First qualified observation-start run id (not the current gate). */
+  reportOnlyRunId?: number;
+  reportOnlyRunAttempt?: number;
+  reportOnlyRunHeadSha?: string;
   requiredCheckName: string;
   rulesetId?: number;
   rulesetReady: boolean;
@@ -204,6 +208,7 @@ interface WorkflowRun {
   created_at?: string;
   run_started_at?: string;
   updated_at?: string;
+  run_attempt?: number;
 }
 
 interface WorkflowRunsResult {
@@ -306,11 +311,21 @@ export interface BaselineSourceProvenance {
   runAttempt: number;
 }
 
+/** Independently verified observation-start run that began the seven-day clock. */
+export interface BaselineObservationProvenance {
+  repository: string;
+  headSha: string;
+  runId: number;
+  runAttempt: number;
+  startedAt: string;
+}
+
 export interface BaselineDocument {
   schemaVersion: typeof BASELINE_SCHEMA_VERSION;
   fingerprints: string[];
   generatedAt: string;
   source: BaselineSourceProvenance;
+  observation: BaselineObservationProvenance;
 }
 
 export interface BaselineResult {
@@ -1656,6 +1671,71 @@ function inspectVersionedBaseline(
       detail: "versioned baseline source.runAttempt must be a positive integer"
     };
   }
+  const observation = value.observation;
+  if (!isObject(observation)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline observation must be an object"
+    };
+  }
+  if (
+    typeof observation.repository !== "string" ||
+    !isNormalizedRepositoryName(normalizeRepositoryName(observation.repository))
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline observation.repository must be OWNER/REPO"
+    };
+  }
+  if (
+    normalizeRepositoryName(observation.repository) !==
+    normalizeRepositoryName(source.repository)
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail:
+        "versioned baseline observation.repository must match source.repository"
+    };
+  }
+  if (
+    typeof observation.headSha !== "string" ||
+    !IMMUTABLE_SHA.test(observation.headSha)
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail:
+        "versioned baseline observation.headSha must be a lowercase 40-character commit SHA"
+    };
+  }
+  if (!isPositiveSafeInteger(observation.runId)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline observation.runId must be a positive integer"
+    };
+  }
+  if (!isPositiveSafeInteger(observation.runAttempt)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline observation.runAttempt must be a positive integer"
+    };
+  }
+  if (
+    typeof observation.startedAt !== "string" ||
+    !isCanonicalUtcInstant(observation.startedAt)
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail:
+        "versioned baseline observation.startedAt must be a canonical RFC3339 UTC instant (YYYY-MM-DDTHH:mm:ss.sssZ)"
+    };
+  }
   return validateFingerprintList(value.fingerprints);
 }
 
@@ -1812,6 +1892,13 @@ export function buildBaselineDocument(
     runId: number;
     runAttempt: number;
   },
+  observation: {
+    repository: string;
+    headSha: string;
+    runId: number;
+    runAttempt: number;
+    startedAt: string;
+  },
   generatedAt: Date
 ): BaselineDocument {
   if (!FINGERPRINT_SHA256.test(source.gateSha256)) {
@@ -1829,6 +1916,36 @@ export function buildBaselineDocument(
   }
   if (!isPositiveSafeInteger(source.runAttempt)) {
     throw new Error("baseline source.runAttempt must be a positive integer");
+  }
+  const observationRepository = normalizeRepositoryName(observation.repository);
+  if (!isNormalizedRepositoryName(observationRepository)) {
+    throw new Error(
+      "baseline observation.repository must be formatted as OWNER/REPO"
+    );
+  }
+  if (observationRepository !== repository) {
+    throw new Error(
+      "baseline observation.repository must match source.repository"
+    );
+  }
+  if (!IMMUTABLE_SHA.test(observation.headSha)) {
+    throw new Error(
+      "baseline observation.headSha must be a lowercase 40-character commit SHA"
+    );
+  }
+  if (!isPositiveSafeInteger(observation.runId)) {
+    throw new Error("baseline observation.runId must be a positive integer");
+  }
+  if (!isPositiveSafeInteger(observation.runAttempt)) {
+    throw new Error("baseline observation.runAttempt must be a positive integer");
+  }
+  if (
+    typeof observation.startedAt !== "string" ||
+    !isCanonicalUtcInstant(observation.startedAt)
+  ) {
+    throw new Error(
+      "baseline observation.startedAt must be a canonical RFC3339 UTC instant (YYYY-MM-DDTHH:mm:ss.sssZ)"
+    );
   }
   const sorted = [...fingerprints].sort();
   if (sorted.some((fingerprint) => !FINGERPRINT_SHA256.test(fingerprint))) {
@@ -1848,6 +1965,13 @@ export function buildBaselineDocument(
       headSha: source.headSha,
       runId: source.runId,
       runAttempt: source.runAttempt
+    },
+    observation: {
+      repository: observationRepository,
+      headSha: observation.headSha,
+      runId: observation.runId,
+      runAttempt: observation.runAttempt,
+      startedAt: observation.startedAt
     }
   };
 }
@@ -1883,6 +2007,8 @@ function baselineAlreadyMatches(
     }
     const source = current.source;
     if (!isObject(source)) return false;
+    const observation = current.observation;
+    if (!isObject(observation)) return false;
     return (
       source.gateSha256 === document.source.gateSha256 &&
       source.mode === document.source.mode &&
@@ -1890,7 +2016,14 @@ function baselineAlreadyMatches(
       normalizeRepositoryName(source.repository) === document.source.repository &&
       source.headSha === document.source.headSha &&
       source.runId === document.source.runId &&
-      source.runAttempt === document.source.runAttempt
+      source.runAttempt === document.source.runAttempt &&
+      typeof observation.repository === "string" &&
+      normalizeRepositoryName(observation.repository) ===
+        document.observation.repository &&
+      observation.headSha === document.observation.headSha &&
+      observation.runId === document.observation.runId &&
+      observation.runAttempt === document.observation.runAttempt &&
+      observation.startedAt === document.observation.startedAt
     );
   } catch {
     return false;
@@ -1911,6 +2044,10 @@ function renderBaselineReport(
     `- Source repository: \`${document.source.repository}\``,
     `- Source head SHA: \`${document.source.headSha}\``,
     `- Source run: \`${document.source.runId}\` attempt \`${document.source.runAttempt}\``,
+    `- Observation started: \`${document.observation.startedAt}\``,
+    `- Observation repository: \`${document.observation.repository}\``,
+    `- Observation head SHA: \`${document.observation.headSha}\``,
+    `- Observation run: \`${document.observation.runId}\` attempt \`${document.observation.runAttempt}\``,
     `- Fingerprint count: ${document.fingerprints.length}`,
     `- Clean repository (empty baseline): ${clean ? "yes" : "no"}`,
     `- Baseline schema: \`${document.schemaVersion}\``,
@@ -2016,6 +2153,31 @@ async function latestPathCommitTime(
   return commits[0] ? commitTime(commits[0]) : undefined;
 }
 
+function observationRunAttempt(run: WorkflowRun): number | undefined {
+  // Default only when GitHub omits run_attempt; never invent a value for junk.
+  if (run.run_attempt === undefined) return 1;
+  return isPositiveSafeInteger(run.run_attempt) ? run.run_attempt : undefined;
+}
+
+function observationRunProof(run: WorkflowRun): {
+  since?: Date;
+  runId?: number;
+  runAttempt?: number;
+  headSha?: string;
+} {
+  const since = workflowRunTime(run);
+  const runId = isPositiveSafeInteger(run.id) ? run.id : undefined;
+  const runAttempt = observationRunAttempt(run);
+  const headSha =
+    typeof run.head_sha === "string" ? run.head_sha.toLowerCase() : undefined;
+  return {
+    since,
+    runId,
+    runAttempt,
+    headSha: headSha && IMMUTABLE_SHA.test(headSha) ? headSha : undefined
+  };
+}
+
 async function inspectObservationPeriod(
   context: CommandContext,
   github: GitHubClient,
@@ -2024,7 +2186,14 @@ async function inspectObservationPeriod(
   mode: ScannerMode | undefined,
   configuredSince: Date | undefined,
   runs: WorkflowRun[]
-): Promise<{ check: DoctorCheck; since?: Date; ageDays?: number }> {
+): Promise<{
+  check: DoctorCheck;
+  since?: Date;
+  ageDays?: number;
+  runId?: number;
+  runAttempt?: number;
+  headSha?: string;
+}> {
   if (!mode || mode === "advisory") {
     return {
       check: makeCheck(
@@ -2094,7 +2263,10 @@ async function inspectObservationPeriod(
     };
   }
 
-  const since = firstQualifiedRun ? workflowRunTime(firstQualifiedRun) : undefined;
+  const proof = firstQualifiedRun
+    ? observationRunProof(firstQualifiedRun)
+    : {};
+  const since = proof.since;
   if (!since) {
     return {
       check: makeCheck(
@@ -2115,6 +2287,9 @@ async function inspectObservationPeriod(
   return {
     since,
     ageDays,
+    runId: proof.runId,
+    runAttempt: proof.runAttempt,
+    headSha: proof.headSha,
     check: makeCheck(
       "report-only-observation",
       "report-only observation",
@@ -2750,6 +2925,9 @@ async function doctorInternal(
       baselineCount: baseline.count,
       reportOnlySince: observation.since?.toISOString(),
       reportOnlyAgeDays: observation.ageDays,
+      reportOnlyRunId: observation.runId,
+      reportOnlyRunAttempt: observation.runAttempt,
+      reportOnlyRunHeadSha: observation.headSha,
       requiredCheckName: expectedCheck,
       rulesetId: ruleset.ownedRulesetId,
       rulesetReady: ruleset.ready
@@ -3046,27 +3224,6 @@ export async function baseline(
       `gate.json repository ${parsedGate.repository} does not match requested ${requestedRepository}`
     );
   }
-  const document = buildBaselineDocument(
-    parsedGate.fingerprints,
-    {
-      gateSha256: parsedGate.gateSha256,
-      repository: parsedGate.repository,
-      headSha: parsedGate.headSha,
-      runId: parsedGate.runId,
-      runAttempt: parsedGate.runAttempt
-    },
-    currentTime(context)
-  );
-  const baselineJson = serializeBaselineDocument(document);
-  const report = renderBaselineReport(repository, document);
-  const resultBase = {
-    baseline: document,
-    baselineJson,
-    fingerprintCount: document.fingerprints.length,
-    clean: document.fingerprints.length === 0,
-    gateSha256: document.source.gateSha256,
-    report
-  };
 
   const diagnosis = await doctorInternal(context, repository);
   if (diagnosis.facts.scannerMode !== "report-only") {
@@ -3116,6 +3273,51 @@ export async function baseline(
       }`
     );
   }
+  // Fail closed: observation readiness alone is not enough without proof fields.
+  const observationStartedAt = diagnosis.facts.reportOnlySince;
+  const observationRunId = diagnosis.facts.reportOnlyRunId;
+  const observationRunAttempt = diagnosis.facts.reportOnlyRunAttempt;
+  const observationHeadSha = diagnosis.facts.reportOnlyRunHeadSha;
+  if (
+    !observationStartedAt ||
+    !isCanonicalUtcInstant(observationStartedAt) ||
+    observationRunId === undefined ||
+    observationRunAttempt === undefined ||
+    !observationHeadSha
+  ) {
+    throw new Error(
+      "Cannot open a baseline PR without independently verified observation-start run proof (repository, headSha, runId, runAttempt, startedAt)"
+    );
+  }
+
+  const document = buildBaselineDocument(
+    parsedGate.fingerprints,
+    {
+      gateSha256: parsedGate.gateSha256,
+      repository: parsedGate.repository,
+      headSha: parsedGate.headSha,
+      runId: parsedGate.runId,
+      runAttempt: parsedGate.runAttempt
+    },
+    {
+      repository: requestedRepository,
+      headSha: observationHeadSha,
+      runId: observationRunId,
+      runAttempt: observationRunAttempt,
+      startedAt: observationStartedAt
+    },
+    currentTime(context)
+  );
+  const baselineJson = serializeBaselineDocument(document);
+  const report = renderBaselineReport(repository, document);
+  const resultBase = {
+    baseline: document,
+    baselineJson,
+    fingerprintCount: document.fingerprints.length,
+    clean: document.fingerprints.length === 0,
+    gateSha256: document.source.gateSha256,
+    report
+  };
 
   const { owner, repo } = parseRepository(repository);
   const metadata = await context.github.getRepository(owner, repo);

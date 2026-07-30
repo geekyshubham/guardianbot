@@ -101,8 +101,11 @@ to render the baseline document without writes.
 The baseline is committed separately and reviewed like source code. Preferred
 form is the versioned object produced by `guardianctl baseline`. `generatedAt` is
 only the generation timestamp; human review evidence is the pull request's review
-and merge. `source.runId` / `source.headSha` must match the doctor-observed
-security-gate evidence run (not a later DAST-only schedule on the same commit):
+and merge. `source` is the current successful report-only gate that supplied the
+fingerprints; its `runId` / `headSha` must match the doctor-observed security-gate
+evidence run (not a later DAST-only schedule on the same commit). `observation` is
+the independently verified first qualified report-only `push` /
+`workflow_dispatch` gate that started the seven-day clock:
 
 ```json guardianbot-config=none
 {
@@ -118,16 +121,23 @@ security-gate evidence run (not a later DAST-only schedule on the same commit):
     "headSha": "cccccccccccccccccccccccccccccccccccccccc",
     "runId": 200,
     "runAttempt": 1
+  },
+  "observation": {
+    "repository": "acme/service",
+    "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+    "runId": 100,
+    "runAttempt": 1,
+    "startedAt": "2026-07-20T06:00:00.000Z"
   }
 }
 ```
 
-Legacy non-empty arrays and `{ "fingerprints": [...] }` documents remain accepted.
-An empty fingerprint list is accepted only for the versioned object with a
-canonical RFC3339 UTC `generatedAt` and valid source
-`gateSha256` / `mode` / `repository` / `headSha` / `runId` / `runAttempt`; empty
-legacy baselines are rejected. Duplicate, malformed, or missing baseline documents
-are not ready for enforcement. The seven-day clock starts at the first successful
+Legacy arrays and versionless `{ "fingerprints": [...] }` documents may still be
+inspected on non-enforcing compatibility paths, but are never authorized for
+enforce mode. Empty and non-empty versioned baselines both require valid
+`source` and `observation` provenance for enforce authorization; empty legacy
+baselines are rejected. Duplicate, malformed, or missing baseline documents are
+not ready for enforcement. The seven-day clock starts at the first successful
 default-branch push or `workflow_dispatch` after the current report-only
 configuration was committed whose exact run has a present, non-skipped,
 successful security gate—not when an onboarding PR was opened, not from a
