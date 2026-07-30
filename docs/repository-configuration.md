@@ -133,6 +133,7 @@ image:
     requireImmutableDigest: true
     requireSignature: true
     requireSbom: true
+    promotionMode: enforce-only
 ```
 
 `buildArguments` and `runtimeEnvironment` accept only non-secret static values.
@@ -140,7 +141,15 @@ Secret-like keys are rejected. `ephemeralEnvironment` contains names only; the
 runner generates or resolves their values without writing them to the
 repository. `registry` is a GHCR destination, and promotion requires the same
 immutable digest, expected keyless workflow identity, and CycloneDX SBOM
-evidence.
+evidence. `image.deployment.promotionMode` is optional and defaults to
+`enforce-only` when omitted: generated callers always pass that value as the
+reusable workflow `promotion-mode` input and keep image push disabled until
+scanner mode is `enforce`. Set `verified-default-branch` only when a report-only
+repository must promote Critical-clean default-branch images for staging or
+authenticated DAST. The reusable workflow treats promotion mode as a hard
+contract (invalid values fail validation), authorizes promotion only for
+`enforce` or `report-only`+`verified-default-branch`, and still refuses Critical,
+missing-scan, and scanner-error promotion.
 
 ## DAST policy
 
@@ -265,6 +274,7 @@ Schema and the inline `GuardianConfig` TypeScript interface.
 | `image.deployment.requireImmutableDigest` | yes | Requires deployment by the tested image digest. |
 | `image.deployment.requireSignature` | yes | Requires verified keyless signature identity. |
 | `image.deployment.requireSbom` | yes | Requires SBOM evidence for the same digest. |
+| `image.deployment.promotionMode` | no | `enforce-only` (default) or `verified-default-branch` opt-in for Critical-clean default-branch promotion while scanners remain report-only. |
 | `dast` | no | Staging-only DAST policy, or `null`. |
 | `dast.allowedOrigin` | yes | Primary exact HTTPS staging origin. |
 | `dast.allowedOrigins` | no | Complete exact-origin allowlist including the primary origin. |

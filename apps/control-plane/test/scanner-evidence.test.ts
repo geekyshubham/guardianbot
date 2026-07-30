@@ -1309,6 +1309,119 @@ test("fails image evidence on scanner_error or a policy count that disagrees wit
   }
 });
 
+test("rejects Critical-bearing image-promotion evidence before DigitalOcean promotion", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const criticalTrivy = {
+    SchemaVersion: 2,
+    ArtifactName: "ghcr.io/example/service:test",
+    ArtifactType: "container_image",
+    Results: [
+      {
+        Target: "ghcr.io/example/service:test (debian 12)",
+        Class: "os-pkgs",
+        Type: "debian",
+        Vulnerabilities: [
+          {
+            VulnerabilityID: "CVE-2024-9999",
+            PkgName: "libc6",
+            InstalledVersion: "2.36-9",
+            Severity: "CRITICAL",
+            Title: "critical base image issue",
+            Description: "Critical vulnerability retained in promotion evidence"
+          }
+        ]
+      }
+    ]
+  };
+  const validationZip = buildProvenanceZip(
+    "image-validation",
+    validImageReports({
+      "trivy-image.json": criticalTrivy,
+      "policy.json": { criticalFindings: 1 }
+    })
+  );
+  const promotionZip = buildProvenanceZip("image-promotion", {
+    ...validPromotionReports(),
+    "trivy-image.json": criticalTrivy,
+    "policy.json": { criticalFindings: 1 },
+    "build-digests.json": {
+      schemaVersion: "1.0.0",
+      imageId: `sha256:${"1".repeat(64)}`,
+      repoTags: [`ghcr.io/example/service:${HEAD_SHA}`],
+      promotionExpected: true
+    }
+  });
+  const github = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      {
+        name: "image build, smoke, scan, SBOM",
+        status: "completed",
+        conclusion: "success"
+      },
+      {
+        name: "image push, sign, attest",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[
+      artifactRecord(525, "guardianbot-image-evidence-500-2", validationZip),
+      artifactRecord(526, "guardianbot-image-promotion-500-2", promotionZip)
+    ]],
+    zipByArtifactId: { 525: validationZip, 526: promotionZip }
+  });
+  const appId = "346b3b81-b8cf-4136-b706-0a7195bc9f00";
+  let digitalOceanCalls = 0;
+  const fetchStub: typeof fetch = (async (request, init) => {
+    const url =
+      request instanceof URL
+        ? request
+        : new URL(typeof request === "string" ? request : request.url);
+    if (url.origin === "https://api.digitalocean.com") {
+      digitalOceanCalls += 1;
+      return Response.json({ app: { id: appId } });
+    }
+    return github.fetchStub(request, init);
+  }) as typeof fetch;
+  const environment = {
+    ...TEST_ENV,
+    DIGITALOCEAN_STAGING_TOKEN: "dop_v1_test-token-with-enough-entropy",
+    GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON: JSON.stringify({
+      consumer: {
+        repository: "Geekyshubham/guardianbot-consumer",
+        repositoryId: 99,
+        appId,
+        appName: "guardianbot-consumer-staging",
+        serviceNames: ["web"],
+        imageName: "ghcr.io/example/service",
+        environment: "staging",
+        origin: "https://staging.example.com",
+        healthPath: "/healthz",
+        apiTokenEnv: "DIGITALOCEAN_STAGING_TOKEN",
+        timeoutSeconds: 60
+      }
+    })
+  };
+
+  await assert.rejects(
+    () => createHandler(store, fetchStub, environment)(handlerInput()),
+    /Critical findings/i
+  );
+  assert.equal(digitalOceanCalls, 0);
+  assert.equal(
+    scannerEvidence(store).some((entry) => entry.kind === "deployment"),
+    false
+  );
+  assert.equal(
+    scannerEvidence(store).some((entry) => entry.evidenceKey === "signature"),
+    false
+  );
+});
+
 test("requires structurally valid Cosign signature and CycloneDX attestation evidence for promotion", async () => {
   const store = new ForeignKeyCheckingMemoryStore();
   await seedRepository(store);

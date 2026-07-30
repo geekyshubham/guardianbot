@@ -992,7 +992,8 @@ export function generateGuardianConfig(
             environment: "staging",
             requireImmutableDigest: true,
             requireSignature: true,
-            requireSbom: true
+            requireSbom: true,
+            promotionMode: "enforce-only"
           }
         }
       : null,

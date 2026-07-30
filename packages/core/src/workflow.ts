@@ -40,11 +40,17 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
       dependent-services: ${JSON.stringify((image.dependentServices ?? []).join(","))}
       ephemeral-env-keys: ${JSON.stringify((image.ephemeralEnvironment ?? []).join(","))}
       policy-mode: ${JSON.stringify(options.scannerMode)}
+      promotion-mode: ${JSON.stringify(image.deployment?.promotionMode ?? "enforce-only")}
       runtime-env: |
 ${runtimeEnvironment || "          # No runtime environment values configured."}
       migration-command: ${JSON.stringify(image.migrationCommand ?? "")}
       smoke-command: ${JSON.stringify(image.testCommand ?? "")}
-      push: ${options.scannerMode === "enforce" ? `\${{ github.event_name == 'push' && github.ref == 'refs/heads/${options.defaultBranch}' }}` : "false"}
+      push: ${
+        options.scannerMode === "enforce" ||
+        image.deployment?.promotionMode === "verified-default-branch"
+          ? `\${{ github.event_name == 'push' && github.ref == 'refs/heads/${options.defaultBranch}' }}`
+          : "false"
+      }
 ` : "";
   const dastJobs = dast ? `
   guardianbot-dast-smoke:

@@ -170,6 +170,41 @@ test("accepts the complete reusable repository contract", () => {
   assert.deepEqual(validateAgainstJsonSchema(schema, config), []);
 });
 
+test("accepts optional verified-default-branch promotion and rejects invalid values", () => {
+  const accepted = richConfig();
+  accepted.image!.deployment = {
+    environment: "staging",
+    requireImmutableDigest: true,
+    requireSignature: true,
+    requireSbom: true,
+    promotionMode: "verified-default-branch"
+  };
+  assert.deepEqual(validateGuardianConfig(accepted), []);
+  assert.deepEqual(validateAgainstJsonSchema(schema, accepted), []);
+
+  const omitted = richConfig();
+  assert.equal(omitted.image?.deployment?.promotionMode, undefined);
+  assert.deepEqual(validateGuardianConfig(omitted), []);
+  assert.deepEqual(validateAgainstJsonSchema(schema, omitted), []);
+
+  const rejected = richConfig() as GuardianConfig & {
+    image: NonNullable<GuardianConfig["image"]> & {
+      deployment: NonNullable<NonNullable<GuardianConfig["image"]>["deployment"]> & {
+        promotionMode: string;
+      };
+    };
+  };
+  rejected.image.deployment.promotionMode = "always";
+  const implementationErrors = validateGuardianConfig(rejected);
+  assert.ok(
+    implementationErrors.some((error) =>
+      error.includes("image.deployment.promotionMode is invalid")
+    )
+  );
+  const schemaErrors = validateAgainstJsonSchema(schema, rejected);
+  assert.ok(schemaErrors.length > 0);
+});
+
 test("rejects repository secrets, backend fields, and cross-origin DAST", () => {
   const config = richConfig() as GuardianConfig & {
     modelBackendUrl?: string;

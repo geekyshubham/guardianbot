@@ -443,6 +443,9 @@
             },
             "requireSbom": {
               "const": true
+            },
+            "promotionMode": {
+              "enum": ["enforce-only", "verified-default-branch"]
             }
           }
         }

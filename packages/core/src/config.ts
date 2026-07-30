@@ -4,6 +4,7 @@ import addFormatsImport from "ajv-formats";
 import YAML from "yaml";
 
 export type ScannerMode = "advisory" | "report-only" | "enforce";
+export type ImagePromotionMode = "enforce-only" | "verified-default-branch";
 export type ReviewCategory =
   | "security"
   | "logic"
@@ -106,6 +107,7 @@ export interface GuardianConfig {
       requireImmutableDigest: true;
       requireSignature: true;
       requireSbom: true;
+      promotionMode?: ImagePromotionMode;
     };
   };
   dast?: null | {
@@ -143,6 +145,10 @@ const DAST_PROFILES = new Set<DastScanProfile>([
   "authenticated-baseline",
   "full",
   "authenticated-full"
+]);
+const IMAGE_PROMOTION_MODES = new Set<ImagePromotionMode>([
+  "enforce-only",
+  "verified-default-branch"
 ]);
 const BRANCH_PATTERN = /^(?!\/)(?!.*(?:\/\/|\.\.|@\{))[^\s~^:?*[\\]+(?<![/.])$/;
 
@@ -737,7 +743,13 @@ export function validateGuardianConfig(config: unknown): string[] {
         } else {
           unknownFields(
             config.image.deployment,
-            ["environment", "requireImmutableDigest", "requireSignature", "requireSbom"],
+            [
+              "environment",
+              "requireImmutableDigest",
+              "requireSignature",
+              "requireSbom",
+              "promotionMode"
+            ],
             "image.deployment",
             errors
           );
@@ -755,6 +767,14 @@ export function validateGuardianConfig(config: unknown): string[] {
             if (config.image.deployment[key] !== true) {
               errors.push(`image.deployment.${key} must be true`);
             }
+          }
+          if (
+            config.image.deployment.promotionMode !== undefined &&
+            !IMAGE_PROMOTION_MODES.has(
+              config.image.deployment.promotionMode as ImagePromotionMode
+            )
+          ) {
+            errors.push("image.deployment.promotionMode is invalid");
           }
         }
       }

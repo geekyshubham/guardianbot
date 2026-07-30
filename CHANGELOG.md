@@ -5,6 +5,25 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.33] - 2026-07-30
+
+### Added
+
+- Optional `image.deployment.promotionMode` (`enforce-only` default, or
+  `verified-default-branch`) and matching `guardianctl --image-promotion`
+  override for onboard/upgrade.
+- Explicit `verified-default-branch` allows Critical-clean default-branch image
+  promotion while scanner mode remains `report-only`; omitted config stays
+  `enforce-only` and is backward-compatible.
+
+### Security
+
+- Image promotion requires Critical-clean Trivy evidence and a permitted
+  promotion mode; the promote job rechecks that evidence before signing or
+  publishing.
+- The control plane independently rejects Critical-bearing image-promotion
+  artifacts before any DigitalOcean promotion.
+
 ## [0.2.32] - 2026-07-30
 
 ### Fixed

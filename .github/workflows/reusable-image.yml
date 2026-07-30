@@ -15,6 +15,7 @@ on:
       runtime-env: { required: false, type: string, default: "" }
       ephemeral-env-keys: { required: false, type: string, default: "" }
       policy-mode: { required: false, type: string, default: "enforce" }
+      promotion-mode: { required: false, type: string, default: "enforce-only" }
       push: { required: false, type: boolean, default: false }
 
 permissions:
@@ -30,6 +31,8 @@ jobs:
       id-token: write
     outputs:
       image-tar-sha256: ${{ steps.build.outputs.image-tar-sha256 }}
+      promotion-eligible: ${{ steps.policy.outputs.promotion-eligible }}
+      promotion-authorized: ${{ steps.policy.outputs.promotion-authorized }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -189,8 +192,11 @@ jobs:
             "${INPUT_IMAGE_NAME}:${GITHUB_SHA}"
           test -s guardianbot-image-evidence/sbom.cdx.json
       - name: Enforce Critical image policy
+        id: policy
         env:
           INPUT_POLICY_MODE: ${{ inputs.policy-mode }}
+          INPUT_PROMOTION_MODE: ${{ inputs.promotion-mode }}
+          INPUT_PUSH: ${{ inputs.push }}
         run: |
           case "$INPUT_POLICY_MODE" in
             advisory|report-only|enforce) ;;
@@ -199,10 +205,17 @@ jobs:
               exit 1
               ;;
           esac
+          case "$INPUT_PROMOTION_MODE" in
+            enforce-only|verified-default-branch) ;;
+            *)
+              echo "Image promotion mode is invalid."
+              exit 1
+              ;;
+          esac
           critical_count="$(
             jq '[.Results[]? |
               ((.Vulnerabilities // []) + (.Misconfigurations // []) + (.Secrets // []))[]? |
-              select(.Severity == "CRITICAL")] | length' \
+              select((.Severity // "") | ascii_upcase == "CRITICAL")] | length' \
               guardianbot-image-evidence/trivy-image.json
           )"
           scanner_error="$(jq -r '.scanner_error == true' guardianbot-image-evidence/trivy-image.json)"
@@ -210,13 +223,49 @@ jobs:
             --argjson criticalFindings "$critical_count" \
             --argjson scannerError "$scanner_error" \
             --arg mode "$INPUT_POLICY_MODE" \
+            --arg promotionMode "$INPUT_PROMOTION_MODE" \
             '{
               criticalFindings: $criticalFindings,
               scannerError: $scannerError,
               mode: $mode,
+              promotionMode: $promotionMode,
               enforced: ($mode == "enforce")
             }' \
             > guardianbot-image-evidence/policy.json
+          # Caller push is operator intent only. Promotion eligibility is the
+          # non-bypassable Critical-clean decision from this reusable workflow.
+          if [ "$scanner_error" != "true" ] && [ "$critical_count" -eq 0 ]; then
+            promotion_eligible=true
+          else
+            promotion_eligible=false
+          fi
+          # Mode authorization is independent of Critical cleanliness:
+          # enforce always may promote; report-only only with verified-default-branch;
+          # advisory never promotes.
+          if [ "$INPUT_POLICY_MODE" = "enforce" ] ||
+             { [ "$INPUT_POLICY_MODE" = "report-only" ] &&
+               [ "$INPUT_PROMOTION_MODE" = "verified-default-branch" ]; }; then
+            promotion_authorized=true
+          else
+            promotion_authorized=false
+          fi
+          echo "promotion-eligible=${promotion_eligible}" >> "$GITHUB_OUTPUT"
+          echo "promotion-authorized=${promotion_authorized}" >> "$GITHUB_OUTPUT"
+          if [ -f guardianbot-image-evidence/build-digests.json ]; then
+            if [ "$INPUT_PUSH" = "true" ] &&
+               [ "$promotion_eligible" = "true" ] &&
+               [ "$promotion_authorized" = "true" ]; then
+              promotion_expected=true
+            else
+              promotion_expected=false
+            fi
+            jq --argjson promotionExpected "$promotion_expected" \
+              '.promotionExpected = $promotionExpected' \
+              guardianbot-image-evidence/build-digests.json \
+              > guardianbot-image-evidence/build-digests.json.tmp
+            mv guardianbot-image-evidence/build-digests.json.tmp \
+              guardianbot-image-evidence/build-digests.json
+          fi
           if [ "$scanner_error" = "true" ]; then
             echo "Image policy blocked because Trivy failed operationally."
             exit 1
@@ -229,7 +278,10 @@ jobs:
             echo "::warning::Image scan found ${critical_count} Critical finding(s); ${INPUT_POLICY_MODE} mode retains evidence without blocking."
           fi
       - name: Upload exact image transfer
-        if: inputs.push
+        if: >-
+          inputs.push &&
+          steps.policy.outputs.promotion-eligible == 'true' &&
+          steps.policy.outputs.promotion-authorized == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: guardianbot-image-transfer-${{ github.run_id }}-${{ github.run_attempt }}
@@ -451,9 +503,12 @@ jobs:
     name: image push, sign, attest
     # Never trust the caller's boolean by itself. A pull request can edit its
     # caller workflow, so promotion must also be tied to the repository's real
-    # default-branch push event.
+    # default-branch push event, mode authorization, and an independent
+    # Critical-clean eligibility decision from validate-image.
     if: >-
       inputs.push &&
+      needs.validate-image.outputs.promotion-eligible == 'true' &&
+      needs.validate-image.outputs.promotion-authorized == 'true' &&
       github.event_name == 'push' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     needs: validate-image
@@ -486,6 +541,39 @@ jobs:
           actual_tar_sha="$(sha256sum guardianbot-image-transfer/exact-image.tar.gz | cut -d' ' -f1)"
           test "$actual_tar_sha" = "${{ needs.validate-image.outputs.image-tar-sha256 }}"
           gzip -dc guardianbot-image-transfer/exact-image.tar.gz | docker load
+      - name: Recheck Critical-clean policy evidence
+        run: |
+          set -euo pipefail
+          jq -e 'type == "object"' guardianbot-image-evidence/policy.json >/dev/null
+          jq -e 'type == "object"' guardianbot-image-evidence/trivy-image.json >/dev/null
+          scanner_error="$(jq -r '.scanner_error == true' guardianbot-image-evidence/trivy-image.json)"
+          if [ "$scanner_error" = "true" ]; then
+            echo "Promotion blocked: downloaded Trivy evidence reports scanner_error."
+            exit 1
+          fi
+          policy_critical="$(
+            jq -e '
+              if type == "object" and (.criticalFindings | type == "number")
+              then .criticalFindings
+              else empty
+              end
+            ' guardianbot-image-evidence/policy.json
+          )"
+          if [ "$policy_critical" != "0" ]; then
+            echo "Promotion blocked: policy criticalFindings must be exactly 0."
+            exit 1
+          fi
+          recomputed_critical="$(
+            jq '[.Results[]? |
+              ((.Vulnerabilities // []) + (.Misconfigurations // []) + (.Secrets // []))[]? |
+              select((.Severity // "") | ascii_upcase == "CRITICAL")] | length' \
+              guardianbot-image-evidence/trivy-image.json
+          )"
+          if [ "$recomputed_critical" != "0" ] ||
+             [ "$recomputed_critical" != "$policy_critical" ]; then
+            echo "Promotion blocked: recomputed Critical count is not clean."
+            exit 1
+          fi
       - name: Authenticate GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Push immutable content

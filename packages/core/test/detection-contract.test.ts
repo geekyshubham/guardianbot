@@ -166,7 +166,8 @@ test("generates the extended reusable config from content-aware repository detec
     environment: "staging",
     requireImmutableDigest: true,
     requireSignature: true,
-    requireSbom: true
+    requireSbom: true,
+    promotionMode: "enforce-only"
   });
   assert.equal(config.dast, null);
 });

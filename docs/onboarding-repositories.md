@@ -16,9 +16,11 @@ It creates one draft PR. The workflow calls GuardianBot at an immutable commit.
 No scanner implementation or infrastructure credential enters the repository.
 
 For a known staging contract, operators may supply reusable declarative overrides:
-`--dockerfile`, `--health-path`, `--readiness-path`, `--dast-origin`, `--openapi`,
-`--auth-profile`, and `--session-path`. GuardianBot validates that the Dockerfile
-exists and requires the complete DAST tuple; none of these flags accepts a secret.
+`--dockerfile`, `--health-path`, `--readiness-path`, `--image-promotion`,
+`--dast-origin`, `--openapi`, `--auth-profile`, and `--session-path`. GuardianBot
+validates that the Dockerfile exists, requires configured image deployment for
+`--image-promotion` (`enforce-only` or `verified-default-branch`), and requires
+the complete DAST tuple; none of these flags accepts a secret.
 
 Lifecycle commands:
 
@@ -36,6 +38,7 @@ configuration and caller changes:
 
 ```sh
 guardianctl upgrade OWNER/REPOSITORY \
+  --image-promotion verified-default-branch \
   --dast-origin https://staging.example.com \
   --openapi /openapi.json \
   --auth-profile control-plane://profiles/example-staging \
@@ -44,6 +47,9 @@ guardianctl upgrade OWNER/REPOSITORY \
 
 All four DAST options are required together. Partial profiles are rejected, and
 no credential or backend URL is written to the consumer repository.
+`--image-promotion verified-default-branch` is the explicit opt-in that lets a
+report-only Docker repository render default-branch push intent; Critical-clean
+eligibility remains enforced inside the reusable image workflow.
 
 `doctor` validates:
 

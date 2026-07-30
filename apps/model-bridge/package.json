@@ -1,6 +1,6 @@
 {
   "name": "@guardianbot/model-bridge",
-  "version": "0.2.32",
+  "version": "0.2.33",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,6 @@
     "typecheck": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@guardianbot/protocol": "0.2.32"
+    "@guardianbot/protocol": "0.2.33"
   }
 }

@@ -1624,6 +1624,14 @@ async function processImageArtifact(
     payload: sbomSummary
   });
   if (artifact.artifactType === "image-promotion") {
+    // Fail closed before signature verification or DigitalOcean promotion when
+    // the recomputed Trivy Critical count is non-zero, even if workflow
+    // metadata or promotionExpected otherwise look trusted.
+    if (criticalCount !== 0) {
+      throw new Error(
+        "image promotion evidence contains Critical findings and cannot be accepted"
+      );
+    }
     const expectedCallerWorkflowRef = `refs/heads/${defaultBranch}`;
     if (
       run.event !== "push" ||

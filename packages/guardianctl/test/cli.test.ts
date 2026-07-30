@@ -1027,6 +1027,67 @@ test("upgrade rejects partial DAST override contracts without opening a branch",
   assert.equal(github.writes.length, 0);
 });
 
+test("upgrade applies verified-default-branch image promotion overrides", async () => {
+  const github = new MockGitHub();
+  const image: NonNullable<GuardianConfig["image"]> = {
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64",
+    registry: "ghcr.io/acme/service",
+    healthPath: "/health",
+    sbomFormat: "cyclonedx-json",
+    deployment: {
+      environment: "staging",
+      requireImmutableDigest: true,
+      requireSignature: true,
+      requireSbom: true,
+      promotionMode: "enforce-only"
+    }
+  };
+  const state = github.add(healthyState("service", { image }));
+  state.files.set("Dockerfile", { content: "FROM scratch\n", sha: "dockerfile-sha" });
+
+  const result = await upgrade(
+    commandContext(github, {
+      overrides: {
+        imagePromotion: "verified-default-branch"
+      }
+    }),
+    "acme/service"
+  );
+
+  assert.equal(result.changed, true);
+  const configWrite = github.writes.find((write) => write.path === CONFIG_PATH)!;
+  const updated = parseGuardianConfig(configWrite.content);
+  assert.equal(updated.image?.deployment?.promotionMode, "verified-default-branch");
+  const workflowWrite = github.writes.find(
+    (write) => write.path === CALLER_WORKFLOW_PATH
+  )!;
+  assert.match(
+    workflowWrite.content,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+});
+
+test("upgrade rejects image-promotion without configured image deployment", async () => {
+  const github = new MockGitHub();
+  github.add(healthyState());
+
+  await assert.rejects(
+    upgrade(
+      commandContext(github, {
+        overrides: {
+          imagePromotion: "verified-default-branch"
+        }
+      }),
+      "acme/service"
+    ),
+    /image-promotion override requires configured image deployment/
+  );
+  assert.equal(github.branches.length, 0);
+  assert.equal(github.writes.length, 0);
+});
+
 test("upgrade --all consumes every GitHub repository page", async (t) => {
   const config = guardianConfig();
   const workflow = workflowFor(config);

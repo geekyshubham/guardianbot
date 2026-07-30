@@ -42,6 +42,7 @@ export interface CommandContext {
     dockerfile?: string;
     healthPath?: string;
     readinessPath?: string;
+    imagePromotion?: "enforce-only" | "verified-default-branch";
     dastOrigin?: string;
     openapi?: string;
     authenticationProfile?: string;
@@ -79,6 +80,20 @@ function applyConfigurationOverrides(
       throw new Error("readiness-path override requires configured image coverage");
     }
     config.image.readinessPath = override.readinessPath;
+  }
+  if (override.imagePromotion) {
+    if (!config.image?.deployment) {
+      throw new Error("image-promotion override requires configured image deployment");
+    }
+    if (
+      override.imagePromotion !== "enforce-only" &&
+      override.imagePromotion !== "verified-default-branch"
+    ) {
+      throw new Error(
+        "image-promotion must be enforce-only or verified-default-branch"
+      );
+    }
+    config.image.deployment.promotionMode = override.imagePromotion;
   }
   if (
     override.dastOrigin ||
@@ -1020,6 +1035,15 @@ async function inspectImageConfiguration(
       !image.deployment.requireSbom
     ) {
       problems.push("deployment promotion must require digest, signature, and SBOM evidence");
+    }
+    if (
+      image.deployment.promotionMode !== undefined &&
+      image.deployment.promotionMode !== "enforce-only" &&
+      image.deployment.promotionMode !== "verified-default-branch"
+    ) {
+      problems.push(
+        "deployment promotionMode must be enforce-only or verified-default-branch"
+      );
     }
   }
   if (safeRepositoryPath(image.dockerfile)) {

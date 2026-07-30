@@ -30,6 +30,7 @@ Options:
   --dockerfile PATH
   --health-path PATH
   --readiness-path PATH
+  --image-promotion MODE
   --dast-origin HTTPS_ORIGIN
   --openapi PATH_OR_URL
   --auth-profile CONTROL_PLANE_REFERENCE
@@ -61,11 +62,24 @@ const VALUE_OPTIONS = new Set([
   "--dockerfile",
   "--health-path",
   "--readiness-path",
+  "--image-promotion",
   "--dast-origin",
   "--openapi",
   "--auth-profile",
   "--session-path"
 ]);
+
+function imagePromotionMode(
+  value: string | undefined
+): "enforce-only" | "verified-default-branch" | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "enforce-only" && value !== "verified-default-branch") {
+    throw new Error(
+      "--image-promotion must be enforce-only or verified-default-branch"
+    );
+  }
+  return value;
+}
 
 function positionalRepository(args: string[]): string | undefined {
   for (let index = 1; index < args.length; index += 1) {
@@ -114,6 +128,7 @@ async function main() {
       dockerfile: option(args, "--dockerfile"),
       healthPath: option(args, "--health-path"),
       readinessPath: option(args, "--readiness-path"),
+      imagePromotion: imagePromotionMode(option(args, "--image-promotion")),
       dastOrigin: option(args, "--dast-origin"),
       openapi: option(args, "--openapi"),
       authenticationProfile: option(args, "--auth-profile"),

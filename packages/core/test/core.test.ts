@@ -46,6 +46,7 @@ test("detects a reusable repository configuration", () => {
   assert.deepEqual(validateGuardianConfig(config), []);
   assert.equal(config.scanners.mode, "report-only");
   assert.ok(config.image);
+  assert.equal(config.image?.deployment?.promotionMode, "enforce-only");
 });
 
 test("onboarding report states the effective scanner mode", () => {
@@ -100,11 +101,75 @@ test("generates ephemeral runtime key references without repository-side values"
   });
   assert.match(workflow, /ephemeral-env-keys: "APPLICATION_SMOKE_SECRET"/);
   assert.match(workflow, /policy-mode: "report-only"/);
+  assert.match(workflow, /promotion-mode: "enforce-only"/);
   assert.match(workflow, /push: false/);
   assert.doesNotMatch(workflow, /APPLICATION_SMOKE_SECRET=/);
   assert.match(workflow, /guardianbot-image:[\s\S]*permissions:\n      contents: read\n      packages: write\n      id-token: write/);
   assert.doesNotMatch(workflow, /attestations: write/);
   assert.doesNotMatch(workflow, /evidence-attestation-url/);
+});
+
+test("report-only image callers keep push disabled unless verified promotion is opted in", () => {
+  const image = {
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64" as const,
+    registry: "ghcr.io/geekyshubham/service",
+    healthPath: "/health",
+    sbomFormat: "cyclonedx-json" as const,
+    deployment: {
+      environment: "staging",
+      requireImmutableDigest: true as const,
+      requireSignature: true as const,
+      requireSbom: true as const,
+      promotionMode: "enforce-only" as const
+    }
+  };
+  const reportOnly = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    image
+  });
+  assert.match(reportOnly, /promotion-mode: "enforce-only"/);
+  assert.match(reportOnly, /push: false/);
+  assert.doesNotMatch(
+    reportOnly,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+
+  const verifiedReportOnly = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    image: {
+      ...image,
+      deployment: {
+        ...image.deployment,
+        promotionMode: "verified-default-branch"
+      }
+    }
+  });
+  assert.match(verifiedReportOnly, /promotion-mode: "verified-default-branch"/);
+  assert.match(
+    verifiedReportOnly,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+
+  const enforce = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "enforce",
+    image
+  });
+  assert.match(enforce, /promotion-mode: "enforce-only"/);
+  assert.match(
+    enforce,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
 });
 
 test("rejects DAST configurations that escape the allowed origin", () => {

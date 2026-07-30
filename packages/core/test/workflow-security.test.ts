@@ -129,6 +129,148 @@ test("image workflow masks generated runtime values and never dumps container lo
   );
   assert.match(workflow, /scanner_error.*exit 1/s);
   assert.match(workflow, /advisory\|report-only\|enforce/);
+  assert.match(workflow, /enforce-only\|verified-default-branch/);
+  assert.match(
+    workflow,
+    /promotion-mode: \{ required: false, type: string, default: "enforce-only" \}/
+  );
+  assert.match(workflow, /id: policy/);
+  assert.match(
+    workflow,
+    /promotion-eligible: \$\{\{ steps\.policy\.outputs\.promotion-eligible \}\}/
+  );
+  assert.match(
+    workflow,
+    /promotion-authorized: \$\{\{ steps\.policy\.outputs\.promotion-authorized \}\}/
+  );
+  assert.match(workflow, /echo "promotion-eligible=\$\{promotion_eligible\}" >> "\$GITHUB_OUTPUT"/);
+  assert.match(
+    workflow,
+    /echo "promotion-authorized=\$\{promotion_authorized\}" >> "\$GITHUB_OUTPUT"/
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$scanner_error" != "true" \] && \[ "\$critical_count" -eq 0 \]/
+  );
+  assert.match(
+    workflow,
+    /select\(\(\.Severity \/\/ ""\) \| ascii_upcase == "CRITICAL"\)/
+  );
+  assert.equal(
+    workflow.match(
+      /select\(\(\.Severity \/\/ ""\) \| ascii_upcase == "CRITICAL"\)/g
+    )?.length,
+    2
+  );
+  assert.doesNotMatch(workflow, /select\(\.Severity == "CRITICAL"\)/);
+  assert.match(
+    workflow,
+    /\[ "\$INPUT_POLICY_MODE" = "enforce" \] \|\|/
+  );
+  assert.match(
+    workflow,
+    /\[ "\$INPUT_POLICY_MODE" = "report-only" \] &&\s+\[ "\$INPUT_PROMOTION_MODE" = "verified-default-branch" \]/
+  );
+  assert.match(
+    workflow,
+    /if: >-\n\s+inputs\.push &&\n\s+steps\.policy\.outputs\.promotion-eligible == 'true' &&\n\s+steps\.policy\.outputs\.promotion-authorized == 'true'/
+  );
+  assert.match(
+    workflow,
+    /needs\.validate-image\.outputs\.promotion-eligible == 'true' &&\n\s+needs\.validate-image\.outputs\.promotion-authorized == 'true'/
+  );
+  assert.match(workflow, /- name: Recheck Critical-clean policy evidence/);
+  assert.match(
+    workflow,
+    /jq -e 'type == "object"' guardianbot-image-evidence\/policy\.json/
+  );
+  assert.match(
+    workflow,
+    /jq -e 'type == "object"' guardianbot-image-evidence\/trivy-image\.json/
+  );
+  assert.match(
+    workflow,
+    /policy criticalFindings must be exactly 0/
+  );
+  assert.match(
+    workflow,
+    /recomputed Critical count is not clean/
+  );
+  const recheckAt = workflow.indexOf(
+    "- name: Recheck Critical-clean policy evidence"
+  );
+  const authAt = workflow.indexOf("- name: Authenticate GHCR");
+  assert.ok(recheckAt >= 0);
+  assert.ok(authAt > recheckAt);
+  assert.match(
+    workflow,
+    /\.promotionExpected = \$promotionExpected/
+  );
+});
+
+test("generated image callers always pass promotion-mode and default omitted config to enforce-only", async () => {
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const image = {
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64" as const,
+    registry: "ghcr.io/example/service",
+    healthPath: "/health",
+    sbomFormat: "cyclonedx-json" as const
+  };
+  const omitted = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    image
+  });
+  assert.match(omitted, /promotion-mode: "enforce-only"/);
+  assert.match(omitted, /push: false/);
+
+  const verified = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    image: {
+      ...image,
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true,
+        promotionMode: "verified-default-branch"
+      }
+    }
+  });
+  assert.match(verified, /promotion-mode: "verified-default-branch"/);
+  assert.match(
+    verified,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+
+  const enforce = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "enforce",
+    image: {
+      ...image,
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true,
+        promotionMode: "enforce-only"
+      }
+    }
+  });
+  assert.match(enforce, /promotion-mode: "enforce-only"/);
+  assert.match(
+    enforce,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
 });
 
 test("scanner and DAST workflows reject repository-controlled evidence paths", () => {

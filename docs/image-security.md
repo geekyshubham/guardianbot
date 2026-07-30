@@ -7,9 +7,12 @@ creates a CycloneDX SBOM. Qualifying Critical findings, smoke failure, missing
 scan evidence, or a missing SBOM stop promotion.
 
 In `advisory` and `report-only` modes, image findings are retained and attested
-without failing the validation check, but the generated caller disables image
-publication. Promotion is enabled only after `guardianctl enforce` changes the
-repository to `enforce`; Critical findings then fail the check.
+without failing the validation check. Generated configs default
+`image.deployment.promotionMode` to `enforce-only`, so report-only callers keep
+`push: false`. Operators may opt into `verified-default-branch` so a report-only
+repository can publish a default-branch image only when the reusable workflow
+independently confirms a Critical-clean, non-error Trivy result. After
+`guardianctl enforce`, Critical findings fail the validation check.
 
 ## Validation and promotion
 
@@ -18,15 +21,28 @@ an isolated Docker network. Declarative build, test, migration, and runtime
 settings come from `.guardianbot/config.yml`; credentials are generated in the
 runner and are never committed to the consumer repository.
 
-Pull requests run only validation, with no package-publish permission.
-Enforced default-branch promotion restores the exact validated image artifact, pushes it
-to GHCR, signs the registry digest keylessly with Cosign, attaches the CycloneDX
-SBOM attestation, and verifies the expected GitHub workflow identity. Evidence
-paths are runner-controlled; a repository-created path or symlink fails closed.
+Pull requests run only validation, with no package-publish permission. The
+caller's `push` input is operator intent only. Generated callers always pass
+`promotion-mode` (defaulting omitted config to `enforce-only`). Promotion and
+exact-image transfer upload also require the reusable workflow's Critical-clean
+`promotion-eligible` output, mode authorization (`promotion-authorized`:
+`policy-mode=enforce`, or `report-only` with `promotion-mode=verified-default-branch`;
+advisory never authorizes), a default-branch `push` event, and the protected
+`guardianbot-image-promotion` environment. Before registry authentication the
+promote job independently re-reads downloaded `policy.json` and
+`trivy-image.json`, rejects scanner errors, and requires both the policy
+Critical count and a case-insensitive recomputed Trivy Critical count to be
+exactly zero and matching. Qualifying promotion restores the exact validated
+image artifact, pushes it to GHCR, signs the registry digest keylessly with
+Cosign, attaches the CycloneDX SBOM attestation, and verifies the expected
+GitHub workflow identity. Evidence paths are runner-controlled; a
+repository-created path or symlink fails closed.
 
 The control plane independently accepts promotion evidence only from the
-configured reusable workflow SHA on a GitHub-hosted runner. A local Docker image
-ID is not a registry digest and cannot satisfy monitoring.
+configured reusable workflow SHA on a GitHub-hosted runner, and rejects
+Critical-bearing image-promotion artifacts before signature or DigitalOcean
+processing even when workflow metadata otherwise looks trusted. A local Docker
+image ID is not a registry digest and cannot satisfy monitoring.
 
 ## DigitalOcean deployment reconciliation
 
