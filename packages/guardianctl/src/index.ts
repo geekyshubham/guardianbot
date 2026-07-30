@@ -31,6 +31,8 @@ export const BASELINE_SCHEMA_VERSION = "guardianbot.baseline.v1" as const;
 const IMMUTABLE_SHA = /^[a-f0-9]{40}$/;
 const FINGERPRINT_SHA256 = /^[a-f0-9]{64}$/;
 const MAX_WORKFLOW_RUN_PAGES = 10;
+/** Shared page cap for Actions job and commit check-run listings (100 items/page). */
+const MAX_EVIDENCE_PAGES = MAX_WORKFLOW_RUN_PAGES;
 const MAX_GATE_JSON_BYTES = 1_048_576;
 const MAX_POLICY_FINDINGS = 500;
 
@@ -213,6 +215,23 @@ interface CheckRun {
   status: string;
   conclusion: string | null;
   details_url?: string;
+  html_url?: string;
+}
+
+interface WorkflowJob {
+  id?: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  html_url?: string;
+}
+
+interface GateEvidence {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  run: WorkflowRun;
+  skipped: boolean;
 }
 
 interface CommitSummary {
@@ -315,6 +334,7 @@ interface RunInspection {
 interface GateCheckInspection {
   name?: string;
   check: DoctorCheck;
+  evidenceRun?: WorkflowRun;
 }
 
 const appInventoryCache = new WeakMap<
@@ -620,6 +640,57 @@ function workflowRunIsExpected(run: WorkflowRun, defaultBranch: string): boolean
   return !run.event || ["push", "schedule", "workflow_dispatch"].includes(run.event);
 }
 
+function actionsRunIdFromUrl(value?: string | null): number | undefined {
+  if (!value) return undefined;
+  const match = /\/actions\/runs\/(\d+)(?:\/|$)/.exec(value);
+  if (!match) return undefined;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
+function pickSecurityGateJob(jobs: WorkflowJob[]): WorkflowJob | undefined {
+  const gates = jobs.filter((job) => isGateCheckName(job.name));
+  if (!gates.length) return undefined;
+  const active = gates.filter((job) => job.conclusion !== "skipped");
+  const pool = active.length ? active : gates;
+  const nested = pool.filter((job) => job.name.includes(" / "));
+  return nested[0] ?? pool[0];
+}
+
+function pickSecurityGateCheck(checks: CheckRun[]): CheckRun | undefined {
+  const gates = checks.filter((check) => isGateCheckName(check.name));
+  if (!gates.length) return undefined;
+  const active = gates.filter((check) => check.conclusion !== "skipped");
+  const pool = active.length ? active : gates;
+  const nested = pool.filter((check) => check.name.includes(" / "));
+  return nested[0] ?? pool[0];
+}
+
+function gateEvidenceFromJob(run: WorkflowRun, job: WorkflowJob): GateEvidence {
+  return {
+    name: job.name,
+    status: job.status,
+    conclusion: job.conclusion,
+    run,
+    skipped: job.conclusion === "skipped"
+  };
+}
+
+function gateEvidenceFromCheck(run: WorkflowRun, check: CheckRun): GateEvidence {
+  return {
+    name: check.name,
+    status: check.status,
+    conclusion: check.conclusion,
+    run,
+    skipped: check.conclusion === "skipped"
+  };
+}
+
+/** Push and manual dispatch always attempt the security gate; schedules may be DAST-only. */
+function isAlwaysSecurityEvent(event?: string): boolean {
+  return event === "push" || event === "workflow_dispatch";
+}
+
 async function loadWorkflowRuns(
   github: GitHubClient,
   owner: string,
@@ -787,59 +858,223 @@ function inspectLatestRun(
   };
 }
 
-async function inspectGateCheck(
+async function loadWorkflowJobs(
   github: GitHubClient,
   owner: string,
   repo: string,
-  run?: WorkflowRun
+  runId: number
+): Promise<WorkflowJob[]> {
+  const jobs: WorkflowJob[] = [];
+  for (let page = 1; page <= MAX_EVIDENCE_PAGES; page += 1) {
+    const response = await github.request<{ jobs?: WorkflowJob[] }>(
+      "GET",
+      `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?filter=all&per_page=100&page=${page}`
+    );
+    const batch = response.jobs ?? [];
+    jobs.push(...batch);
+    if (batch.length < 100) return jobs;
+  }
+  throw new Error(
+    `workflow job listing for run ${runId} exceeded ${MAX_EVIDENCE_PAGES} pages; fail closed`
+  );
+}
+
+async function loadCommitCheckRuns(
+  github: GitHubClient,
+  owner: string,
+  repo: string,
+  headSha: string
+): Promise<CheckRun[]> {
+  const checkRuns: CheckRun[] = [];
+  for (let page = 1; page <= MAX_EVIDENCE_PAGES; page += 1) {
+    const response = await github.request<{ check_runs: CheckRun[] }>(
+      "GET",
+      `/repos/${owner}/${repo}/commits/${encodeURIComponent(
+        headSha
+      )}/check-runs?filter=all&per_page=100&page=${page}`
+    );
+    const batch = response.check_runs ?? [];
+    checkRuns.push(...batch);
+    if (batch.length < 100) return checkRuns;
+  }
+  throw new Error(
+    `check-run listing for ${headSha.slice(0, 12)} exceeded ${MAX_EVIDENCE_PAGES} pages; fail closed`
+  );
+}
+
+/**
+ * Resolve security-gate evidence for a specific Actions run using job metadata
+ * first, then check-run URLs that reference that run id. Same-SHA checks from
+ * other runs are never accepted without that provenance.
+ */
+async function loadGateEvidenceForRun(
+  github: GitHubClient,
+  owner: string,
+  repo: string,
+  run: WorkflowRun
+): Promise<GateEvidence | null> {
+  if (!run.id) return null;
+
+  try {
+    const jobs = await loadWorkflowJobs(github, owner, repo, run.id);
+    const job = pickSecurityGateJob(jobs);
+    if (job) return gateEvidenceFromJob(run, job);
+    // Non-empty job list without a security-gate job is definitive for this run
+    // (for example DAST-only schedules that omit the skipped caller job record).
+    if (jobs.length > 0) return null;
+  } catch (error) {
+    const status = githubErrorStatus(error);
+    if (!status || ![403, 404].includes(status)) throw error;
+  }
+
+  // Fallback when jobs are unavailable or empty: associate check runs only via
+  // Actions URLs that include this run id. Never accept same-SHA checks from
+  // other runs without that provenance.
+  if (!run.head_sha) return null;
+  try {
+    const checkRuns = await loadCommitCheckRuns(github, owner, repo, run.head_sha);
+    const associated = checkRuns.filter(
+      (check) =>
+        isGateCheckName(check.name) &&
+        (actionsRunIdFromUrl(check.details_url) === run.id ||
+          actionsRunIdFromUrl(check.html_url) === run.id)
+    );
+    const gate = pickSecurityGateCheck(associated);
+    if (gate) return gateEvidenceFromCheck(run, gate);
+  } catch (error) {
+    const status = githubErrorStatus(error);
+    if (!status || ![403, 404].includes(status)) throw error;
+  }
+
+  return null;
+}
+
+async function inspectGateCheck(
+  context: CommandContext,
+  github: GitHubClient,
+  owner: string,
+  repo: string,
+  runs: WorkflowRun[],
+  requiredAfter?: Date,
+  managedChangeError?: string
 ): Promise<GateCheckInspection> {
-  if (!run?.head_sha) {
+  if (managedChangeError) {
     return {
       check: makeCheck(
         "security-gate-check",
         "security gate check",
         false,
-        "latest expected run has no head SHA",
+        `managed caller/configuration change time is not observable: ${managedChangeError}`,
+        { state: "failed" }
+      )
+    };
+  }
+  if (!requiredAfter) {
+    return {
+      check: makeCheck(
+        "security-gate-check",
+        "security gate check",
+        false,
+        "managed caller/configuration commit time is missing",
         { state: "missing" }
       )
     };
   }
+
+  const maxAgeHours =
+    context.expectedRunMaxAgeHours ?? DEFAULT_EXPECTED_RUN_MAX_AGE_HOURS;
+  const now = currentTime(context);
+  let sawCompletedInWindow = false;
+  let sawStaleQualifyingCandidate = false;
+
   try {
-    const checkRuns: CheckRun[] = [];
-    for (let page = 1; ; page += 1) {
-      const response = await github.request<{ check_runs: CheckRun[] }>(
-        "GET",
-        `/repos/${owner}/${repo}/commits/${encodeURIComponent(
-          run.head_sha
-        )}/check-runs?filter=latest&per_page=100&page=${page}`
-      );
-      const batch = response.check_runs ?? [];
-      checkRuns.push(...batch);
-      if (batch.length < 100) break;
-    }
-    const gate = checkRuns.find((checkRun) => isGateCheckName(checkRun.name));
-    if (!gate) {
+    for (const run of runs) {
+      if (run.status !== "completed") continue;
+      const completedAt = workflowRunTime(run);
+      if (!completedAt) {
+        return {
+          check: makeCheck(
+            "security-gate-check",
+            "security gate check",
+            false,
+            "completed run has no usable timestamp; security-gate freshness cannot be verified",
+            { state: "stale" }
+          )
+        };
+      }
+      if (completedAt.getTime() < requiredAfter.getTime()) {
+        // Remaining runs are older (list is newest-first).
+        break;
+      }
+      const ageHours = (now.getTime() - completedAt.getTime()) / 3_600_000;
+      if (ageHours < -0.25) {
+        return {
+          check: makeCheck(
+            "security-gate-check",
+            "security gate check",
+            false,
+            `security-gate run timestamp is ${Math.abs(ageHours).toFixed(1)} hours in the future`,
+            { state: "failed" }
+          )
+        };
+      }
+      if (ageHours > maxAgeHours) {
+        sawStaleQualifyingCandidate = true;
+        // Older runs are staler; stop scanning.
+        break;
+      }
+      sawCompletedInWindow = true;
+
+      const evidence = await loadGateEvidenceForRun(github, owner, repo, run);
+      // Only schedules may omit or skip the gate (generated DAST-only crons).
+      // Push and workflow_dispatch always attempt it; missing/skipped fails closed
+      // so a newer non-security event cannot hide behind an older success.
+      if (!evidence || evidence.skipped) {
+        if (!isAlwaysSecurityEvent(run.event)) continue;
+        if (!evidence) {
+          return {
+            evidenceRun: run,
+            check: makeCheck(
+              "security-gate-check",
+              "security gate check",
+              false,
+              `${run.event} run ${run.id ?? "unknown"} has no ${SECURITY_GATE_PREFIX} evidence`,
+              { state: "missing" }
+            )
+          };
+        }
+        return {
+          name: evidence.name,
+          evidenceRun: evidence.run,
+          check: makeCheck(
+            "security-gate-check",
+            "security gate check",
+            false,
+            `${evidence.name}: ${evidence.status}/${evidence.conclusion ?? "pending"} (run ${
+              evidence.run.id ?? "unknown"
+            }); ${run.event} runs must not skip the security gate`,
+            { state: "failed" }
+          )
+        };
+      }
+
+      // Non-skipped gate on any event (including schedule) is security evidence.
+      const ok =
+        evidence.status === "completed" && evidence.conclusion === "success";
       return {
+        name: evidence.name,
+        evidenceRun: evidence.run,
         check: makeCheck(
           "security-gate-check",
           "security gate check",
-          false,
-          `commit ${run.head_sha} has no ${SECURITY_GATE_PREFIX} check`,
-          { state: "missing" }
+          ok,
+          `${evidence.name}: ${evidence.status}/${evidence.conclusion ?? "pending"} (run ${
+            evidence.run.id ?? "unknown"
+          })`,
+          { state: ok ? "ok" : "failed" }
         )
       };
     }
-    const ok = gate.status === "completed" && gate.conclusion === "success";
-    return {
-      name: gate.name,
-      check: makeCheck(
-        "security-gate-check",
-        "security gate check",
-        ok,
-        `${gate.name}: ${gate.status}/${gate.conclusion ?? "pending"}`,
-        { state: ok ? "ok" : "failed" }
-      )
-    };
   } catch (error) {
     return {
       check: makeCheck(
@@ -851,6 +1086,30 @@ async function inspectGateCheck(
       )
     };
   }
+
+  if (sawStaleQualifyingCandidate && !sawCompletedInWindow) {
+    return {
+      check: makeCheck(
+        "security-gate-check",
+        "security gate check",
+        false,
+        `no ${SECURITY_GATE_PREFIX} evidence within ${maxAgeHours} hours; DAST-only or skipped gates are ignored`,
+        { state: "stale" }
+      )
+    };
+  }
+
+  return {
+    check: makeCheck(
+      "security-gate-check",
+      "security gate check",
+      false,
+      sawCompletedInWindow
+        ? `no ${SECURITY_GATE_PREFIX} evidence from a qualifying security run in the freshness window; DAST-only or skipped gates are ignored`
+        : `no completed expected run can supply ${SECURITY_GATE_PREFIX} evidence`,
+      { state: "missing" }
+    )
+  };
 }
 
 async function loadUserInstallationInventory(
@@ -1786,12 +2045,18 @@ function inspectObservationPeriod(
       )
     };
   }
+  // Observation and enforcement timing start only from the first successful
+  // default-branch push or workflow_dispatch after report-only config. All
+  // schedule events are excluded (including security-bearing ones) so DAST-only
+  // smokes cannot start the clock; onboarding normally starts it via the merge
+  // push that lands the generated caller.
   const firstSuccessfulRun = [...runs]
     .filter((run) => {
       const time = workflowRunTime(run);
       return (
         run.status === "completed" &&
         run.conclusion === "success" &&
+        isAlwaysSecurityEvent(run.event) &&
         time &&
         time.getTime() >= configuredSince.getTime()
       );
@@ -1807,7 +2072,7 @@ function inspectObservationPeriod(
         "report-only-observation",
         "report-only observation",
         false,
-        `no successful default-branch run proves report-only operation since ${configuredSince.toISOString()}`,
+        `no successful default-branch push or workflow_dispatch proves report-only operation since ${configuredSince.toISOString()} (scheduled runs do not start the clock)`,
         { blocking, state: "missing" }
       )
     };
@@ -1825,7 +2090,7 @@ function inspectObservationPeriod(
       "report-only-observation",
       "report-only observation",
       ok,
-      `${ageDays.toFixed(2)} days since first successful report-only run ${since.toISOString()}; minimum is ${minimum}`,
+      `${ageDays.toFixed(2)} days since first successful report-only security run ${since.toISOString()}; minimum is ${minimum}`,
       { blocking, state: ok ? "ok" : "stale" }
     )
   };
@@ -2293,10 +2558,13 @@ async function doctorInternal(
 
   const gate = workflow
     ? await inspectGateCheck(
+        context,
         context.github,
         owner,
         repo,
-        runInspection.latestCompleted
+        runInspection.runs,
+        managedConfigurationChangedAt,
+        managedChangeError
       )
     : {
         check: makeCheck(
@@ -2436,11 +2704,14 @@ async function doctorInternal(
     facts: {
       scannerMode: parsedConfig?.scanners.mode,
       appAccess: appAccess.state,
-      latestRunAt: runInspection.latestCompleted
-        ? workflowRunTime(runInspection.latestCompleted)?.toISOString()
-        : undefined,
-      latestRunId: runInspection.latestCompleted?.id,
-      latestRunHeadSha: runInspection.latestCompleted?.head_sha,
+      latestRunAt: gate.evidenceRun
+        ? workflowRunTime(gate.evidenceRun)?.toISOString()
+        : runInspection.latestCompleted
+          ? workflowRunTime(runInspection.latestCompleted)?.toISOString()
+          : undefined,
+      latestRunId: gate.evidenceRun?.id ?? runInspection.latestCompleted?.id,
+      latestRunHeadSha:
+        gate.evidenceRun?.head_sha ?? runInspection.latestCompleted?.head_sha,
       managedConfigurationChangedAt:
         managedConfigurationChangedAt?.toISOString(),
       securityGateCheck: gate.name,
