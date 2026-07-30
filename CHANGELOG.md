@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.35] - 2026-07-30
+
 ### Fixed
 
 - Internal GitHub repository visibility routes model reviews as `restricted`

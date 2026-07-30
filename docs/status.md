@@ -3,6 +3,12 @@
 Release: `0.2.34`
 Last verified: 2026-07-30
 
+**Release control:** Automated code/test verification on this page is current
+through `v0.2.35` (2026-07-30). Live fleet/deployment evidence remains
+`v0.2.34` unless an individual row or evidence link says otherwise. This does
+not claim live `v0.2.35` deployment, production AI, authenticated-full schedule,
+AstraNull current schedule, or enforcement.
+
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
 test environment; it is not evidence that the corresponding GitHub or
