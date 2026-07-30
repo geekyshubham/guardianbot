@@ -5,6 +5,16 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Fixed
+
+- `guardianctl inventory` no longer treats the all-zero CLI placeholder as an
+  administrative workflow target. Without `GUARDIANBOT_WORKFLOW_SHA`, inventory
+  derives the expected pin from each repository's validated config or consistent
+  caller pins, still rejects mutable/zero/mismatched pins, and continues to
+  surface drift, schema, run, and evidence failures. An explicit published SHA
+  still flags repositories behind that target. `upgrade` and `upgrade --all`
+  continue to require an immutable operator-supplied SHA.
+
 ### Evidence
 
 - Live RouteLens and AstraNull proof of v0.2.33

@@ -34,6 +34,9 @@ const MAX_WORKFLOW_RUN_PAGES = 10;
 const MAX_GATE_JSON_BYTES = 1_048_576;
 const MAX_POLICY_FINDINGS = 500;
 
+/** CLI placeholder when GUARDIANBOT_WORKFLOW_SHA is unset; never a valid pin or upgrade target. */
+export const PLACEHOLDER_WORKFLOW_SHA = "0".repeat(40);
+
 export interface CommandContext {
   github: GitHubClient;
   guardianRepository: string;
@@ -357,7 +360,8 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 export function isImmutableWorkflowSha(value: string): boolean {
-  return IMMUTABLE_SHA.test(value);
+  // Reject the all-zero CLI placeholder so inventory/upgrade never treat it as a pin.
+  return IMMUTABLE_SHA.test(value) && value !== PLACEHOLDER_WORKFLOW_SHA;
 }
 
 export function assertImmutableWorkflowSha(value: string): void {
@@ -366,6 +370,29 @@ export function assertImmutableWorkflowSha(value: string): void {
       "workflowSha must be an immutable 40-character lowercase hexadecimal commit SHA"
     );
   }
+}
+
+/**
+ * When inventory has no administrative target SHA, derive the expected pin from
+ * the repository's own validated config or consistent caller references.
+ */
+function deriveConfiguredWorkflowSha(
+  guardianRepository: string,
+  parsedConfig: GuardianConfig | undefined,
+  workflowContent: string | undefined
+): string | undefined {
+  if (parsedConfig && isImmutableWorkflowSha(parsedConfig.workflowVersion)) {
+    return parsedConfig.workflowVersion;
+  }
+  if (!workflowContent) return undefined;
+  const pins = managedWorkflowPins(workflowContent, guardianRepository);
+  if (
+    pins.length > 0 &&
+    pins.every((pin) => pin === pins[0] && isImmutableWorkflowSha(pin))
+  ) {
+    return pins[0];
+  }
+  return undefined;
 }
 
 export function parseRepository(value: string): { owner: string; repo: string } {
@@ -2084,12 +2111,13 @@ async function doctorInternal(
   }
 
   let effectiveWorkflowSha = context.workflowSha;
-  if (
-    options.allowConfiguredWorkflowSha &&
-    !isImmutableWorkflowSha(effectiveWorkflowSha) &&
-    parsedConfig
-  ) {
-    effectiveWorkflowSha = parsedConfig.workflowVersion;
+  if (options.allowConfiguredWorkflowSha && !isImmutableWorkflowSha(effectiveWorkflowSha)) {
+    const derived = deriveConfiguredWorkflowSha(
+      context.guardianRepository,
+      parsedConfig,
+      workflow?.content
+    );
+    if (derived) effectiveWorkflowSha = derived;
   }
   const effectiveShaValid = isImmutableWorkflowSha(effectiveWorkflowSha);
   if (parsedConfig) {
@@ -2103,7 +2131,9 @@ async function doctorInternal(
         pinCurrent
           ? `immutable pin ${effectiveWorkflowSha}`
           : `configured ${parsedConfig.workflowVersion}; expected ${
-              effectiveShaValid ? effectiveWorkflowSha : "an immutable operator-supplied SHA"
+              effectiveShaValid
+                ? effectiveWorkflowSha
+                : "an immutable 40-character lowercase commit SHA"
             }`
       )
     );

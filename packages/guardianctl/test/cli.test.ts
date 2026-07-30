@@ -21,6 +21,7 @@ import {
   CONFIG_PATH,
   DEFAULT_SECURITY_GATE_CHECK,
   ONBOARDING_REPORT_PATH,
+  PLACEHOLDER_WORKFLOW_SHA,
   baseline,
   buildBaselineDocument,
   buildSecurityGateRuleset,
@@ -1335,6 +1336,124 @@ test("inventory classifies all production lifecycle states", async () => {
     "acme/partial": "misconfigured",
     "acme/report": "report-only"
   });
+});
+
+test("inventory classifies healthy repos without an administrative target workflow SHA", async () => {
+  const github = new MockGitHub();
+  github.appObservable = true;
+  github.add(healthyState("report"));
+  github.add(healthyState("enforced", { mode: "enforce" }));
+
+  const advisory = healthyState("advisory");
+  advisory.files.delete(CONFIG_PATH);
+  advisory.files.delete(CALLER_WORKFLOW_PATH);
+  advisory.files.delete(BASELINE_PATH);
+  github.add(advisory);
+
+  const rows = await inventory(
+    commandContext(github, { workflowSha: PLACEHOLDER_WORKFLOW_SHA })
+  );
+  const statuses = Object.fromEntries(rows.map((row) => [row.repository, row.status]));
+
+  assert.deepEqual(statuses, {
+    "acme/advisory": "advisory-only",
+    "acme/enforced": "enforced",
+    "acme/report": "report-only"
+  });
+  for (const row of rows) {
+    assert.doesNotMatch(row.detail, /0000000000000000000000000000000000000000/);
+  }
+});
+
+test("inventory flags config/caller pin mismatch without an administrative target SHA", async () => {
+  const github = new MockGitHub();
+  github.appObservable = true;
+  const state = github.add(healthyState("pin-mismatch"));
+  const config = guardianConfig("report-only", { workflowSha: WORKFLOW_SHA });
+  state.files.set(CONFIG_PATH, {
+    content: serializeGuardianConfig(config),
+    sha: "config-sha"
+  });
+  state.files.set(CALLER_WORKFLOW_PATH, {
+    content: workflowFor(config, OLD_WORKFLOW_SHA),
+    sha: "workflow-sha"
+  });
+
+  const rows = await inventory(
+    commandContext(github, { workflowSha: PLACEHOLDER_WORKFLOW_SHA })
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.status, "misconfigured");
+  assert.match(rows[0]!.detail, /caller workflow pin|workflow pin/i);
+});
+
+test("inventory flags malformed or non-immutable workflow pins without a target SHA", async () => {
+  const github = new MockGitHub();
+  github.appObservable = true;
+
+  const mutable = github.add(healthyState("mutable-pin"));
+  // Write a config/caller pair that pin mutable refs instead of commit SHAs.
+  mutable.files.set(CONFIG_PATH, {
+    content: serializeGuardianConfig(guardianConfig()).replace(WORKFLOW_SHA, "main"),
+    sha: "config-sha"
+  });
+  mutable.files.set(CALLER_WORKFLOW_PATH, {
+    content: workflowFor(guardianConfig()).replaceAll(WORKFLOW_SHA, "main"),
+    sha: "workflow-sha"
+  });
+
+  const zeroPin = github.add(healthyState("zero-pin"));
+  zeroPin.files.set(CONFIG_PATH, {
+    content: serializeGuardianConfig(guardianConfig()).replace(
+      WORKFLOW_SHA,
+      PLACEHOLDER_WORKFLOW_SHA
+    ),
+    sha: "config-sha"
+  });
+  zeroPin.files.set(CALLER_WORKFLOW_PATH, {
+    content: workflowFor(guardianConfig()).replaceAll(
+      WORKFLOW_SHA,
+      PLACEHOLDER_WORKFLOW_SHA
+    ),
+    sha: "workflow-sha"
+  });
+
+  const rows = await inventory(
+    commandContext(github, { workflowSha: PLACEHOLDER_WORKFLOW_SHA })
+  );
+  const byRepo = Object.fromEntries(rows.map((row) => [row.repository, row]));
+  assert.equal(byRepo["acme/mutable-pin"]!.status, "misconfigured");
+  assert.equal(byRepo["acme/zero-pin"]!.status, "misconfigured");
+  assert.match(
+    byRepo["acme/mutable-pin"]!.detail + byRepo["acme/zero-pin"]!.detail,
+    /immutable|pin|workflow/i
+  );
+});
+
+test("inventory with an explicit target SHA flags repositories behind that pin", async () => {
+  const github = new MockGitHub();
+  github.appObservable = true;
+
+  github.add(healthyState("current"));
+
+  const behind = github.add(healthyState("behind"));
+  const oldConfig = guardianConfig("report-only", { workflowSha: OLD_WORKFLOW_SHA });
+  behind.files.set(CONFIG_PATH, {
+    content: serializeGuardianConfig(oldConfig),
+    sha: "config-sha"
+  });
+  behind.files.set(CALLER_WORKFLOW_PATH, {
+    content: workflowFor(oldConfig, OLD_WORKFLOW_SHA),
+    sha: "workflow-sha"
+  });
+
+  const rows = await inventory(commandContext(github, { workflowSha: WORKFLOW_SHA }));
+  const byRepo = Object.fromEntries(rows.map((row) => [row.repository, row]));
+
+  assert.equal(byRepo["acme/current"]!.status, "report-only");
+  assert.equal(byRepo["acme/behind"]!.status, "misconfigured");
+  assert.match(byRepo["acme/behind"]!.detail, /pin|workflow/i);
+  assert.match(byRepo["acme/behind"]!.detail, new RegExp(WORKFLOW_SHA));
 });
 
 test("upgrade requires immutable SHAs and repairs caller drift even when the pin is current", async () => {

@@ -138,6 +138,14 @@ minimum observation period cannot be configured below seven days.
 
 ## Inventory and upgrades
 
+`inventory` may run without `GUARDIANBOT_WORKFLOW_SHA`. In that mode it still
+validates immutable config/caller pins, internal caller consistency, config-to-
+caller pin match, and the usual drift/schema/run/evidence checks, deriving the
+expected pin from each repository rather than treating the CLI all-zero
+placeholder as a target. Supplying a published SHA additionally flags
+repositories whose pins are behind that target. `upgrade` and `upgrade --all`
+still require an explicit published SHA.
+
 `inventory` paginates all operator-owned repositories and emits one of:
 
 - `enforced`: enforce mode, fresh successful evidence, and the exact strict
