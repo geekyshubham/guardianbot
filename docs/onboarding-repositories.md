@@ -61,10 +61,16 @@ eligibility remains enforced inside the reusable image workflow.
   caller drift when the release pin itself has not changed;
 - optional image paths/runtime fields and the exact-origin DAST contract;
 - a fresh successful default-branch push, scheduled, or manually dispatched run
-  (36 hours by default) and the actual `guardianbot/security-gate` check GitHub
-  attached to that commit;
-- a reviewed `.guardianbot/baseline.json`, the first successful report-only run,
-  and the elapsed observation period;
+  (36 hours by default) and the actual `guardianbot/security-gate` evidence from
+  the most recent fresh run that emitted the gate (Actions job metadata, or a
+  check-run URL bound to that run id—not an unrelated same-SHA check). A later
+  DAST-only schedule that omits or skips the gate is ignored for security-gate
+  readiness. A later push or manual dispatch with a missing or skipped gate
+  fails closed and cannot reuse an older success. A scheduled run that actually
+  emits a non-skipped failed gate also fails closed;
+- a reviewed `.guardianbot/baseline.json`, the first successful report-only
+  default-branch push or `workflow_dispatch` (scheduled runs never start the
+  seven-day clock), and the elapsed observation period;
 - active rulesets or classic branch protection requiring the exact observed gate
   check when scanner mode is `enforce`.
 
@@ -94,7 +100,8 @@ to render the baseline document without writes.
 The baseline is committed separately and reviewed like source code. Preferred
 form is the versioned object produced by `guardianctl baseline`. `generatedAt` is
 only the generation timestamp; human review evidence is the pull request's review
-and merge:
+and merge. `source.runId` / `source.headSha` must match the doctor-observed
+security-gate evidence run (not a later DAST-only schedule on the same commit):
 
 ```json guardianbot-config=none
 {
@@ -120,8 +127,10 @@ canonical RFC3339 UTC `generatedAt` and valid source
 `gateSha256` / `mode` / `repository` / `headSha` / `runId` / `runAttempt`; empty
 legacy baselines are rejected. Duplicate, malformed, or missing baseline documents
 are not ready for enforcement. The seven-day clock starts at the first successful
-default-branch GuardianBot run after the current report-only configuration was
-committed, not when an onboarding PR was opened.
+default-branch push or `workflow_dispatch` after the current report-only
+configuration was committed—not when an onboarding PR was opened, and not from
+any scheduled run (including a security-bearing schedule). Onboarding normally
+starts the clock via the merge push that lands the generated caller.
 
 `doctor.status: ready` means the repository is healthy in its current mode.
 `doctor.enforcementReady` separately indicates that the baseline and observation

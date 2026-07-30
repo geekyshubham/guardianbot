@@ -21,23 +21,36 @@
   in the App installation settings. An observable `missing` or `suspended` result
   must be repaired before enforcement.
 - Missing expected run: `doctor` considers default-branch push, scheduled, and
-  manually dispatched caller runs. The latest completed successful run must be
-  within 36 hours by default, occur after the latest managed caller/configuration
-  change, and have a successful `guardianbot/security-gate` check. Inspect Actions
+  manually dispatched caller runs. The latest completed successful caller run
+  must be within 36 hours by default and occur after the latest managed
+  caller/configuration change. Security-gate readiness is separate: `doctor`
+  selects the most recent fresh run that actually emitted `guardianbot/security-gate`
+  (via Actions job metadata or a check-run URL bound to that run id). A later
+  successful DAST-only schedule that omits or skips the gate does not invalidate a
+  valid fresh gate. A later push or `workflow_dispatch` with a missing or skipped
+  gate fails closed and cannot reuse an older success. Inspect Actions
   permissions, the default branch, schedule, generated caller, and the
   missing-scheduled-run runbook.
+- Inventory flags a skipped security gate after a good push: confirm the skip
+  came from an intentional DAST-only or image-only schedule. `doctor` ignores
+  that schedule skip and keeps the prior qualifying gate when it is still fresh.
+  If a later push or `workflow_dispatch` is missing or skipped the gate, or a
+  later schedule emitted a non-skipped failed gate, inventory stays
+  `misconfigured` and must not reuse the older success.
 - Required-check mismatch: reusable jobs may appear as
   `guardianbot/security-gate / deterministic scanners`. `enforce` uses the exact
-  check name observed on the latest successful commit. Remove or repair a legacy
-  ruleset that requires a different context.
+  check name observed on the latest qualifying security-gate evidence run.
+  Remove or repair a legacy ruleset that requires a different context.
 - Baseline not ready: commit `.guardianbot/baseline.json` with a non-empty, unique
   set of reviewed lowercase SHA-256 fingerprints. Empty or malformed baselines
   fail closed. The reusable workflow also validates the baseline on the
   enforcement PR.
 - Report-only period incomplete: the seven-day clock begins with the first
-  successful default-branch run after report-only configuration was committed.
-  Opening the onboarding PR, a failed run, or an advisory-only period does not
-  start the clock.
+  successful default-branch push or `workflow_dispatch` after report-only
+  configuration was committed. Opening the onboarding PR, a failed run, an
+  advisory-only period, or any scheduled run (including security-bearing or
+  DAST-only) does not start the clock. The merge push after onboarding is the
+  normal start.
 - Inventory says `misconfigured` instead of `missing-expected-runs`: configuration,
   pin, caller, App-access, optional image/DAST, baseline-in-enforce-mode, and
   required-rule failures take precedence over missing run evidence. Fix those

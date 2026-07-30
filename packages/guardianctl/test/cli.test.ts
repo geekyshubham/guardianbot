@@ -119,6 +119,16 @@ interface MockCheckRun {
   name: string;
   status: string;
   conclusion: string | null;
+  details_url?: string;
+  html_url?: string;
+}
+
+interface MockWorkflowJob {
+  id?: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  html_url?: string;
 }
 
 interface MockRuleset {
@@ -139,6 +149,7 @@ interface MockRepositoryState {
   configCommits: Array<{ sha: string; date: string }>;
   workflowRuns: MockWorkflowRun[];
   checkRuns: Map<string, MockCheckRun[]>;
+  runJobs: Map<number, MockWorkflowJob[]>;
   rulesets: MockRuleset[];
   branchProtection?: {
     strict: boolean;
@@ -241,16 +252,28 @@ function healthyState(
       ])
     );
   }
+  // Newest is a successful DAST-only schedule (gate skipped). Security evidence
+  // and baseline binding come from the fresh push (id 200 / GATE_RUN_ID).
   const workflowRuns: MockWorkflowRun[] = [
     {
-      id: 200,
+      id: 300,
       status: "completed",
       conclusion: "success",
       event: "schedule",
       head_branch: "main",
       head_sha: HEAD_SHA,
       created_at: hoursAgo(1),
-      html_url: "https://github.example/runs/200"
+      html_url: "https://github.example/actions/runs/300"
+    },
+    {
+      id: 200,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(2),
+      html_url: "https://github.example/actions/runs/200"
     },
     {
       id: 100,
@@ -260,7 +283,7 @@ function healthyState(
       head_branch: "main",
       head_sha: OLD_HEAD_SHA,
       created_at: daysAgo(8),
-      html_url: "https://github.example/runs/100"
+      html_url: "https://github.example/actions/runs/100"
     }
   ];
   const rulesets =
@@ -283,6 +306,51 @@ function healthyState(
         HEAD_SHA,
         [
           {
+            name: "guardianbot/security-gate",
+            status: "completed",
+            conclusion: "skipped",
+            details_url: "https://github.example/actions/runs/300/job/1"
+          },
+          {
+            name: DEFAULT_SECURITY_GATE_CHECK,
+            status: "completed",
+            conclusion: "success",
+            details_url: "https://github.example/actions/runs/200/job/2"
+          }
+        ]
+      ],
+      [
+        OLD_HEAD_SHA,
+        [
+          {
+            name: DEFAULT_SECURITY_GATE_CHECK,
+            status: "completed",
+            conclusion: "success",
+            details_url: "https://github.example/actions/runs/100/job/3"
+          }
+        ]
+      ]
+    ]),
+    runJobs: new Map([
+      [
+        300,
+        [
+          {
+            name: "guardianbot/security-gate",
+            status: "completed",
+            conclusion: "skipped"
+          },
+          {
+            name: "guardianbot/dast-smoke",
+            status: "completed",
+            conclusion: "success"
+          }
+        ]
+      ],
+      [
+        200,
+        [
+          {
             name: DEFAULT_SECURITY_GATE_CHECK,
             status: "completed",
             conclusion: "success"
@@ -290,7 +358,7 @@ function healthyState(
         ]
       ],
       [
-        OLD_HEAD_SHA,
+        100,
         [
           {
             name: DEFAULT_SECURITY_GATE_CHECK,
@@ -415,15 +483,27 @@ class MockGitHub {
       const state = this.state(workflowRuns[1]!, workflowRuns[2]!);
       return { workflow_runs: state.workflowRuns } as T;
     }
+    const runJobs =
+      /^\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/jobs$/.exec(url.pathname);
+    if (runJobs) {
+      const state = this.state(runJobs[1]!, runJobs[2]!);
+      const runId = Number(runJobs[3]);
+      const all = state.runJobs.get(runId) ?? [];
+      const page = Math.max(1, Number(url.searchParams.get("page") ?? "1") || 1);
+      const start = (page - 1) * 100;
+      return { jobs: all.slice(start, start + 100) } as T;
+    }
     const checkRuns =
       /^\/repos\/([^/]+)\/([^/]+)\/commits\/([^/]+)\/check-runs$/.exec(
         url.pathname
       );
     if (checkRuns) {
       const state = this.state(checkRuns[1]!, checkRuns[2]!);
-      return {
-        check_runs: state.checkRuns.get(decodeURIComponent(checkRuns[3]!)) ?? []
-      } as T;
+      const all =
+        state.checkRuns.get(decodeURIComponent(checkRuns[3]!)) ?? [];
+      const page = Math.max(1, Number(url.searchParams.get("page") ?? "1") || 1);
+      const start = (page - 1) * 100;
+      return { check_runs: all.slice(start, start + 100) } as T;
     }
     const commits = /^\/repos\/([^/]+)\/([^/]+)\/commits$/.exec(url.pathname);
     if (
@@ -693,22 +773,31 @@ test("doctor verifies optional image build context and repository-relative paths
 test("inventory distinguishes stale or absent expected gate evidence", async () => {
   const staleGitHub = new MockGitHub();
   const stale = staleGitHub.add(healthyState("stale"));
-  stale.workflowRuns = [
-    {
-      ...stale.workflowRuns[0]!,
-      created_at: daysAgo(3)
-    }
-  ];
+  stale.workflowRuns = stale.workflowRuns.map((run) => ({
+    ...run,
+    created_at: daysAgo(3)
+  }));
   const staleRows = await inventory(commandContext(staleGitHub));
   assert.equal(staleRows[0]!.status, "missing-expected-runs");
-  assert.match(staleRows[0]!.detail, /maximum is 36/);
+  assert.match(staleRows[0]!.detail, /maximum is 36|no guardianbot\/security-gate evidence within/);
 
   const missingGateGitHub = new MockGitHub();
   const missingGate = missingGateGitHub.add(healthyState("missing-gate"));
   missingGate.checkRuns.set(HEAD_SHA, []);
+  missingGate.runJobs.set(200, []);
+  missingGate.runJobs.set(300, [
+    {
+      name: "guardianbot/dast-smoke",
+      status: "completed",
+      conclusion: "success"
+    }
+  ]);
   const missingRows = await inventory(commandContext(missingGateGitHub));
   assert.equal(missingRows[0]!.status, "missing-expected-runs");
-  assert.match(missingRows[0]!.detail, /has no guardianbot\/security-gate check/);
+  assert.match(
+    missingRows[0]!.detail,
+    /no guardianbot\/security-gate evidence|qualifying security run/
+  );
 });
 
 test("fresh runs that predate the current caller or configuration are still stale", async () => {
@@ -734,6 +823,375 @@ test("fresh runs that predate the current caller or configuration are still stal
   assert.equal(result.status, "misconfigured");
   assert.equal(checkByCode(result, "expected-run").state, "stale");
   assert.match(checkByCode(result, "expected-run").detail, /predates managed/);
+});
+
+test("doctor ignores a later DAST-only schedule with a skipped gate after a fresh push gate", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("dast-after-push"));
+  // Explicit production shape: push gate success, later schedule skips the gate.
+  assert.equal(state.workflowRuns[0]!.event, "schedule");
+  assert.equal(state.workflowRuns[1]!.event, "push");
+  assert.equal(
+    state.runJobs.get(300)?.find((job) => job.name.startsWith("guardianbot/security-gate"))
+      ?.conclusion,
+    "skipped"
+  );
+
+  const result = await doctor(commandContext(github), "acme/dast-after-push");
+  const rows = await inventory(commandContext(github));
+
+  assert.equal(result.status, "ready");
+  assert.equal(checkByCode(result, "security-gate-check").ok, true);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 200/);
+  assert.doesNotMatch(checkByCode(result, "security-gate-check").detail, /skipped/);
+  assert.equal(result.facts.latestRunId, 200);
+  assert.equal(result.facts.latestRunHeadSha, HEAD_SHA);
+  assert.equal(rows[0]!.status, "report-only");
+});
+
+test("doctor fail-closes on a later qualifying security run with a failed gate", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("later-failed-gate"));
+  state.workflowRuns = [
+    {
+      id: 400,
+      status: "completed",
+      conclusion: "failure",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.5),
+      html_url: "https://github.example/actions/runs/400"
+    },
+    ...state.workflowRuns
+  ];
+  state.runJobs.set(400, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "failure"
+    }
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "failure",
+      details_url: "https://github.example/actions/runs/400/job/9"
+    },
+    ...(state.checkRuns.get(HEAD_SHA) ?? [])
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/later-failed-gate");
+  const rows = await inventory(commandContext(github));
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.match(checkByCode(result, "security-gate-check").detail, /failure/);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 400/);
+  assert.equal(result.facts.latestRunId, 400);
+  assert.equal(result.status, "misconfigured");
+  assert.equal(rows[0]!.status, "misconfigured");
+});
+
+test("doctor fail-closes on a later push with no gate and cannot reuse older success", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("later-push-no-gate"));
+  state.workflowRuns = [
+    {
+      id: 410,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.5),
+      html_url: "https://github.example/actions/runs/410"
+    },
+    ...state.workflowRuns
+  ];
+  // Newer push has other jobs but no security-gate job or check.
+  state.runJobs.set(410, [
+    {
+      name: "guardianbot/dast-smoke",
+      status: "completed",
+      conclusion: "success"
+    }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/later-push-no-gate");
+  const rows = await inventory(commandContext(github));
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.match(
+    checkByCode(result, "security-gate-check").detail,
+    /push run 410 has no guardianbot\/security-gate/
+  );
+  assert.doesNotMatch(checkByCode(result, "security-gate-check").detail, /run 200/);
+  assert.equal(result.facts.latestRunId, 410);
+  assert.equal(result.status, "misconfigured");
+  assert.equal(rows[0]!.status, "missing-expected-runs");
+});
+
+test("doctor fail-closes on a later push with a skipped gate and cannot reuse older success", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("later-push-skipped-gate"));
+  state.workflowRuns = [
+    {
+      id: 420,
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.5),
+      html_url: "https://github.example/actions/runs/420"
+    },
+    ...state.workflowRuns
+  ];
+  state.runJobs.set(420, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "skipped"
+    }
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "skipped",
+      details_url: "https://github.example/actions/runs/420/job/9"
+    },
+    ...(state.checkRuns.get(HEAD_SHA) ?? [])
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/later-push-skipped-gate");
+  const rows = await inventory(commandContext(github));
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.match(checkByCode(result, "security-gate-check").detail, /skipped/);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 420/);
+  assert.match(
+    checkByCode(result, "security-gate-check").detail,
+    /must not skip the security gate/
+  );
+  assert.equal(result.facts.latestRunId, 420);
+  assert.equal(result.status, "misconfigured");
+  assert.equal(rows[0]!.status, "misconfigured");
+});
+
+test("doctor fail-closes on a later schedule with a non-skipped failed gate", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("later-schedule-failed-gate"));
+  state.workflowRuns = [
+    {
+      id: 430,
+      status: "completed",
+      conclusion: "failure",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.5),
+      html_url: "https://github.example/actions/runs/430"
+    },
+    ...state.workflowRuns
+  ];
+  state.runJobs.set(430, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "failure"
+    }
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "failure",
+      details_url: "https://github.example/actions/runs/430/job/9"
+    },
+    ...(state.checkRuns.get(HEAD_SHA) ?? [])
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/later-schedule-failed-gate");
+  const rows = await inventory(commandContext(github));
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.match(checkByCode(result, "security-gate-check").detail, /failure/);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 430/);
+  assert.equal(result.facts.latestRunId, 430);
+  assert.equal(result.status, "misconfigured");
+  assert.equal(rows[0]!.status, "misconfigured");
+});
+
+test("doctor accepts a later schedule with a non-skipped successful gate", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("later-schedule-success-gate"));
+  // Replace the default DAST-only newest schedule with a security-bearing one.
+  state.workflowRuns = [
+    {
+      id: 440,
+      status: "completed",
+      conclusion: "success",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.5),
+      html_url: "https://github.example/actions/runs/440"
+    },
+    state.workflowRuns.find((run) => run.id === 200)!,
+    state.workflowRuns.find((run) => run.id === 100)!
+  ];
+  state.runJobs.set(440, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "success"
+    }
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "success",
+      details_url: "https://github.example/actions/runs/440/job/1"
+    }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/later-schedule-success-gate");
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, true);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 440/);
+  assert.equal(result.facts.latestRunId, 440);
+  assert.equal(result.status, "ready");
+});
+
+test("doctor fail-closes when workflow job pagination exceeds the safe page cap", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("job-page-cap"));
+  // 10 pages of 100 full-size batches without a terminal short page.
+  state.runJobs.set(
+    300,
+    Array.from({ length: 1000 }, (_, index) => ({
+      name: `filler-job-${index}`,
+      status: "completed",
+      conclusion: "success"
+    }))
+  );
+
+  const result = await doctor(commandContext(github), "acme/job-page-cap");
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.match(
+    checkByCode(result, "security-gate-check").detail,
+    /exceeded 10 pages|fail closed/
+  );
+});
+
+test("doctor associates same-SHA duplicate gate checks to their Actions run", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("same-sha-dupes"));
+  // No job metadata: association must come from check details_url run ids only.
+  state.runJobs = new Map();
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "skipped",
+      details_url: "https://github.example/acme/same-sha-dupes/actions/runs/300/job/1"
+    },
+    {
+      name: DEFAULT_SECURITY_GATE_CHECK,
+      status: "completed",
+      conclusion: "success",
+      details_url: "https://github.example/acme/same-sha-dupes/actions/runs/200/job/2"
+    }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/same-sha-dupes");
+
+  assert.equal(checkByCode(result, "security-gate-check").ok, true);
+  assert.match(checkByCode(result, "security-gate-check").detail, /run 200/);
+  assert.equal(result.facts.latestRunId, 200);
+  assert.equal(result.status, "ready");
+});
+
+test("DAST-only schedules do not start report-only observation or satisfy enforcement timing", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("dast-observation"));
+  // Only successful activity after config is a DAST schedule; no push/dispatch.
+  state.workflowRuns = [
+    {
+      id: 500,
+      status: "completed",
+      conclusion: "success",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: daysAgo(10),
+      html_url: "https://github.example/actions/runs/500"
+    },
+    {
+      id: 501,
+      status: "completed",
+      conclusion: "success",
+      event: "schedule",
+      head_branch: "main",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(1),
+      html_url: "https://github.example/actions/runs/501"
+    }
+  ];
+  state.runJobs = new Map([
+    [
+      500,
+      [
+        {
+          name: "guardianbot/security-gate",
+          status: "completed",
+          conclusion: "skipped"
+        },
+        {
+          name: "guardianbot/dast-smoke",
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ],
+    [
+      501,
+      [
+        {
+          name: "guardianbot/security-gate",
+          status: "completed",
+          conclusion: "skipped"
+        },
+        {
+          name: "guardianbot/dast-smoke",
+          status: "completed",
+          conclusion: "success"
+        }
+      ]
+    ]
+  ]);
+  state.checkRuns.set(HEAD_SHA, [
+    {
+      name: "guardianbot/security-gate",
+      status: "completed",
+      conclusion: "skipped",
+      details_url: "https://github.example/actions/runs/501/job/1"
+    }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/dast-observation");
+
+  assert.equal(checkByCode(result, "report-only-observation").ok, false);
+  assert.match(
+    checkByCode(result, "report-only-observation").detail,
+    /scheduled runs do not start the clock|push or workflow_dispatch/
+  );
+  assert.equal(checkByCode(result, "security-gate-check").ok, false);
+  assert.equal(result.enforcementReady, false);
 });
 
 test("doctor requires the observed gate check in enforced rulesets", async () => {

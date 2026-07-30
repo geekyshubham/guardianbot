@@ -7,6 +7,19 @@ reusable workflow commits remain immutable.
 
 ### Fixed
 
+- `guardianctl doctor` / `inventory` select `guardianbot/security-gate` evidence
+  from the most recent fresh GuardianBot run that actually emitted the gate,
+  using Actions job metadata (or check-run URLs that reference that run id).
+  A later successful DAST-only schedule that intentionally skips the gate no
+  longer shadows a valid push/security gate on the same SHA. Only `schedule`
+  may omit or skip the gate; a later `push` or `workflow_dispatch` with a
+  missing or skipped gate fails closed and cannot reuse an older success. A
+  scheduled run with a non-skipped failed gate also fails closed; a
+  non-skipped successful scheduled gate remains valid security evidence. Job
+  and check-run listings are bounded to a safe page cap and fail closed if
+  exhausted. Report-only observation starts only from a successful
+  default-branch push or `workflow_dispatch` (scheduled runs never start the
+  seven-day clock; onboarding normally starts it via the merge push).
 - `guardianctl inventory` no longer treats the all-zero CLI placeholder as an
   administrative workflow target. Without `GUARDIANBOT_WORKFLOW_SHA`, inventory
   derives the expected pin from each repository's validated config or consistent
