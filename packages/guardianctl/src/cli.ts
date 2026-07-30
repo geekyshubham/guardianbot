@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import {
+  baseline,
   doctor,
   enforce,
   inventory,
@@ -18,6 +20,7 @@ function help(): never {
 Commands:
   onboard       Detect a repository and open one draft onboarding PR
   doctor        Verify access, pins, drift, evidence, expected runs, and required checks
+  baseline      Open a draft baseline PR from a report-only gate.json
   enforce       Require a reviewed baseline and seven report-only days before promotion
   upgrade       Regenerate configuration pins and callers at an immutable workflow SHA
   inventory     Classify owned repositories by effective GuardianBot lifecycle state
@@ -27,6 +30,7 @@ Options:
   --dry-run     Inspect or render without writing to GitHub
   --json        Emit JSON
   --all         Upgrade every onboarded, non-archived, non-fork repository
+  --from-gate PATH
   --dockerfile PATH
   --health-path PATH
   --readiness-path PATH
@@ -59,6 +63,7 @@ function option(args: string[], name: string): string | undefined {
 }
 
 const VALUE_OPTIONS = new Set([
+  "--from-gate",
   "--dockerfile",
   "--health-path",
   "--readiness-path",
@@ -148,7 +153,11 @@ async function main() {
     if (!repository) throw new Error(`${command} requires OWNER/REPOSITORY`);
     if (command === "onboard") result = await onboard(context, repository);
     else if (command === "doctor") result = await doctor(context, repository);
-    else if (command === "enforce") result = await enforce(context, repository);
+    else if (command === "baseline") {
+      const fromGate = option(args, "--from-gate");
+      if (!fromGate) throw new Error("baseline requires --from-gate PATH");
+      result = await baseline(context, repository, readFileSync(fromGate, "utf8"));
+    } else if (command === "enforce") result = await enforce(context, repository);
     else if (command === "upgrade") result = await upgrade(context, repository);
     else if (command === "offboard") result = await offboard(context, repository);
     else throw new Error(`Unknown command: ${command}`);

@@ -42,7 +42,7 @@ import {
   type FindingLifecycleSummary,
   type ReviewFileGroup
 } from "./render.js";
-import type { ReviewState, Store } from "./store.js";
+import type { ReviewState, Store, WebhookQueueCounts } from "./store.js";
 
 export interface ServiceOptions {
   appId: string;
@@ -272,13 +272,28 @@ export class GuardianService {
     const inserted = await this.store.enqueueWebhook(delivery, name, event);
     if (inserted) this.metrics.increment("webhook_enqueued_total");
     else this.metrics.increment("webhook_duplicate_total");
+    await this.refreshQueueMetricsBestEffort();
     return inserted;
+  }
+
+  async refreshQueueMetrics(now = this.now()): Promise<WebhookQueueCounts> {
+    const counts = await this.store.countWebhookJobs(now);
+    this.metrics.setQueueCounts(counts);
+    return counts;
+  }
+
+  private async refreshQueueMetricsBestEffort(now = this.now()): Promise<void> {
+    try {
+      await this.refreshQueueMetrics(now);
+    } catch {
+      // Scrape-time store refresh remains authoritative; never fail job handling for gauges.
+    }
   }
 
   async processNextWebhook(workerId: string): Promise<boolean> {
     const job = await this.store.claimWebhook(workerId, this.webhookLeaseMs, this.now());
     if (!job) {
-      this.metrics.setQueueDepth(0);
+      await this.refreshQueueMetricsBestEffort();
       return false;
     }
     this.metrics.increment("webhook_claimed_total");
@@ -308,6 +323,7 @@ export class GuardianService {
       if (error instanceof BackendError) this.metrics.increment("backend_failures_total");
     } finally {
       this.metrics.setInFlight(0);
+      await this.refreshQueueMetricsBestEffort();
     }
     return true;
   }

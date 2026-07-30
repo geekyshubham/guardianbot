@@ -21,6 +21,41 @@ reusable workflow commits remain immutable.
   immutable v0.2.33 commit `6d04f85ef5cf1c6865300f0125ef8875c6c42afb`, with
   report-only image publication remaining `enforce-only`.
 
+## [0.2.34] - 2026-07-30
+
+### Added
+
+- `guardianctl baseline` opens a draft PR with `.guardianbot/baseline.json`
+  from a provenance-bound successful report-only `gate.json` after the minimum
+  seven-day observation period. It never switches scanner mode, never changes
+  rulesets, and never merges; human review of the draft remains required.
+- Authoritative control-plane webhook queue gauges for pending, leased,
+  dead-letter, and runnable depth, refreshed from the shared store on
+  `/metrics` scrape (fail closed with `503` if the store refresh fails).
+- Bounded terminal webhook job retention/cleanup for `succeeded` and
+  `dead-letter` rows only, with multi-instance-safe batch deletes and
+  environment-bounded retention defaults.
+- Real HTTP loopback model-bridge protocol-client conformance coverage, plus
+  fail-closed schema-invalid request handling (`400` `bad_request`) and
+  sanitized non-leaking provider/internal failures.
+
+### Changed
+
+- Pull-request command documentation matches the implemented command surface:
+  `review`, `full-review`, `explain <id>`, `suggest-fix <id>`, `status`,
+  `pause`, `resume`, and `help`.
+- Documentation quality gate accepts `guardianbot-config=none` for structured
+  non-configuration examples such as baseline documents.
+
+### Security
+
+- Model-bridge request validation rejects schema-invalid and malformed review
+  bodies before adapter dispatch; adapter/output validation failures stay
+  backend faults and do not leak prompts, credentials, endpoints, or provider
+  bodies.
+- Webhook terminal cleanup never deletes pending or leased jobs; purge limits
+  and retention bounds fail closed at process boot when misconfigured.
+
 ## [0.2.33] - 2026-07-30
 
 ### Added

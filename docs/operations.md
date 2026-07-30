@@ -141,6 +141,7 @@ Monitor at minimum:
 - public `/healthz` and `/readyz`;
 - scheduler run, failure, duration, and last-success metrics;
 - GitHub webhook 4xx/5xx rates and replay rejections;
+- webhook queue depth, pending/leased/dead-letter gauges, and cleanup failures;
 - bridge availability and review latency;
 - expected workflow runs, repository-index freshness, and scanner evidence;
 - distinct DAST smoke/nightly freshness and DefectDojo imports;
@@ -152,6 +153,24 @@ Public Caddy requests to `/metrics` return `404`. Metrics access requires
 `GUARDIANBOT_TRUST_PRIVATE_METRICS=1` on a genuinely private Compose network.
 Health/readiness endpoints are useful process signals, not substitutes for
 external probes and evidence reconciliation.
+
+### Webhook queue retention
+
+The control-plane worker periodically purges only terminal webhook rows
+(`succeeded` and `dead-letter`). Pending and leased jobs are never deleted.
+Cleanup runs in a separate loop so purge failures cannot block review handling.
+
+| Environment variable | Default | Bounds |
+| --- | --- | --- |
+| `GUARDIANBOT_WEBHOOK_SUCCEEDED_RETENTION_MS` | 7 days | 1 hour … 365 days |
+| `GUARDIANBOT_WEBHOOK_DEAD_LETTER_RETENTION_MS` | 30 days | 1 hour … 365 days; must be ≥ succeeded retention |
+| `GUARDIANBOT_WEBHOOK_CLEANUP_INTERVAL_MS` | 1 hour | 1 minute … 24 hours |
+| `GUARDIANBOT_WEBHOOK_CLEANUP_BATCH_LIMIT` | 1000 | 1 … 10000 |
+
+Invalid values fail boot with a clear error, including dead-letter retention
+shorter than succeeded retention. Each cleanup batch is hard-capped (API and
+env) and multi-instance safe (`FOR UPDATE SKIP LOCKED` on PostgreSQL).
+Shutdown aborts the cleanup sleep so SIGTERM does not wait out the interval.
 
 ## Host and secret operations
 

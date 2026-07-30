@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   GitHubClient,
   generateCallerWorkflow,
@@ -11,17 +16,24 @@ import {
 } from "@guardianbot/core";
 import {
   BASELINE_PATH,
+  BASELINE_SCHEMA_VERSION,
   CALLER_WORKFLOW_PATH,
   CONFIG_PATH,
   DEFAULT_SECURITY_GATE_CHECK,
   ONBOARDING_REPORT_PATH,
+  baseline,
+  buildBaselineDocument,
   buildSecurityGateRuleset,
   callerWorkflowMatches,
   doctor,
   enforce,
+  inspectBaselineContent,
   inventory,
   offboard,
+  parseGateForBaseline,
   parseRepository,
+  serializeBaselineDocument,
+  sha256Hex,
   upgrade,
   upgradeAll,
   type CommandContext
@@ -858,6 +870,426 @@ test("enforce is idempotent when mode and required protection are already active
     github.requests.some((request) => ["POST", "PUT"].includes(request.method)),
     false
   );
+});
+
+const SECOND_FINGERPRINT = "f".repeat(64);
+const GATE_RUN_ID = 200;
+const GATE_RUN_ATTEMPT = 1;
+
+function gateJson(options: {
+  mode?: string;
+  passed?: boolean;
+  failures?: unknown[];
+  policyFindings?: unknown[];
+  schemaVersion?: string;
+  repository?: string;
+  headSha?: string;
+  runId?: number;
+  runAttempt?: number;
+  omitProvenance?: boolean;
+} = {}): string {
+  const body: Record<string, unknown> = {
+    schemaVersion: options.schemaVersion ?? "1.0.0",
+    mode: options.mode ?? "report-only",
+    baselineRequired: false,
+    baselineCount: 0,
+    passed: options.passed ?? true,
+    failures: options.failures ?? [],
+    policyFindings: options.policyFindings ?? [
+      { fingerprint: SECOND_FINGERPRINT, source: "semgrep" },
+      { fingerprint: FINGERPRINT, source: "trivy" }
+    ],
+    activeSuppressions: 0,
+    expiredSuppressions: []
+  };
+  if (!options.omitProvenance) {
+    body.repository = options.repository ?? "acme/service";
+    body.headSha = options.headSha ?? HEAD_SHA;
+    body.runId = options.runId ?? GATE_RUN_ID;
+    body.runAttempt = options.runAttempt ?? GATE_RUN_ATTEMPT;
+  }
+  return JSON.stringify(body);
+}
+
+function versionedBaselineSource(overrides: Record<string, unknown> = {}) {
+  return {
+    gateSha256: "a".repeat(64),
+    mode: "report-only",
+    repository: "acme/service",
+    headSha: HEAD_SHA,
+    runId: GATE_RUN_ID,
+    runAttempt: GATE_RUN_ATTEMPT,
+    ...overrides
+  };
+}
+
+test("parseGateForBaseline rejects malformed, failed, enforce-mode, and duplicate gates", () => {
+  assert.throws(() => parseGateForBaseline("{"), /not valid JSON/);
+  assert.throws(
+    () => parseGateForBaseline(gateJson({ mode: "enforce" })),
+    /mode must be report-only/
+  );
+  assert.throws(
+    () => parseGateForBaseline(gateJson({ passed: false, failures: ["x"] })),
+    /passed=true/
+  );
+  assert.throws(
+    () => parseGateForBaseline(gateJson({ failures: ["still-failed"] })),
+    /failures must be empty/
+  );
+  assert.throws(
+    () =>
+      parseGateForBaseline(
+        gateJson({
+          policyFindings: [
+            { fingerprint: FINGERPRINT },
+            { fingerprint: FINGERPRINT }
+          ]
+        })
+      ),
+    /duplicate fingerprints/
+  );
+  assert.throws(
+    () =>
+      parseGateForBaseline(
+        gateJson({
+          policyFindings: [{ fingerprint: "not-a-fingerprint" }]
+        })
+      ),
+    /lowercase SHA-256/
+  );
+  assert.throws(
+    () =>
+      parseGateForBaseline(
+        gateJson({
+          policyFindings: [{ noFingerprint: true }]
+        })
+      ),
+    /fingerprint must be a lowercase SHA-256/
+  );
+  assert.throws(
+    () => parseGateForBaseline(gateJson({ omitProvenance: true })),
+    /missing repository\/headSha\/runId\/runAttempt provenance/
+  );
+});
+
+test("parseGateForBaseline sorts fingerprints and digests the exact gate input", () => {
+  const source = gateJson();
+  const parsed = parseGateForBaseline(source);
+  assert.deepEqual(parsed.fingerprints, [FINGERPRINT, SECOND_FINGERPRINT]);
+  assert.equal(parsed.gateSha256, sha256Hex(source));
+  assert.equal(parsed.gateSha256.length, 64);
+  assert.equal(parsed.repository, "acme/service");
+  assert.equal(parsed.headSha, HEAD_SHA);
+  assert.equal(parsed.runId, GATE_RUN_ID);
+  assert.equal(parsed.runAttempt, GATE_RUN_ATTEMPT);
+});
+
+test("doctor and inspectBaselineContent accept generated empty versioned baselines only", async () => {
+  const emptyVersioned = serializeBaselineDocument(
+    buildBaselineDocument(
+      [],
+      {
+        gateSha256: "a".repeat(64),
+        repository: "acme/clean-baseline",
+        headSha: HEAD_SHA,
+        runId: GATE_RUN_ID,
+        runAttempt: GATE_RUN_ATTEMPT
+      },
+      NOW
+    )
+  );
+  assert.equal(inspectBaselineContent(emptyVersioned).ready, true);
+  assert.equal(inspectBaselineContent(emptyVersioned).count, 0);
+  assert.equal(inspectBaselineContent("[]").ready, false);
+  assert.match(inspectBaselineContent("[]").detail, /legacy baseline fingerprint set is empty/);
+  assert.equal(inspectBaselineContent(JSON.stringify({ fingerprints: [] })).ready, false);
+  assert.match(
+    inspectBaselineContent(JSON.stringify({ fingerprints: [] })).detail,
+    /legacy baseline fingerprint set is empty/
+  );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: "2026",
+        source: versionedBaselineSource()
+      })
+    ).ready,
+    false
+  );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: "2026-07-27T06:00:00Z",
+        source: versionedBaselineSource()
+      })
+    ).ready,
+    false
+  );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: NOW.toISOString(),
+        source: { gateSha256: "a".repeat(64), mode: "report-only" }
+      })
+    ).ready,
+    false
+  );
+
+  const github = new MockGitHub();
+  const state = github.add(healthyState("clean-baseline"));
+  state.files.set(BASELINE_PATH, {
+    content: emptyVersioned,
+    sha: "empty-baseline-sha"
+  });
+  const result = await doctor(commandContext(github), "acme/clean-baseline");
+  assert.equal(checkByCode(result, "baseline").ok, true);
+  assert.equal(result.facts.baselineCount, 0);
+  assert.equal(result.enforcementReady, true);
+});
+
+test("baseline opens a deterministic draft PR and stays dry-run/idempotent", async () => {
+  const source = gateJson({ repository: "acme/baseline-dry" });
+  const parsed = parseGateForBaseline(source);
+
+  const dryGitHub = new MockGitHub();
+  const dryState = dryGitHub.add(healthyState("baseline-dry"));
+  dryState.files.delete(BASELINE_PATH);
+  const dryRun = await baseline(
+    commandContext(dryGitHub, { dryRun: true }),
+    "acme/baseline-dry",
+    source
+  );
+  assert.equal(dryRun.dryRun, true);
+  assert.equal(dryRun.changed, true);
+  assert.equal(dryRun.clean, false);
+  assert.equal(dryRun.fingerprintCount, 2);
+  assert.equal(dryRun.gateSha256, parsed.gateSha256);
+  assert.deepEqual(dryRun.baseline.fingerprints, [FINGERPRINT, SECOND_FINGERPRINT]);
+  assert.equal(dryRun.baseline.schemaVersion, BASELINE_SCHEMA_VERSION);
+  assert.equal(dryRun.baseline.source.mode, "report-only");
+  assert.equal(dryRun.baseline.source.repository, "acme/baseline-dry");
+  assert.equal(dryRun.baseline.source.headSha, HEAD_SHA);
+  assert.equal(dryRun.baseline.source.runId, GATE_RUN_ID);
+  assert.equal(dryRun.baseline.source.runAttempt, GATE_RUN_ATTEMPT);
+  assert.equal(dryRun.baseline.generatedAt, NOW.toISOString());
+  assert.equal(dryGitHub.writes.length, 0);
+  assert.equal(dryGitHub.pulls.length, 0);
+  assert.equal(dryGitHub.branches.length, 0);
+
+  const openSource = gateJson({ repository: "acme/baseline-open" });
+  const openParsed = parseGateForBaseline(openSource);
+  const github = new MockGitHub();
+  const state = github.add(healthyState("baseline-open"));
+  state.files.delete(BASELINE_PATH);
+  const opened = await baseline(commandContext(github), "acme/baseline-open", openSource);
+  assert.equal(opened.changed, true);
+  assert.equal(opened.dryRun, false);
+  assert.ok(opened.url);
+  assert.deepEqual(github.writes.map((write) => write.path), [BASELINE_PATH]);
+  assert.equal(github.writes[0]!.content, opened.baselineJson);
+  assert.equal(github.pulls.length, 1);
+  assert.equal(github.pulls[0]!.input.draft, true);
+  assert.match(github.pulls[0]!.input.body, new RegExp(openParsed.gateSha256));
+  assert.match(github.pulls[0]!.input.body, /Fingerprint count: 2/);
+  assert.match(github.pulls[0]!.input.body, /Clean repository \(empty baseline\): no/);
+  assert.match(github.pulls[0]!.input.body, /Source head SHA/);
+  assert.match(github.pulls[0]!.input.body, /Source run/);
+  assert.match(github.pulls[0]!.input.body, /human review evidence is this pull request/i);
+  assert.equal(
+    github.requests.some((request) => ["POST", "PUT"].includes(request.method) && request.path.includes("rulesets")),
+    false
+  );
+
+  // Mock writes land on the PR branch only; seed the default branch for idempotency.
+  state.files.set(BASELINE_PATH, {
+    content: opened.baselineJson,
+    sha: "baseline-written"
+  });
+  const idempotent = await baseline(
+    commandContext(github),
+    "acme/baseline-open",
+    openSource
+  );
+  assert.equal(idempotent.changed, false);
+  assert.equal(github.pulls.length, 1);
+  assert.equal(github.writes.length, 1);
+});
+
+test("baseline rejects wrong repository, run ID, and head SHA without writes", async () => {
+  const wrongRepoGitHub = new MockGitHub();
+  const wrongRepo = wrongRepoGitHub.add(healthyState("baseline-bind"));
+  wrongRepo.files.delete(BASELINE_PATH);
+  await assert.rejects(
+    baseline(
+      commandContext(wrongRepoGitHub),
+      "acme/baseline-bind",
+      gateJson({ repository: "acme/other" })
+    ),
+    /does not match requested/
+  );
+  assert.equal(wrongRepoGitHub.writes.length, 0);
+  assert.equal(wrongRepoGitHub.pulls.length, 0);
+
+  const wrongRunGitHub = new MockGitHub();
+  const wrongRun = wrongRunGitHub.add(healthyState("baseline-run"));
+  wrongRun.files.delete(BASELINE_PATH);
+  await assert.rejects(
+    baseline(
+      commandContext(wrongRunGitHub),
+      "acme/baseline-run",
+      gateJson({ repository: "acme/baseline-run", runId: 999 })
+    ),
+    /does not match doctor latest run/
+  );
+  assert.equal(wrongRunGitHub.writes.length, 0);
+  assert.equal(wrongRunGitHub.pulls.length, 0);
+
+  const wrongHeadGitHub = new MockGitHub();
+  const wrongHead = wrongHeadGitHub.add(healthyState("baseline-head"));
+  wrongHead.files.delete(BASELINE_PATH);
+  await assert.rejects(
+    baseline(
+      commandContext(wrongHeadGitHub),
+      "acme/baseline-head",
+      gateJson({ repository: "acme/baseline-head", headSha: "f".repeat(40) })
+    ),
+    /does not match doctor latest run head/
+  );
+  assert.equal(wrongHeadGitHub.writes.length, 0);
+  assert.equal(wrongHeadGitHub.pulls.length, 0);
+});
+
+test("baseline rejects incomplete observation, enforce mode, and malformed gates before writes", async () => {
+  const source = gateJson({ repository: "acme/young-baseline" });
+
+  const youngGitHub = new MockGitHub();
+  const young = youngGitHub.add(healthyState("young-baseline"));
+  young.files.delete(BASELINE_PATH);
+  young.configCommits = [{ sha: "4".repeat(40), date: daysAgo(6) }];
+  young.historicalFiles.set(
+    "4".repeat(40),
+    new Map([
+      [
+        CONFIG_PATH,
+        {
+          content: serializeGuardianConfig(guardianConfig("report-only")),
+          sha: "young-config"
+        }
+      ]
+    ])
+  );
+  young.workflowRuns[1] = {
+    ...young.workflowRuns[1]!,
+    created_at: daysAgo(5)
+  };
+  await assert.rejects(
+    baseline(commandContext(youngGitHub), "acme/young-baseline", source),
+    /report-only observation/
+  );
+  assert.equal(youngGitHub.writes.length, 0);
+  assert.equal(youngGitHub.pulls.length, 0);
+
+  const enforceGitHub = new MockGitHub();
+  enforceGitHub.add(healthyState("already-enforce", { mode: "enforce" }));
+  await assert.rejects(
+    baseline(
+      commandContext(enforceGitHub),
+      "acme/already-enforce",
+      gateJson({ repository: "acme/already-enforce" })
+    ),
+    /report-only scanner mode/
+  );
+  assert.equal(enforceGitHub.writes.length, 0);
+
+  const malformedGitHub = new MockGitHub();
+  const malformed = malformedGitHub.add(healthyState("malformed-gate"));
+  malformed.files.delete(BASELINE_PATH);
+  await assert.rejects(
+    baseline(
+      commandContext(malformedGitHub),
+      "acme/malformed-gate",
+      gateJson({ mode: "enforce", repository: "acme/malformed-gate" })
+    ),
+    /mode must be report-only/
+  );
+  assert.equal(malformedGitHub.writes.length, 0);
+});
+
+test("baseline opens a clean empty versioned baseline from a zero-finding gate", async () => {
+  const source = gateJson({ repository: "acme/clean-gate", policyFindings: [] });
+  const github = new MockGitHub();
+  const state = github.add(healthyState("clean-gate"));
+  state.files.delete(BASELINE_PATH);
+
+  const result = await baseline(
+    commandContext(github),
+    "acme/clean-gate",
+    source
+  );
+  assert.equal(result.clean, true);
+  assert.equal(result.fingerprintCount, 0);
+  assert.deepEqual(result.baseline.fingerprints, []);
+  assert.equal(result.baseline.schemaVersion, BASELINE_SCHEMA_VERSION);
+  assert.equal(result.baseline.source.repository, "acme/clean-gate");
+  assert.equal(result.baseline.source.headSha, HEAD_SHA);
+  assert.equal(result.baseline.source.runId, GATE_RUN_ID);
+  assert.match(result.report, /Clean repository \(empty baseline\): yes/);
+  assert.equal(inspectBaselineContent(result.baselineJson).ready, true);
+  assert.equal(github.writes.length, 1);
+  assert.equal(github.pulls[0]!.input.draft, true);
+});
+
+test("CLI help lists baseline and requires --from-gate", () => {
+  const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+  const help = spawnSync("tsx", [cliPath, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /baseline/);
+  assert.match(help.stdout, /Open a draft baseline PR from a report-only gate\.json/);
+  assert.doesNotMatch(help.stdout, /draft reviewed baseline/);
+  assert.match(help.stdout, /--from-gate PATH/);
+
+  const missing = spawnSync("tsx", [cliPath, "baseline", "acme/service"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GUARDIANBOT_WORKFLOW_SHA: WORKFLOW_SHA,
+      GH_TOKEN: "test-token"
+    }
+  });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /--from-gate PATH/);
+
+  const directory = mkdtempSync(join(tmpdir(), "guardianctl-baseline-"));
+  const gatePath = join(directory, "gate.json");
+  writeFileSync(gatePath, gateJson({ mode: "enforce" }));
+  const badGate = spawnSync(
+    "tsx",
+    [
+      cliPath,
+      "baseline",
+      "acme/service",
+      "--from-gate",
+      gatePath,
+      "--dry-run"
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GUARDIANBOT_WORKFLOW_SHA: WORKFLOW_SHA,
+        GH_TOKEN: "test-token"
+      }
+    }
+  );
+  assert.notEqual(badGate.status, 0);
+  assert.match(badGate.stderr, /mode must be report-only/);
 });
 
 test("inventory classifies all production lifecycle states", async () => {

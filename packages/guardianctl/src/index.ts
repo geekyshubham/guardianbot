@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   GitHubClient,
   detectRepository,
@@ -25,9 +26,13 @@ export const DEFAULT_SECURITY_GATE_CHECK =
   "guardianbot/security-gate / deterministic scanners";
 export const DEFAULT_EXPECTED_RUN_MAX_AGE_HOURS = 36;
 export const DEFAULT_REPORT_ONLY_MINIMUM_DAYS = 7;
+export const BASELINE_SCHEMA_VERSION = "guardianbot.baseline.v1" as const;
 
 const IMMUTABLE_SHA = /^[a-f0-9]{40}$/;
+const FINGERPRINT_SHA256 = /^[a-f0-9]{64}$/;
 const MAX_WORKFLOW_RUN_PAGES = 10;
+const MAX_GATE_JSON_BYTES = 1_048_576;
+const MAX_POLICY_FINDINGS = 500;
 
 export interface CommandContext {
   github: GitHubClient;
@@ -264,10 +269,38 @@ interface DiagnosticOptions {
   allowConfiguredWorkflowSha?: boolean;
 }
 
-interface BaselineInspection {
+export interface BaselineInspection {
   ready: boolean;
   count?: number;
   detail: string;
+}
+
+export interface BaselineSourceProvenance {
+  gateSha256: string;
+  mode: "report-only";
+  repository: string;
+  headSha: string;
+  runId: number;
+  runAttempt: number;
+}
+
+export interface BaselineDocument {
+  schemaVersion: typeof BASELINE_SCHEMA_VERSION;
+  fingerprints: string[];
+  generatedAt: string;
+  source: BaselineSourceProvenance;
+}
+
+export interface BaselineResult {
+  dryRun: boolean;
+  changed: boolean;
+  url?: string;
+  baseline: BaselineDocument;
+  baselineJson: string;
+  fingerprintCount: number;
+  clean: boolean;
+  gateSha256: string;
+  report: string;
 }
 
 interface RunInspection {
@@ -1214,51 +1247,392 @@ function inspectDastConfiguration(dast: GuardianConfig["dast"]): DoctorCheck {
   );
 }
 
-function inspectBaselineContent(source: string): BaselineInspection {
+/** Canonical RFC3339 UTC instant: must equal `new Date(value).toISOString()`. */
+export function isCanonicalUtcInstant(value: string): boolean {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function normalizeRepositoryName(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isNormalizedRepositoryName(value: string): boolean {
+  return /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(value);
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function validateFingerprintList(fingerprints: unknown[]): BaselineInspection {
+  const invalid = fingerprints.filter(
+    (fingerprint) =>
+      typeof fingerprint !== "string" || !FINGERPRINT_SHA256.test(fingerprint)
+  );
+  if (invalid.length) {
+    return {
+      ready: false,
+      count: fingerprints.length,
+      detail: `${invalid.length} baseline fingerprint(s) are not lowercase SHA-256 values`
+    };
+  }
+  if (new Set(fingerprints as string[]).size !== fingerprints.length) {
+    return {
+      ready: false,
+      count: fingerprints.length,
+      detail: "baseline contains duplicate fingerprints"
+    };
+  }
+  return {
+    ready: true,
+    count: fingerprints.length,
+    detail:
+      fingerprints.length === 0
+        ? "0 reviewed fingerprint(s); clean repository baseline"
+        : `${fingerprints.length} reviewed fingerprint(s)`
+  };
+}
+
+function inspectVersionedBaseline(
+  value: Record<string, unknown>
+): BaselineInspection {
+  if (!Array.isArray(value.fingerprints)) {
+    return {
+      ready: false,
+      detail: "versioned baseline must include a fingerprints array"
+    };
+  }
+  if (typeof value.generatedAt !== "string" || !isCanonicalUtcInstant(value.generatedAt)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail:
+        "versioned baseline generatedAt must be a canonical RFC3339 UTC instant (YYYY-MM-DDTHH:mm:ss.sssZ)"
+    };
+  }
+  const source = value.source;
+  if (!isObject(source)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source must be an object"
+    };
+  }
+  if (
+    typeof source.gateSha256 !== "string" ||
+    !FINGERPRINT_SHA256.test(source.gateSha256)
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.gateSha256 must be a lowercase SHA-256 digest"
+    };
+  }
+  if (source.mode !== "report-only") {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.mode must be report-only"
+    };
+  }
+  if (
+    typeof source.repository !== "string" ||
+    !isNormalizedRepositoryName(normalizeRepositoryName(source.repository))
+  ) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.repository must be OWNER/REPO"
+    };
+  }
+  if (typeof source.headSha !== "string" || !IMMUTABLE_SHA.test(source.headSha)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.headSha must be a lowercase 40-character commit SHA"
+    };
+  }
+  if (!isPositiveSafeInteger(source.runId)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.runId must be a positive integer"
+    };
+  }
+  if (!isPositiveSafeInteger(source.runAttempt)) {
+    return {
+      ready: false,
+      count: value.fingerprints.length,
+      detail: "versioned baseline source.runAttempt must be a positive integer"
+    };
+  }
+  return validateFingerprintList(value.fingerprints);
+}
+
+export function inspectBaselineContent(source: string): BaselineInspection {
   try {
     const value = JSON.parse(source) as unknown;
-    const fingerprints = Array.isArray(value)
-      ? value
-      : value &&
-          typeof value === "object" &&
-          Array.isArray((value as { fingerprints?: unknown }).fingerprints)
-        ? (value as { fingerprints: unknown[] }).fingerprints
-        : undefined;
-    if (!fingerprints) {
+    if (Array.isArray(value)) {
+      if (!value.length) {
+        return {
+          ready: false,
+          count: 0,
+          detail: "legacy baseline fingerprint set is empty"
+        };
+      }
+      return validateFingerprintList(value);
+    }
+    if (!isObject(value) || !Array.isArray(value.fingerprints)) {
       return {
         ready: false,
         detail: "baseline must be an array or an object with a fingerprints array"
       };
     }
-    if (!fingerprints.length) {
-      return { ready: false, count: 0, detail: "baseline fingerprint set is empty" };
+    if (value.schemaVersion === BASELINE_SCHEMA_VERSION) {
+      return inspectVersionedBaseline(value);
     }
-    const invalid = fingerprints.filter(
-      (fingerprint) =>
-        typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint)
-    );
-    if (invalid.length) {
+    if (!value.fingerprints.length) {
       return {
         ready: false,
-        count: fingerprints.length,
-        detail: `${invalid.length} baseline fingerprint(s) are not lowercase SHA-256 values`
+        count: 0,
+        detail: "legacy baseline fingerprint set is empty"
       };
     }
-    if (new Set(fingerprints).size !== fingerprints.length) {
-      return {
-        ready: false,
-        count: fingerprints.length,
-        detail: "baseline contains duplicate fingerprints"
-      };
-    }
-    return {
-      ready: true,
-      count: fingerprints.length,
-      detail: `${fingerprints.length} reviewed fingerprint(s)`
-    };
+    return validateFingerprintList(value.fingerprints);
   } catch (error) {
     return { ready: false, detail: `invalid JSON: ${errorMessage(error)}` };
   }
+}
+
+export function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+const GATE_PROVENANCE_UPGRADE_MESSAGE =
+  "gate.json is missing repository/headSha/runId/runAttempt provenance; re-run the security gate with the current reusable workflow and pass that gate.json to guardianctl baseline";
+
+export function parseGateForBaseline(gateJson: string): {
+  fingerprints: string[];
+  gateSha256: string;
+  repository: string;
+  headSha: string;
+  runId: number;
+  runAttempt: number;
+} {
+  if (Buffer.byteLength(gateJson, "utf8") > MAX_GATE_JSON_BYTES) {
+    throw new Error(
+      `gate.json exceeds the maximum size of ${MAX_GATE_JSON_BYTES} bytes`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(gateJson) as unknown;
+  } catch (error) {
+    throw new Error(`gate.json is not valid JSON: ${errorMessage(error)}`);
+  }
+  if (!isObject(parsed)) {
+    throw new Error("gate.json must be a GuardianBot gate object");
+  }
+  if (parsed.schemaVersion !== "1.0.0") {
+    throw new Error("gate.json schemaVersion must be 1.0.0");
+  }
+  if (parsed.mode !== "report-only") {
+    throw new Error("gate.json mode must be report-only");
+  }
+  if (parsed.passed !== true) {
+    throw new Error("gate.json must have passed=true");
+  }
+  if (!Array.isArray(parsed.failures)) {
+    throw new Error("gate.json failures must be an array");
+  }
+  if (parsed.failures.length !== 0) {
+    throw new Error("gate.json failures must be empty");
+  }
+  if (!Array.isArray(parsed.policyFindings)) {
+    throw new Error("gate.json policyFindings must be an array");
+  }
+  if (parsed.policyFindings.length > MAX_POLICY_FINDINGS) {
+    throw new Error(
+      `gate.json policyFindings exceeds the maximum of ${MAX_POLICY_FINDINGS}`
+    );
+  }
+  const missingProvenance =
+    parsed.repository === undefined ||
+    parsed.headSha === undefined ||
+    parsed.runId === undefined ||
+    parsed.runAttempt === undefined;
+  if (missingProvenance) {
+    throw new Error(GATE_PROVENANCE_UPGRADE_MESSAGE);
+  }
+  if (typeof parsed.repository !== "string" || !parsed.repository.trim()) {
+    throw new Error("gate.json repository must be a non-empty OWNER/REPO string");
+  }
+  const repository = normalizeRepositoryName(parsed.repository);
+  if (!isNormalizedRepositoryName(repository)) {
+    throw new Error("gate.json repository must be formatted as OWNER/REPO");
+  }
+  if (typeof parsed.headSha !== "string" || !IMMUTABLE_SHA.test(parsed.headSha.toLowerCase())) {
+    throw new Error("gate.json headSha must be a lowercase 40-character commit SHA");
+  }
+  const headSha = parsed.headSha.toLowerCase();
+  if (parsed.headSha !== headSha) {
+    throw new Error("gate.json headSha must be a lowercase 40-character commit SHA");
+  }
+  if (!isPositiveSafeInteger(parsed.runId)) {
+    throw new Error("gate.json runId must be a positive integer");
+  }
+  if (!isPositiveSafeInteger(parsed.runAttempt)) {
+    throw new Error("gate.json runAttempt must be a positive integer");
+  }
+  const fingerprints: string[] = [];
+  for (const [index, finding] of parsed.policyFindings.entries()) {
+    if (!isObject(finding)) {
+      throw new Error(`gate.json policyFindings[${index}] must be an object`);
+    }
+    if (
+      typeof finding.fingerprint !== "string" ||
+      !FINGERPRINT_SHA256.test(finding.fingerprint)
+    ) {
+      throw new Error(
+        `gate.json policyFindings[${index}].fingerprint must be a lowercase SHA-256 digest`
+      );
+    }
+    fingerprints.push(finding.fingerprint);
+  }
+  if (new Set(fingerprints).size !== fingerprints.length) {
+    throw new Error("gate.json policyFindings contain duplicate fingerprints");
+  }
+  fingerprints.sort();
+  return {
+    fingerprints,
+    gateSha256: sha256Hex(gateJson),
+    repository,
+    headSha,
+    runId: parsed.runId,
+    runAttempt: parsed.runAttempt
+  };
+}
+
+export function buildBaselineDocument(
+  fingerprints: string[],
+  source: {
+    gateSha256: string;
+    repository: string;
+    headSha: string;
+    runId: number;
+    runAttempt: number;
+  },
+  generatedAt: Date
+): BaselineDocument {
+  if (!FINGERPRINT_SHA256.test(source.gateSha256)) {
+    throw new Error("gateSha256 must be a lowercase SHA-256 digest");
+  }
+  const repository = normalizeRepositoryName(source.repository);
+  if (!isNormalizedRepositoryName(repository)) {
+    throw new Error("baseline source.repository must be formatted as OWNER/REPO");
+  }
+  if (!IMMUTABLE_SHA.test(source.headSha)) {
+    throw new Error("baseline source.headSha must be a lowercase 40-character commit SHA");
+  }
+  if (!isPositiveSafeInteger(source.runId)) {
+    throw new Error("baseline source.runId must be a positive integer");
+  }
+  if (!isPositiveSafeInteger(source.runAttempt)) {
+    throw new Error("baseline source.runAttempt must be a positive integer");
+  }
+  const sorted = [...fingerprints].sort();
+  if (sorted.some((fingerprint) => !FINGERPRINT_SHA256.test(fingerprint))) {
+    throw new Error("baseline fingerprints must be lowercase SHA-256 digests");
+  }
+  if (new Set(sorted).size !== sorted.length) {
+    throw new Error("baseline fingerprints must be unique");
+  }
+  return {
+    schemaVersion: BASELINE_SCHEMA_VERSION,
+    fingerprints: sorted,
+    generatedAt: generatedAt.toISOString(),
+    source: {
+      gateSha256: source.gateSha256,
+      mode: "report-only",
+      repository,
+      headSha: source.headSha,
+      runId: source.runId,
+      runAttempt: source.runAttempt
+    }
+  };
+}
+
+export function serializeBaselineDocument(document: BaselineDocument): string {
+  return `${JSON.stringify(document, null, 2)}\n`;
+}
+
+function baselineAlreadyMatches(
+  currentContent: string | undefined,
+  document: BaselineDocument
+): boolean {
+  if (!currentContent) return false;
+  try {
+    const current = JSON.parse(currentContent) as unknown;
+    if (!isObject(current) || current.schemaVersion !== BASELINE_SCHEMA_VERSION) {
+      return false;
+    }
+    if (!Array.isArray(current.fingerprints)) return false;
+    if (
+      current.fingerprints.some((fingerprint) => typeof fingerprint !== "string")
+    ) {
+      return false;
+    }
+    const currentFingerprints = [...(current.fingerprints as string[])].sort();
+    if (
+      currentFingerprints.length !== document.fingerprints.length ||
+      !currentFingerprints.every(
+        (fingerprint, index) => fingerprint === document.fingerprints[index]
+      )
+    ) {
+      return false;
+    }
+    const source = current.source;
+    if (!isObject(source)) return false;
+    return (
+      source.gateSha256 === document.source.gateSha256 &&
+      source.mode === document.source.mode &&
+      typeof source.repository === "string" &&
+      normalizeRepositoryName(source.repository) === document.source.repository &&
+      source.headSha === document.source.headSha &&
+      source.runId === document.source.runId &&
+      source.runAttempt === document.source.runAttempt
+    );
+  } catch {
+    return false;
+  }
+}
+
+function renderBaselineReport(
+  repository: string,
+  document: BaselineDocument
+): string {
+  const clean = document.fingerprints.length === 0;
+  return [
+    "Opens a GuardianBot baseline draft for eventual enforcement.",
+    "",
+    `- Repository: \`${repository}\``,
+    `- Generated at: \`${document.generatedAt}\` (generation timestamp; not human review)`,
+    `- Source gate digest: \`${document.source.gateSha256}\``,
+    `- Source repository: \`${document.source.repository}\``,
+    `- Source head SHA: \`${document.source.headSha}\``,
+    `- Source run: \`${document.source.runId}\` attempt \`${document.source.runAttempt}\``,
+    `- Fingerprint count: ${document.fingerprints.length}`,
+    `- Clean repository (empty baseline): ${clean ? "yes" : "no"}`,
+    `- Baseline schema: \`${document.schemaVersion}\``,
+    "",
+    "Human review evidence is this pull request's review and merge, not generatedAt.",
+    "A human must review and merge this baseline before enforcement.",
+    "This PR does not change scanner mode or repository rulesets."
+  ].join("\n");
 }
 
 async function inspectBaseline(
@@ -2324,6 +2698,139 @@ export interface EnforceResult {
   ruleset: ReturnType<typeof buildSecurityGateRuleset>;
   rulesetAction: "created" | "updated" | "unchanged" | "planned-create" | "planned-update";
   configurationTransition: "report-only-to-enforce" | "already-enforced";
+}
+
+export async function baseline(
+  context: CommandContext,
+  repository: string,
+  gateJson: string
+): Promise<BaselineResult> {
+  assertImmutableWorkflowSha(context.workflowSha);
+  const parsedGate = parseGateForBaseline(gateJson);
+  const requestedRepository = normalizeRepositoryName(repository);
+  if (parsedGate.repository !== requestedRepository) {
+    throw new Error(
+      `gate.json repository ${parsedGate.repository} does not match requested ${requestedRepository}`
+    );
+  }
+  const document = buildBaselineDocument(
+    parsedGate.fingerprints,
+    {
+      gateSha256: parsedGate.gateSha256,
+      repository: parsedGate.repository,
+      headSha: parsedGate.headSha,
+      runId: parsedGate.runId,
+      runAttempt: parsedGate.runAttempt
+    },
+    currentTime(context)
+  );
+  const baselineJson = serializeBaselineDocument(document);
+  const report = renderBaselineReport(repository, document);
+  const resultBase = {
+    baseline: document,
+    baselineJson,
+    fingerprintCount: document.fingerprints.length,
+    clean: document.fingerprints.length === 0,
+    gateSha256: document.source.gateSha256,
+    report
+  };
+
+  const diagnosis = await doctorInternal(context, repository);
+  if (diagnosis.facts.scannerMode !== "report-only") {
+    throw new Error(
+      "Cannot open a baseline PR unless the repository is in report-only scanner mode"
+    );
+  }
+  const requiredCodes = new Set([
+    "repository-access",
+    "app-access",
+    "configuration",
+    "configuration-pin",
+    "repository-configuration",
+    "workflow-pin",
+    "generated-caller",
+    "image-configuration",
+    "dast-configuration",
+    "expected-run",
+    "security-gate-check",
+    "report-only-observation"
+  ]);
+  const failures = diagnosis.checks.filter(
+    (check) => requiredCodes.has(check.code) && !check.ok
+  );
+  if (failures.length) {
+    throw new Error(
+      `Cannot open a baseline PR until prerequisites pass: ${failures
+        .map((check) => `${check.name}: ${check.detail}`)
+        .join("; ")}`
+    );
+  }
+  if (
+    diagnosis.facts.latestRunId === undefined ||
+    parsedGate.runId !== diagnosis.facts.latestRunId
+  ) {
+    throw new Error(
+      `gate.json runId ${parsedGate.runId} does not match doctor latest run ${
+        diagnosis.facts.latestRunId ?? "none"
+      }`
+    );
+  }
+  const latestHeadSha = diagnosis.facts.latestRunHeadSha?.toLowerCase();
+  if (!latestHeadSha || parsedGate.headSha !== latestHeadSha) {
+    throw new Error(
+      `gate.json headSha ${parsedGate.headSha} does not match doctor latest run head ${
+        latestHeadSha ?? "none"
+      }`
+    );
+  }
+
+  const { owner, repo } = parseRepository(repository);
+  const metadata = await context.github.getRepository(owner, repo);
+  const existing = await context.github.getFile(
+    owner,
+    repo,
+    BASELINE_PATH,
+    metadata.default_branch
+  );
+  if (baselineAlreadyMatches(existing?.content, document)) {
+    return {
+      dryRun: Boolean(context.dryRun),
+      changed: false,
+      ...resultBase
+    };
+  }
+  if (context.dryRun) {
+    return {
+      dryRun: true,
+      changed: true,
+      ...resultBase
+    };
+  }
+
+  const branch = branchName("baseline");
+  await context.github.createBranch(owner, repo, branch, metadata.default_branch);
+  await context.github.putFile(
+    owner,
+    repo,
+    BASELINE_PATH,
+    branch,
+    "chore(guardianbot): add baseline for review",
+    baselineJson,
+    existing?.sha
+  );
+  const pull = await context.github.createPullRequest(owner, repo, {
+    title: "chore: review GuardianBot baseline",
+    head: branch,
+    base: metadata.default_branch,
+    draft: true,
+    body: report
+  });
+  return {
+    dryRun: false,
+    changed: true,
+    url: pull.html_url,
+    ...resultBase
+  };
 }
 
 export async function enforce(

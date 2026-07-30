@@ -171,6 +171,10 @@ test("service redacts upstream refusal and rejects malformed request bodies", as
       body: "{"
     });
     assert.equal(malformed.status, 400);
+    const malformedBody = await malformed.json();
+    assert.equal(malformedBody.error.code, "bad_request");
+    assert.equal(malformedBody.error.message, "Request validation failed.");
+    assert.equal(malformedBody.error.retryable, false);
 
     const refusal = await fetch(`${baseUrl}/v1/reviews`, {
       method: "POST",
@@ -181,6 +185,118 @@ test("service redacts upstream refusal and rejects malformed request bodies", as
     const body = await refusal.json();
     assert.equal(body.error.code, "refusal");
     assert.equal(String(body.error.message).includes("fixture"), false);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("schema-invalid JSON requests are deterministic non-retryable 400 responses", async () => {
+  const request = sampleRequest();
+  const fixtureFile = writeFixtureFile({
+    defaultResult: sampleResult(request)
+  });
+  const { server, baseUrl } = await startService({
+    protocolVersion: "guardian.review.v1",
+    bindings: {
+      fixtures: {
+        adapter: "fixture-provider",
+        fixtureFile,
+        allowedClassifications: ["public", "private"],
+        retention: "none"
+      }
+    },
+    routes: {
+      "routine-review": {
+        binding: "fixtures"
+      }
+    }
+  });
+
+  try {
+    const missingFields = await fetch(`${baseUrl}/v1/reviews`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        protocolVersion: "guardian.review.v1",
+        schemaVersion: "1.0.0",
+        requestId: "req-invalid"
+      })
+    });
+    assert.equal(missingFields.status, 400);
+    const missingBody = await missingFields.json();
+    assert.deepEqual(missingBody, {
+      error: {
+        code: "bad_request",
+        message: "Request validation failed.",
+        retryable: false
+      }
+    });
+
+    const invalidEnum = await fetch(`${baseUrl}/v1/reviews`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...request,
+        profile: "not-a-real-profile"
+      })
+    });
+    assert.equal(invalidEnum.status, 400);
+    const invalidBody = await invalidEnum.json();
+    assert.equal(invalidBody.error.code, "bad_request");
+    assert.equal(invalidBody.error.retryable, false);
+    assert.equal(invalidBody.error.message, "Request validation failed.");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("schema-invalid fixture results are not client bad_request and do not leak validation detail", async () => {
+  const request = sampleRequest({ requestId: "req-bad-fixture-output" });
+  // Intentionally schema-invalid model output: summary must be an object.
+  const fixtureFile = writeFixtureFile({
+    defaultResult: {
+      ...sampleResult(request),
+      summary: "not-a-summary-object"
+    }
+  });
+  const { server, baseUrl } = await startService({
+    protocolVersion: "guardian.review.v1",
+    bindings: {
+      fixtures: {
+        adapter: "fixture-provider",
+        fixtureFile,
+        allowedClassifications: ["public", "private"],
+        retention: "none"
+      }
+    },
+    routes: {
+      "routine-review": {
+        binding: "fixtures"
+      }
+    }
+  });
+
+  try {
+    const review = await fetch(`${baseUrl}/v1/reviews`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    // Backend output validation must not look like a client 400/bad_request.
+    assert.notEqual(review.status, 400);
+    assert.equal(review.status, 503);
+    const body = await review.json();
+    assert.deepEqual(body, {
+      error: {
+        code: "invalid_output",
+        message: "Model output failed bridge validation.",
+        retryable: true
+      }
+    });
+    const serialized = JSON.stringify(body);
+    assert.equal(serialized.includes("not-a-summary-object"), false);
+    assert.equal(serialized.includes("ProtocolValidation"), false);
+    assert.equal(serialized.includes("failed schema validation"), false);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

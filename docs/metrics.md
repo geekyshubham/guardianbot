@@ -46,3 +46,26 @@ Metrics transport stays private by default. Public Caddy exposure returns `404`
 for `/metrics`; successful access requires
 `GUARDIANBOT_METRICS_BEARER_TOKEN` or an explicitly trusted private-runtime
 override with `GUARDIANBOT_TRUST_PRIVATE_METRICS=1`.
+
+## Control-plane webhook queue gauges
+
+`/metrics` refreshes webhook queue gauges from the shared store before
+rendering so multi-instance scrapes stay database-true. If that store refresh
+fails, the endpoint returns `503` rather than fabricating a zero backlog.
+
+Queue gauges (no repository identifiers or secrets in labels):
+
+| Metric | Meaning |
+| --- | --- |
+| `guardianbot_queue_depth` | Runnable backlog: pending jobs available now plus expired/reclaimable leases |
+| `guardianbot_webhook_jobs_pending` | Jobs with status `pending` (includes not-yet-available retries) |
+| `guardianbot_webhook_jobs_leased` | Jobs with status `leased` |
+| `guardianbot_webhook_jobs_dead_letter` | Jobs with status `dead-letter` |
+| `guardianbot_jobs_in_flight` | Process-local job currently being handled |
+
+Related counters:
+
+- `guardianbot_webhook_enqueued_total`, `guardianbot_webhook_claimed_total`
+- `guardianbot_webhook_succeeded_total`, `guardianbot_webhook_failed_total`
+- `guardianbot_webhook_dead_letter_total`
+- `guardianbot_webhook_cleanup_deleted_total`, `guardianbot_webhook_cleanup_failures_total`

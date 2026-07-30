@@ -834,6 +834,138 @@ test("enforcement accepts a valid non-empty baseline from the exact immutable in
   );
 });
 
+test("enforcement accepts a valid empty versioned baseline with provenance", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository({ scannerState: "enforced" }));
+  await seedImmutableConfigIndex(
+    store,
+    { mode: "enforce" },
+    JSON.stringify({
+      schemaVersion: "guardianbot.baseline.v1",
+      fingerprints: [],
+      generatedAt: "2026-07-27T06:00:00.000Z",
+      source: {
+        gateSha256: "b".repeat(64),
+        mode: "report-only",
+        repository: "acme/service",
+        headSha: "a".repeat(40),
+        runId: 500,
+        runAttempt: 1
+      }
+    })
+  );
+  await store.upsertScannerWorkflowRun(scannerRun());
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.inventoryState, "enforced");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "baseline-readiness")?.status,
+    "passing"
+  );
+});
+
+test("enforcement rejects empty legacy baselines and malformed versioned provenance", async () => {
+  const cases = [
+    JSON.stringify([]),
+    JSON.stringify({ fingerprints: [] }),
+    JSON.stringify({
+      schemaVersion: "guardianbot.baseline.v1",
+      fingerprints: [],
+      generatedAt: "2026",
+      source: {
+        gateSha256: "b".repeat(64),
+        mode: "report-only",
+        repository: "acme/service",
+        headSha: "a".repeat(40),
+        runId: 500,
+        runAttempt: 1
+      }
+    }),
+    JSON.stringify({
+      schemaVersion: "guardianbot.baseline.v1",
+      fingerprints: [],
+      generatedAt: "2026-07-27T06:00:00.000Z",
+      source: {
+        gateSha256: "b".repeat(64),
+        mode: "report-only"
+      }
+    }),
+    JSON.stringify({
+      schemaVersion: "guardianbot.baseline.v1",
+      fingerprints: [1, null, { digest: "c".repeat(64) }],
+      generatedAt: "2026-07-27T06:00:00.000Z",
+      source: {
+        gateSha256: "b".repeat(64),
+        mode: "report-only",
+        repository: "acme/service",
+        headSha: "a".repeat(40),
+        runId: 500,
+        runAttempt: 1
+      }
+    }),
+    JSON.stringify({
+      schemaVersion: "guardianbot.baseline.v1",
+      fingerprints: ["not-a-fingerprint", "C".repeat(64)],
+      generatedAt: "2026-07-27T06:00:00.000Z",
+      source: {
+        gateSha256: "b".repeat(64),
+        mode: "report-only",
+        repository: "acme/service",
+        headSha: "a".repeat(40),
+        runId: 500,
+        runAttempt: 1
+      }
+    })
+  ];
+
+  for (const [index, baselineContent] of cases.entries()) {
+    const store = new MemoryStore();
+    await store.upsertRepository(repository({ scannerState: "enforced" }));
+    await seedImmutableConfigIndex(store, { mode: "enforce" }, baselineContent);
+    await store.upsertScannerWorkflowRun(scannerRun());
+    for (const record of [
+      evidence("semgrep-summary", "semgrep"),
+      evidence("trivy-summary", "trivy"),
+      evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+      evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+    ]) {
+      await store.upsertScannerEvidence(record);
+    }
+    const monitoring = new MonitoringService(store, {
+      enabled: true,
+      intervalMs: 15 * 60_000,
+      clock: { now: () => new Date(INITIAL_NOW) }
+    });
+
+    await monitoring.reconcileOnce();
+    const snapshot = await store.getLatestMonitoringSnapshot(20);
+    assert.equal(
+      snapshot?.inventoryState,
+      "misconfigured",
+      `case ${index} should fail readiness`
+    );
+    assert.equal(
+      snapshot?.checks.find((check) => check.key === "baseline-readiness")?.status,
+      "failing",
+      `case ${index} should fail baseline-readiness`
+    );
+  }
+});
+
 test("enforcement rejects an invalid baseline from the exact immutable index", async () => {
   const store = new MemoryStore();
   await store.upsertRepository(repository({ scannerState: "enforced" }));

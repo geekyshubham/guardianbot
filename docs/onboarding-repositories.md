@@ -75,22 +75,53 @@ suspended installation is a failure for a configured repository.
 
 ## Baseline and enforcement
 
-The baseline is committed separately and reviewed like source code. It is either a
-JSON array of lowercase SHA-256 fingerprints or an object with a `fingerprints`
-array:
+After report-only observation is complete, open a baseline draft PR from a
+successful local `gate.json` artifact produced by the current reusable security
+workflow:
 
-```json
+```bash
+guardianctl baseline OWNER/REPOSITORY --from-gate path/to/gate.json
+```
+
+The command requires App access, a healthy current configuration, report-only
+scanner mode, a fresh successful security gate, and the completed minimum
+observation period. The gate artifact must include repository, head SHA, run ID,
+and run attempt provenance bound to that latest doctor-observed run; older gate
+artifacts without those fields fail with an upgrade/rerun message. It never
+switches scanner mode, never changes rulesets, and never merges. Use `--dry-run`
+to render the baseline document without writes.
+
+The baseline is committed separately and reviewed like source code. Preferred
+form is the versioned object produced by `guardianctl baseline`. `generatedAt` is
+only the generation timestamp; human review evidence is the pull request's review
+and merge:
+
+```json guardianbot-config=none
 {
+  "schemaVersion": "guardianbot.baseline.v1",
   "fingerprints": [
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  ]
+  ],
+  "generatedAt": "2026-07-27T06:00:00.000Z",
+  "source": {
+    "gateSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "mode": "report-only",
+    "repository": "acme/service",
+    "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+    "runId": 200,
+    "runAttempt": 1
+  }
 }
 ```
 
-Empty, duplicate, malformed, or missing baseline fingerprints are not ready for
-enforcement. The seven-day clock starts at the first successful default-branch
-GuardianBot run after the current report-only configuration was committed, not
-when an onboarding PR was opened.
+Legacy non-empty arrays and `{ "fingerprints": [...] }` documents remain accepted.
+An empty fingerprint list is accepted only for the versioned object with a
+canonical RFC3339 UTC `generatedAt` and valid source
+`gateSha256` / `mode` / `repository` / `headSha` / `runId` / `runAttempt`; empty
+legacy baselines are rejected. Duplicate, malformed, or missing baseline documents
+are not ready for enforcement. The seven-day clock starts at the first successful
+default-branch GuardianBot run after the current report-only configuration was
+committed, not when an onboarding PR was opened.
 
 `doctor.status: ready` means the repository is healthy in its current mode.
 `doctor.enforcementReady` separately indicates that the baseline and observation

@@ -1,3 +1,5 @@
+import type { WebhookQueueCounts } from "./store.js";
+
 type CounterName =
   | "webhook_verified_total"
   | "webhook_invalid_total"
@@ -7,6 +9,8 @@ type CounterName =
   | "webhook_succeeded_total"
   | "webhook_failed_total"
   | "webhook_dead_letter_total"
+  | "webhook_cleanup_deleted_total"
+  | "webhook_cleanup_failures_total"
   | "review_stale_total"
   | "commands_authorized_total"
   | "commands_rejected_total"
@@ -27,6 +31,9 @@ export class GuardianMetrics {
     ])
   };
   private queueDepth = 0;
+  private pendingJobs = 0;
+  private leasedJobs = 0;
+  private deadLetterJobs = 0;
   private inFlight = 0;
 
   constructor() {
@@ -39,6 +46,8 @@ export class GuardianMetrics {
       "webhook_succeeded_total",
       "webhook_failed_total",
       "webhook_dead_letter_total",
+      "webhook_cleanup_deleted_total",
+      "webhook_cleanup_failures_total",
       "review_stale_total",
       "commands_authorized_total",
       "commands_rejected_total",
@@ -65,6 +74,13 @@ export class GuardianMetrics {
     this.queueDepth = queueDepth;
   }
 
+  setQueueCounts(counts: WebhookQueueCounts): void {
+    this.queueDepth = counts.runnable;
+    this.pendingJobs = counts.pending;
+    this.leasedJobs = counts.leased;
+    this.deadLetterJobs = counts.deadLetter;
+  }
+
   setInFlight(inFlight: number): void {
     this.inFlight = inFlight;
   }
@@ -75,6 +91,12 @@ export class GuardianMetrics {
       "guardianbot_up 1",
       "# TYPE guardianbot_queue_depth gauge",
       `guardianbot_queue_depth ${this.queueDepth}`,
+      "# TYPE guardianbot_webhook_jobs_pending gauge",
+      `guardianbot_webhook_jobs_pending ${this.pendingJobs}`,
+      "# TYPE guardianbot_webhook_jobs_leased gauge",
+      `guardianbot_webhook_jobs_leased ${this.leasedJobs}`,
+      "# TYPE guardianbot_webhook_jobs_dead_letter gauge",
+      `guardianbot_webhook_jobs_dead_letter ${this.deadLetterJobs}`,
       "# TYPE guardianbot_jobs_in_flight gauge",
       `guardianbot_jobs_in_flight ${this.inFlight}`
     ];

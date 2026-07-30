@@ -551,7 +551,9 @@ export async function validateStructuredExamples(root, documents, repositorySche
       if (!["yaml", "yml", "json", "jsonc"].includes(language)) continue;
       const value = parseStructuredExample(fence, document.file, errors);
       if (value === undefined) continue;
-      const configMatch = /\bguardianbot-config=(full|image|dast)\b/.exec(fence.info);
+      // full|image|dast = repository-config examples; none = non-config/exempt structured JSON
+      // (e.g. baseline documents) that must not be schema-validated as repository config.
+      const configMatch = /\bguardianbot-config=(full|image|dast|none)\b/.exec(fence.info);
       const openApi = /\bopenapi\b/.test(fence.info);
       const topLevelKeys = value && typeof value === "object" && !Array.isArray(value)
         ? Object.keys(value)
@@ -561,7 +563,7 @@ export async function validateStructuredExamples(root, documents, repositorySche
       if (looksLikeConfig && !configMatch) {
         errors.push(`${location} looks like GuardianBot configuration but lacks guardianbot-config=<scope>`);
       }
-      if (configMatch) {
+      if (configMatch && configMatch[1] !== "none") {
         configExamples += 1;
         const scope = configMatch[1];
         const validate = scope === "full" ? fullValidator : fragmentValidators.get(scope);

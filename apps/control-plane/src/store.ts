@@ -218,7 +218,161 @@ export interface WebhookJob {
   leaseExpiresAt?: string;
   lastError?: string;
   deadLetteredAt?: string;
+  updatedAt?: string;
 }
+
+/** Authoritative per-status webhook queue gauges from the shared store. */
+export interface WebhookQueueCounts {
+  /** Jobs with status pending (including not-yet-available retries). */
+  pending: number;
+  /** Jobs currently marked leased (including expired leases not yet reclaimed). */
+  leased: number;
+  /** Jobs in dead-letter. */
+  deadLetter: number;
+  /**
+   * Currently runnable backlog: pending jobs with available_at <= now plus
+   * leased jobs whose lease has expired (or has no expiry).
+   */
+  runnable: number;
+}
+
+export interface PurgeTerminalWebhookJobsOptions {
+  succeededBefore: Date;
+  deadLetterBefore: Date;
+  limit: number;
+  now?: Date;
+}
+
+export interface PurgeTerminalWebhookJobsResult {
+  deleted: number;
+}
+
+export const DEFAULT_WEBHOOK_SUCCEEDED_RETENTION_MS = 7 * 24 * 60 * 60_000;
+export const DEFAULT_WEBHOOK_DEAD_LETTER_RETENTION_MS = 30 * 24 * 60 * 60_000;
+export const DEFAULT_WEBHOOK_CLEANUP_INTERVAL_MS = 60 * 60_000;
+export const DEFAULT_WEBHOOK_CLEANUP_BATCH_LIMIT = 1000;
+export const MIN_WEBHOOK_RETENTION_MS = 60 * 60_000;
+export const MAX_WEBHOOK_RETENTION_MS = 365 * 24 * 60 * 60_000;
+export const MIN_WEBHOOK_CLEANUP_INTERVAL_MS = 60_000;
+export const MAX_WEBHOOK_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+export const MIN_WEBHOOK_CLEANUP_BATCH_LIMIT = 1;
+export const MAX_WEBHOOK_CLEANUP_BATCH_LIMIT = 10_000;
+
+export interface WebhookRetentionOptions {
+  succeededRetentionMs: number;
+  deadLetterRetentionMs: number;
+  cleanupIntervalMs: number;
+  batchLimit: number;
+}
+
+function parsePositiveBoundedInteger(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+export function webhookRetentionOptionsFromEnvironment(
+  environment: Record<string, string | undefined> = process.env
+): WebhookRetentionOptions {
+  const options: WebhookRetentionOptions = {
+    succeededRetentionMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_WEBHOOK_SUCCEEDED_RETENTION_MS,
+      "GUARDIANBOT_WEBHOOK_SUCCEEDED_RETENTION_MS",
+      DEFAULT_WEBHOOK_SUCCEEDED_RETENTION_MS,
+      MIN_WEBHOOK_RETENTION_MS,
+      MAX_WEBHOOK_RETENTION_MS
+    ),
+    deadLetterRetentionMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_WEBHOOK_DEAD_LETTER_RETENTION_MS,
+      "GUARDIANBOT_WEBHOOK_DEAD_LETTER_RETENTION_MS",
+      DEFAULT_WEBHOOK_DEAD_LETTER_RETENTION_MS,
+      MIN_WEBHOOK_RETENTION_MS,
+      MAX_WEBHOOK_RETENTION_MS
+    ),
+    cleanupIntervalMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_WEBHOOK_CLEANUP_INTERVAL_MS,
+      "GUARDIANBOT_WEBHOOK_CLEANUP_INTERVAL_MS",
+      DEFAULT_WEBHOOK_CLEANUP_INTERVAL_MS,
+      MIN_WEBHOOK_CLEANUP_INTERVAL_MS,
+      MAX_WEBHOOK_CLEANUP_INTERVAL_MS
+    ),
+    batchLimit: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_WEBHOOK_CLEANUP_BATCH_LIMIT,
+      "GUARDIANBOT_WEBHOOK_CLEANUP_BATCH_LIMIT",
+      DEFAULT_WEBHOOK_CLEANUP_BATCH_LIMIT,
+      MIN_WEBHOOK_CLEANUP_BATCH_LIMIT,
+      MAX_WEBHOOK_CLEANUP_BATCH_LIMIT
+    )
+  };
+  if (options.deadLetterRetentionMs < options.succeededRetentionMs) {
+    throw new Error(
+      "GUARDIANBOT_WEBHOOK_DEAD_LETTER_RETENTION_MS must be greater than or equal to GUARDIANBOT_WEBHOOK_SUCCEEDED_RETENTION_MS"
+    );
+  }
+  return options;
+}
+
+/** Shared API guard so purge limits cannot bypass env bounds when called directly. */
+export function assertWebhookPurgeLimit(limit: number): void {
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < MIN_WEBHOOK_CLEANUP_BATCH_LIMIT ||
+    limit > MAX_WEBHOOK_CLEANUP_BATCH_LIMIT
+  ) {
+    throw new Error(
+      `purge limit must be a safe integer between ${MIN_WEBHOOK_CLEANUP_BATCH_LIMIT} and ${MAX_WEBHOOK_CLEANUP_BATCH_LIMIT}`
+    );
+  }
+}
+
+/** Parameterized count query shared by PostgresStore (contract for tests). */
+export const WEBHOOK_QUEUE_COUNTS_SQL = `
+SELECT
+  COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+  COUNT(*) FILTER (WHERE status = 'leased')::int AS leased,
+  COUNT(*) FILTER (WHERE status = 'dead-letter')::int AS dead_letter,
+  COUNT(*) FILTER (
+    WHERE (
+      status = 'pending'
+      AND available_at <= $1
+    ) OR (
+      status = 'leased'
+      AND (lease_expires_at IS NULL OR lease_expires_at <= $1)
+    )
+  )::int AS runnable
+FROM webhook_jobs
+`.trim();
+
+/** Parameterized terminal-job purge (multi-instance safe via SKIP LOCKED). */
+export const WEBHOOK_TERMINAL_PURGE_SQL = `
+WITH candidates AS (
+  SELECT delivery_id
+  FROM webhook_jobs
+  WHERE (
+    status = 'succeeded'
+    AND updated_at < $1
+  ) OR (
+    status = 'dead-letter'
+    AND COALESCE(dead_lettered_at, updated_at) < $2
+  )
+  ORDER BY updated_at ASC
+  LIMIT $3
+  FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_jobs AS jobs
+USING candidates
+WHERE jobs.delivery_id = candidates.delivery_id
+RETURNING jobs.delivery_id
+`.trim();
 
 export interface Store {
   ping(): Promise<void>;
@@ -259,6 +413,10 @@ export interface Store {
     deadLetter: boolean
   ): Promise<void>;
   getWebhook(deliveryId: string): Promise<WebhookJob | undefined>;
+  countWebhookJobs(now?: Date): Promise<WebhookQueueCounts>;
+  purgeTerminalWebhookJobs(
+    options: PurgeTerminalWebhookJobsOptions
+  ): Promise<PurgeTerminalWebhookJobsResult>;
   upsertScannerWorkflowRun(record: ScannerWorkflowRunRecord): Promise<void>;
   getScannerWorkflowRun(
     repositoryId: number,
@@ -490,13 +648,15 @@ export class MemoryStore implements Store {
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
     if (this.webhooks.has(deliveryId)) return false;
+    const nowIso = new Date().toISOString();
     this.webhooks.set(deliveryId, {
       deliveryId,
       eventName,
       payload,
       status: "pending",
       attempts: 0,
-      availableAt: new Date(0).toISOString()
+      availableAt: new Date(0).toISOString(),
+      updatedAt: nowIso
     });
     return true;
   }
@@ -520,7 +680,8 @@ export class MemoryStore implements Store {
       status: "leased",
       attempts: eligible.attempts + 1,
       leaseOwner: workerId,
-      leaseExpiresAt: new Date(now.getTime() + leaseMs).toISOString()
+      leaseExpiresAt: new Date(now.getTime() + leaseMs).toISOString(),
+      updatedAt: now.toISOString()
     };
     this.webhooks.set(claimed.deliveryId, claimed);
     return { ...claimed, payload: { ...claimed.payload } };
@@ -533,7 +694,8 @@ export class MemoryStore implements Store {
       ...current,
       status: "succeeded",
       leaseOwner: undefined,
-      leaseExpiresAt: undefined
+      leaseExpiresAt: undefined,
+      updatedAt: new Date().toISOString()
     });
   }
 
@@ -546,6 +708,7 @@ export class MemoryStore implements Store {
   ) {
     const current = this.webhooks.get(deliveryId);
     if (!current || current.leaseOwner !== workerId) return;
+    const nowIso = new Date().toISOString();
     this.webhooks.set(deliveryId, {
       ...current,
       status: deadLetter ? "dead-letter" : "pending",
@@ -553,7 +716,8 @@ export class MemoryStore implements Store {
       leaseExpiresAt: undefined,
       availableAt: deadLetter ? current.availableAt : iso(retryAt ?? new Date()),
       lastError: error,
-      deadLetteredAt: deadLetter ? new Date().toISOString() : undefined
+      deadLetteredAt: deadLetter ? nowIso : undefined,
+      updatedAt: nowIso
     });
   }
 
@@ -565,6 +729,60 @@ export class MemoryStore implements Store {
           payload: { ...job.payload }
         }
       : undefined;
+  }
+
+  async countWebhookJobs(now = new Date()): Promise<WebhookQueueCounts> {
+    const nowMs = now.getTime();
+    let pending = 0;
+    let leased = 0;
+    let deadLetter = 0;
+    let runnable = 0;
+    for (const job of this.webhooks.values()) {
+      if (job.status === "pending") {
+        pending += 1;
+        if (new Date(job.availableAt).getTime() <= nowMs) runnable += 1;
+      } else if (job.status === "leased") {
+        leased += 1;
+        if (!job.leaseExpiresAt || new Date(job.leaseExpiresAt).getTime() <= nowMs) {
+          runnable += 1;
+        }
+      } else if (job.status === "dead-letter") {
+        deadLetter += 1;
+      }
+    }
+    return { pending, leased, deadLetter, runnable };
+  }
+
+  async purgeTerminalWebhookJobs(
+    options: PurgeTerminalWebhookJobsOptions
+  ): Promise<PurgeTerminalWebhookJobsResult> {
+    assertWebhookPurgeLimit(options.limit);
+    const limit = options.limit;
+    const succeededBeforeMs = options.succeededBefore.getTime();
+    const deadLetterBeforeMs = options.deadLetterBefore.getTime();
+    const candidates = [...this.webhooks.values()]
+      .filter((job) => {
+        if (job.status === "succeeded") {
+          const updatedMs = job.updatedAt ? Date.parse(job.updatedAt) : Number.NaN;
+          return Number.isFinite(updatedMs) && updatedMs < succeededBeforeMs;
+        }
+        if (job.status === "dead-letter") {
+          const terminalAt = job.deadLetteredAt ?? job.updatedAt;
+          const terminalMs = terminalAt ? Date.parse(terminalAt) : Number.NaN;
+          return Number.isFinite(terminalMs) && terminalMs < deadLetterBeforeMs;
+        }
+        return false;
+      })
+      .sort((left, right) => {
+        const leftMs = Date.parse(left.updatedAt ?? left.availableAt);
+        const rightMs = Date.parse(right.updatedAt ?? right.availableAt);
+        return leftMs - rightMs;
+      })
+      .slice(0, limit);
+    for (const job of candidates) {
+      this.webhooks.delete(job.deliveryId);
+    }
+    return { deleted: candidates.length };
   }
 
   async upsertScannerWorkflowRun(record: ScannerWorkflowRunRecord) {
@@ -1086,6 +1304,9 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS webhook_jobs_claim_idx
         ON webhook_jobs (status, available_at, lease_expires_at);
+      CREATE INDEX IF NOT EXISTS webhook_jobs_terminal_cleanup_idx
+        ON webhook_jobs (status, updated_at)
+        WHERE status IN ('succeeded', 'dead-letter');
 
       CREATE TABLE IF NOT EXISTS repository_indexes (
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -1574,6 +1795,45 @@ export class PostgresStore implements Store {
   async getWebhook(deliveryId: string) {
     const result = await this.pool.query("SELECT * FROM webhook_jobs WHERE delivery_id=$1", [deliveryId]);
     return result.rows[0] ? this.toWebhookJob(result.rows[0]) : undefined;
+  }
+
+  async countWebhookJobs(now = new Date()): Promise<WebhookQueueCounts> {
+    const result = await this.pool.query<{
+      pending: number;
+      leased: number;
+      dead_letter: number;
+      runnable: number;
+    }>(WEBHOOK_QUEUE_COUNTS_SQL, [now]);
+    const row = result.rows[0];
+    return {
+      pending: Number(row?.pending ?? 0),
+      leased: Number(row?.leased ?? 0),
+      deadLetter: Number(row?.dead_letter ?? 0),
+      runnable: Number(row?.runnable ?? 0)
+    };
+  }
+
+  async purgeTerminalWebhookJobs(
+    options: PurgeTerminalWebhookJobsOptions
+  ): Promise<PurgeTerminalWebhookJobsResult> {
+    assertWebhookPurgeLimit(options.limit);
+    const limit = options.limit;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<{ delivery_id: string }>(WEBHOOK_TERMINAL_PURGE_SQL, [
+        options.succeededBefore,
+        options.deadLetterBefore,
+        limit
+      ]);
+      await client.query("COMMIT");
+      return { deleted: result.rowCount ?? result.rows.length };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async upsertScannerWorkflowRun(record: ScannerWorkflowRunRecord) {
@@ -2343,7 +2603,8 @@ export class PostgresStore implements Store {
       leaseOwner: row.lease_owner ?? undefined,
       leaseExpiresAt: fromUnknownDate(row.lease_expires_at),
       lastError: row.last_error ?? undefined,
-      deadLetteredAt: fromUnknownDate(row.dead_lettered_at)
+      deadLetteredAt: fromUnknownDate(row.dead_lettered_at),
+      updatedAt: fromUnknownDate(row.updated_at)
     };
   }
 

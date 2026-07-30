@@ -21,6 +21,41 @@ Guardrails:
 - prompts delimit repository content as untrusted data
 - bridge responses reject refusal, incomplete output, multiple text outputs, malformed
   JSON, and schema mismatches before anything reaches the control plane
+- schema-invalid review requests return a deterministic non-retryable `400`
+  `bad_request` response; malformed JSON is also `400`; provider and internal
+  failures stay sanitized and never leak prompts, credentials, endpoints, or
+  provider response bodies
+
+## Control plane vs bridge configuration
+
+The control plane points only at bridge HTTP origins. Prefer the administrative
+registry JSON (`GUARDIAN_REVIEW_REGISTRY_JSON`, or legacy
+`GUARDIAN_MODEL_BACKEND_REGISTRY`) so profiles map to bridge aliases. The legacy
+single-backend pair `GUARDIAN_MODEL_BACKEND_URL` /
+`GUARDIAN_MODEL_BACKEND_TOKEN` remains available when no registry is set. Do not
+put provider product names, model ids, or upstream provider URLs into control-plane
+config; those belong only in bridge admin config
+(`GUARDIAN_MODEL_BRIDGE_CONFIG_JSON` or `GUARDIAN_MODEL_BRIDGE_CONFIG_FILE`).
+
+## Running the included bridge
+
+Run the bridge as its own process, separate from the control plane:
+
+```sh
+export HOST=127.0.0.1
+export PORT=3001
+export GUARDIAN_MODEL_BRIDGE_TOKEN=CONTROL_PLANE_TO_BRIDGE_TOKEN
+export GUARDIAN_MODEL_BRIDGE_CONFIG_JSON='{"protocolVersion":"guardian.review.v1","bindings":{"default":{"adapter":"openai-responses","apiKeyEnv":"OPENAI_API_KEY","allowedClassifications":["public","private"],"retention":"bounded"}},"routes":{"routine-review":{"binding":"default"},"high-risk-review":{"binding":"default"},"benchmark-review":{"binding":"default"}}}'
+export OPENAI_API_KEY=PROVIDER_SECRET_ONLY_ON_BRIDGE
+npm run build --workspace @guardianbot/model-bridge
+npm start --workspace @guardianbot/model-bridge
+```
+
+Loopback-only local development may omit the bearer token; any non-loopback bind
+requires `GUARDIAN_MODEL_BRIDGE_TOKEN`. Verify with `GET /healthz`, authenticated
+`GET /v1/capabilities`, and the package tests
+(`npm test --workspace @guardianbot/model-bridge`), including the loopback
+protocol-client wire conformance suite.
 
 Operationally, publish one bridge instance only when every routed binding agrees on
 classification scope and retention semantics. The protocol capabilities endpoint cannot

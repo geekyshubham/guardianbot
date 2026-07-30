@@ -19,7 +19,12 @@ import {
 import { RepositoryIndexService } from "./repository-index-service.js";
 import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
 import { GuardianService } from "./service.js";
-import { MemoryStore, PostgresStore, type Store } from "./store.js";
+import {
+  MemoryStore,
+  PostgresStore,
+  webhookRetentionOptionsFromEnvironment,
+  type Store
+} from "./store.js";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -53,6 +58,8 @@ async function start() {
     return;
   }
   const metrics = new GuardianMetrics();
+  // Fail boot before opening listeners/workers when retention env is invalid.
+  const webhookRetention = webhookRetentionOptionsFromEnvironment(process.env);
   const store = await createStore();
   const monitoring = new MonitoringService(
     store,
@@ -110,6 +117,9 @@ async function start() {
   let shuttingDown = false;
   let lastWorkerPollAt = Date.now();
   let workerPromise: Promise<void> | undefined;
+  let cleanupPromise: Promise<void> | undefined;
+  // Dedicated controller so shutdown can cancel the long cleanup sleep immediately.
+  const cleanupAbort = new AbortController();
 
   async function workerLoop(): Promise<void> {
     while (!shuttingDown) {
@@ -119,9 +129,57 @@ async function start() {
     }
   }
 
+  async function webhookCleanupLoop(): Promise<void> {
+    while (!shuttingDown) {
+      const now = Date.now();
+      try {
+        const result = await store.purgeTerminalWebhookJobs({
+          succeededBefore: new Date(now - webhookRetention.succeededRetentionMs),
+          deadLetterBefore: new Date(now - webhookRetention.deadLetterRetentionMs),
+          limit: webhookRetention.batchLimit
+        });
+        if (result.deleted > 0) {
+          metrics.increment("webhook_cleanup_deleted_total", result.deleted);
+        }
+      } catch (error) {
+        metrics.increment("webhook_cleanup_failures_total");
+        console.error(
+          JSON.stringify({
+            event: "guardianbot.webhook_cleanup_failed",
+            error: boundedErrorKind(error)
+          })
+        );
+      }
+      try {
+        await service.refreshQueueMetrics(new Date(now));
+      } catch {
+        // Scrape path remains fail-closed; cleanup must not crash the worker.
+      }
+      try {
+        await delay(webhookRetention.cleanupIntervalMs, undefined, {
+          signal: cleanupAbort.signal
+        });
+      } catch (error) {
+        // Normal on SIGTERM/SIGINT: cancel the sleep so the process can exit promptly.
+        if (error instanceof Error && error.name === "AbortError") return;
+        throw error;
+      }
+    }
+  }
+
   workerPromise = workerLoop().catch((error) => {
     console.error(error);
     process.exitCode = 1;
+  });
+  cleanupPromise = webhookCleanupLoop().catch((error) => {
+    // Abort during shutdown is expected; never fail the process for cleanup alone.
+    if (error instanceof Error && error.name === "AbortError") return;
+    console.error(
+      JSON.stringify({
+        event: "guardianbot.webhook_cleanup_loop_failed",
+        error: boundedErrorKind(error)
+      })
+    );
   });
 
   const server = createServer(async (request, response) => {
@@ -149,6 +207,21 @@ async function start() {
         )
       ) {
         response.writeHead(404).end();
+        return;
+      }
+      try {
+        // Scrape-time store refresh is authoritative across multi-instance deploys.
+        await service.refreshQueueMetrics();
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            event: "guardianbot.metrics_queue_refresh_failed",
+            error: boundedErrorKind(error)
+          })
+        );
+        response
+          .writeHead(503, { "content-type": "application/json" })
+          .end(JSON.stringify({ error: "queue metrics unavailable" }));
         return;
       }
       response
@@ -315,9 +388,10 @@ async function start() {
   async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    cleanupAbort.abort();
     server.close();
     await Promise.race([
-      Promise.all([workerPromise, monitoring.stop()]),
+      Promise.all([workerPromise, cleanupPromise, monitoring.stop()]),
       delay(15_000)
     ]);
     await store.close();
@@ -326,6 +400,11 @@ async function start() {
 
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+/** Bound production logs to error kind/name only — never raw driver messages. */
+function boundedErrorKind(error: unknown): string {
+  return error instanceof Error ? error.name.slice(0, 64) : "UnknownError";
 }
 
 start().catch((error) => {

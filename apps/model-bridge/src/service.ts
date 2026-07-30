@@ -2,7 +2,9 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   PROTOCOL_VERSION,
+  ProtocolValidationError,
   type DataClassification,
+  type ReviewRequest,
   validateBackendCapabilities,
   validateReviewRequest
 } from "@guardianbot/protocol";
@@ -110,7 +112,15 @@ export class ModelBridgeService {
           return;
         }
         const body = await readJsonBody(request, this.config.requestBodyBytes);
-        const reviewRequest = validateReviewRequest(body);
+        let reviewRequest: ReviewRequest;
+        try {
+          reviewRequest = validateReviewRequest(body);
+        } catch (error) {
+          if (error instanceof ProtocolValidationError) {
+            throw new BridgeError("bad_request", error.message, 400, false);
+          }
+          throw error;
+        }
         const routeRuntime = this.routes.get(reviewRequest.profile);
         if (!routeRuntime) {
           throw new BridgeError("unsupported_route", "route is not configured", 422, false);
@@ -136,7 +146,7 @@ export class ModelBridgeService {
           sendJson(response, 200, primaryResult.result);
           return;
         } catch (error) {
-          const sanitized = sanitizeError(error);
+          const sanitized = sanitizeError(mapOutputValidationError(error));
           if (!routeRuntime.fallback || !sanitized.retryable) {
             throw sanitized;
           }
@@ -160,7 +170,7 @@ export class ModelBridgeService {
 
       sendJson(response, 404, { error: "Not found" });
     } catch (error) {
-      const safe = sanitizeError(error);
+      const safe = sanitizeError(mapOutputValidationError(error));
       sendJson(response, safe.statusCode, {
         error: {
           code: safe.code,
@@ -235,6 +245,19 @@ export class ModelBridgeService {
       }
     }
   }
+}
+
+// Adapter/fixture validateReviewResult failures are backend faults, not 400s.
+function mapOutputValidationError(error: unknown): unknown {
+  if (error instanceof ProtocolValidationError) {
+    return new BridgeError(
+      "invalid_output",
+      "structured output failed schema validation",
+      503,
+      true
+    );
+  }
+  return error;
 }
 
 function constantTimeTokenMatch(actual: string, expected: string): boolean {

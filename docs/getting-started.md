@@ -70,22 +70,57 @@ Do not connect GuardianBot to an external database provider.
 ## 3. Connect a conforming model bridge
 
 The control plane communicates only through `guardian.review.v1`. Deploy
-`apps/model-bridge` as an isolated service or connect another conforming bridge,
-then configure only:
+`apps/model-bridge` as an isolated service or connect another conforming bridge.
+Control-plane configuration names only bridge endpoints and bearer tokens—never
+provider product names, model ids, or upstream provider URLs.
+
+### Administrative registry (preferred)
+
+Set a multi-backend registry JSON on the control plane. Each backend alias is a
+bridge origin; routes map review profiles to those aliases:
+
+```text
+GUARDIAN_REVIEW_REGISTRY_JSON={"protocolVersion":"guardian.review.v1","backends":{"default":{"endpoint":"https://INTERNAL_BRIDGE_ORIGIN","tokenEnv":"GUARDIAN_MODEL_BACKEND_TOKEN","allowedClassifications":["public","private"],"timeoutMs":90000}},"routes":{"routine-review":"default","high-risk-review":"default","benchmark-review":"default"}}
+GUARDIAN_MODEL_BACKEND_TOKEN=CONTROL_PLANE_TO_BRIDGE_TOKEN
+```
+
+`GUARDIAN_MODEL_BACKEND_REGISTRY` is accepted as a legacy alias for the same
+JSON. When registry JSON is present it takes precedence over the single-backend
+shortcut below.
+
+### Legacy single-backend shortcut
+
+When no registry JSON is set, a single default route can still be configured
+with:
 
 ```text
 GUARDIAN_MODEL_BACKEND_URL=https://INTERNAL_BRIDGE_ORIGIN
 GUARDIAN_MODEL_BACKEND_TOKEN=CONTROL_PLANE_TO_BRIDGE_TOKEN
 ```
 
-The included `openai-responses` adapter calls the Responses API with native
-strict Structured Outputs. Its default profile mapping is:
+### Run the included bridge separately
+
+Provider credentials and adapter bindings stay on the bridge process only. From
+the monorepo root, build and start `apps/model-bridge` with its own config:
+
+```sh
+export GUARDIAN_MODEL_BRIDGE_CONFIG_JSON='{"protocolVersion":"guardian.review.v1","bindings":{"default":{"adapter":"openai-responses","apiKeyEnv":"OPENAI_API_KEY","allowedClassifications":["public","private"],"retention":"bounded"}},"routes":{"routine-review":{"binding":"default"},"high-risk-review":{"binding":"default"},"benchmark-review":{"binding":"default"}}}'
+export GUARDIAN_MODEL_BRIDGE_TOKEN=CONTROL_PLANE_TO_BRIDGE_TOKEN
+export OPENAI_API_KEY=PROVIDER_SECRET_ONLY_ON_BRIDGE
+npm run build --workspace @guardianbot/model-bridge
+npm start --workspace @guardianbot/model-bridge
+```
+
+See [model bridge adapters](model-bridge-adapters.md) for binding fields,
+retention rules, and adapter guardrails. The included `openai-responses`
+adapter calls the Responses API with native strict Structured Outputs. Its
+default profile mapping (bridge admin config only) is:
 
 - `routine-review` to `gpt-5.6-terra`;
 - `high-risk-review` to `gpt-5.6-sol`; and
 - `benchmark-review` to `gpt-5.6-sol`.
 
-Put `OPENAI_API_KEY` only in the model-bridge service. The model receives
+Put provider API keys only in the model-bridge service. The model receives
 bounded, explicitly delimited untrusted repository context, no tools, no GitHub
 client, and no credentials. Malformed output is discarded. `store: false` is
 used, but the bridge reports bounded retention unless Zero Data Retention is
@@ -133,16 +168,18 @@ guardianctl doctor OWNER/REPOSITORY
 `.guardianbot/config.yml`, a small immutable caller workflow, and an onboarding
 report. It copies no scanner implementation or infrastructure credential.
 
-Merge the PR to begin the seven-day report-only period. After a reviewed,
-healthy baseline, set `scanners.mode: enforce`, update the baseline document,
-and run:
+Merge the PR to begin the seven-day report-only period. After that observation
+window and a successful provenance-bound report-only gate, open a baseline draft
+with `guardianctl baseline OWNER/REPOSITORY --from-gate path/to/gate.json`,
+review and merge the baseline PR, then promote with:
 
 ```sh
 guardianctl enforce OWNER/REPOSITORY
 ```
 
-Use `guardianctl inventory` for fleet state and `guardianctl upgrade --all` to
-open immutable pin-update PRs. See
+`enforce` fails closed until doctor is clean for enforcement, the observation
+period is complete, and a baseline is present. Use `guardianctl inventory` for
+fleet state and `guardianctl upgrade --all` to open immutable pin-update PRs. See
 [repository onboarding](onboarding-repositories.md) for the complete lifecycle.
 
 ## 6. Verify and operate

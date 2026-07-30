@@ -585,9 +585,57 @@ jobs:
             return findings;
           };
 
+          const isCanonicalUtcInstant = (value) => {
+            if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+              return false;
+            }
+            const parsed = new Date(value);
+            return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+          };
+
           const baselineDocument = (raw) => {
-            if (Array.isArray(raw)) return raw;
-            if (raw && typeof raw === "object" && Array.isArray(raw.fingerprints)) return raw.fingerprints;
+            const fingerprintSha256 = /^[a-f0-9]{64}$/;
+            const immutableSha = /^[a-f0-9]{40}$/;
+            const repositoryName = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
+            const isPositiveSafeInteger = (value) =>
+              typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+            if (Array.isArray(raw)) {
+              if (raw.length === 0) {
+                throw new Error("legacy baseline fingerprint set is empty");
+              }
+              return raw;
+            }
+            if (raw && typeof raw === "object" && Array.isArray(raw.fingerprints)) {
+              if (raw.schemaVersion === "guardianbot.baseline.v1") {
+                if (!isCanonicalUtcInstant(raw.generatedAt)) {
+                  throw new Error(
+                    "versioned baseline generatedAt must be a canonical RFC3339 UTC instant"
+                  );
+                }
+                if (
+                  !raw.source ||
+                  typeof raw.source !== "object" ||
+                  typeof raw.source.gateSha256 !== "string" ||
+                  !fingerprintSha256.test(raw.source.gateSha256) ||
+                  raw.source.mode !== "report-only" ||
+                  typeof raw.source.repository !== "string" ||
+                  !repositoryName.test(String(raw.source.repository).toLowerCase()) ||
+                  typeof raw.source.headSha !== "string" ||
+                  !immutableSha.test(raw.source.headSha) ||
+                  !isPositiveSafeInteger(raw.source.runId) ||
+                  !isPositiveSafeInteger(raw.source.runAttempt)
+                ) {
+                  throw new Error(
+                    "versioned baseline source must include lowercase gateSha256, mode report-only, repository, headSha, runId, and runAttempt"
+                  );
+                }
+                return raw.fingerprints;
+              }
+              if (raw.fingerprints.length === 0) {
+                throw new Error("legacy baseline fingerprint set is empty");
+              }
+              return raw.fingerprints;
+            }
             throw new Error("baseline must be an array or an object with a fingerprints array");
           };
 
@@ -666,9 +714,6 @@ jobs:
                   throw new Error("baseline contains duplicate fingerprints");
                 }
                 baselineFingerprints = new Set(baselineValues);
-                if (baselineFingerprints.size === 0) {
-                  executionFailures.push(`Baseline is empty: ${process.env.BASELINE_PATH}`);
-                }
               } catch (error) {
                 executionFailures.push(`Invalid baseline document at ${process.env.BASELINE_PATH}: ${error.message}`);
               }
@@ -725,9 +770,30 @@ jobs:
           const enforcedFindings = process.env.SCANNER_MODE === "enforce" ? policyFindings : [];
           const failures = [...executionFailures, ...enforcedFindings.map(summarizeFinding)];
 
+          const repository = String(process.env.GITHUB_REPOSITORY || "").trim().toLowerCase();
+          const headSha = String(process.env.GITHUB_SHA || "").trim().toLowerCase();
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+          if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) {
+            throw new Error("GITHUB_REPOSITORY must be a normalized OWNER/REPO value");
+          }
+          if (!/^[a-f0-9]{40}$/.test(headSha)) {
+            throw new Error("GITHUB_SHA must be a lowercase 40-character commit SHA");
+          }
+          if (!Number.isSafeInteger(runId) || runId <= 0) {
+            throw new Error("GITHUB_RUN_ID must be a positive integer");
+          }
+          if (!Number.isSafeInteger(runAttempt) || runAttempt <= 0) {
+            throw new Error("GITHUB_RUN_ATTEMPT must be a positive integer");
+          }
+
           fs.writeFileSync("guardianbot-evidence/gate.json", JSON.stringify({
             schemaVersion: "1.0.0",
             mode: process.env.SCANNER_MODE,
+            repository,
+            headSha,
+            runId,
+            runAttempt,
             baselineRequired: process.env.SCANNER_MODE === "enforce",
             baselineCount: baselineFingerprints.size,
             passed: failures.length === 0,

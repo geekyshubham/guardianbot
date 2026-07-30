@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ReviewRequest } from "@guardianbot/protocol";
 import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { ReviewBackendRegistry } from "../src/backend-registry.js";
+import { GuardianMetrics } from "../src/metrics.js";
 import { GuardianService, addedLineRanges, redactUntrustedText } from "../src/service.js";
 import { MemoryStore } from "../src/store.js";
 
@@ -709,6 +710,91 @@ test("failing jobs retry and dead-letter after the max attempt budget", async ()
   assert.equal(job?.status, "dead-letter");
   assert.equal(job?.attempts, 3);
   assert.match(job?.lastError ?? "", /GitHub GET \/tree returned 500/);
+});
+
+test("queue metrics track pending, leased, runnable depth, and dead-letter gauges", async () => {
+  const store = new MemoryStore();
+  const metrics = new GuardianMetrics();
+  let nowMs = Date.UTC(2026, 6, 27, 12, 0, 0);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      metrics,
+      webhookLeaseMs: 720_000,
+      githubClientFactory: async () => new FakeGitHub(),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [
+      {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        default_branch: "main",
+        private: false
+      }
+    ]
+  };
+
+  await service.enqueue("installation", event, "queue-a");
+  await service.enqueue("installation", event, "queue-b");
+  let rendered = metrics.render();
+  assert.match(rendered, /guardianbot_queue_depth 2/);
+  assert.match(rendered, /guardianbot_webhook_jobs_pending 2/);
+  assert.match(rendered, /guardianbot_webhook_jobs_leased 0/);
+  assert.match(rendered, /guardianbot_webhook_jobs_dead_letter 0/);
+  assert.doesNotMatch(rendered, /Geekyshubham|secret|private-key|token/i);
+
+  const leased = await store.claimWebhook("worker-metrics", 720_000, new Date(nowMs));
+  assert.equal(leased?.deliveryId, "queue-a");
+  await service.refreshQueueMetrics();
+  rendered = metrics.render();
+  assert.match(rendered, /guardianbot_queue_depth 1/);
+  assert.match(rendered, /guardianbot_webhook_jobs_pending 1/);
+  assert.match(rendered, /guardianbot_webhook_jobs_leased 1/);
+
+  nowMs += 721_000;
+  await service.refreshQueueMetrics();
+  rendered = metrics.render();
+  assert.match(rendered, /guardianbot_queue_depth 2/);
+  assert.match(rendered, /guardianbot_webhook_jobs_pending 1/);
+  assert.match(rendered, /guardianbot_webhook_jobs_leased 1/);
+
+  await store.completeWebhook("queue-a", "worker-metrics");
+  await service.refreshQueueMetrics();
+  rendered = metrics.render();
+  assert.match(rendered, /guardianbot_queue_depth 1/);
+  assert.match(rendered, /guardianbot_webhook_jobs_leased 0/);
+
+  const failing = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      metrics,
+      webhookLeaseMs: 720_000,
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => ({
+        ...new FakeGitHub(),
+        getTree: async () => {
+          throw new Error("GitHub GET /tree returned 500");
+        }
+      }),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+  assert.equal(await failing.processNextWebhook("worker-metrics"), true);
+  rendered = metrics.render();
+  assert.match(rendered, /guardianbot_webhook_jobs_dead_letter 1/);
+  assert.match(rendered, /guardianbot_queue_depth 0/);
+  assert.match(rendered, /guardianbot_webhook_dead_letter_total 1/);
+  assert.doesNotMatch(rendered, /queue-a|queue-b|Geekyshubham/);
 });
 
 test("stale PR heads never publish final review output", async () => {

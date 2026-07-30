@@ -543,6 +543,38 @@ test("DAST OpenAPI sanitization keeps only safe, exact-origin operations", async
   }
 });
 
+test("security workflow accepts generated empty versioned baselines and rejects empty legacy baselines", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  assert.match(workflow, /guardianbot\.baseline\.v1/);
+  assert.match(workflow, /legacy baseline fingerprint set is empty/);
+  assert.match(
+    workflow,
+    /versioned baseline generatedAt must be a canonical RFC3339 UTC instant/
+  );
+  assert.match(
+    workflow,
+    /versioned baseline source must include lowercase gateSha256, mode report-only, repository, headSha, runId, and runAttempt/
+  );
+  assert.match(workflow, /const repository = String\(process\.env\.GITHUB_REPOSITORY/);
+  assert.match(workflow, /const headSha = String\(process\.env\.GITHUB_SHA/);
+  assert.match(workflow, /const runId = Number\(process\.env\.GITHUB_RUN_ID\)/);
+  assert.match(workflow, /const runAttempt = Number\(process\.env\.GITHUB_RUN_ATTEMPT\)/);
+  assert.match(
+    workflow,
+    /repository,\s*headSha,\s*runId,\s*runAttempt,/
+  );
+  assert.doesNotMatch(
+    workflow,
+    /Baseline is empty: \$\{process\.env\.BASELINE_PATH\}/
+  );
+  assert.match(
+    workflow,
+    /if \(raw\.schemaVersion === "guardianbot\.baseline\.v1"\)/
+  );
+  assert.doesNotMatch(workflow, /reviewedAt/);
+  assert.match(workflow, /isCanonicalUtcInstant/);
+});
+
 test("DAST profiles are bounded and preserve operational failure evidence", () => {
   const workflow = repositoryFile(".github/workflows/reusable-dast.yml");
 

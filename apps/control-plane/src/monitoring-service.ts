@@ -61,6 +61,9 @@ const ZAP_NIGHTLY_IMPORT_EVIDENCE_KEY =
 const DAST_SMOKE_MAX_AGE_MS = 45 * 60_000;
 const SUPPRESSION_NOTIFY_BEFORE_MS = 7 * 24 * 60 * 60_000;
 const BASELINE_FINGERPRINT = /^[a-f0-9]{64}$/;
+const BASELINE_SCHEMA_VERSION = "guardianbot.baseline.v1";
+const BASELINE_IMMUTABLE_SHA = /^[a-f0-9]{40}$/;
+const BASELINE_REPOSITORY = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
 const BASELINE_PATH = ".guardianbot/baseline.json";
 const WEEK_MS = 7 * 24 * 60 * 60_000;
 const MONITORED_EVIDENCE_KEYS = new Set([
@@ -590,6 +593,55 @@ function evaluateInventoryItem(
   };
 }
 
+function isCanonicalUtcInstant(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function versionedBaselineFingerprints(
+  value: Record<string, unknown>
+): string[] | undefined {
+  if (value.schemaVersion !== BASELINE_SCHEMA_VERSION) return undefined;
+  if (!Array.isArray(value.fingerprints)) return undefined;
+  if (typeof value.generatedAt !== "string" || !isCanonicalUtcInstant(value.generatedAt)) {
+    return undefined;
+  }
+  const source = value.source;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return undefined;
+  const provenance = source as Record<string, unknown>;
+  if (
+    typeof provenance.gateSha256 !== "string" ||
+    !BASELINE_FINGERPRINT.test(provenance.gateSha256) ||
+    provenance.mode !== "report-only" ||
+    typeof provenance.repository !== "string" ||
+    !BASELINE_REPOSITORY.test(provenance.repository.toLowerCase()) ||
+    typeof provenance.headSha !== "string" ||
+    !BASELINE_IMMUTABLE_SHA.test(provenance.headSha) ||
+    !isPositiveSafeInteger(provenance.runId) ||
+    !isPositiveSafeInteger(provenance.runAttempt)
+  ) {
+    return undefined;
+  }
+  const fingerprints: string[] = [];
+  for (const fingerprint of value.fingerprints) {
+    if (
+      typeof fingerprint !== "string" ||
+      !BASELINE_FINGERPRINT.test(fingerprint)
+    ) {
+      return undefined;
+    }
+    fingerprints.push(fingerprint);
+  }
+  return fingerprints;
+}
+
 function readIndexedBaseline(item: MonitoringRepositoryInventory): {
   ready: boolean;
   check: MonitoringCheckResult;
@@ -609,15 +661,29 @@ function readIndexedBaseline(item: MonitoringRepositoryInventory): {
   }
   try {
     const parsed: unknown = JSON.parse(baselineSymbol.content);
-    const fingerprints = Array.isArray(parsed)
-      ? parsed
-      : parsed &&
-          typeof parsed === "object" &&
-          Array.isArray((parsed as { fingerprints?: unknown }).fingerprints)
-        ? (parsed as { fingerprints: unknown[] }).fingerprints
-        : undefined;
+    let fingerprints: unknown[] | undefined;
+    if (Array.isArray(parsed)) {
+      fingerprints = parsed;
+      if (!fingerprints.length) {
+        return invalidBaseline("Indexed enforcement baseline is invalid");
+      }
+    } else if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      if (record.schemaVersion === BASELINE_SCHEMA_VERSION) {
+        fingerprints = versionedBaselineFingerprints(record);
+        if (!fingerprints) {
+          return invalidBaseline("Indexed enforcement baseline is invalid");
+        }
+        // Empty fingerprints are accepted only for the strict versioned document.
+      } else if (Array.isArray(record.fingerprints)) {
+        fingerprints = record.fingerprints;
+        if (!fingerprints.length) {
+          return invalidBaseline("Indexed enforcement baseline is invalid");
+        }
+      }
+    }
     if (
-      !fingerprints?.length ||
+      !fingerprints ||
       !fingerprints.every(
         (fingerprint): fingerprint is string =>
           typeof fingerprint === "string" && BASELINE_FINGERPRINT.test(fingerprint)

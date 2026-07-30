@@ -18,8 +18,50 @@ import {
   validateMermaidDiagram,
   validateOpenApiDocument,
   validateSafeOpenApiSurface,
-  validateReleaseNotes
+  validateReleaseNotes,
+  validateStructuredExamples
 } from "./docs-check-lib.mjs";
+
+const MINIMAL_REPOSITORY_SCHEMA = {
+  type: "object",
+  properties: {
+    schemaVersion: { type: "string" },
+    image: {
+      type: "object",
+      properties: { enabled: { type: "boolean" } }
+    },
+    dast: {
+      type: "object",
+      properties: { enabled: { type: "boolean" } }
+    }
+  }
+};
+
+const BASELINE_JSON = `{
+  "schemaVersion": "guardianbot.baseline.v1",
+  "fingerprints": [
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  ]
+}`;
+
+const SUPPORTING_STRUCTURED_FENCES = [
+  "```yaml guardianbot-config=full",
+  "schemaVersion: guardianbot.config.v1",
+  "```",
+  "",
+  "```yaml openapi",
+  "openapi: 3.1.0",
+  "info:",
+  "  title: Safe API",
+  "  version: 1.0.0",
+  "paths: {}",
+  "```",
+  "",
+  "```mermaid",
+  "flowchart LR",
+  "A --> B",
+  "```"
+].join("\n");
 
 function temporaryRepository(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "guardianbot-docs-test-"));
@@ -209,4 +251,85 @@ test("CI fails closed when its release-note diff base is unavailable", () => {
     unresolvedCiBase: true
   });
   assert.match(result.errors[0], /could not resolve/);
+});
+
+test("guardianbot-config=none accepts non-config baseline examples without counting them as config", async (context) => {
+  const root = temporaryRepository({
+    "docs/example.md": [
+      "# Example",
+      "",
+      "```json guardianbot-config=none",
+      BASELINE_JSON,
+      "```",
+      "",
+      SUPPORTING_STRUCTURED_FENCES
+    ].join("\n")
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = await validateStructuredExamples(
+    root,
+    readMarkdownDocuments(root),
+    MINIMAL_REPOSITORY_SCHEMA
+  );
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.configExamples, 1);
+  assert.equal(result.openApiExamples, 1);
+  assert.equal(result.mermaidDiagrams, 1);
+});
+
+test("structured examples that look like config still fail without a guardianbot-config marker", async (context) => {
+  const root = temporaryRepository({
+    "docs/example.md": [
+      "# Example",
+      "",
+      "```json",
+      BASELINE_JSON,
+      "```",
+      "",
+      SUPPORTING_STRUCTURED_FENCES
+    ].join("\n")
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = await validateStructuredExamples(
+    root,
+    readMarkdownDocuments(root),
+    MINIMAL_REPOSITORY_SCHEMA
+  );
+  assert.match(
+    result.errors.join("\n"),
+    /looks like GuardianBot configuration but lacks guardianbot-config=<scope>/
+  );
+  assert.equal(result.configExamples, 1);
+});
+
+test("guardianbot-config=none does not bypass JSON parsing or other structured validation", async (context) => {
+  const root = temporaryRepository({
+    "docs/example.md": [
+      "# Example",
+      "",
+      "```json guardianbot-config=none",
+      "{ schemaVersion: not-valid-json }",
+      "```",
+      "",
+      "```json guardianbot-config=none openapi",
+      "{",
+      '  "notOpenApi": true',
+      "}",
+      "```",
+      "",
+      SUPPORTING_STRUCTURED_FENCES
+    ].join("\n")
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = await validateStructuredExamples(
+    root,
+    readMarkdownDocuments(root),
+    MINIMAL_REPOSITORY_SCHEMA
+  );
+  assert.match(result.errors.join("\n"), /has invalid JSON/);
+  assert.match(result.errors.join("\n"), /is not a valid OpenAPI document/);
+  assert.equal(result.configExamples, 1);
 });
