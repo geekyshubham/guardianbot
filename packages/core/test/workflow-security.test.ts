@@ -606,4 +606,29 @@ test("DAST profiles are bounded and preserve operational failure evidence", () =
     workflow,
     /EVIDENCE_FILES: scan-status\.json,zap\.json,zap\.xml/
   );
+  assert.match(
+    workflow,
+    /DAST minutes must be an integer between 5 and 45/
+  );
+  assert.match(
+    workflow,
+    /SCAN_PROFILE === "authenticated-baseline" && minutes > 15/
+  );
+  assert.match(
+    workflow,
+    /SCAN_PROFILE === "authenticated-full" && minutes < 30/
+  );
+  assert.match(
+    workflow,
+    /authenticated-baseline DAST minutes must be at most 15/
+  );
+  assert.match(
+    workflow,
+    /authenticated-full DAST minutes must be at least 30/
+  );
+  assert.match(workflow, /scanProfile: contract\.scanProfile/);
+  assert.match(
+    workflow,
+    /headSha: process\.env\.GITHUB_SHA\.toLowerCase\(\),\s*scanProfile: contract\.scanProfile/
+  );
 });

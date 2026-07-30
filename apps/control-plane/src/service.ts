@@ -721,7 +721,7 @@ export class GuardianService {
         : "routine-review";
     const indexVisibility = repositoryVisibility(event.repository);
     const classification: DataClassification =
-      indexVisibility === "public" ? "public" : "private";
+      indexVisibility === "internal" ? "restricted" : indexVisibility;
     const routed = this.reviewClient(profile, classification);
     if (!routed) {
       await this.publishUnavailable(

@@ -53,6 +53,7 @@ function request(overrides: Record<string, unknown> = {}): Record<string, unknow
     runId: 500,
     runAttempt: 2,
     headSha: HEAD_SHA,
+    scanProfile: "authenticated-baseline",
     ...overrides
   };
 }
@@ -305,6 +306,82 @@ test("rejects push-triggered DAST even when deployment evidence exists", async (
     () => service.issue("Bearer github-oidc", request()),
     (error: unknown) =>
       error instanceof DastSessionError && error.statusCode === 401
+  );
+});
+
+test("rejects authenticated-full sessions for workflow_dispatch", async () => {
+  let exchangeCalls = 0;
+  const service = createDastSessionService({
+    store: await seededStore(),
+    environment: exchangeEnvironment(),
+    now: () => NOW,
+    oidcVerifier: {
+      verify: async () => oidc({ event_name: "workflow_dispatch" })
+    },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () => {
+      exchangeCalls += 1;
+      throw new Error("must not exchange");
+    }) as typeof fetch
+  });
+  await assert.rejects(
+    () =>
+      service.issue(
+        "Bearer github-oidc",
+        request({ scanProfile: "authenticated-full" })
+      ),
+    (error: unknown) =>
+      error instanceof DastSessionError && error.statusCode === 401
+  );
+  assert.equal(exchangeCalls, 0);
+});
+
+test("accepts authenticated-full sessions for genuine schedule events", async () => {
+  const service = createDastSessionService({
+    store: await seededStore(),
+    environment: exchangeEnvironment(),
+    now: () => NOW,
+    oidcVerifier: { verify: async () => oidc({ event_name: "schedule" }) },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () =>
+      Response.json({
+        schemaVersion: "1.0.0",
+        credential: "session=full-scheduled",
+        expiresAt: new Date(NOW.getTime() + 240_000).toISOString()
+      })) as typeof fetch
+  });
+  const result = await service.issue(
+    "Bearer github-oidc",
+    request({ scanProfile: "authenticated-full" })
+  );
+  assert.equal(result.headerValue, "session=full-scheduled");
+  assert.equal(result.assurance, "target-exchanged");
+});
+
+test("rejects invalid or missing scanProfile in the session request", async () => {
+  const service = createDastSessionService({
+    store: await seededStore(),
+    environment: exchangeEnvironment(),
+    now: () => NOW,
+    oidcVerifier: { verify: async () => oidc() },
+    authorizeRepository: async () => repositoryAuthorization(),
+    fetchImpl: (async () => {
+      throw new Error("must not exchange");
+    }) as typeof fetch
+  });
+
+  await assert.rejects(
+    () => service.issue("Bearer github-oidc", request({ scanProfile: "nightly" })),
+    (error: unknown) =>
+      error instanceof DastSessionError && error.statusCode === 400
+  );
+
+  const missing = request();
+  delete missing.scanProfile;
+  await assert.rejects(
+    () => service.issue("Bearer github-oidc", missing),
+    (error: unknown) =>
+      error instanceof DastSessionError && error.statusCode === 400
   );
 });
 

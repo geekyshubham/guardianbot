@@ -2016,12 +2016,15 @@ async function latestPathCommitTime(
   return commits[0] ? commitTime(commits[0]) : undefined;
 }
 
-function inspectObservationPeriod(
+async function inspectObservationPeriod(
   context: CommandContext,
+  github: GitHubClient,
+  owner: string,
+  repo: string,
   mode: ScannerMode | undefined,
   configuredSince: Date | undefined,
   runs: WorkflowRun[]
-): { check: DoctorCheck; since?: Date; ageDays?: number } {
+): Promise<{ check: DoctorCheck; since?: Date; ageDays?: number }> {
   if (!mode || mode === "advisory") {
     return {
       check: makeCheck(
@@ -2046,11 +2049,13 @@ function inspectObservationPeriod(
     };
   }
   // Observation and enforcement timing start only from the first successful
-  // default-branch push or workflow_dispatch after report-only config. All
-  // schedule events are excluded (including security-bearing ones) so DAST-only
-  // smokes cannot start the clock; onboarding normally starts it via the merge
-  // push that lands the generated caller.
-  const firstSuccessfulRun = [...runs]
+  // default-branch push or workflow_dispatch after report-only config that also
+  // has a present, non-skipped, completed, successful run-bound security gate.
+  // Missing/skipped/failed gates do not start the clock. All schedule events
+  // are excluded (including security-bearing ones) so DAST-only smokes cannot
+  // start it; onboarding normally starts via the merge push that lands the
+  // generated caller.
+  const candidates = [...runs]
     .filter((run) => {
       const time = workflowRunTime(run);
       return (
@@ -2064,15 +2069,39 @@ function inspectObservationPeriod(
     .sort(
       (left, right) =>
         (workflowRunTime(left)?.getTime() ?? 0) - (workflowRunTime(right)?.getTime() ?? 0)
-    )[0];
-  const since = firstSuccessfulRun ? workflowRunTime(firstSuccessfulRun) : undefined;
+    );
+
+  let firstQualifiedRun: WorkflowRun | undefined;
+  try {
+    for (const run of candidates) {
+      const evidence = await loadGateEvidenceForRun(github, owner, repo, run);
+      if (!evidence || evidence.skipped) continue;
+      if (evidence.status === "completed" && evidence.conclusion === "success") {
+        firstQualifiedRun = run;
+        break;
+      }
+      // Failed or incomplete gate evidence: keep looking at later eligible runs.
+    }
+  } catch (error) {
+    return {
+      check: makeCheck(
+        "report-only-observation",
+        "report-only observation",
+        false,
+        `could not load security-gate evidence to start report-only observation: ${errorMessage(error)}`,
+        { blocking, state: "failed" }
+      )
+    };
+  }
+
+  const since = firstQualifiedRun ? workflowRunTime(firstQualifiedRun) : undefined;
   if (!since) {
     return {
       check: makeCheck(
         "report-only-observation",
         "report-only observation",
         false,
-        `no successful default-branch push or workflow_dispatch proves report-only operation since ${configuredSince.toISOString()} (scheduled runs do not start the clock)`,
+        `no successful default-branch push or workflow_dispatch with a successful non-skipped security gate proves report-only operation since ${configuredSince.toISOString()} (scheduled runs do not start the clock)`,
         { blocking, state: "missing" }
       )
     };
@@ -2602,8 +2631,11 @@ async function doctorInternal(
     )
   );
 
-  const observation = inspectObservationPeriod(
+  const observation = await inspectObservationPeriod(
     context,
+    context.github,
+    owner,
+    repo,
     parsedConfig?.scanners.mode,
     reportOnlyConfiguredSince,
     runInspection.runs
@@ -3228,7 +3260,9 @@ export async function enforce(
         `- Report-only observation started: ${diagnosis.facts.reportOnlySince}`,
         `- Required check: \`${diagnosis.facts.requiredCheckName}\``,
         "",
-        "Merge only after the enforcement-mode pull request check succeeds."
+        "Pull-request checks stay report-only because they bind the base-branch configuration.",
+        "Merge only after ordinary checks and human review.",
+        "Immediately after merge, verify the first enforce-mode default-branch gate and revert or disable enforcement if it fails."
       ].join("\n")
     });
     url = pull.html_url;

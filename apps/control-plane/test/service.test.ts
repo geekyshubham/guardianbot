@@ -1539,6 +1539,61 @@ test("workflow_run handling emits only validated GuardianBot scanner metadata", 
   assert.equal(observed.length, 1);
 });
 
+test("internal repository visibility routes reviews as restricted", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  github.currentPulls = [{ head: { sha: "head-sha" } }, { head: { sha: "head-sha" } }];
+  github.pullFiles = [[{
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n+line"
+  }]];
+  const routed: Array<{ profile: string; classification: string }> = [];
+  const backend = {
+    requests: [] as ReviewRequest[],
+    async capabilities() {
+      return {
+        protocolVersion: "guardian.review.v1" as const,
+        backendId: "restricted-capable",
+        structuredOutput: true,
+        maxInputCharacters: 200_000,
+        supportedProfiles: ["routine-review", "high-risk-review"],
+        supportedDataClassifications: ["restricted"],
+        retention: "none" as const,
+        usageReporting: true
+      };
+    },
+    async review(request: ReviewRequest) {
+      this.requests.push(request);
+      return createResult(request);
+    }
+  };
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: (profile, classification) => {
+        routed.push({ profile, classification });
+        return classification === "restricted" ? backend : undefined;
+      }
+    },
+    store
+  );
+
+  const event = createPullEvent();
+  event.repository.visibility = "internal";
+  event.repository.private = true;
+
+  await service.enqueue("pull_request", event, "delivery-internal-restricted");
+  await service.processNextWebhook("worker-1");
+
+  assert.deepEqual(routed, [{ profile: "routine-review", classification: "restricted" }]);
+  assert.equal(backend.requests.length, 1);
+  assert.equal(backend.requests[0]?.repository.visibility, "restricted");
+});
+
 test("administrative backend registry routes profiles without implicit fallback", () => {
   const registry = new ReviewBackendRegistry(
     {
