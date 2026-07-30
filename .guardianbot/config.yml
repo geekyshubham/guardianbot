@@ -1,5 +1,5 @@
 schemaVersion: 1.0.0
-workflowVersion: ac52fb8123b5897d8c9f67b0d3ff8ca95289a5cb
+workflowVersion: 6d04f85ef5cf1c6865300f0125ef8875c6c42afb
 repository:
   defaultBranch: main
   releaseBranches:
