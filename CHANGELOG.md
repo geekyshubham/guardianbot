@@ -15,12 +15,6 @@ reusable workflow commits remain immutable.
   new runs, seven-day enforcement observation, and production model credential
   remain out of scope for this evidence.
 
-### Changed
-
-- GuardianBot's own generated consumer caller and config are pinned to the
-  immutable v0.2.33 commit `6d04f85ef5cf1c6865300f0125ef8875c6c42afb`, with
-  report-only image publication remaining `enforce-only`.
-
 ## [0.2.34] - 2026-07-30
 
 ### Added
@@ -46,6 +40,10 @@ reusable workflow commits remain immutable.
   `pause`, `resume`, and `help`.
 - Documentation quality gate accepts `guardianbot-config=none` for structured
   non-configuration examples such as baseline documents.
+- Generic `guardianctl upgrade --all` generated the GuardianBot self-upgrade
+  PR and moved its caller/config pin to the immutable v0.2.34 commit
+  `eb22366454ec6e37d38b700aeada4d8a9899635b`, with report-only image
+  publication remaining `enforce-only`.
 
 ### Security
 
