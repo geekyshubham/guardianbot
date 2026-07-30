@@ -1,17 +1,19 @@
 # Capability status
 
-Release: `0.2.35`
+Release: `0.2.36`
 Last verified: 2026-07-30
 
-**Release control:** Automated code/test verification, DigitalOcean
-control-plane deployment, fleet consumer upgrade, and RouteLens/AstraNull
-Critical-clean image promotion with exact-digest ACTIVE deployments are current
-through `v0.2.35` (2026-07-30). Signed release:
+**Release control:** Automated code/test verification is current through
+`v0.2.36` (2026-07-30). DigitalOcean control-plane deployment, fleet consumer
+upgrade, RouteLens/AstraNull Critical-clean image promotion with exact-digest
+ACTIVE deployments, and the signed release remain current through `v0.2.35`
+(2026-07-30):
 https://github.com/geekyshubham/guardianbot/releases/tag/v0.2.35. Live
 scheduled DAST and DefectDojo reimport evidence remains bounded by older
-`v0.2.34` RouteLens scheduled baseline proof only. This does not claim
-production AI review, any v0.2.35 scheduled DAST, authenticated-full scheduled
-success, seven-day completion, baseline, or enforcement.
+`v0.2.34` RouteLens scheduled baseline proof only. This does not claim any
+v0.2.36 live deployment, consumer upgrade, production AI review, live
+enforcement, any v0.2.35 scheduled DAST, authenticated-full scheduled success,
+seven-day completion, baseline, or enforcement.
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
