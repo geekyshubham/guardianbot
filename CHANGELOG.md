@@ -5,6 +5,16 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Live RouteLens and AstraNull proof of v0.2.33
+  `verified-default-branch` image promotion: Critical-clean build/smoke/Trivy/
+  SBOM, promote-job recheck, GHCR immutable push, Cosign signing, exact-digest
+  ACTIVE DigitalOcean deployments, and manual authenticated-baseline DAST.
+  Scheduled authenticated-full nightly DAST, DefectDojo import of these two
+  new runs, seven-day enforcement observation, and production model credential
+  remain out of scope for this evidence.
+
 ### Changed
 
 - GuardianBot's own generated consumer caller and config are pinned to the

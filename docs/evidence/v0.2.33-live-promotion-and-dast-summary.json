@@ -1,0 +1,80 @@
+{
+  "schemaVersion": "guardianbot.live-evidence.v1",
+  "verifiedAt": "2026-07-30",
+  "scope": "v0.2.33-verified-default-branch-promotion-and-authenticated-baseline-dast",
+  "guardianbot": {
+    "release": "v0.2.33",
+    "commit": "6d04f85ef5cf1c6865300f0125ef8875c6c42afb",
+    "releaseRunId": "30532452861",
+    "imageDigest": "sha256:e92167295dfdd23a1c5d9557f5ddcd1c341ec5143bf36abbe65f8fada2870fbe",
+    "digitalOceanDeploymentId": "da058570-596c-4080-b42b-55f5d4e1f7b9",
+    "trustedWorkflowShas": "6d04f85ef5cf1c6865300f0125ef8875c6c42afb"
+  },
+  "routeLens": {
+    "upgradePullRequest": 71,
+    "mainSha": "a0df444005739461c7ed0154c08ba4327c0ab973",
+    "promotionMode": "verified-default-branch",
+    "promotionRunId": "30533400229",
+    "imageDigest": "sha256:12cc5b56f7635065fbbe6398cb6357b8added52934b62d7542d3de4c7d9963a7",
+    "digitalOceanDeploymentId": "3f97e061-a268-4319-979e-9f2144a4f59f",
+    "deploymentStatus": "ACTIVE",
+    "dastRunId": "30534247886",
+    "dastArtifactId": "8756057114",
+    "dastArtifactDigest": "sha256:fffcd5a0f6f2e927c0eed48a83852cf34ee8a3aef0a1228c5b733fa07537e247",
+    "dastProfile": "authenticated-baseline",
+    "zapExitCode": 2,
+    "zapXmlSha256": "3dc95ca30ddf00dd8972fd99277e2648347c08ce80ce838cb26de144185d739c",
+    "zapXmlBytes": 105746,
+    "zapAlerts": {
+      "medium": 1,
+      "low": 6,
+      "informational": 5
+    }
+  },
+  "astraNull": {
+    "upgradePullRequest": 9,
+    "mainSha": "a05f7cbdddb894490b442e5e87efd4ee45b4b740",
+    "promotionMode": "verified-default-branch",
+    "promotionRunId": "30533330968",
+    "imageDigest": "sha256:ea3d21c13df848e51c2939578e0319e0e378e0ac271eeb1d65c9d54c154e7030",
+    "digitalOceanDeploymentId": "9349d9c4-b59d-46db-96e4-5d4e34a10bab",
+    "deploymentStatus": "ACTIVE",
+    "dastRunId": "30534230222",
+    "dastArtifactId": "8755973760",
+    "dastArtifactDigest": "sha256:528897a38296a09fea5dbe5dbb4a02fdff86fb46bf6485e79a0f5c6f55774647",
+    "dastProfile": "authenticated-baseline",
+    "zapExitCode": 2,
+    "zapXmlSha256": "a4f681bbe69e0bb635e2c49c3ee962c94a87b3c83c2cae0020900fe77c41769d",
+    "zapXmlBytes": 29191,
+    "zapAlerts": {
+      "low": 5,
+      "informational": 4
+    }
+  },
+  "fleet": {
+    "applicableRepositoriesUpgradedToV0233": 18,
+    "reportOnlyHealthy": 16,
+    "advisoryOnlyHealthy": 2,
+    "notApplicableFork": "NotebookLM-Resource-Deleter",
+    "doctorStatus": "ready",
+    "enforcementReady": false
+  },
+  "verified": [
+    "verified-default-branch promotion for RouteLens and AstraNull",
+    "exact-digest DigitalOcean ACTIVE deployments for both consumers",
+    "manual authenticated-baseline DAST for both consumers"
+  ],
+  "notClaimed": [
+    "authenticated-full nightly DAST",
+    "DefectDojo import/reimport of these two v0.2.33 DAST runs",
+    "seven-day enforcement observation",
+    "reviewed enforcement baseline",
+    "production model credential"
+  ],
+  "remaining": [
+    "scheduled authenticated-full nightly DAST",
+    "seven-day report-only observation and baseline",
+    "production model credential",
+    "DefectDojo least-privilege automation permissions"
+  ]
+}
