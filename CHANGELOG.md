@@ -30,6 +30,18 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Live GuardianBot v0.2.34 release/control-plane rotation, generic fleet
+  upgrade (18 merged PRs), RouteLens and AstraNull Critical-clean
+  `verified-default-branch` promotion with exact-digest ACTIVE DigitalOcean
+  deployments, RouteLens genuine scheduled `authenticated-baseline` DAST with
+  DefectDojo Test ID 5 reimport, and post-fix no-target-SHA inventory
+  (19 visible / 16 report-only / 2 advisory-only / 1 not-applicable fork /
+  zero misconfigured / zero missing-expected-runs). See
+  [v0.2.34 live fleet and scheduled DAST evidence](docs/evidence/v0.2.34-live-fleet-and-scheduled-dast.md).
+  Scheduled `authenticated-full`, current AstraNull v0.2.34 scheduled baseline,
+  seven-day enforcement observation, production model credential, and
+  DefectDojo HA/restore/least-privilege hardening remain out of scope for this
+  evidence.
 - Live RouteLens and AstraNull proof of v0.2.33
   `verified-default-branch` image promotion: Critical-clean build/smoke/Trivy/
   SBOM, promote-job recheck, GHCR immutable push, Cosign signing, exact-digest
