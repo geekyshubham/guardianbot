@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
       id-token: write
     steps:
       - name: Check out reviewed repository
@@ -153,6 +154,25 @@ jobs:
           test -s guardianbot-engine/rules/semgrep.yml
           printf '%s\n' "$resolved_revision" \
             > guardianbot-evidence/rule-pack-revision.txt
+
+      - name: Verify enforce readiness
+        if: >-
+          steps.config.outcome == 'success' &&
+          steps.rule_pack.outcome == 'success' &&
+          steps.config.outputs.mode == 'enforce' &&
+          github.event_name != 'pull_request'
+        env:
+          GUARDIANBOT_BASELINE_PATH: ${{ steps.config.outputs.baseline-path }}
+          GUARDIANBOT_CONFIG_PATH: ${{ inputs.config-path }}
+          GUARDIANBOT_REPOSITORY: ${{ github.repository }}
+          GUARDIANBOT_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          GUARDIANBOT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GUARDIANBOT_REQUIRED_CHECK_NAME: guardianbot/security-gate / deterministic scanners
+          GUARDIANBOT_GITHUB_API_URL: ${{ github.api_url }}
+          GUARDIANBOT_GITHUB_TOKEN: ${{ github.token }}
+          GUARDIANBOT_MINIMUM_OBSERVATION_DAYS: "7"
+        shell: bash
+        run: node guardianbot-engine/scripts/verify-enforcement-readiness.mjs
 
       - name: Semgrep
         shell: bash

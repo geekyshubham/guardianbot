@@ -113,6 +113,7 @@ interface MockWorkflowRun {
   head_sha: string;
   created_at: string;
   html_url: string;
+  run_attempt?: number;
 }
 
 interface MockCheckRun {
@@ -670,6 +671,13 @@ test("doctor verifies fresh runs, the real gate check, baseline, observation age
   assert.equal(result.facts.requiredCheckName, DEFAULT_SECURITY_GATE_CHECK);
   assert.equal(result.facts.baselineCount, 1);
   assert.ok((result.facts.reportOnlyAgeDays ?? 0) >= 7);
+  // Observation proof is the first qualified run (id 100), not the current gate (200).
+  assert.equal(result.facts.reportOnlySince, daysAgo(8));
+  assert.equal(result.facts.reportOnlyRunId, 100);
+  assert.equal(result.facts.reportOnlyRunAttempt, 1);
+  assert.equal(result.facts.reportOnlyRunHeadSha, OLD_HEAD_SHA);
+  assert.equal(result.facts.latestRunId, 200);
+  assert.equal(result.facts.latestRunHeadSha, HEAD_SHA);
   assert.equal(checkByCode(result, "expected-run").ok, true);
   assert.equal(checkByCode(result, "security-gate-check").ok, true);
   assert.equal(checkByCode(result, "baseline").ok, true);
@@ -1311,6 +1319,9 @@ test("observation clock starts at first push with a successful non-skipped gate,
   const result = await doctor(commandContext(github), "acme/obs-gate-start");
 
   assert.equal(result.facts.reportOnlySince, daysAgo(3));
+  assert.equal(result.facts.reportOnlyRunId, 610);
+  assert.equal(result.facts.reportOnlyRunAttempt, 1);
+  assert.equal(result.facts.reportOnlyRunHeadSha, HEAD_SHA);
   assert.ok((result.facts.reportOnlyAgeDays ?? 0) < 7);
   assert.equal(checkByCode(result, "report-only-observation").ok, false);
   assert.match(
@@ -1679,6 +1690,33 @@ function versionedBaselineSource(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function versionedBaselineObservation(overrides: Record<string, unknown> = {}) {
+  return {
+    repository: "acme/service",
+    headSha: OLD_HEAD_SHA,
+    runId: 100,
+    runAttempt: 1,
+    startedAt: daysAgo(8),
+    ...overrides
+  };
+}
+
+function observationProofForBuild(overrides: {
+  repository?: string;
+  headSha?: string;
+  runId?: number;
+  runAttempt?: number;
+  startedAt?: string;
+} = {}) {
+  return {
+    repository: overrides.repository ?? "acme/service",
+    headSha: overrides.headSha ?? OLD_HEAD_SHA,
+    runId: overrides.runId ?? 100,
+    runAttempt: overrides.runAttempt ?? 1,
+    startedAt: overrides.startedAt ?? daysAgo(8)
+  };
+}
+
 test("parseGateForBaseline rejects malformed, failed, enforce-mode, and duplicate gates", () => {
   assert.throws(() => parseGateForBaseline("{"), /not valid JSON/);
   assert.throws(
@@ -1752,6 +1790,7 @@ test("doctor and inspectBaselineContent accept generated empty versioned baselin
         runId: GATE_RUN_ID,
         runAttempt: GATE_RUN_ATTEMPT
       },
+      observationProofForBuild({ repository: "acme/clean-baseline" }),
       NOW
     )
   );
@@ -1770,7 +1809,8 @@ test("doctor and inspectBaselineContent accept generated empty versioned baselin
         schemaVersion: BASELINE_SCHEMA_VERSION,
         fingerprints: [],
         generatedAt: "2026",
-        source: versionedBaselineSource()
+        source: versionedBaselineSource(),
+        observation: versionedBaselineObservation()
       })
     ).ready,
     false
@@ -1781,7 +1821,8 @@ test("doctor and inspectBaselineContent accept generated empty versioned baselin
         schemaVersion: BASELINE_SCHEMA_VERSION,
         fingerprints: [],
         generatedAt: "2026-07-27T06:00:00Z",
-        source: versionedBaselineSource()
+        source: versionedBaselineSource(),
+        observation: versionedBaselineObservation()
       })
     ).ready,
     false
@@ -1797,6 +1838,85 @@ test("doctor and inspectBaselineContent accept generated empty versioned baselin
     ).ready,
     false
   );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: NOW.toISOString(),
+        source: versionedBaselineSource(),
+        observation: versionedBaselineObservation({ startedAt: "2026-07-19T06:00:00Z" })
+      })
+    ).ready,
+    false
+  );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: NOW.toISOString(),
+        source: versionedBaselineSource(),
+        observation: { repository: "acme/service", headSha: OLD_HEAD_SHA, runId: 100 }
+      })
+    ).ready,
+    false
+  );
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: NOW.toISOString(),
+        source: versionedBaselineSource()
+      })
+    ).ready,
+    false
+  );
+  assert.throws(
+    () =>
+      buildBaselineDocument(
+        [],
+        {
+          gateSha256: "a".repeat(64),
+          repository: "acme/service",
+          headSha: HEAD_SHA,
+          runId: GATE_RUN_ID,
+          runAttempt: GATE_RUN_ATTEMPT
+        },
+        {
+          repository: "acme/service",
+          headSha: OLD_HEAD_SHA,
+          runId: 100,
+          runAttempt: 1,
+          startedAt: "2026-07-19T06:00:00Z"
+        },
+        NOW
+      ),
+    /observation\.startedAt/
+  );
+  assert.throws(
+    () =>
+      buildBaselineDocument(
+        [],
+        {
+          gateSha256: "a".repeat(64),
+          repository: "acme/service",
+          headSha: HEAD_SHA,
+          runId: GATE_RUN_ID,
+          runAttempt: GATE_RUN_ATTEMPT
+        },
+        {
+          repository: "acme/service",
+          headSha: "not-a-sha",
+          runId: 100,
+          runAttempt: 1,
+          startedAt: daysAgo(8)
+        },
+        NOW
+      ),
+    /observation\.headSha/
+  );
 
   const github = new MockGitHub();
   const state = github.add(healthyState("clean-baseline"));
@@ -1808,6 +1928,69 @@ test("doctor and inspectBaselineContent accept generated empty versioned baselin
   assert.equal(checkByCode(result, "baseline").ok, true);
   assert.equal(result.facts.baselineCount, 0);
   assert.equal(result.enforcementReady, true);
+});
+
+test("inspect and build reject observation repository that differs from source", () => {
+  const mismatched = inspectBaselineContent(
+    JSON.stringify({
+      schemaVersion: BASELINE_SCHEMA_VERSION,
+      fingerprints: [],
+      generatedAt: NOW.toISOString(),
+      source: versionedBaselineSource({ repository: "acme/service" }),
+      observation: versionedBaselineObservation({ repository: "acme/other" })
+    })
+  );
+  assert.equal(mismatched.ready, false);
+  assert.match(mismatched.detail, /observation\.repository must match source\.repository/);
+
+  // Canonical normalization: case/whitespace-equivalent names still match.
+  assert.equal(
+    inspectBaselineContent(
+      JSON.stringify({
+        schemaVersion: BASELINE_SCHEMA_VERSION,
+        fingerprints: [],
+        generatedAt: NOW.toISOString(),
+        source: versionedBaselineSource({ repository: "Acme/Service" }),
+        observation: versionedBaselineObservation({
+          repository: "  acme/service  "
+        })
+      })
+    ).ready,
+    true
+  );
+
+  assert.throws(
+    () =>
+      buildBaselineDocument(
+        [],
+        {
+          gateSha256: "a".repeat(64),
+          repository: "acme/service",
+          headSha: HEAD_SHA,
+          runId: GATE_RUN_ID,
+          runAttempt: GATE_RUN_ATTEMPT
+        },
+        observationProofForBuild({ repository: "acme/other" }),
+        NOW
+      ),
+    /observation\.repository must match source\.repository/
+  );
+
+  // Builder also accepts normalized-equivalent repositories.
+  const built = buildBaselineDocument(
+    [],
+    {
+      gateSha256: "a".repeat(64),
+      repository: "Acme/Service",
+      headSha: HEAD_SHA,
+      runId: GATE_RUN_ID,
+      runAttempt: GATE_RUN_ATTEMPT
+    },
+    observationProofForBuild({ repository: "  acme/service  " }),
+    NOW
+  );
+  assert.equal(built.source.repository, "acme/service");
+  assert.equal(built.observation.repository, "acme/service");
 });
 
 test("baseline opens a deterministic draft PR and stays dry-run/idempotent", async () => {
@@ -1834,6 +2017,14 @@ test("baseline opens a deterministic draft PR and stays dry-run/idempotent", asy
   assert.equal(dryRun.baseline.source.headSha, HEAD_SHA);
   assert.equal(dryRun.baseline.source.runId, GATE_RUN_ID);
   assert.equal(dryRun.baseline.source.runAttempt, GATE_RUN_ATTEMPT);
+  // Current gate (200) in source; earliest qualified observation run (100) separately.
+  assert.equal(dryRun.baseline.observation.repository, "acme/baseline-dry");
+  assert.equal(dryRun.baseline.observation.headSha, OLD_HEAD_SHA);
+  assert.equal(dryRun.baseline.observation.runId, 100);
+  assert.equal(dryRun.baseline.observation.runAttempt, 1);
+  assert.equal(dryRun.baseline.observation.startedAt, daysAgo(8));
+  assert.notEqual(dryRun.baseline.source.runId, dryRun.baseline.observation.runId);
+  assert.notEqual(dryRun.baseline.source.headSha, dryRun.baseline.observation.headSha);
   assert.equal(dryRun.baseline.generatedAt, NOW.toISOString());
   assert.equal(dryGitHub.writes.length, 0);
   assert.equal(dryGitHub.pulls.length, 0);
@@ -1857,6 +2048,10 @@ test("baseline opens a deterministic draft PR and stays dry-run/idempotent", asy
   assert.match(github.pulls[0]!.input.body, /Clean repository \(empty baseline\): no/);
   assert.match(github.pulls[0]!.input.body, /Source head SHA/);
   assert.match(github.pulls[0]!.input.body, /Source run/);
+  assert.match(github.pulls[0]!.input.body, /Observation started/);
+  assert.match(github.pulls[0]!.input.body, /Observation head SHA/);
+  assert.match(github.pulls[0]!.input.body, /Observation run/);
+  assert.match(github.pulls[0]!.input.body, new RegExp(daysAgo(8)));
   assert.match(github.pulls[0]!.input.body, /human review evidence is this pull request/i);
   assert.equal(
     github.requests.some((request) => ["POST", "PUT"].includes(request.method) && request.path.includes("rulesets")),
@@ -1876,6 +2071,25 @@ test("baseline opens a deterministic draft PR and stays dry-run/idempotent", asy
   assert.equal(idempotent.changed, false);
   assert.equal(github.pulls.length, 1);
   assert.equal(github.writes.length, 1);
+
+  // Matching source/fingerprints with different observation is not already-matched.
+  const mismatchedObservation = JSON.parse(opened.baselineJson) as Record<string, unknown>;
+  mismatchedObservation.observation = versionedBaselineObservation({
+    repository: "acme/baseline-open",
+    runId: 999,
+    startedAt: daysAgo(9)
+  });
+  state.files.set(BASELINE_PATH, {
+    content: `${JSON.stringify(mismatchedObservation, null, 2)}\n`,
+    sha: "baseline-obs-mismatch"
+  });
+  const reopened = await baseline(
+    commandContext(github, { dryRun: true }),
+    "acme/baseline-open",
+    openSource
+  );
+  assert.equal(reopened.changed, true);
+  assert.equal(reopened.baseline.observation.runId, 100);
 });
 
 test("baseline rejects wrong repository, run ID, and head SHA without writes", async () => {
@@ -1996,10 +2210,52 @@ test("baseline opens a clean empty versioned baseline from a zero-finding gate",
   assert.equal(result.baseline.source.repository, "acme/clean-gate");
   assert.equal(result.baseline.source.headSha, HEAD_SHA);
   assert.equal(result.baseline.source.runId, GATE_RUN_ID);
+  assert.equal(result.baseline.observation.repository, "acme/clean-gate");
+  assert.equal(result.baseline.observation.headSha, OLD_HEAD_SHA);
+  assert.equal(result.baseline.observation.runId, 100);
+  assert.equal(result.baseline.observation.startedAt, daysAgo(8));
   assert.match(result.report, /Clean repository \(empty baseline\): yes/);
   assert.equal(inspectBaselineContent(result.baselineJson).ready, true);
   assert.equal(github.writes.length, 1);
   assert.equal(github.pulls[0]!.input.draft, true);
+});
+
+test("baseline observation stays pinned to the first qualified run after a later current gate", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("obs-stable"));
+  state.files.delete(BASELINE_PATH);
+  // Current gate remains run 200 (hoursAgo(2)); observation start remains run 100 (daysAgo(8)).
+  // Explicit run_attempt proves we keep the earliest qualified attempt, not the later gate.
+  state.workflowRuns[1] = { ...state.workflowRuns[1]!, run_attempt: 2 };
+  state.workflowRuns[2] = { ...state.workflowRuns[2]!, run_attempt: 3 };
+
+  const diagnosis = await doctor(commandContext(github), "acme/obs-stable");
+  assert.equal(diagnosis.facts.latestRunId, GATE_RUN_ID);
+  assert.equal(diagnosis.facts.latestRunHeadSha, HEAD_SHA);
+  assert.equal(diagnosis.facts.reportOnlyRunId, 100);
+  assert.equal(diagnosis.facts.reportOnlyRunAttempt, 3);
+  assert.equal(diagnosis.facts.reportOnlyRunHeadSha, OLD_HEAD_SHA);
+  assert.equal(diagnosis.facts.reportOnlySince, daysAgo(8));
+
+  const result = await baseline(
+    commandContext(github, { dryRun: true }),
+    "acme/obs-stable",
+    gateJson({
+      repository: "acme/obs-stable",
+      runId: GATE_RUN_ID,
+      runAttempt: 2,
+      headSha: HEAD_SHA
+    })
+  );
+  assert.equal(result.baseline.source.runId, GATE_RUN_ID);
+  assert.equal(result.baseline.source.runAttempt, 2);
+  assert.equal(result.baseline.source.headSha, HEAD_SHA);
+  assert.equal(result.baseline.observation.runId, 100);
+  assert.equal(result.baseline.observation.runAttempt, 3);
+  assert.equal(result.baseline.observation.headSha, OLD_HEAD_SHA);
+  assert.equal(result.baseline.observation.startedAt, daysAgo(8));
+  assert.notEqual(result.baseline.source.runId, result.baseline.observation.runId);
+  assert.notEqual(result.baseline.source.headSha, result.baseline.observation.headSha);
 });
 
 test("CLI help lists baseline and requires --from-gate", () => {

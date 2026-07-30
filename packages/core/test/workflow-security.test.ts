@@ -387,6 +387,102 @@ test("scanner config parsing preserves the private evidence directory contract",
   );
 });
 
+test("security workflow verifies enforce readiness before scanners authorize enforce mode", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const scannersJob = workflow.slice(
+    workflow.indexOf("scanners:"),
+    workflow.indexOf("steps:")
+  );
+  assert.match(
+    scannersJob,
+    /permissions:\n\s+contents: read\n\s+actions: read\n\s+id-token: write/
+  );
+  assert.equal((scannersJob.match(/:\s*write/g) ?? []).length, 1);
+  assert.match(scannersJob, /id-token: write/);
+  assert.doesNotMatch(
+    scannersJob,
+    /contents:\s*write|actions:\s*write|security-events:\s*write|packages:\s*write/
+  );
+
+  const rulePackAt = workflow.indexOf("- name: Verify immutable GuardianBot rule pack");
+  const enforceReadinessAt = workflow.indexOf("- name: Verify enforce readiness");
+  const semgrepAt = workflow.indexOf("- name: Semgrep");
+  assert.ok(rulePackAt >= 0);
+  assert.ok(enforceReadinessAt > rulePackAt);
+  assert.ok(semgrepAt > enforceReadinessAt);
+
+  const enforceStep = workflow.slice(enforceReadinessAt, semgrepAt);
+  assert.match(
+    enforceStep,
+    /if: >-\n\s+steps\.config\.outcome == 'success' &&\n\s+steps\.rule_pack\.outcome == 'success' &&\n\s+steps\.config\.outputs\.mode == 'enforce' &&\n\s+github\.event_name != 'pull_request'/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_BASELINE_PATH: \$\{\{ steps\.config\.outputs\.baseline-path \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_CONFIG_PATH: \$\{\{ inputs\.config-path \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_REPOSITORY: \$\{\{ github\.repository \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_WORKFLOW_REPOSITORY: \$\{\{ job\.workflow_repository \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_REQUIRED_CHECK_NAME: guardianbot\/security-gate \/ deterministic scanners/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_GITHUB_API_URL: \$\{\{ github\.api_url \}\}/
+  );
+  assert.match(
+    enforceStep,
+    /GUARDIANBOT_GITHUB_TOKEN: \$\{\{ github\.token \}\}/
+  );
+  assert.match(enforceStep, /GUARDIANBOT_MINIMUM_OBSERVATION_DAYS: "7"/);
+  assert.doesNotMatch(enforceStep, /secrets\./);
+  assert.doesNotMatch(enforceStep, /continue-on-error/);
+  assert.match(
+    enforceStep,
+    /run: node guardianbot-engine\/scripts\/verify-enforcement-readiness\.mjs/
+  );
+  assert.doesNotMatch(
+    enforceStep,
+    /GUARDIANBOT_GITHUB_TOKEN: \$\{\{ secrets\./
+  );
+  assert.doesNotMatch(
+    enforceStep,
+    /node guardianbot-engine\/scripts\/verify-enforcement-readiness\.mjs.*\$\{\{/
+  );
+
+  // Expression contract: PR, report-only, and advisory runs skip the verifier.
+  assert.match(
+    enforceStep,
+    /github\.event_name != 'pull_request'/
+  );
+  assert.match(
+    enforceStep,
+    /steps\.config\.outputs\.mode == 'enforce'/
+  );
+  assert.doesNotMatch(
+    enforceStep,
+    /github\.event_name == 'pull_request'/
+  );
+  assert.doesNotMatch(
+    enforceStep,
+    /mode == 'report-only'|mode == 'advisory'/
+  );
+});
+
 test("DAST OpenAPI sanitization keeps only safe, exact-origin operations", async () => {
   const { spawnSync } = await import("node:child_process");
   const {

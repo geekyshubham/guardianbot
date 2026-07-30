@@ -41,10 +41,13 @@
   `guardianbot/security-gate / deterministic scanners`. `enforce` uses the exact
   check name observed on the latest qualifying security-gate evidence run.
   Remove or repair a legacy ruleset that requires a different context.
-- Baseline not ready: commit `.guardianbot/baseline.json` with a non-empty, unique
-  set of reviewed lowercase SHA-256 fingerprints. Empty or malformed baselines
-  fail closed. The reusable workflow also validates the baseline on the
-  enforcement PR.
+- Baseline not ready: produce a reviewed `guardianbot.baseline.v1` with
+  `guardianctl baseline` (from a provenance-bound report-only `gate.json` after
+  the observation window). Enforce authorization needs valid `source` and
+  `observation` proof, not merely non-empty fingerprints. Runtime readiness
+  rechecks both provenance runs (run attempt, exact deterministic job, immutable
+  referenced reusable workflow), minimum observation age, and a strict required
+  ruleset check; missing or invalid evidence fails closed.
 - Report-only period incomplete: the seven-day clock begins with the first
   successful default-branch push or `workflow_dispatch` after report-only
   configuration was committed. Opening the onboarding PR, a failed run, an
