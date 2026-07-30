@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import {
+  PLACEHOLDER_WORKFLOW_SHA,
   baseline,
   doctor,
   enforce,
@@ -124,7 +125,7 @@ async function main() {
   const context: CommandContext = {
     github: new GitHubClient(token()),
     guardianRepository: process.env.GUARDIANBOT_REPOSITORY ?? "Geekyshubham/guardianbot",
-    workflowSha: process.env.GUARDIANBOT_WORKFLOW_SHA ?? "0000000000000000000000000000000000000000",
+    workflowSha: process.env.GUARDIANBOT_WORKFLOW_SHA ?? PLACEHOLDER_WORKFLOW_SHA,
     guardianAppSlug: process.env.GUARDIANBOT_APP_SLUG,
     expectedRunMaxAgeHours: positiveNumber("GUARDIANBOT_EXPECTED_RUN_MAX_AGE_HOURS", 36),
     reportOnlyMinimumDays: numberAtLeast("GUARDIANBOT_REPORT_ONLY_MINIMUM_DAYS", 7),
@@ -141,7 +142,7 @@ async function main() {
     }
   };
   if (
-    context.workflowSha === "0000000000000000000000000000000000000000" &&
+    context.workflowSha === PLACEHOLDER_WORKFLOW_SHA &&
     !["inventory", "offboard"].includes(command)
   ) {
     throw new Error("Set GUARDIANBOT_WORKFLOW_SHA to the published immutable GuardianBot commit");
