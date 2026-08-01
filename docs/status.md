@@ -1,9 +1,15 @@
 # Capability status
 
-Release: `0.2.39`
+Release: `0.2.40`
 Last verified: 2026-08-02
 
-**Release control:** `v0.2.39` is a signed published release
+**Release control:** `v0.2.40` documents the already-merged private monitoring
+operations ledger (`GET /operations/monitoring`, source and automated tests)
+plus current-binding RouteLens and AstraNull scheduled
+`authenticated-baseline` evidence dated 2026-08-02. **Live operator endpoint
+deployment, weekly-report acceptance, authenticated-full DAST, and DefectDojo
+current-run import are not claimed.** Live control plane remains the signed
+published `v0.2.39` release
 (https://github.com/geekyshubham/guardianbot/releases/tag/v0.2.39). Hotfix PR
 [#34](https://github.com/geekyshubham/guardianbot/pull/34) merged at
 `704c9041c78b6e0dfee1d481f9de6cc33b2040f6`; release-prep PR
@@ -39,15 +45,17 @@ deployment `2a394a68-9c23-4fd0-8978-8d2018664f81` with `/healthz` and
 `/readyz` HTTP 200 (see
 [live v0.2.39 fleet upgrade](evidence/v0.2.39-live-fleet-upgrade.md)). It does **not** prove live PR review consumption of descriptor-first
 rows, live ANN performance/readiness, production model-backed review,
-seven-day enforcement, authenticated-full DAST, or DefectDojo reimport. See
+seven-day enforcement, authenticated-full DAST, DefectDojo reimport, live
+`GET /operations/monitoring` output, or weekly-report acceptance. See
 [live v0.2.39 index recovery evidence](evidence/v0.2.39-live-index-recovery.md).
 Prior v0.2.38 control-plane deployment evidence remains historical:
 [v0.2.38 evidence](evidence/v0.2.38-live-control-plane-deployment.md).
 Hardening already reflected in this matrix includes lifecycle provenance and
 closed-form advisories, descriptor-first durable repository-index candidate
 sourcing on the review path, migration and webhook hardening, base-commit
-onboarding path binding, the live call-edge duplicate publication fix, and
-related automated fixes.
+onboarding path binding, the live call-edge duplicate publication fix, the
+private monitoring operations ledger (source/tests), and related automated
+fixes.
 
 **Fleet pin upgrade (verified, merged):** generic `guardianctl upgrade --all`
 opened 18 draft PRs; all 18 are merged and pin immutable published release
@@ -84,18 +92,27 @@ ACTIVE deployment `fcc6f1ca-82ff-4c77-8ac9-e2bb85e7cbf9`, `/health` and
 Prior v0.2.37 fleet/promotion evidence remains historical:
 [v0.2.37 live control-plane, fleet, and promotion](evidence/v0.2.37-live-control-plane-fleet-and-promotion.md).
 
-AstraNull has current-binding scheduled `authenticated-baseline` evidence on
-head `3664cff061398c1bf3efc0c937a2470746d60e3d` / digest
+RouteLens and AstraNull both have current-binding scheduled
+`authenticated-baseline` evidence. RouteLens: head
+`55eeead5b7306972abfff1b30a32b5cae95e96eb` / digest
+`sha256:7ac78ef0d9ab23c14f7e3665a834f21fd73a9be3ceed040b4c76b7a06532dceb`
+(genuine `schedule` run
+[`30718271723`](https://github.com/geekyshubham/RouteLens/actions/runs/30718271723);
+staging contract, one-time session, bounded ZAP, provenance attestation, and
+artifact upload passed; `dast-nightly` skipped; artifact `8824056295` digest
+`sha256:19afaae9c663dc3a8f8261a50870672023d3c95967efd50ae561d00c85a689af`;
+provenance binds `geekyshubham/routelens`, run/attempt `30718271723/1`,
+workflow SHA `7524547700e4c3994353f5c61d1625b2bd5e5428`). AstraNull: head
+`3664cff061398c1bf3efc0c937a2470746d60e3d` / digest
 `sha256:6c4f2e9cb3a497fe0871cb73cfd7b2aa0f072c2f7e54626d19a6b81a67ce087a`
 (genuine `schedule` run
 [`30717179796`](https://github.com/geekyshubham/AstraNull/actions/runs/30717179796);
 artifact `8823702700` digest
 `sha256:0d7592fe5c23c37838733f63ebf7f716d30e6307822e29b08f1c3e570a82d45b`;
-`dast-nightly` skipped). That is baseline-only and does **not** close full
-DAST acceptance. RouteLens has no current-binding scheduled baseline on this
-pass. Scheduled authenticated-full DAST remains **open** for both RouteLens
-and AstraNull: acceptance requires current default SHAs and exact current
-deployed digests above. AstraNull had an earlier genuine full run, and
+`dast-nightly` skipped). Both are baseline-only and do **not** close full
+DAST acceptance. Scheduled authenticated-full DAST remains **open** for both
+RouteLens and AstraNull: acceptance requires current default SHAs and exact
+current deployed digests above. AstraNull had an earlier genuine full run, and
 RouteLens' earlier full run completed ZAP but failed final attestation after a
 trust-SHA transition; neither closes the current-binding full criterion. The
 next genuine `47 2 * * *` scheduled full run remains required for both. GitHub
@@ -125,9 +142,10 @@ descriptor-first PR review consumption and live ANN performance remain open.
 This does not claim production model-backed review, seven-day enforcement
 completion, reviewed baselines, ruleset readiness, authenticated-full DAST
 success on the current v0.2.39 RouteLens/AstraNull digests, a new DefectDojo
-reimport, live GitHub App `pull_request_review_comment` event application, live
-PostgreSQL/pgvector/ANN performance, weekly monitoring proof, recovery drills,
-or full PoC acceptance.
+reimport, live operator endpoint deployment or live `GET /operations/monitoring`
+output, weekly-report acceptance, live GitHub App
+`pull_request_review_comment` event application, live PostgreSQL/pgvector/ANN
+performance, recovery drills, or full PoC acceptance.
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
@@ -358,6 +376,20 @@ one live passing enforcing gate, and one safe negative blocking test.
     HTTP 401 because its old trusted reusable workflow SHA
     `152649be5a86862f619a86d60598fc25bafb0429` was superseded by the v0.2.37
     trust cutover before the long scan finished.
+- **Current-binding RouteLens authenticated-baseline (2026-08-02 UTC):** genuine
+  GitHub `schedule` run
+  [`30718271723`](https://github.com/geekyshubham/RouteLens/actions/runs/30718271723)
+  on current default SHA `55eeead5b7306972abfff1b30a32b5cae95e96eb` / deployed
+  digest
+  `sha256:7ac78ef0d9ab23c14f7e3665a834f21fd73a9be3ceed040b4c76b7a06532dceb`.
+  Staging contract, one-time session, bounded ZAP, provenance attestation, and
+  artifact upload all passed; `guardianbot/dast-nightly` was skipped. Artifact
+  `8824056295` digest
+  `sha256:19afaae9c663dc3a8f8261a50870672023d3c95967efd50ae561d00c85a689af`.
+  Provenance binds repository `geekyshubham/routelens`, run/attempt
+  `30718271723/1`, workflow SHA `7524547700e4c3994353f5c61d1625b2bd5e5428`.
+  Authenticated-baseline only; does **not** close full DAST acceptance. No
+  DefectDojo import/reimport is claimed for this run.
 - **Current-binding AstraNull authenticated-baseline (2026-08-01 UTC):** genuine
   GitHub `schedule` run
   [`30717179796`](https://github.com/geekyshubham/AstraNull/actions/runs/30717179796)
@@ -373,8 +405,7 @@ one live passing enforcing gate, and one safe negative blocking test.
   `sha256:6c4f2e9cb3a497fe0871cb73cfd7b2aa0f072c2f7e54626d19a6b81a67ce087a`,
   profile `authenticated-baseline`, 15 minutes, ZAP exit 2. Baseline-only; does
   **not** close full DAST acceptance. No DefectDojo import/reimport is claimed
-  for this run. RouteLens has no current-binding scheduled baseline on this
-  pass.
+  for this run.
 - GitHub environment `guardianbot-dast` now has a custom `main` branch-only
   deployment policy in both RouteLens and AstraNull (re-read from GitHub after
   the AstraNull policy was added). Does not imply required reviewers or prove a
@@ -436,14 +467,14 @@ alert. Older baseline reimports are retained as historical evidence only.
   repositories evaluated, **7 failing repositories**, 0 warning repositories,
   and **28 active alerts**. That 7/28 aggregate is a real unresolved production
   signal from `/metrics`; it is not operator-ledger identity proof.
-- **Source/test only (not released/deployed):** authenticated read-only
-  `GET /operations/monitoring` (`guardianbot.monitoring.status.v1`) is
-  implemented and tested in source—bounded sanitized alert page (≤512),
-  process-local scheduler scope, page-scoped repository names/`complete`,
-  current UTC-week report or `null`, same bearer/private-metrics policy as
-  `/metrics`, public Caddy 404 for both private paths. Do **not** claim live
-  endpoint output, alert identities, or weekly-report acceptance until a
-  release deploys this path.
+- **Source released in `v0.2.40` (live operator endpoint not deployed):**
+  authenticated read-only `GET /operations/monitoring`
+  (`guardianbot.monitoring.status.v1`) ships as source and automated tests in
+  this release—bounded sanitized alert page (≤512), process-local scheduler
+  scope, page-scoped repository names/`complete`, current UTC-week report or
+  `null`, same bearer/private-metrics policy as `/metrics`, public Caddy 404
+  for both private paths. Do **not** claim live endpoint output, alert
+  identities, live operator endpoint deployment, or weekly-report acceptance.
 - Still open: observe nightly full Semgrep/Trivy and deployed-digest rescans
   across the applicable fleet; verify repository-index freshness,
   expected-workflow reconciliation, DefectDojo reconciliation,
@@ -457,9 +488,10 @@ alert. Older baseline reimports are retained as historical evidence only.
 
 **Completion evidence:** versioned scheduler snapshots, at least one current
 weekly report, representative alert-and-recovery evidence (including triage of
-the live 7/28 aggregate), a deployed operator ledger when released, and an
-inventory with no unexplained missing expected runs. Direct database/SSH
-firewall broadening is not required for metrics or the operator ledger.
+the live 7/28 aggregate), a live-deployed operator ledger with proven output
+(source only in `v0.2.40`), and an inventory with no unexplained missing
+expected runs. Direct database/SSH firewall broadening is not required for
+metrics or the operator ledger.
 
 ### 8. Finish production-readiness and recovery evidence
 
