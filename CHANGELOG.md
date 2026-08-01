@@ -22,7 +22,37 @@ reusable workflow commits remain immutable.
   Evidence:
   [v0.2.37 live control-plane, fleet, and promotion](docs/evidence/v0.2.37-live-control-plane-fleet-and-promotion.md).
   Does not claim production AI review, seven-day enforcement, scheduled
-  authenticated-full DAST, or a new DefectDojo reimport.
+  authenticated-full DAST on the v0.2.37 digests, or a new DefectDojo reimport.
+
+### Evidence
+
+- On 2026-08-01, the production-hardening shutdown/cancellation implementation
+  was independently reviewed in source; the control-plane test suite passed
+  **240/240**. Backend calls receive `AbortSignal`, the owned handler is
+  awaited rather than detached, cancellation checkpoints prevent post-review
+  lifecycle/GitHub writes, and the delivery lease is requeued without consuming
+  attempt budget. Marks only that outstanding sub-item done as source/test
+  evidence (not live cancel-under-load or recovery drills). Recorded in
+  [docs/status.md](docs/status.md) and
+  [v0.2.37 evidence](docs/evidence/v0.2.37-live-control-plane-fleet-and-promotion.md).
+- Independently found delayed genuine GitHub `schedule` authenticated-full
+  DAST runs from the pre-v0.2.37 binding: AstraNull
+  [`30686350591`](https://github.com/geekyshubham/AstraNull/actions/runs/30686350591)
+  succeeded end-to-end with provenance on old head
+  `9f21cabdcbe38b5e8697935914bba165c206229d` / digest
+  `sha256:6760bb3a8e1fadba14ae766aa74eb76b5b5f28f782c1354c612a9b488103a3bf`;
+  RouteLens
+  [`30686352313`](https://github.com/geekyshubham/RouteLens/actions/runs/30686352313)
+  completed staging contract, one-time session, authenticated assertion, and
+  bounded 45-minute ZAP on old head
+  `9722f0ee6abf192508e3fdbc866f662f31fe5d43` / digest
+  `sha256:26d56ce97607b1550d7f14396692edff01bac95dcc45199f42ceb414c56e979e` but
+  failed provenance HTTP 401 after the v0.2.37 trust cutover superseded old
+  trusted reusable workflow SHA `152649be5a86862f619a86d60598fc25bafb0429`.
+  Historical only; does **not** close required scheduled authenticated-full
+  evidence on current v0.2.37 heads/digests. DefectDojo, model, enforcement,
+  GitHub App feedback events, current DAST on v0.2.37 digests, live
+  pgvector/ANN, weekly monitoring, and recovery blockers remain open.
 
 ## [0.2.37] - 2026-08-01
 
@@ -184,26 +214,45 @@ reusable workflow commits remain immutable.
   health checks. See
   [v0.2.36 live control-plane and fleet upgrade evidence](docs/evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md).
 - On 2026-08-01, genuine scheduled authenticated-baseline smoke completed for
-  both current default-branch SHAs and exact DigitalOcean deployed digests:
-  AstraNull run
+  the then-current (pre-v0.2.37 promotion) default-branch SHAs and DigitalOcean
+  deployed digests: AstraNull run
   [`30684302779`](https://github.com/geekyshubham/AstraNull/actions/runs/30684302779)
   and RouteLens run
   [`30684781163`](https://github.com/geekyshubham/RouteLens/actions/runs/30684781163).
   Each completed the staging-contract → one-time session assertion → bounded
   ZAP → evidence attestation/artifact chain and skipped `authenticated-full` /
-  `dast-nightly`. No new DefectDojo import/reimport was independently verified
-  for those runs. Scheduled authenticated-full acceptance remains missing.
+  `dast-nightly`. Separately, delayed genuine GitHub `schedule`
+  authenticated-full DAST runs from the same pre-v0.2.37 binding were found
+  (historical only; do **not** close required acceptance on current v0.2.37
+  heads/digests): AstraNull
+  [`30686350591`](https://github.com/geekyshubham/AstraNull/actions/runs/30686350591)
+  succeeded end-to-end with provenance on old head
+  `9f21cabdcbe38b5e8697935914bba165c206229d` / digest
+  `sha256:6760bb3a8e1fadba14ae766aa74eb76b5b5f28f782c1354c612a9b488103a3bf`;
+  RouteLens
+  [`30686352313`](https://github.com/geekyshubham/RouteLens/actions/runs/30686352313)
+  completed staging contract, one-time session, authenticated assertion, and
+  bounded 45-minute ZAP on old head
+  `9722f0ee6abf192508e3fdbc866f662f31fe5d43` / digest
+  `sha256:26d56ce97607b1550d7f14396692edff01bac95dcc45199f42ceb414c56e979e` but
+  provenance attestation returned HTTP 401 after the v0.2.37 trust cutover
+  superseded old reusable workflow SHA
+  `152649be5a86862f619a86d60598fc25bafb0429`. No new DefectDojo
+  import/reimport was independently verified for those runs. Scheduled
+  authenticated-full acceptance on the current v0.2.37 heads/digests remains
+  open.
 - Durable repository-index candidate sourcing and production review-path wiring
   are source/test evidence only (see Added). No live PostgreSQL/pgvector proof,
   live ANN performance, production deployment of that path, or `v0.2.37`
   release is claimed.
 - No production model credential or live AI-backed review, seven-day
   observation completion, reviewed baseline, ruleset readiness, scanner
-  enforcement, scheduled authenticated-full DAST success, or new DefectDojo
-  import/reimport is claimed. career-ops retained 31 Critical image findings
-  report-only (not Critical-clean). Older RouteLens v0.2.34 scheduled
-  baseline/DefectDojo and v0.2.35 schedule baseline-only evidence remain
-  prior-release / baseline-only distinctions.
+  enforcement, scheduled authenticated-full DAST success on the current
+  v0.2.37 heads/digests, or new DefectDojo import/reimport is claimed.
+  career-ops retained 31 Critical image findings report-only (not
+  Critical-clean). Older RouteLens v0.2.34 scheduled baseline/DefectDojo and
+  v0.2.35 schedule baseline-only evidence remain prior-release /
+  baseline-only distinctions.
 
 ## [0.2.36] - 2026-07-30
 
