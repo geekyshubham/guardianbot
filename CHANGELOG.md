@@ -5,6 +5,28 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Live GuardianBot v0.2.38 signed release and exact-digest control-plane
+  deployment (commit `d1967eded422b7d3a216ec9aff3ea9e2ce44da33`, image
+  `sha256:1b0344fd41304d49659967b55d0b2c9b4b0ae79da496fd556eb03b5211941bdd`,
+  ACTIVE deployment `c774c3fa-2b53-4ebe-97d5-e9343a3fd60d`, `/healthz` and
+  `/readyz` HTTP 200) plus post-boot managed PostgreSQL repository-index
+  table observation. Zero-row `repository_index_edges` is schema-only, not
+  live call-edge retrieval. Evidence:
+  [v0.2.38 live control-plane deployment](docs/evidence/v0.2.38-live-control-plane-deployment.md).
+- AstraNull current-head promotion repair on immutable v0.2.37 pin
+  `f2a7f5410bd5d8b140378a7c722b74ba0b455727`: head
+  `5f600f4a866da24006bcde8838e1499e532d7276`, push run
+  [`30696798791`](https://github.com/geekyshubham/AstraNull/actions/runs/30696798791)
+  attempt 2 success, promoted signed digest
+  `sha256:90f052c61997c50e8f5724b7260b5314c95b2473afe023967977120cd8c37202`,
+  ACTIVE DigitalOcean deployment `742ad233-8c8a-4345-a440-42cd09a77787`
+  (app `2a76914e-d04e-4a6c-8b9c-929a1e8976e2`), `/health` and `/ready` HTTP
+  200. Push correctly skipped DAST; scheduled authenticated-full on this
+  head/digest remains open. Evidence:
+  [v0.2.37 AstraNull current promotion repair](docs/evidence/v0.2.37-astranull-current-promotion-repair.md).
+
 ## [0.2.38] - 2026-08-01
 
 ### Added
