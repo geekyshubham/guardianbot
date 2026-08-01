@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.37] - 2026-08-01
+
 ### Added
 
 - Stable-fingerprint lifecycle records persist provenance: first and last-seen
