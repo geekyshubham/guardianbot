@@ -69,8 +69,12 @@ confirming clean behaviour; seven were fixed with mutation-proven tests and one
 was triaged as not a defect, and the suite passes 484 checks across all gate
 stages on 2026-08-01 (control-plane 257). That closes the cancellation sub-item
 as source/test evidence only, not live cancel-under-load or other
-production-readiness work, and those fixes are **not** part of the signed
-`v0.2.37` release; they are uncommitted work after that tag.
+production-readiness work. Those fixes (shutdown/lease hardening and
+descriptor-first durable review retrieval already described in this matrix) are
+**not** part of the signed `v0.2.37` release. GuardianBot PR #31 at commit
+`b915051274edbbac8175f619c742b4a80a3c1745` is merged to `main` (2026-08-01)
+with automated/`npm run check` evidence; `v0.2.38` publication, exact-digest
+DigitalOcean deployment, and live verification remain pending.
 
 This does not claim production model-backed review, seven-day enforcement
 completion, reviewed baselines, ruleset readiness, authenticated-full DAST
