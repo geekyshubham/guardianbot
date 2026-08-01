@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { toPersistedVectorRows } from "@guardianbot/core";
 import { BackendError, type ReviewRequest } from "@guardianbot/protocol";
 import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { ReviewBackendRegistry } from "../src/backend-registry.js";
@@ -2914,52 +2915,32 @@ test("the advisory body degrades below GitHub's comment limit instead of failing
 });
 
 /**
- * Serves a snapshot document that is missing one path's symbols while leaving that
- * path's durable vector and record rows intact, and counts the durable reads.
- *
- * This is the one shape that can tell a wired durable retrieval path apart from an
- * unwired one. Every record being both materialised and durable — the ordinary case
- * — produces identical output either way, which is exactly why the missing wiring
- * went unnoticed: the core tests exercised a ranker they supplied themselves, so
- * they passed whether or not any production caller ever supplied one.
+ * Production review must never materialise index_document. A store whose document
+ * load throws proves the path is descriptor-first: a valid review still produces
+ * indexed context from durable rows alone.
  */
-class PartialDocumentStore extends MemoryStore {
-  vectorQueries: string[] = [];
-  hydrations: string[] = [];
-
-  constructor(private readonly omittedPath: string) {
-    super();
-  }
+class DocumentLoadForbiddenStore extends MemoryStore {
+  documentLoads = 0;
+  pathQueries: string[] = [];
 
   override async getRepositoryIndex(
     ...args: Parameters<MemoryStore["getRepositoryIndex"]>
   ) {
-    const index = await super.getRepositoryIndex(...args);
-    if (!index) return index;
-    return {
-      ...index,
-      symbols: index.symbols.filter((symbol) => symbol.path !== this.omittedPath)
-    };
+    this.documentLoads += 1;
+    throw new Error("index_document materialisation is forbidden on the review path");
   }
 
-  override async queryRepositoryIndexVectors(
-    ...args: Parameters<MemoryStore["queryRepositoryIndexVectors"]>
+  override async queryRepositoryIndexRecordsByPath(
+    ...args: Parameters<MemoryStore["queryRepositoryIndexRecordsByPath"]>
   ) {
-    this.vectorQueries.push(args[1].repositoryScope);
-    return super.queryRepositoryIndexVectors(...args);
-  }
-
-  override async hydrateRepositoryIndexRecords(
-    ...args: Parameters<MemoryStore["hydrateRepositoryIndexRecords"]>
-  ) {
-    this.hydrations.push(args[1].repositoryScope);
-    return super.hydrateRepositoryIndexRecords(...args);
+    this.pathQueries.push(args[1].repositoryScope);
+    return super.queryRepositoryIndexRecordsByPath(...args);
   }
 }
 
-test("the review path supplies a durable ranker, so a record absent from the loaded snapshot is still retrieved", async () => {
+test("production review produces indexed context without loading index_document", async () => {
   const baseSha = "e".repeat(40);
-  const store = new PartialDocumentStore("src/auth.ts");
+  const store = new DocumentLoadForbiddenStore();
   await store.upsertRepository({
     installationId: 1,
     repositoryId: 99,
@@ -2982,8 +2963,20 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       )
     }
   });
-  const repositoryIndexService = new RepositoryIndexService(store);
-  await repositoryIndexService.refreshDefaultBranchIndex({
+  // Publish through a store that can load documents for indexing refresh only.
+  const publishStore = new MemoryStore();
+  await publishStore.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const publisher = new RepositoryIndexService(publishStore);
+  await publisher.refreshDefaultBranchIndex({
     github,
     repositoryId: 99,
     installationId: 1,
@@ -2991,18 +2984,12 @@ test("the review path supplies a durable ranker, so a record absent from the loa
     defaultBranch: "main",
     visibility: "public"
   });
-  // The premise the assertions rest on: the document a review loads does not carry
-  // this symbol, but durable storage does.
-  const served = await store.getRepositoryIndex(99, "github:99", baseSha);
-  assert.ok(served);
-  assert.equal(served.symbols.some((symbol) => symbol.path === "src/auth.ts"), false);
-  const durableRows = await store.hydrateRepositoryIndexRecords(99, {
-    repositoryScope: "github:99",
-    commitSha: baseSha,
-    records: [{ recordType: "symbol", recordId: "auth-probe" }]
-  });
-  assert.deepEqual(durableRows, []);
-  store.hydrations.length = 0;
+  // Copy durable rows into the review store without going through getRepositoryIndex
+  // during review. Re-publish via replace so vectors/records/edges/descriptor exist.
+  const index = await publishStore.getRepositoryIndex(99, "github:99", baseSha);
+  assert.ok(index);
+  await store.replaceRepositoryIndex(99, index, toPersistedVectorRows(index));
+  store.documentLoads = 0;
 
   const event = createPullEvent();
   event.pull_request.base.sha = baseSha;
@@ -3024,21 +3011,17 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       webhookSecret: "secret",
       githubClientFactory: async () => github,
       reviewClientFactory: () => backend,
-      repositoryIndexService
+      repositoryIndexService: new RepositoryIndexService(store)
     },
     store
   );
 
-  await service.enqueue("pull_request", event, "review-durable-ranker");
+  await service.enqueue("pull_request", event, "review-descriptor-first");
   await service.processNextWebhook("worker-1");
 
   assert.equal(backend.requests.length, 1);
-  // A ranker was actually supplied and used on the real review path, and the read
-  // was scoped to this repository.
-  assert.deepEqual(store.vectorQueries, ["github:99"]);
-  assert.deepEqual(store.hydrations, ["github:99"]);
-  // And the durable record reached the model, which it cannot do without wiring
-  // because the loaded document does not contain it.
+  assert.equal(store.documentLoads, 0, "review path must not call getRepositoryIndex");
+  assert.deepEqual(store.pathQueries, ["github:99"]);
   const indexed = backend.requests[0]!.contexts.filter((context) =>
     context.id.startsWith(`repository-index:github:99:${baseSha}:`)
   );
@@ -3440,11 +3423,17 @@ class ForeignDescriptorStore extends MemoryStore {
   }
 }
 
-/** The mirror image: the document is foreign while the columns are correct. */
+/**
+ * Document identity is foreign while columns are correct. Under descriptor-first
+ * review this must NOT reject: the document is never loaded.
+ */
 class ForeignDocumentStore extends MemoryStore {
+  documentLoads = 0;
+
   override async getRepositoryIndex(
     ...args: Parameters<MemoryStore["getRepositoryIndex"]>
   ) {
+    this.documentLoads += 1;
     const index = await super.getRepositoryIndex(...args);
     if (!index) return index;
     return { ...index, repository: "attacker/other-repo" };
@@ -3497,19 +3486,74 @@ test("a column-sourced identity that disagrees with the request is rejected even
   assert.match(body, /Partial review/);
 });
 
-test("a document-sourced identity that disagrees with the request is rejected even though the columns agree", async () => {
-  // The other half of the pair, and the reason the document check is retained rather
-  // than replaced: here the columns agree with the request, so the descriptor check
-  // alone would accept this row. Deleting the document-sourced check fails this test
-  // while leaving the visibility-mismatch test above passing, which is what pins
-  // three-source comparison as the asserted property instead of an accident.
-  const { indexed, body } = await runIndexedReview(
-    new ForeignDocumentStore(),
-    "review-document-foreign"
+test("a foreign index_document is ignored because the review path never loads it", async () => {
+  const store = new ForeignDocumentStore();
+  // Indexing refresh may still load the document; the production review path must not.
+  const baseSha = "d".repeat(40);
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(role) {\n  return role === 'admin';\n}\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  store.documentLoads = 0;
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    patch: "@@ -1 +1 @@\n+export function authorize(role) { return role === 'admin'; }"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 1 })
   );
-  assert.deepEqual(indexed, []);
-  assert.match(body, /repository index context was rejected by repository isolation checks/);
-  assert.match(body, /Partial review/);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, "review-document-foreign-ignored");
+  await service.processNextWebhook("worker-1");
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  assert.ok(indexed.length > 0);
+  assert.equal(store.documentLoads, 0);
+  assert.doesNotMatch(
+    github.updates.at(-1)?.body ?? "",
+    /repository index context was rejected by repository isolation checks/
+  );
 });
 
 test("a cross-repository descriptor row is rejected and degrades the review rather than crashing", async () => {

@@ -4,10 +4,16 @@ import {
   LexicalHashEmbeddingProvider,
   RepositoryIsolationError,
   toPersistedVectorRows,
+  type DurableRepositoryContextSource,
+  type IndexEmbeddingMetadata,
   type PersistedRecordRow,
   type PersistedVectorRow,
+  type RepositoryCallEdgeQuery,
+  type RepositoryCallEdgeQueryResult,
   type RepositoryIndex,
   type RepositoryIndexDescriptor,
+  type RepositoryPathRecordQuery,
+  type RepositoryPathRecordQueryResult,
   type RepositoryRecordHydrationRequest,
   type RepositoryVectorMatch,
   type RepositoryVectorQuery,
@@ -572,8 +578,7 @@ export class RepositoryIndexService {
    * it: this method takes no caller-supplied scope, so such a check would compare a
    * derived value against itself and assert nothing.
    *
-   * It does NOT narrow the document load. Nothing consumes it yet; the production
-   * review path still loads the full document.
+   * The production review path loads this instead of the materialised document.
    */
   async loadRepositoryIndexDescriptor(
     repositoryId: number,
@@ -609,6 +614,20 @@ export class RepositoryIndexService {
    * id the caller asked about rather than against the document.
    */
   repositoryVectorRanker(repositoryId: number): RepositoryVectorRanker {
+    const source = this.durableRepositoryContextSource(repositoryId);
+    return {
+      query: source.query.bind(source),
+      hydrateRecords: source.hydrateRecords.bind(source)
+    };
+  }
+
+  /**
+   * Binds every durable read needed by descriptor-first review retrieval to one
+   * numeric repository id. Path records, call edges, vectors, and content all
+   * share the same scope guard: the request must name `github:{repositoryId}`,
+   * and every returned row must carry that scope.
+   */
+  durableRepositoryContextSource(repositoryId: number): DurableRepositoryContextSource {
     const repositoryScope = `github:${repositoryId}`;
     const assertRowScope = (row: { repositoryScope: string }, what: string): void => {
       if (row.repositoryScope !== repositoryScope) {
@@ -642,6 +661,39 @@ export class RepositoryIndexService {
           assertRowScope(row, "durable record hydration");
         }
         return rows;
+      },
+      hydrateVectors: async (
+        request: RepositoryRecordHydrationRequest
+      ): Promise<PersistedVectorRow[]> => {
+        assertRequestScope(request.repositoryScope, "durable vector hydration");
+        const rows = await this.store.hydrateRepositoryIndexVectors(repositoryId, request);
+        for (const row of rows) {
+          assertRowScope(row, "durable vector hydration");
+        }
+        return rows;
+      },
+      queryRecordsByPath: async (
+        request: RepositoryPathRecordQuery
+      ): Promise<RepositoryPathRecordQueryResult> => {
+        assertRequestScope(request.repositoryScope, "durable path-record retrieval");
+        const result = await this.store.queryRepositoryIndexRecordsByPath(
+          repositoryId,
+          request
+        );
+        for (const row of result.rows) {
+          assertRowScope(row, "durable path-record retrieval");
+        }
+        return result;
+      },
+      queryCallEdges: async (
+        request: RepositoryCallEdgeQuery
+      ): Promise<RepositoryCallEdgeQueryResult> => {
+        assertRequestScope(request.repositoryScope, "durable call-edge retrieval");
+        const result = await this.store.queryRepositoryIndexCallEdges(repositoryId, request);
+        for (const edge of result.edges) {
+          assertRowScope(edge, "durable call-edge retrieval");
+        }
+        return result;
       }
     };
   }
@@ -650,19 +702,19 @@ export class RepositoryIndexService {
    * The provider that can re-embed a review query into the same space a stored
    * index was built in, or nothing when it cannot be reconstructed.
    *
-   * Retrieval only consults a ranker when it holds a query vector in the index's
-   * own space, so without this the wired ranker would be dormant. The lexical
-   * provider is a pure function of its dimension count, so it reconstructs exactly;
-   * the id is compared rather than assumed, because a provider whose id differs is
-   * by definition a different embedding space and comparing across the two would
-   * return confident nonsense instead of an error.
+   * Accepts either a full index or embedding metadata (from a descriptor) so the
+   * production review path need not load the materialised document.
    */
   retrievalEmbeddingProvider(
-    index: RepositoryIndex
+    indexOrEmbedding: RepositoryIndex | RepositoryIndexDescriptor | IndexEmbeddingMetadata
   ): LexicalHashEmbeddingProvider | undefined {
-    const dimensions = index.embedding.dimensions;
+    const embedding =
+      "embedding" in indexOrEmbedding
+        ? indexOrEmbedding.embedding
+        : indexOrEmbedding;
+    const dimensions = embedding.dimensions;
     if (
-      index.embedding.kind !== "lexical-fallback" ||
+      embedding.kind !== "lexical-fallback" ||
       !Number.isSafeInteger(dimensions) ||
       dimensions < 8 ||
       dimensions > 4_096
@@ -670,7 +722,7 @@ export class RepositoryIndexService {
       return undefined;
     }
     const provider = new LexicalHashEmbeddingProvider(dimensions);
-    return provider.id === index.embedding.providerId ? provider : undefined;
+    return provider.id === embedding.providerId ? provider : undefined;
   }
 
   private async resolveBranchHead(

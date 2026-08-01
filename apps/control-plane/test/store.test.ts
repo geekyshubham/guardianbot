@@ -12,11 +12,15 @@ import {
 } from "@guardianbot/core";
 import {
   applyFindingFeedback,
+  buildRepositoryIndexCallEdgeQueryStatement,
   buildRepositoryIndexDescriptorStatement,
+  buildRepositoryIndexEdgeBatchStatement,
+  buildRepositoryIndexPathRecordQueryStatement,
   buildRepositoryIndexRecordBatchStatement,
   buildRepositoryIndexRecordDeleteStatement,
   buildRepositoryIndexRecordQueryStatement,
   buildRepositoryIndexVectorDeleteStatement,
+  buildRepositoryIndexVectorHydrationStatement,
   buildRepositoryIndexVectorQueryStatement,
   MAX_FEEDBACK_COMMENT_IDS,
   MAX_INDEX_GENERATION_SWEEP_BATCH_LIMIT,
@@ -1927,6 +1931,135 @@ function respondWithDescriptorRows(rows: ReturnType<typeof descriptorRow>[]) {
     };
   };
 }
+
+test("path-record and call-edge statements bind repository_id and storage_key", () => {
+  const storageKey = repositoryIndexStorageKey({
+    repositoryScope: "github:42",
+    commitSha: "a".repeat(40)
+  });
+  const pathStatement = buildRepositoryIndexPathRecordQueryStatement(42, storageKey, {
+    repositoryScope: "github:42",
+    commitSha: "a".repeat(40),
+    paths: ["src/a.ts", "src/b.ts"],
+    limit: 10
+  });
+  assert.match(pathStatement.text, /repository_id=\$1 AND r\.storage_key=\$2|repository_id=\$1 AND storage_key=\$2/);
+  assert.match(pathStatement.text, /r\.repository_id=\$1 AND r\.storage_key=\$2/);
+  assert.ok(!pathStatement.text.includes("index_document"));
+  assert.equal(pathStatement.values[0], 42);
+  assert.equal(pathStatement.values[1], storageKey);
+  assert.deepEqual(pathStatement.values[2], ["src/a.ts", "src/b.ts"]);
+  assert.equal(pathStatement.values.at(-1), 11); // limit+1
+
+  const edgeStatement = buildRepositoryIndexCallEdgeQueryStatement(42, storageKey, {
+    repositoryScope: "github:42",
+    commitSha: "a".repeat(40),
+    symbolIds: ["sym-1"],
+    targetNames: ["foo"],
+    limit: 5
+  });
+  assert.match(edgeStatement.text, /repository_id=\$1 AND storage_key=\$2/);
+  assert.ok(!edgeStatement.text.includes("index_document"));
+  assert.deepEqual(edgeStatement.values, [42, storageKey, ["sym-1"], ["foo"], 6]);
+
+  const vectorHydration = buildRepositoryIndexVectorHydrationStatement(42, storageKey, [
+    { recordType: "symbol", recordId: "s1" }
+  ]);
+  assert.match(vectorHydration.text, /repository_id=\$1 AND storage_key=\$2/);
+  assert.equal(vectorHydration.values[0], 42);
+  assert.equal(vectorHydration.values[1], storageKey);
+
+  const edgeBatch = buildRepositoryIndexEdgeBatchStatement(42, [
+    {
+      storageKey,
+      repositoryScope: "github:42",
+      commitSha: "a".repeat(40),
+      edgeId: "e1",
+      path: "src/a.ts",
+      line: 1,
+      target: "foo",
+      targetName: "foo",
+      resolvedSymbolIds: ["sym-1"],
+      resolution: "name-match"
+    }
+  ]);
+  assert.ok(edgeBatch);
+  assert.match(edgeBatch.text, /INSERT INTO repository_index_edges/);
+  assert.equal(edgeBatch.values[1], 42);
+  assert.equal(edgeBatch.values[0], storageKey);
+});
+
+test("memory store path and edge queries are repository isolated and respect limits", async () => {
+  const commitSha = "d".repeat(40);
+  const store = new MemoryStore();
+  for (const repositoryId of [42, 43]) {
+    await store.upsertRepository({
+      installationId: 1,
+      repositoryId,
+      fullName: `Acme/repo-${repositoryId}`,
+      visibility: "private",
+      defaultBranch: "main",
+      scannerState: "report-only",
+      repositoryState: "active",
+      automaticReviewPaused: false
+    });
+    const index = indexRepository({
+      repository: `Acme/repo-${repositoryId}`,
+      repositoryId,
+      commitSha,
+      files: {
+        "src/a.ts": "export function alpha() { return beta(); }\nexport function beta() { return 1; }"
+      }
+    });
+    await store.replaceRepositoryIndex(repositoryId, index, toPersistedVectorRows(index));
+  }
+
+  const pathRows = await store.queryRepositoryIndexRecordsByPath(42, {
+    repositoryScope: "github:42",
+    commitSha,
+    paths: ["src/a.ts"],
+    limit: 100
+  });
+  assert.ok(pathRows.rows.length >= 1);
+  assert.ok(pathRows.rows.every((row) => row.repositoryScope === "github:42"));
+
+  const foreignPath = await store.queryRepositoryIndexRecordsByPath(42, {
+    repositoryScope: "github:43",
+    commitSha,
+    paths: ["src/a.ts"],
+    limit: 100
+  });
+  // Scope derives a different storage key; repository 42 has no rows under github:43.
+  assert.deepEqual(foreignPath.rows, []);
+
+  const limited = await store.queryRepositoryIndexRecordsByPath(42, {
+    repositoryScope: "github:42",
+    commitSha,
+    paths: ["src/a.ts"],
+    limit: 1
+  });
+  assert.equal(limited.rows.length, 1);
+  assert.equal(limited.truncated, true);
+
+  const symbols = pathRows.rows.filter((row) => row.recordType === "symbol");
+  const edgeResult = await store.queryRepositoryIndexCallEdges(42, {
+    repositoryScope: "github:42",
+    commitSha,
+    symbolIds: symbols.map((row) => row.recordId),
+    targetNames: symbols.map((row) => row.name.toLowerCase()),
+    limit: 100
+  });
+  assert.ok(edgeResult.edges.every((edge) => edge.repositoryScope === "github:42"));
+
+  const foreignEdges = await store.queryRepositoryIndexCallEdges(43, {
+    repositoryScope: "github:42",
+    commitSha,
+    symbolIds: symbols.map((row) => row.recordId),
+    targetNames: [],
+    limit: 100
+  });
+  assert.deepEqual(foreignEdges.edges, []);
+});
 
 test("the index descriptor statement omits the document and binds repository and commit", () => {
   const commitSha = "a".repeat(40);

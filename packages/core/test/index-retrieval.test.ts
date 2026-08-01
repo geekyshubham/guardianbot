@@ -4,15 +4,40 @@ import {
   InMemoryRepositoryIndexPersistence,
   LexicalHashEmbeddingProvider,
   indexRepositorySyntaxAware,
+  retrieveDurableRepositoryContext,
   retrieveRepositoryContext,
   retrievedContextKindCoverage,
   retrievedContextKinds,
   reviewKindByRetrievedKind,
   toPersistedVectorRows,
+  type DurableRepositoryContextSource,
   type RepositoryIndex,
   type RetrievedContextKind,
   type RetrievedContextKindDurability
 } from "../src/indexer.js";
+
+function asDurableSource(
+  persistence: InMemoryRepositoryIndexPersistence
+): DurableRepositoryContextSource {
+  return {
+    query: (request) => persistence.query(request),
+    hydrateRecords: (request) => persistence.hydrateRecords(request),
+    hydrateVectors: (request) => persistence.hydrateVectors(request),
+    queryRecordsByPath: (request) => persistence.queryRecordsByPath(request),
+    queryCallEdges: (request) => persistence.queryCallEdges(request)
+  };
+}
+
+function descriptorOf(index: RepositoryIndex) {
+  return {
+    storageKey: index.storageKey,
+    repository: index.repository,
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha,
+    visibility: index.visibility,
+    embedding: { ...index.embedding }
+  };
+}
 
 const commitSha = "a".repeat(40);
 
@@ -74,25 +99,6 @@ async function callEdgeFixture(): Promise<RepositoryIndex> {
       ].join("\n")
     }
   });
-}
-
-/**
- * A document carrying identity but no records at all, so every recalled row must be
- * classified by `classifyDurableRecord`.
- *
- * This models an EMPTY materialised key set, which is what a document-free retrieval
- * would produce. It is a test-only construction: production code must not express a
- * missing document as empty arrays, because empty is indistinguishable from a
- * genuinely empty repository to every future reader.
- */
-function withoutMaterialisedRecords(index: RepositoryIndex): RepositoryIndex {
-  const stripped = structuredClone(index);
-  stripped.files = [];
-  stripped.symbols = [];
-  stripped.imports = [];
-  stripped.calls = [];
-  stripped.history = [];
-  return stripped;
 }
 
 function locations(
@@ -171,88 +177,147 @@ test("the materialised document yields caller, callee, and the call-based test r
   assert.deepEqual(locations(edgeless.contexts), ["changed-symbol:src/quota.ts:1"]);
 });
 
-/**
- * ENCODES AN INTENTIONAL CURRENT LIMITATION. Do NOT delete this test.
- *
- * There is no durable representation of a call edge: no call-edge table exists, and
- * neither `PersistedVectorRow` nor `PersistedRecordRow` carries a call target or a
- * resolved callee. So when the materialised document does not hold a record,
- * `classifyDurableRecord` is a strict SUBSET of `primaryCandidates` and three kinds
- * silently vanish. Nothing raises; the review is just thinner.
- *
- * When durable call edges land, this test must be UPDATED to assert the kinds are
- * now present. Deleting it re-arms exactly the silent degradation it exists to
- * detect, because no other test would notice the loss.
- */
-test("durable classification silently drops caller, the call-derived callee, and the call-based test relation", async () => {
+test("descriptor-first durable retrieval reconstructs caller, callee, and call-based test", async () => {
   const index = await callEdgeFixture();
   const persistence = new InMemoryRepositoryIndexPersistence();
   await persistence.replace(index, toPersistedVectorRows(index));
   const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
 
-  // Same repository, same commit, same records durably present, same query. The
-  // only difference is that no record is materialised, so nothing is subtracted
-  // from hydration and every row is classified durably.
-  const durable = await retrieveRepositoryContext({
-    index: withoutMaterialisedRecords(index),
+  const durable = await retrieveDurableRepositoryContext({
+    descriptor: descriptorOf(index),
     repositoryScope: index.repositoryScope,
     commitSha,
     changes: [{ path: "src/quota.ts", additions: 1, deletions: 0 }],
     query: "throttle quota seal window",
     embeddingProvider: provider,
-    vectorRanker: persistence,
-    vectorRankerLimit: 500
+    source: asDurableSource(persistence)
   });
   const found = locations(durable.contexts);
 
-  // Recall genuinely reached the repository: the diff-bounded kind survives, so a
-  // failure below is kind-loss and not an empty result.
+  assert.ok(found.includes("changed-symbol:src/quota.ts:1"), `got ${found.join(", ")}`);
+  assert.ok(found.includes("caller:src/dispatch.ts:1"), `missing caller, got ${found.join(", ")}`);
+  assert.ok(found.includes("callee:src/window.ts:1"), `missing callee, got ${found.join(", ")}`);
   assert.ok(
-    found.includes("changed-symbol:src/quota.ts:1"),
-    `durable recall returned nothing to classify, got ${found.join(", ")}`
+    found.includes("test:test/dispatch.test.ts:1"),
+    `missing call-based test, got ${found.join(", ")}`
+  );
+});
+
+test("path-scoped retrieval finds a changed symbol outside the ANN top-N", async () => {
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/PathExact",
+    repositoryId: 1202,
+    commitSha,
+    files: {
+      "src/noise-a.ts": "export function noiseA() { return 1; }",
+      "src/noise-b.ts": "export function noiseB() { return 2; }",
+      "src/noise-c.ts": "export function noiseC() { return 3; }",
+      "src/target.ts": "export function rareChangedSymbolUnique() { return 99; }"
+    }
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+
+  // ANN limit 1 with a query that prefers noise — path query must still recover target.
+  const durable = await retrieveDurableRepositoryContext({
+    descriptor: descriptorOf(index),
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/target.ts", additions: 1, deletions: 0 }],
+    query: "noise noise noise",
+    embeddingProvider: provider,
+    source: asDurableSource(persistence),
+    vectorRankerLimit: 1
+  });
+  assert.ok(
+    durable.contexts.some(
+      (context) => context.kind === "changed-symbol" && context.path === "src/target.ts"
+    ),
+    `expected path-exact changed-symbol, got ${locations(durable.contexts).join(", ")}`
+  );
+});
+
+test("path and edge truncation yield partial coverage and warnings", async () => {
+  const multi = await indexRepositorySyntaxAware({
+    repository: "Acme/Truncate",
+    repositoryId: 1203,
+    commitSha,
+    files: {
+      "src/a.ts": [
+        "export function one() { return 1; }",
+        "export function two() { return 2; }",
+        "export function three() { return 3; }"
+      ].join("\n")
+    }
+  });
+  const pathStore = new InMemoryRepositoryIndexPersistence();
+  await pathStore.replace(multi, toPersistedVectorRows(multi));
+  const pathTruncated = await retrieveDurableRepositoryContext({
+    descriptor: descriptorOf(multi),
+    repositoryScope: multi.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/a.ts", additions: 3, deletions: 0 }],
+    source: asDurableSource(pathStore),
+    pathRecordLimit: 1
+  });
+  assert.equal(pathTruncated.partial, true);
+  assert.ok(
+    pathTruncated.warnings?.some(
+      (warning) => warning.includes("path-record") && warning.includes("truncated")
+    )
   );
 
-  // The three losses. Asserted on path and line, NOT on the kind label alone.
+  const index = await callEdgeFixture();
+  const edgeStore = new InMemoryRepositoryIndexPersistence();
+  await edgeStore.replace(index, toPersistedVectorRows(index));
+  const edgeTruncated = await retrieveDurableRepositoryContext({
+    descriptor: descriptorOf(index),
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/quota.ts", additions: 1, deletions: 0 }],
+    source: asDurableSource(edgeStore),
+    callEdgeLimit: 1
+  });
+  assert.equal(edgeTruncated.partial, true);
   assert.ok(
-    !durable.contexts.some((context) => context.kind === "caller"),
-    `expected no caller candidate durably, got ${found.join(", ")}`
+    edgeTruncated.warnings?.some(
+      (warning) => warning.includes("call-edge") && warning.includes("truncated")
+    )
   );
-  assert.ok(
-    !found.includes("callee:src/window.ts:1"),
-    `expected the call-resolved callee to be absent durably, got ${found.join(", ")}`
-  );
-  assert.ok(
-    !found.includes("test:test/dispatch.test.ts:1"),
-    `expected the call-based test relation to be absent durably, got ${found.join(", ")}`
-  );
+});
 
-  // WHY the callee assertion is keyed on path and line: classifyDurableRecord DOES
-  // emit the literal string "callee", for a RELATED-source lexical match on name
-  // and content, with resolvedSymbolIds never consulted. A bare
-  // kinds.has("callee") assertion would therefore pass while every call edge was
-  // missing. That label is not call-edge coverage and must not be counted as such.
-  const callEdgeCallees = new Set(
-    index.calls
-      .filter((call) => call.callerSymbolId)
-      .flatMap((call) => call.resolvedSymbolIds)
+test("foreign durable rows fail closed on descriptor-first retrieval", async () => {
+  const index = await callEdgeFixture();
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const source = asDurableSource(persistence);
+  const foreign = {
+    ...source,
+    queryRecordsByPath: async (request: Parameters<typeof source.queryRecordsByPath>[0]) => {
+      const result = await source.queryRecordsByPath(request);
+      return {
+        ...result,
+        rows: result.rows.map((row) => ({
+          ...row,
+          repositoryScope: "github:9999",
+          storageKey: "guardianbot/repository-index/v2/github%3A9999/" + commitSha
+        }))
+      };
+    }
+  };
+  await assert.rejects(
+    () =>
+      retrieveDurableRepositoryContext({
+        descriptor: descriptorOf(index),
+        repositoryScope: index.repositoryScope,
+        commitSha,
+        changes: [{ path: "src/quota.ts", additions: 1, deletions: 0 }],
+        source: foreign
+      }),
+    (error: unknown) =>
+      error instanceof Error && error.name === "RepositoryIsolationError"
   );
-  assert.ok(callEdgeCallees.size > 0, "fixture must have at least one resolved callee");
-  const durableCalleePaths = new Set(
-    durable.contexts.filter((context) => context.kind === "callee").map((context) => context.path)
-  );
-  for (const symbol of index.symbols) {
-    if (!callEdgeCallees.has(symbol.id)) continue;
-    assert.ok(
-      !durableCalleePaths.has(symbol.path) || symbol.path === "src/quota.ts",
-      `${symbol.path} is a call-edge callee and must not be reproduced durably as one`
-    );
-  }
-
-  assert.equal(retrievedContextKindCoverage.caller.durability, "document-only");
-  assert.equal(retrievedContextKindCoverage.callee.durability, "document-only");
-  assert.deepEqual(retrievedContextKindCoverage.test.documentOnlyRelations, [
-    "call-based test relation (relatedByCall)"
-  ]);
 });
 
 test("the declared kind-durability table partitions every retrieved context kind", () => {
@@ -296,16 +361,13 @@ test("the declared kind-durability table partitions every retrieved context kind
   // Union: nothing is left unclassified.
   assert.deepEqual([...assigned].sort(), [...retrievedContextKinds].sort());
 
-  // The classification that matters is asserted explicitly, so widening it is a
-  // deliberate edit to this test and not an incidental table change.
-  assert.deepEqual(byClass.get("document-only")?.sort(), ["callee", "caller"]);
-  // Deliberately EMPTY. `changed-symbol` is the one kind whose durable route could be
-  // exact — repository_index_records carries every field the changed-line intersection
-  // needs — but retrieval has no path-scoped record query, so its durable route runs
-  // through recall-bounded sourcing like every other kind. The class is retained rather
-  // than deleted because it names the property a future path-scoped query would earn;
-  // populating it must be a deliberate edit to this line, backed by that query existing.
-  assert.deepEqual(byClass.get("durably-exact"), []);
+  // Path queries + durable edges close these three kinds.
+  assert.deepEqual(byClass.get("document-only") ?? [], []);
+  assert.deepEqual(byClass.get("durably-exact")?.sort(), [
+    "callee",
+    "caller",
+    "changed-symbol"
+  ]);
 });
 
 test("only kinds with a document-only relation may claim durable reproduction gaps", () => {

@@ -3,19 +3,28 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 import {
   assertDescriptorReference,
   assertIndexReference,
+  compareCallEdges,
   compareRecordRows,
   cosineSimilarity,
   normalizeCommitSha,
+  normalizeRepositoryPath,
   repositoryIndexStorageKey,
+  toPersistedCallEdges,
   toPersistedRecordRows
 } from "@guardianbot/core";
 import type {
   IndexEmbeddingMetadata,
+  PersistedCallEdge,
+  PersistedPathRecordRow,
   PersistedRecordRow,
   PersistedVectorRow,
+  RepositoryCallEdgeQuery,
+  RepositoryCallEdgeQueryResult,
   RepositoryIndex,
   RepositoryIndexDescriptor,
   RepositoryIndexVectorDelta,
+  RepositoryPathRecordQuery,
+  RepositoryPathRecordQueryResult,
   RepositoryRecordHydrationRequest,
   RepositoryRecordReference,
   RepositoryVectorMatch,
@@ -1210,6 +1219,29 @@ export interface Store {
     request: RepositoryRecordHydrationRequest
   ): Promise<PersistedRecordRow[]>;
   /**
+   * Vectors for named records of one snapshot. Call-edge reconstruction loads
+   * content and vectors separately so a missing vector cannot invent content.
+   */
+  hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]>;
+  /**
+   * Exact path-scoped record fetch with a hard limit. Used by descriptor-first
+   * review retrieval so changed-path candidates do not depend on ANN recall.
+   */
+  queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult>;
+  /**
+   * Bounded call-edge fetch for caller/callee reconstruction without the document.
+   */
+  queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult>;
+  /**
    * Partial publication beside `replaceRepositoryIndex`. It upserts only changed
    * records and deletes only named ones, so a large repository's unchanged rows
    * are never rewritten.
@@ -1373,6 +1405,7 @@ export class MemoryStore implements Store {
   >();
   private repositoryIndexVectors = new Map<string, PersistedVectorRow[]>();
   private repositoryIndexRecords = new Map<string, Map<string, PersistedRecordRow>>();
+  private repositoryIndexEdges = new Map<string, PersistedCallEdge[]>();
   private scannerRuns = new Map<string, ScannerWorkflowRunRecord>();
   private scannerArtifacts = new Map<string, ScannerArtifactRecord>();
   private scannerEvidence = new Map<string, ScannerEvidenceRecord>();
@@ -1417,10 +1450,11 @@ export class MemoryStore implements Store {
       .slice(0, options.limit);
     for (const [storageKey] of candidates) {
       this.repositoryIndexes.delete(storageKey);
-      // Mirrors the ON DELETE CASCADE from repository_indexes to its vectors and
-      // its per-record content rows.
+      // Mirrors the ON DELETE CASCADE from repository_indexes to its vectors,
+      // per-record content rows, and call edges.
       this.repositoryIndexVectors.delete(storageKey);
       this.repositoryIndexRecords.delete(storageKey);
+      this.repositoryIndexEdges.delete(storageKey);
     }
     return { deleted: candidates.length };
   }
@@ -1459,6 +1493,10 @@ export class MemoryStore implements Store {
         toPersistedRecordRows(index).map((row) => [`${row.recordType}:${row.recordId}`, row])
       )
     );
+    this.repositoryIndexEdges.set(
+      index.storageKey,
+      toPersistedCallEdges(index).map((edge) => structuredClone(edge))
+    );
     this.repositories.set(repositoryId, {
       ...repository,
       indexSha: index.commitSha,
@@ -1491,6 +1529,111 @@ export class MemoryStore implements Store {
       }
     }
     return [...hydrated.values()].sort(compareRecordRows);
+  }
+
+  async hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return [];
+    const byKey = new Map(
+      (this.repositoryIndexVectors.get(storageKey) ?? []).map((row) => [
+        `${row.recordType}:${row.recordId}`,
+        row
+      ])
+    );
+    const hydrated = new Map<string, PersistedVectorRow>();
+    for (const reference of request.records) {
+      const recordKey = `${reference.recordType}:${reference.recordId}`;
+      const row = byKey.get(recordKey);
+      if (row && row.storageKey === storageKey && !hydrated.has(recordKey)) {
+        hydrated.set(recordKey, structuredClone(row));
+      }
+    }
+    return [...hydrated.values()].sort((left, right) => {
+      if (left.recordType !== right.recordType) {
+        return left.recordType < right.recordType ? -1 : 1;
+      }
+      return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+    });
+  }
+
+  async queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult> {
+    assertPathRecordQuery(request);
+    if (!request.paths.length) return { rows: [], truncated: false };
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return { rows: [], truncated: false };
+    const pathSet = new Set(request.paths.map((path) => normalizeRepositoryPath(path)));
+    const acceptedTypes = request.recordTypes ? new Set(request.recordTypes) : undefined;
+    const vectors = new Map(
+      (this.repositoryIndexVectors.get(storageKey) ?? []).map((row) => [
+        `${row.recordType}:${row.recordId}`,
+        row
+      ])
+    );
+    const matched: PersistedPathRecordRow[] = [];
+    for (const row of this.repositoryIndexRecords.get(storageKey)?.values() ?? []) {
+      if (row.storageKey !== storageKey) continue;
+      if (!pathSet.has(row.path)) continue;
+      if (acceptedTypes && !acceptedTypes.has(row.recordType)) continue;
+      const vector = vectors.get(`${row.recordType}:${row.recordId}`);
+      if (!vector) continue;
+      matched.push({
+        ...structuredClone(row),
+        vector: [...vector.vector],
+        visibility: vector.visibility,
+        providerId: vector.providerId,
+        dimensions: vector.dimensions
+      });
+    }
+    matched.sort((left, right) => {
+      if (left.path !== right.path) return left.path < right.path ? -1 : 1;
+      return compareRecordRows(left, right);
+    });
+    const truncated = matched.length > request.limit;
+    return {
+      rows: truncated ? matched.slice(0, request.limit) : matched,
+      truncated
+    };
+  }
+
+  async queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult> {
+    assertCallEdgeQuery(request);
+    if (!request.symbolIds.length && !request.targetNames.length) {
+      return { edges: [], truncated: false };
+    }
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return { edges: [], truncated: false };
+    const symbolIds = new Set(request.symbolIds);
+    const targetNames = new Set(
+      request.targetNames.map((name) => name.trim().toLowerCase()).filter(Boolean)
+    );
+    const matched = (this.repositoryIndexEdges.get(storageKey) ?? []).filter((edge) => {
+      if (edge.storageKey !== storageKey) return false;
+      if (edge.callerSymbolId && symbolIds.has(edge.callerSymbolId)) return true;
+      if (edge.resolvedSymbolIds.some((id) => symbolIds.has(id))) return true;
+      return Boolean(edge.targetName && targetNames.has(edge.targetName));
+    });
+    matched.sort(compareCallEdges);
+    const truncated = matched.length > request.limit;
+    return {
+      edges: (truncated ? matched.slice(0, request.limit) : matched).map((edge) =>
+        structuredClone(edge)
+      ),
+      truncated
+    };
   }
 
   async queryRepositoryIndexVectors(
@@ -1571,6 +1714,12 @@ export class MemoryStore implements Store {
       }
     }
     this.repositoryIndexRecords.set(storageKey, records);
+    // Edges are commit-scoped under a new storage key, so publish the full edge
+    // set for this generation rather than attempting a partial merge.
+    this.repositoryIndexEdges.set(
+      storageKey,
+      toPersistedCallEdges(delta.index).map((edge) => structuredClone(edge))
+    );
     this.repositories.set(repositoryId, {
       ...repository,
       indexSha: delta.index.commitSha,
@@ -2596,6 +2745,29 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS repository_index_records_scope_commit_idx
         ON repository_index_records (repository_scope, commit_sha);
+      CREATE INDEX IF NOT EXISTS repository_index_records_path_idx
+        ON repository_index_records (repository_id, storage_key, path);
+
+      CREATE TABLE IF NOT EXISTS repository_index_edges (
+        storage_key TEXT NOT NULL REFERENCES repository_indexes(storage_key) ON DELETE CASCADE,
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        repository_scope TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        edge_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        caller_symbol_id TEXT,
+        resolved_symbol_ids TEXT[] NOT NULL,
+        resolution TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (storage_key, edge_id)
+      );
+      CREATE INDEX IF NOT EXISTS repository_index_edges_scope_commit_idx
+        ON repository_index_edges (repository_scope, commit_sha);
+      CREATE INDEX IF NOT EXISTS repository_index_edges_caller_idx
+        ON repository_index_edges (repository_id, storage_key, caller_symbol_id);
 
       CREATE TABLE IF NOT EXISTS scanner_workflow_runs (
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -2871,6 +3043,20 @@ export class PostgresStore implements Store {
           records.slice(start, start + 100)
         );
       }
+      // Call edges for caller/callee reconstruction. Same transaction as the
+      // snapshot so a durable review never sees vectors without their graph.
+      await client.query(
+        "DELETE FROM repository_index_edges WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
+      );
+      const edges = toPersistedCallEdges(index);
+      for (let start = 0; start < edges.length; start += 100) {
+        await this.insertRepositoryIndexEdgeBatch(
+          client,
+          repositoryId,
+          edges.slice(start, start + 100)
+        );
+      }
       await client.query(
         `UPDATE repositories
          SET index_sha=$2, index_updated_at=$3, updated_at=now()
@@ -3013,6 +3199,101 @@ export class PostgresStore implements Store {
       .sort(compareRecordRows);
   }
 
+  async hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexVectorHydrationStatement(
+      repositoryId,
+      storageKey,
+      request.records
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    return result.rows
+      .map((row) => {
+        const persisted = toPersistedVectorRow(row);
+        if (
+          persisted.storageKey !== storageKey ||
+          persisted.repositoryScope !== request.repositoryScope
+        ) {
+          throw new Error("repository index vector hydration returned a foreign storage key");
+        }
+        return persisted;
+      })
+      .sort((left, right) => {
+        if (left.recordType !== right.recordType) {
+          return left.recordType < right.recordType ? -1 : 1;
+        }
+        return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+      });
+  }
+
+  async queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult> {
+    assertPathRecordQuery(request);
+    if (!request.paths.length) return { rows: [], truncated: false };
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexPathRecordQueryStatement(
+      repositoryId,
+      storageKey,
+      request
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    const rows = result.rows.map((row) => {
+      const persisted = toPersistedPathRecordRow(row);
+      if (
+        persisted.storageKey !== storageKey ||
+        persisted.repositoryScope !== request.repositoryScope
+      ) {
+        throw new Error("repository index path-record query returned a foreign storage key");
+      }
+      return persisted;
+    });
+    // limit+1 fetch: drop the sentinel row and report truncation.
+    const truncated = rows.length > request.limit;
+    return {
+      rows: truncated ? rows.slice(0, request.limit) : rows,
+      truncated
+    };
+  }
+
+  async queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult> {
+    assertCallEdgeQuery(request);
+    if (!request.symbolIds.length && !request.targetNames.length) {
+      return { edges: [], truncated: false };
+    }
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexCallEdgeQueryStatement(
+      repositoryId,
+      storageKey,
+      request
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    const edges = result.rows.map((row) => {
+      const persisted = toPersistedCallEdge(row);
+      if (
+        persisted.storageKey !== storageKey ||
+        persisted.repositoryScope !== request.repositoryScope
+      ) {
+        throw new Error("repository index call-edge query returned a foreign storage key");
+      }
+      return persisted;
+    });
+    const truncated = edges.length > request.limit;
+    return {
+      edges: truncated ? edges.slice(0, request.limit) : edges,
+      truncated
+    };
+  }
+
   async applyRepositoryIndexDelta(
     repositoryId: number,
     delta: RepositoryIndexVectorDelta,
@@ -3063,6 +3344,20 @@ export class PostgresStore implements Store {
           client,
           repositoryId,
           records.slice(start, start + 100)
+        );
+      }
+      // Full edge set for the new generation. Storage key is commit-scoped, so
+      // this cannot rewrite a previous generation's edges.
+      await client.query(
+        "DELETE FROM repository_index_edges WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
+      );
+      const edges = toPersistedCallEdges(index);
+      for (let start = 0; start < edges.length; start += 100) {
+        await this.insertRepositoryIndexEdgeBatch(
+          client,
+          repositoryId,
+          edges.slice(start, start + 100)
         );
       }
       await client.query(
@@ -4491,6 +4786,16 @@ export class PostgresStore implements Store {
     if (!statement) return;
     await client.query(statement.text, statement.values);
   }
+
+  private async insertRepositoryIndexEdgeBatch(
+    client: PoolClient,
+    repositoryId: number,
+    edges: readonly PersistedCallEdge[]
+  ): Promise<void> {
+    const statement = buildRepositoryIndexEdgeBatchStatement(repositoryId, edges);
+    if (!statement) return;
+    await client.query(statement.text, statement.values);
+  }
 }
 
 /**
@@ -4523,6 +4828,37 @@ function assertVectorQuery(request: RepositoryVectorQuery): void {
     request.vector.some((value) => !Number.isFinite(value))
   ) {
     throw new Error("vector query must supply a finite, non-empty vector");
+  }
+}
+
+function assertPathRecordQuery(request: RepositoryPathRecordQuery): void {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 1_000) {
+    throw new RangeError("path record query limit must be between 1 and 1000");
+  }
+  if (request.paths.length > 1_000) {
+    throw new RangeError("path record query is limited to 1000 paths per request");
+  }
+  for (const path of request.paths) {
+    normalizeRepositoryPath(path);
+  }
+  if (request.recordTypes) {
+    for (const recordType of request.recordTypes) {
+      if (recordType !== "symbol" && recordType !== "history") {
+        throw new Error("path record query accepts only symbol and history records");
+      }
+    }
+  }
+}
+
+function assertCallEdgeQuery(request: RepositoryCallEdgeQuery): void {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 1_000) {
+    throw new RangeError("call edge query limit must be between 1 and 1000");
+  }
+  if (request.symbolIds.length > 1_000 || request.targetNames.length > 1_000) {
+    throw new RangeError("call edge query is limited to 1000 symbol ids and target names");
+  }
+  for (const id of request.symbolIds) {
+    if (!id.trim()) throw new Error("call edge query requires non-empty symbol ids");
   }
 }
 
@@ -4678,6 +5014,39 @@ function toPersistedRecordRow(row: Record<string, any>): PersistedRecordRow {
     content: row.content,
     contentSha256: row.content_sha256,
     summary: row.summary ?? undefined
+  };
+}
+
+function toPersistedPathRecordRow(row: Record<string, any>): PersistedPathRecordRow {
+  const base = toPersistedRecordRow(row);
+  const vector = Array.isArray(row.vector_json)
+    ? (row.vector_json as number[])
+    : (JSON.parse(String(row.vector_json)) as number[]);
+  return {
+    ...base,
+    vector,
+    visibility: row.visibility,
+    providerId: row.provider_id,
+    dimensions: Number(row.dimensions)
+  };
+}
+
+function toPersistedCallEdge(row: Record<string, any>): PersistedCallEdge {
+  const resolved = Array.isArray(row.resolved_symbol_ids)
+    ? (row.resolved_symbol_ids as string[])
+    : [];
+  return {
+    storageKey: row.storage_key,
+    repositoryScope: row.repository_scope,
+    commitSha: row.commit_sha,
+    edgeId: row.edge_id,
+    path: row.path,
+    line: Number(row.line),
+    target: row.target,
+    targetName: row.target_name,
+    callerSymbolId: row.caller_symbol_id ?? undefined,
+    resolvedSymbolIds: resolved,
+    resolution: row.resolution === "name-match" ? "name-match" : "unresolved"
   };
 }
 
@@ -4843,6 +5212,166 @@ export function buildRepositoryIndexRecordBatchStatement(
          summary=excluded.summary,
          updated_at=now()`,
     values
+  };
+}
+
+export interface RepositoryIndexEdgeBatchStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Upserts call-graph edges for one snapshot. Same repository_id + storage_key
+ * boundary as vector/record rows; written in the same publication transaction.
+ */
+export function buildRepositoryIndexEdgeBatchStatement(
+  repositoryId: number,
+  edges: readonly PersistedCallEdge[]
+): RepositoryIndexEdgeBatchStatement | undefined {
+  if (!edges.length) return undefined;
+  const values: unknown[] = [];
+  const rows: string[] = [];
+  for (const edge of edges) {
+    const firstPosition = values.length + 1;
+    values.push(
+      edge.storageKey,
+      repositoryId,
+      edge.repositoryScope,
+      edge.commitSha,
+      edge.edgeId,
+      edge.path,
+      edge.line,
+      edge.target,
+      edge.targetName,
+      edge.callerSymbolId ?? null,
+      edge.resolvedSymbolIds,
+      edge.resolution
+    );
+    rows.push(
+      `(${Array.from({ length: 12 }, (_, offset) => `$${firstPosition + offset}`).join(",")})`
+    );
+  }
+  return {
+    text: `INSERT INTO repository_index_edges
+       (storage_key, repository_id, repository_scope, commit_sha, edge_id, path, line,
+        target, target_name, caller_symbol_id, resolved_symbol_ids, resolution)
+       VALUES ${rows.join(",")}
+       ON CONFLICT (storage_key, edge_id) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         repository_scope=excluded.repository_scope,
+         commit_sha=excluded.commit_sha,
+         path=excluded.path,
+         line=excluded.line,
+         target=excluded.target,
+         target_name=excluded.target_name,
+         caller_symbol_id=excluded.caller_symbol_id,
+         resolved_symbol_ids=excluded.resolved_symbol_ids,
+         resolution=excluded.resolution,
+         updated_at=now()`,
+    values
+  };
+}
+
+export interface RepositoryIndexPathRecordQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Exact path-scoped record fetch with vector join. Fetches `limit + 1` rows so
+ * truncation is observable. Predicates: repository_id + canonical storage_key.
+ */
+export function buildRepositoryIndexPathRecordQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  request: RepositoryPathRecordQuery
+): RepositoryIndexPathRecordQueryStatement {
+  const paths = request.paths.map((path) => normalizeRepositoryPath(path));
+  const values: unknown[] = [repositoryId, storageKey, paths];
+  let typePredicate = "";
+  if (request.recordTypes?.length) {
+    values.push([...request.recordTypes]);
+    typePredicate = ` AND r.record_type = ANY($${values.length}::text[])`;
+  }
+  values.push(request.limit + 1);
+  return {
+    text: `SELECT r.storage_key, r.repository_scope, r.commit_sha, r.record_type, r.record_id,
+            r.path, r.line, r.end_line, r.name, r.content, r.content_sha256, r.summary,
+            v.vector_json, v.visibility, v.provider_id, v.dimensions
+       FROM repository_index_records AS r
+       INNER JOIN repository_index_vectors AS v
+         ON v.storage_key = r.storage_key
+        AND v.record_type = r.record_type
+        AND v.record_id = r.record_id
+       WHERE r.repository_id=$1 AND r.storage_key=$2
+         AND r.path = ANY($3::text[])${typePredicate}
+       ORDER BY r.path ASC, r.record_type ASC, r.record_id ASC
+       LIMIT $${values.length}`,
+    values
+  };
+}
+
+export interface RepositoryIndexCallEdgeQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Bounded call-edge fetch. Predicates: repository_id + canonical storage_key, plus
+ * caller/resolved/target-name filters. Fetches `limit + 1` for truncation.
+ */
+export function buildRepositoryIndexCallEdgeQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  request: RepositoryCallEdgeQuery
+): RepositoryIndexCallEdgeQueryStatement {
+  const symbolIds = [...request.symbolIds];
+  const targetNames = request.targetNames
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, edge_id, path, line, target,
+            target_name, caller_symbol_id, resolved_symbol_ids, resolution
+       FROM repository_index_edges
+       WHERE repository_id=$1 AND storage_key=$2
+         AND (
+           caller_symbol_id = ANY($3::text[])
+           OR resolved_symbol_ids && $3::text[]
+           OR target_name = ANY($4::text[])
+         )
+       ORDER BY edge_id ASC
+       LIMIT $5`,
+    values: [repositoryId, storageKey, symbolIds, targetNames, request.limit + 1]
+  };
+}
+
+export interface RepositoryIndexVectorHydrationStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Vectors for named records of one snapshot. Same two-predicate isolation as
+ * record hydration.
+ */
+export function buildRepositoryIndexVectorHydrationStatement(
+  repositoryId: number,
+  storageKey: string,
+  records: readonly RepositoryRecordReference[]
+): RepositoryIndexVectorHydrationStatement {
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, visibility, provider_id, dimensions,
+            record_type, record_id, path, vector_json
+       FROM repository_index_vectors
+       WHERE repository_id=$1 AND storage_key=$2
+         AND (record_type, record_id) IN (SELECT * FROM unnest($3::text[], $4::text[]))
+       ORDER BY record_type ASC, record_id ASC`,
+    values: [
+      repositoryId,
+      storageKey,
+      records.map((record) => record.recordType),
+      records.map((record) => record.recordId)
+    ]
   };
 }
 

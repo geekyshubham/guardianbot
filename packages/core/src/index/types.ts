@@ -279,6 +279,72 @@ export interface RepositoryRecordHydrationRequest extends RepositoryIndexReferen
   records: readonly RepositoryRecordReference[];
 }
 
+/**
+ * Content row plus the vector needed to score it. Path-scoped retrieval returns
+ * this so a changed-path candidate can be ranked without a second round trip and
+ * without materialising the index document.
+ */
+export interface PersistedPathRecordRow extends PersistedRecordRow {
+  vector: number[];
+  visibility: RepositoryVisibility;
+  providerId: string;
+  dimensions: number;
+}
+
+/**
+ * Bounded exact lookup of durable records on selected repository paths. This is
+ * what makes changed-symbol retrieval exact rather than ANN-recall-bounded: the
+ * diff names the paths, and storage returns only those rows up to a hard limit.
+ */
+export interface RepositoryPathRecordQuery extends RepositoryIndexReference {
+  paths: readonly string[];
+  limit: number;
+  recordTypes?: readonly PersistedRecordRow["recordType"][];
+}
+
+export interface RepositoryPathRecordQueryResult {
+  rows: PersistedPathRecordRow[];
+  /** True when storage held more matching rows than `limit` allowed back. */
+  truncated: boolean;
+}
+
+/**
+ * One call-graph edge, durable without the materialised document. Enough to
+ * reconstruct caller/callee candidates: who called, what was targeted, and which
+ * symbol ids resolved.
+ */
+export interface PersistedCallEdge {
+  storageKey: string;
+  repositoryScope: string;
+  commitSha: string;
+  edgeId: string;
+  path: string;
+  line: number;
+  target: string;
+  /** Lowercased simple identifier from `target`, for name-based edge lookup. */
+  targetName: string;
+  callerSymbolId?: string;
+  resolvedSymbolIds: string[];
+  resolution: IndexedCall["resolution"];
+}
+
+/**
+ * Bounded call-edge fetch for one snapshot. Predicate is repository-scoped via
+ * the derived storage key; symbol ids and target names further narrow which edges
+ * are relevant to a changed set.
+ */
+export interface RepositoryCallEdgeQuery extends RepositoryIndexReference {
+  symbolIds: readonly string[];
+  targetNames: readonly string[];
+  limit: number;
+}
+
+export interface RepositoryCallEdgeQueryResult {
+  edges: PersistedCallEdge[];
+  /** True when storage held more matching edges than `limit` allowed back. */
+  truncated: boolean;
+}
+
 export interface RepositoryVectorQuery extends RepositoryIndexReference {
   providerId: string;
   vector: readonly number[];
@@ -316,4 +382,45 @@ export interface RepositoryIndexPersistence {
   hydrateRecords(
     request: RepositoryRecordHydrationRequest
   ): Promise<PersistedRecordRow[]>;
+  /**
+   * Optional path-scoped exact record fetch. When present, durable retrieval can
+   * recover changed-path candidates without ANN recall and without the document.
+   */
+  queryRecordsByPath?(
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult>;
+  /**
+   * Optional call-edge fetch. When present, durable retrieval can reconstruct
+   * caller/callee candidates without the materialised `index.calls` array.
+   */
+  queryCallEdges?(
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult>;
+}
+
+/**
+ * Production review retrieval source: vector rank, content hydrate, path-scoped
+ * exact records, and call edges — all without the materialised document.
+ *
+ * `hydrateRecords` is required here (optional on the wider ranker seam) because
+ * the descriptor-first path has no document to fall back on for content.
+ */
+export interface DurableRepositoryContextSource {
+  query(request: RepositoryVectorQuery): Promise<RepositoryVectorMatch[]>;
+  hydrateRecords(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]>;
+  /**
+   * Vectors for named records. Call-edge reconstruction hydrates content and
+   * vectors separately so a missing vector cannot invent a content row.
+   */
+  hydrateVectors(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]>;
+  queryRecordsByPath(
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult>;
+  queryCallEdges(
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult>;
 }
