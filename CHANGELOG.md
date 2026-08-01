@@ -7,15 +7,32 @@ reusable workflow commits remain immutable.
 
 ### Changed
 
-- GuardianBot self-consumer declarative config and reusable workflow references
-  are upgraded in draft PR #37 to immutable published release `v0.2.39` exact
-  commit `7524547700e4c3994353f5c61d1625b2bd5e5428` (from `v0.2.37`
-  `f2a7f5410bd5d8b140378a7c722b74ba0b455727`). Pending merge and green
-  verification; does not claim fleet-wide v0.2.39 pins or completed live
-  acceptance.
+- Fleet consumer pins and GuardianBot self-consumer config/workflow references
+  are upgraded via generic `guardianctl upgrade --all` to immutable published
+  release `v0.2.39` exact commit `7524547700e4c3994353f5c61d1625b2bd5e5428`
+  (from `v0.2.37` `f2a7f5410bd5d8b140378a7c722b74ba0b455727`). All 18 draft
+  upgrade PRs merged, including GuardianBot PR #37.
 
 ### Evidence
 
+- Live GuardianBot v0.2.39 fleet pin upgrade, control-plane trust of release
+  commit `7524547700e4c3994353f5c61d1625b2bd5e5428` for security/image/DAST
+  evidence (ACTIVE deployment `2a394a68-9c23-4fd0-8978-8d2018664f81`;
+  `/healthz` and `/readyz` HTTP 200), final inventory 19 visible / 16
+  report-only / 2 advisory-only / 1 not-applicable fork / zero misconfigured /
+  zero missing-expected-runs, and RouteLens/AstraNull post-merge promotions
+  (RouteLens head `55eeead5b7306972abfff1b30a32b5cae95e96eb`, run
+  [`30716095055`](https://github.com/geekyshubham/RouteLens/actions/runs/30716095055),
+  digest
+  `sha256:7ac78ef0d9ab23c14f7e3665a834f21fd73a9be3ceed040b4c76b7a06532dceb`;
+  AstraNull head `3664cff061398c1bf3efc0c937a2470746d60e3d`, run
+  [`30716664659`](https://github.com/geekyshubham/AstraNull/actions/runs/30716664659),
+  digest
+  `sha256:6c4f2e9cb3a497fe0871cb73cfd7b2aa0f072c2f7e54626d19a6b81a67ce087a`).
+  Does not claim scheduled authenticated-full DAST on current digests,
+  DefectDojo current-run proof, production AI review, seven-day enforcement,
+  or GitHub App review-comment permission. Evidence:
+  [v0.2.39 live fleet upgrade](docs/evidence/v0.2.39-live-fleet-upgrade.md).
 - Live GuardianBot v0.2.39 signed release, exact-digest control-plane
   deployment, and guarded index recovery (hotfix PR #34
   `704c9041c78b6e0dfee1d481f9de6cc33b2040f6`, release commit
@@ -26,9 +43,8 @@ reusable workflow commits remain immutable.
   17,256 document calls / 17,256 distinct call IDs / 17,256 durable edges).
   Proves live fix of the duplicate durable edge publication defect and atomic
   non-empty durable publication for the current snapshot. Does not claim live
-  PR descriptor-first consumption, ANN, production AI review, fleet v0.2.39
-  pins, seven-day enforcement, authenticated-full DAST, or DefectDojo
-  reimport. Evidence:
+  PR descriptor-first consumption, ANN, production AI review, seven-day
+  enforcement, authenticated-full DAST, or DefectDojo reimport. Evidence:
   [v0.2.39 live index recovery](docs/evidence/v0.2.39-live-index-recovery.md).
 
 ## [0.2.39] - 2026-08-02
