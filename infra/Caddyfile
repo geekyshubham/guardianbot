@@ -18,9 +18,9 @@
     Permissions-Policy "accelerometer=(), autoplay=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()"
   }
 
-  # Prometheus scrapes this endpoint over the private Compose network. Do not
-  # expose queue, failure, or backend-health metrics through the public edge.
-  @internal_metrics path /metrics
+  # Prometheus scrapes /metrics over the private Compose network. Operations
+  # status is likewise private-only. Neither path may leave through the public edge.
+  @internal_metrics path /metrics /operations/monitoring
   respond @internal_metrics 404
 
   reverse_proxy control-plane:3000

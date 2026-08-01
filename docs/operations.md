@@ -222,11 +222,58 @@ Monitor at minimum:
 - exact scan/SBOM/signature/deployment digest agreement; and
 - suppression expiry and weekly coverage snapshots.
 
-Public Caddy requests to `/metrics` return `404`. Metrics access requires
-`GUARDIANBOT_METRICS_BEARER_TOKEN` unless the deployment explicitly enables
-`GUARDIANBOT_TRUST_PRIVATE_METRICS=1` on a genuinely private Compose network.
-Health/readiness endpoints are useful process signals, not substitutes for
-external probes and evidence reconciliation.
+### Private metrics and operator monitoring status
+
+`/metrics` and `GET /operations/monitoring` share the same private-metrics
+trust policy. Public Caddy returns `404` for both paths. On App Platform, exact
+bearer authentication is required; private Compose may instead set
+`GUARDIANBOT_TRUST_PRIVATE_METRICS=1` on a genuinely private network. Neither
+path needs direct database or SSH firewall broadening—operators scrape or
+curl the control plane with the same credentials already used for metrics.
+
+Successful access requires `GUARDIANBOT_METRICS_BEARER_TOKEN` (or the private
+Compose trust override). Unauthorized callers, non-`GET` methods, query
+strings, and trailing-slash variants of `/operations/monitoring` return an
+empty `404`. Never put the bearer value in documentation, tickets, or shell
+history that will be committed; load it from the operator environment or the
+DigitalOcean secret store.
+
+```sh
+# App Platform or any deployment that requires the metrics bearer.
+# Export GUARDIANBOT_METRICS_BEARER_TOKEN from the local operator credential
+# store first; do not inline the token.
+curl -fsS \
+  -H "Authorization: Bearer ${GUARDIANBOT_METRICS_BEARER_TOKEN}" \
+  "https://${GUARDIANBOT_HOSTNAME}/metrics"
+
+curl -fsS \
+  -H "Authorization: Bearer ${GUARDIANBOT_METRICS_BEARER_TOKEN}" \
+  "https://${GUARDIANBOT_HOSTNAME}/operations/monitoring"
+```
+
+`GET /operations/monitoring` is a read-only operator ledger. Responses use
+schema `guardianbot.monitoring.status.v1` with `cache-control: no-store` on
+both `200` and the fixed `503` body
+`{"error":"monitoring operations unavailable"}`. Internal failures log only a
+bounded error kind; they never return config, evidence payloads, index
+contents, credentials, digests, webhook payloads, resolved rows, or raw
+provider text.
+
+Response fields:
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| `generatedAt` | request time | ISO-8601 UTC |
+| `scheduler` | process-local | `scope` is always `process-local`; gauges describe this instance only and are not fleet-authoritative |
+| `activeAlerts` | store-backed | At most 512 sanitized active alerts from a stable bounded PostgreSQL JOIN (`repository_id`, `alert_key` order); `truncated` is explicit when more exist |
+| `repositories` | derived from the alert page | Page-scoped unique repository names and `returnedAlertingCount`; `complete` is true only when the alert page itself is not truncated—not a fleet total |
+| `weeklyReport` | store-backed | Current UTC-week aggregate (`v1:YYYY-MM-DD` for that Monday) or `null` when no report row exists yet |
+
+Alert `fullName`, `alertKey`, and `summary` are length-capped (255 / 256 /
+512). Truncation is silent character clipping at those bounds; page-level
+truncation is the separate boolean on `activeAlerts`. Health/readiness
+endpoints are useful process signals, not substitutes for external probes and
+evidence reconciliation.
 
 ### Webhook queue retention
 
