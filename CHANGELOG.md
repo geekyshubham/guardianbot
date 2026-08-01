@@ -5,6 +5,11 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Changed
+
+- GuardianBot self-consumer config/workflow is pinned to immutable v0.2.37
+  commit `f2a7f5410bd5d8b140378a7c722b74ba0b455727`.
+
 ## [0.2.37] - 2026-08-01
 
 ### Added
