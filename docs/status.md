@@ -3,18 +3,22 @@
 Release: `0.2.37`
 Last verified: 2026-08-01
 
-**Release control:** `v0.2.37` is the release candidate being prepared for
-code and documentation automated verification (hardening already reflected in
-this matrix: lifecycle provenance and closed-form advisories, durable
-repository-index candidate sourcing on the review path, migration and webhook
-hardening, base-commit onboarding path binding, and related automated fixes).
-No signed `v0.2.37` release, tag, or container image is claimed yet.
+**Release control:** `v0.2.37` is a signed published release
+(https://github.com/geekyshubham/guardianbot/releases/tag/v0.2.37). Exact
+image digest
+`sha256:5951abf80d82c74c932a0e8f9e3a126203df75e149c08615b34e8051b81ad370` is
+deployed ACTIVE on DigitalOcean with `/healthz` and `/readyz` verified.
+Trusted reusable-workflow SHAs are
+`f2a7f5410bd5d8b140378a7c722b74ba0b455727`. GuardianBot's own consumer
+caller/config pin is updated to that immutable release commit. Hardening
+already reflected in this matrix includes lifecycle provenance and closed-form
+advisories, durable repository-index candidate sourcing on the review path,
+migration and webhook hardening, base-commit onboarding path binding, and
+related automated fixes.
 
-The live DigitalOcean control plane, fleet consumer pins, RouteLens/AstraNull
-exact-digest promotions, and ACTIVE deployments remain at verified signed
-`v0.2.36` (2026-07-30) until post-release deployment and upgrade evidence is
-captured:
-https://github.com/geekyshubham/guardianbot/releases/tag/v0.2.36. See
+Fleet consumer pins, RouteLens/AstraNull exact-digest promotions, and fleet
+ACTIVE deployments remain at verified signed `v0.2.36` (2026-07-30) until
+fleet-upgrade evidence is captured. See prior
 [live v0.2.36 control-plane and fleet upgrade evidence](evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md).
 On 2026-08-01, genuine scheduled authenticated-baseline smoke completed for
 both current default-branch SHAs and exact DigitalOcean deployed digests
@@ -23,11 +27,10 @@ both current default-branch SHAs and exact DigitalOcean deployed digests
 independently verified for those runs. Scheduled authenticated-full acceptance
 and a current DefectDojo reimport remain open.
 
-This does not claim a signed `v0.2.37` release/tag/image, DigitalOcean
-deployment of `v0.2.37`, fleet upgrade to `v0.2.37`, GitHub App event
-application, live PostgreSQL/pgvector/ANN performance, production model-backed
-review, seven-day enforcement completion, authenticated-full DAST success, or a
-new DefectDojo import.
+This does not claim fleet upgrade to `v0.2.37` (including merged fleet pin
+PRs), GitHub App event application, live PostgreSQL/pgvector/ANN performance,
+production model-backed review, seven-day enforcement completion,
+authenticated-full DAST success, or a new DefectDojo import.
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
@@ -45,9 +48,14 @@ the stated live evidence must also be captured where required.
 
 - Reconcile the in-progress control-plane, durable retrieval, privacy,
   retention, rate-limit, shutdown, and webhook-hardening changes into one
-  stable worktree. **Done locally/GitHub:** the stable branch, full repository
-  build/test/lint/documentation/schema/workflow gates, and PR merge for this
-  hardening set are complete for the `v0.2.37` release candidate.
+  stable worktree. **Done:** the stable branch, full repository
+  build/test/lint/documentation/schema/workflow gates, PR merge, signed
+  `v0.2.37` release, immutable reusable-workflow commit
+  `f2a7f5410bd5d8b140378a7c722b74ba0b455727`, exact image digest
+  `sha256:5951abf80d82c74c932a0e8f9e3a126203df75e149c08615b34e8051b81ad370`,
+  ACTIVE DigitalOcean control-plane deployment, and `/healthz`/`/readyz`
+  verification are complete. GuardianBot's own consumer caller/config pin is
+  updated to that immutable release commit.
 - Independently review cancellation behavior so shutdown cannot leave a
   detached model request or webhook handler mutating state after its lease is
   released.
@@ -62,17 +70,15 @@ the stated live evidence must also be captured where required.
   Graph edges still rely on the loaded document; history retrieval remains
   incomplete. Live PostgreSQL/pgvector verification, live ANN performance, and
   production deployment of that path also remain incomplete.
-- **Still pending:** publish a new signed GuardianBot release, immutable
-  reusable-workflow commit, container image, changelog, and release evidence.
-  Deploy it only to the approved DigitalOcean control plane and verify
-  `/healthz` and `/readyz`. Capture post-release deployment and fleet-upgrade
-  evidence; live control plane and consumers remain on verified `v0.2.36`
-  until that evidence exists.
+- **Still pending:** fleet consumer upgrade to `v0.2.37` and versioned
+  fleet-upgrade evidence; fleet consumers remain on verified `v0.2.36` pins
+  until that evidence exists. Do not treat this repository's own pin update as
+  a fleet-wide upgrade.
 
-**Completion evidence:** clean full CI on the release commit (local/GitHub
-gates for the candidate are complete), signed release artifacts, immutable
-workflow SHA, exact deployed image digest, ACTIVE DigitalOcean deployment, and
-updated versioned evidence in this repository.
+**Completion evidence:** clean full CI on the release commit, signed release
+artifacts, immutable workflow SHA, exact deployed image digest, ACTIVE
+DigitalOcean control-plane deployment, and `/healthz`/`/readyz` are done for
+`v0.2.37`. Fleet-upgrade and versioned fleet evidence remain open.
 
 ### 2. Apply and verify the GitHub App permission/event update
 
