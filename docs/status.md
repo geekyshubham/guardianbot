@@ -67,6 +67,16 @@ ACTIVE deployment `742ad233-8c8a-4345-a440-42cd09a77787`, `/health` and
 `/ready` HTTP 200). Prior [v0.2.36 control-plane and fleet upgrade evidence](evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md)
 is retained as historical only.
 
+**Self-consumer pin upgrade (proposed, pending merge):** draft PR
+[#37](https://github.com/geekyshubham/guardianbot/pull/37) updates this
+repository's declarative config (`workflowVersion`) and all reusable workflow
+references from immutable `v0.2.37`
+(`f2a7f5410bd5d8b140378a7c722b74ba0b455727`) to published release `v0.2.39`
+exact commit `7524547700e4c3994353f5c61d1625b2bd5e5428`. Pending merge and
+green verification; live acceptance remains ongoing. This does **not** claim
+fleet-wide `v0.2.39` pins, scheduled authenticated-full DAST closure,
+model-backend production review, enforcement readiness, or DefectDojo proof.
+
 On 2026-08-01, **before** the v0.2.37 fleet merge and promotions, genuine
 scheduled authenticated-baseline smoke completed against the then-current
 v0.2.36 default-branch SHAs and then-current DigitalOcean deployed digests
