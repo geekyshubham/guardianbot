@@ -5,6 +5,141 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Stable-fingerprint lifecycle records persist provenance: first and last-seen
+  head SHA and timestamps, transition and reappearance counts, and enough
+  finding identity to render a human-meaningful line without re-running the
+  model. A finding that returns after a terminal state is therefore detectable
+  for the first time, and is surfaced while it is still open through the
+  advisory lifecycle line, a returned-finding entry, and a new
+  `finding_reappeared_total` counter. The additive migration runs inside the
+  advisory-locked path; pre-existing rows remain readable and an older instance
+  can still write them during a rolling deploy.
+- Resolved, superseded, and returned findings render per finding instead of only
+  as counts, and GuardianBot rewrites its own published inline advisories to a
+  clearly-closed form so stale advisories no longer accumulate on long-lived
+  pull requests. Rewrites are restricted to GuardianBot's own top-level
+  comments, the original advisory is retained rather than deleted so reviewer
+  conversation survives, and the fingerprint marker is anchored to the start of
+  the body so a reviewer quoting an advisory is never matched or overwritten.
+  The advisory body is bounded, shedding lifecycle detail before the complete
+  tally so a churn-heavy pull request cannot exceed the GitHub comment limit.
+- The repository index gained a durable pgvector read path and durable candidate
+  sourcing on the production review path. Nearest-neighbour ranking runs in the
+  database against a dimensioned `vector_ann` column (the vector table was
+  previously write-only). Rows whose own `dimensions` do not match the indexed
+  width are left unwritten so another embedding width degrades to an exact scan
+  instead of failing, and queries stay correct whether or not the approximate
+  index exists. Boot builds that index only while the table is effectively empty,
+  because `CREATE INDEX` holds `ACCESS EXCLUSIVE` and migrations run before the
+  port opens; above the inline ceiling the build is a documented
+  `CREATE INDEX CONCURRENTLY` operator step. Storage mode, approximate-index
+  readiness, and the uncovered-row count are exposed as gauges, and the
+  uncovered count is omitted rather than rendered as zero so an unmeasured
+  backlog is not scraped as an empty one. The control-plane review path now
+  supplies `RepositoryIndexService.repositoryVectorRanker` together with a
+  matching local embedding provider, queries durable storage, batch-hydrates
+  recalled records absent from the loaded document in one round trip, recomputes
+  relevance locally to avoid store score-polarity mismatch, and rechecks
+  repository scope on request and returned rows. Automated tests cover
+  durable-only retrieval, one-round-trip hydration, production wiring/isolation,
+  and pgvector/store behaviour, so the materialised-candidate barrier is closed
+  in source/test evidence. Graph edges still rely on the loaded index document;
+  history retrieval remains incomplete. All pgvector behaviour is automated/local
+  stub evidence only: no live PostgreSQL/pgvector verification, live ANN
+  performance, or production deployment of this path is claimed.
+- Repository index refresh is incremental. Vectors are reused by content digest
+  across a `compare` range, so unchanged files are neither refetched nor
+  re-embedded, and files are read by immutable git blob id. The plan falls back
+  to a full rebuild whenever the range is not a plain forward advance or the
+  changed-file list may be truncated at the API page cap, because an omitted
+  path is indistinguishable from an unchanged one and would otherwise carry a
+  stale embedding forward under the new head. Indexing caps are constructor
+  options rather than module constants, and the truncation ratio reaches the
+  monitoring snapshot so an under-indexed repository is visible instead of
+  silently partial. Superseded index generations are pruned by a bounded sweep
+  outside the migration path.
+- Retained findings per review are bounded by a configurable TTL and cap
+  (`GUARDIANBOT_REVIEW_FINDING_RETENTION_MS`,
+  `GUARDIANBOT_REVIEW_FINDING_LIMIT`, documented in operations) in which only
+  terminal states are evictable, so an active finding is never dropped to
+  satisfy the cap.
+
+### Fixed
+
+- Lifecycle state derives from every reported finding rather than the truncated
+  inline selection. A finding ranking below `maxInlineComments` was previously
+  transitioned to a terminal state while the model still reported it, which the
+  new presentation would have surfaced as a false "resolved" line and a closed
+  inline comment.
+- Migrations no longer block indefinitely on a peer's advisory lock. The
+  migration connection sets `lock_timeout`/`statement_timeout` and retries a
+  bounded number of times before failing with a named error, so a wedged peer
+  produces a loud boot failure instead of a process that never opens a port and
+  never reports readiness.
+- `migrate()` serializes its DDL behind a PostgreSQL session advisory lock on a
+  dedicated connection, matching the existing monitoring-lock pattern.
+  Concurrent instance boots now wait rather than racing on
+  `CREATE TABLE`/`CREATE INDEX IF NOT EXISTS`.
+- `/metrics` emits a valid webhook latency histogram. Bucket counts are already
+  accumulated when observed, so re-accumulating them at render time double
+  counted and produced output where `+Inf` was smaller than `le="60000"`.
+  Counts are now emitted verbatim and `+Inf` equals the observation total.
+- Graceful shutdown waits for an in-flight webhook to settle before closing the
+  store, and cancels the in-flight backend call through an abort signal so the
+  worker eagerly releases its lease instead of stranding the delivery for the
+  full lease duration. The drain budget now exceeds the backend timeout, and
+  idle connections are closed explicitly.
+- GitHub throttling is distinguished from failure. A `403`/`429` carrying
+  `retry-after` or an exhausted `x-ratelimit-remaining` raises a typed
+  rate-limit error carrying the reset instant; the delivery requeues at that
+  instant and does not consume its attempt budget, so a throttling burst no
+  longer dead-letters webhook jobs. The wait is clamped so a malformed or
+  hostile header cannot park a job, and a `403` with no budget signal remains a
+  permanent failure so authorization errors are not treated as throttling.
+  `/metrics` gains a `github_rate_limited_total` counter and a
+  `guardianbot_github_ratelimit_remaining` gauge that stays absent until GitHub
+  reports a budget.
+- The container health check probes `/readyz` instead of the static `/healthz`,
+  so a failed store dependency marks the container unhealthy. `/healthz`
+  remains the pure liveness probe.
+- A prompt that exceeds a route's `maxInputCharacters` raises a typed
+  non-retryable bridge error instead of a plain error reclassified as a
+  retryable backend outage, so a request that can never succeed is not retried
+  as though the provider were unavailable.
+- An oversized upstream bridge response cancels its stream reader before
+  raising, matching the protocol client, so the connection is not leaked.
+
+### Security
+
+- The `/webhooks/github` request body read is guarded, so a client that aborts
+  mid-body can no longer terminate the control plane. The read previously sat
+  outside the handler's `try`, and because the `createServer` callback is
+  `async` and no process-level handler was registered, the resulting
+  `ECONNRESET` escaped as an unhandled rejection and Node's default
+  `--unhandled-rejections=throw` exited the process. The read precedes
+  signature verification, so no valid HMAC was required to trigger it. The two
+  sibling routes already guarded their identical loops. Process-level
+  `unhandledRejection`/`uncaughtException` handlers now log a bounded error
+  kind and drain through the existing shutdown path as defence in depth.
+- Pull request scanner runs resolve onboarding state from the canonical
+  `.guardianbot/config.yml` path in the base commit instead of the
+  head-supplied `config-path` input. A pull request previously could repoint
+  that input at a path absent from base, present itself as the
+  first-onboarding case, and weaken its own gate. Onboarded repositories must
+  now pass the canonical path, and an unresolvable or unreachable base commit
+  fails closed rather than falling back to head configuration. Generated
+  callers already pass the canonical path, so onboarded repositories are
+  unaffected; genuine first onboarding still resolves head configuration in
+  non-enforcing mode.
+- Webhook responses no longer place internal error text in the response body.
+  Signature and delivery failures answer `401`/`400` with fixed strings via a
+  typed authentication error, replacing a substring match on the error text.
+  Enqueue failures answer a static `503` so GitHub treats them as
+  server-side and redelivers, instead of reporting a store outage as a client
+  error.
+
 ### Changed
 
 - GuardianBot self-managed config/caller is upgraded to the immutable v0.2.36
@@ -21,7 +156,21 @@ reusable workflow commits remain immutable.
   exact-digest generic promotions with ACTIVE DigitalOcean deployments and
   health checks. See
   [v0.2.36 live control-plane and fleet upgrade evidence](docs/evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md).
-  No production model credential or live AI-backed review, seven-day
+- On 2026-08-01, genuine scheduled authenticated-baseline smoke completed for
+  both current default-branch SHAs and exact DigitalOcean deployed digests:
+  AstraNull run
+  [`30684302779`](https://github.com/geekyshubham/AstraNull/actions/runs/30684302779)
+  and RouteLens run
+  [`30684781163`](https://github.com/geekyshubham/RouteLens/actions/runs/30684781163).
+  Each completed the staging-contract → one-time session assertion → bounded
+  ZAP → evidence attestation/artifact chain and skipped `authenticated-full` /
+  `dast-nightly`. No new DefectDojo import/reimport was independently verified
+  for those runs. Scheduled authenticated-full acceptance remains missing.
+- Durable repository-index candidate sourcing and production review-path wiring
+  are source/test evidence only (see Added). No live PostgreSQL/pgvector proof,
+  live ANN performance, production deployment of that path, or `v0.2.37`
+  release is claimed.
+- No production model credential or live AI-backed review, seven-day
   observation completion, reviewed baseline, ruleset readiness, scanner
   enforcement, scheduled authenticated-full DAST success, or new DefectDojo
   import/reimport is claimed. career-ops retained 31 Critical image findings

@@ -134,6 +134,80 @@ Restore only after taking a new pre-restore backup:
 Run a restore drill in an isolated DigitalOcean environment before declaring
 the system ready for business-critical retention requirements.
 
+### Schema migration on boot
+
+Migrations run inside store construction, before the process opens a port, and
+are serialised across booting instances by a PostgreSQL advisory lock. Every
+wait is finite so a stalled peer cannot hold a deployment open indefinitely:
+the migration session sets a 10 second `lock_timeout` and a 120 second
+`statement_timeout`, and acquires the lock with 30 attempts at one second
+intervals.
+
+An instance that cannot acquire the lock fails to boot with
+`MigrationLockUnavailableError`. That is the intended fail-loud path, not a
+defect: it means a peer instance held the migration lock for roughly thirty
+seconds. Restarting the container is the normal remedy, since the peer has
+usually finished by then. If a legitimate migration on a large `reviews` table
+needs longer than that budget, treat repeated failures as a signal to run the
+deployment with a single instance rather than to raise the bounds blindly.
+
+A boot that fails this way has applied no partial schema change beyond
+statements that already committed, and every statement is additive and
+re-runnable, so a retry resumes safely.
+
+### Approximate vector index
+
+Repository retrieval ranks in the database when pgvector is present. The
+nearest-neighbour read uses `repository_index_vectors.vector_ann`, a column
+declared at the indexed embedding width (96) and written only for rows whose own
+`dimensions` match it. A provider configured to another width keeps working
+through an exact scan rather than failing a write.
+
+Boot builds the index itself only while the table is effectively empty, because
+`CREATE INDEX` holds ACCESS EXCLUSIVE and migrations run before the port opens.
+At or above 2000 rows in `repository_index_vectors` the build is left to an
+operator, which is the normal path rather than the exception. The gate counts
+total rows rather than rows carrying a vector: `CREATE INDEX` scans the whole
+heap and locks the whole table either way, so a large table with few populated
+vectors is exactly the case that must not build inline.
+
+```sh
+psql "$DATABASE_URL" -c "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+  repository_index_vectors_ann_idx ON repository_index_vectors \
+  USING hnsw (vector_ann vector_cosine_ops);"
+```
+
+`CONCURRENTLY` cannot run inside a transaction block, so issue it as its own
+statement and not under `psql -1`, `BEGIN`, or a migration wrapper. A build that
+fails part way leaves an invalid index behind that no query will use; drop it
+before retrying rather than assuming the retry replaces it:
+
+```sh
+psql "$DATABASE_URL" -c "SELECT indisvalid FROM pg_index \
+  WHERE indexrelid = 'repository_index_vectors_ann_idx'::regclass;"
+psql "$DATABASE_URL" -c "DROP INDEX CONCURRENTLY IF EXISTS repository_index_vectors_ann_idx;"
+```
+
+Queries stay correct whether or not the index exists, so its absence shows up as
+cost rather than as an error. Three gauges on `/metrics` separate a healthy
+install from an under-indexed one:
+
+| Metric | Meaning |
+| --- | --- |
+| `guardianbot_repository_index_storage_mode{mode="…"}` | `pgvector`, `json-array-fallback`, or `memory` |
+| `guardianbot_repository_index_ann_ready` | `1` only when the dimensioned column and its index both exist |
+| `guardianbot_repository_index_uncovered_vector_rows` | rows carrying no durable vector after the boot backfill |
+
+`mode="pgvector"` with `ann_ready 0` is the state to alert on: every retrieval
+read is an exact scan over the snapshot. Build the index out of band as above.
+
+A non-zero uncovered count means rows written before the durable vector column
+existed are still scored in memory rather than in the database. Boot backfills a
+bounded number of them per start, and republishing a repository index rewrites
+its rows in full, so the count converges through repeated boots or through
+republication. Migration steps that degrade this way do not fail boot; they log
+`guardianbot.migration_step_degraded` with the step name and SQLSTATE.
+
 ## Monitoring
 
 Monitor at minimum:
@@ -171,6 +245,41 @@ Invalid values fail boot with a clear error, including dead-letter retention
 shorter than succeeded retention. Each cleanup batch is hard-capped (API and
 env) and multi-instance safe (`FOR UPDATE SKIP LOCKED` on PostgreSQL).
 Shutdown aborts the cleanup sleep so SIGTERM does not wait out the interval.
+
+### Review finding retention
+
+Each review record retains one entry per finding fingerprint so a resolved or
+superseded finding can still be presented and its inline comment closed. The
+retention window and the cap reach only terminal findings: an `open` finding is
+live advisory state and is retained even when that holds the record above the
+cap.
+
+| Environment variable | Default | Bounds |
+| --- | --- | --- |
+| `GUARDIANBOT_REVIEW_FINDING_RETENTION_MS` | 90 days | 24 hours … 365 days |
+| `GUARDIANBOT_REVIEW_FINDING_LIMIT` | 200 | 1 … 5000 |
+| `GUARDIANBOT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS` | 365 days | 24 hours … 5 years |
+
+Invalid or out-of-range values fail boot with a clear error naming the variable
+and its bounds. Set the limit at or above the effective maximum inline comments
+per review; below that, terminal findings are retained rather than dropped for
+no reduction, so provenance survives but the record stays above the cap.
+
+Two rules do reach an open finding, because "retained while it is still
+reported" is not a bound on its own:
+
+- `GUARDIANBOT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS` is an absolute ceiling
+  measured from when a finding was first seen, not last observed, so
+  re-observing it cannot extend it. A pull request can stay open indefinitely,
+  and without this its retained reviewer-engagement identifiers would be too.
+- Removing a repository, or uninstalling the App, discards the retained findings
+  of every affected repository immediately. Both bounds above are applied while
+  a review is being published, and nothing is ever published for a removed
+  repository again, so removal has to be its own trigger. A *suspension* is
+  reversible and does not discard.
+
+The lifetime evicted counter advances by whatever a discard actually dropped, so
+`findings_evicted_total` stays a truthful operator signal in both cases.
 
 ## First live AI review checklist
 

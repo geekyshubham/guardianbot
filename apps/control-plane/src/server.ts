@@ -18,13 +18,17 @@ import {
 } from "./monitoring-service.js";
 import { RepositoryIndexService } from "./repository-index-service.js";
 import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
-import { GuardianService } from "./service.js";
+import { GuardianService, WebhookAuthenticationError } from "./service.js";
 import {
   MemoryStore,
   PostgresStore,
   webhookRetentionOptionsFromEnvironment,
   type Store
 } from "./store.js";
+
+// Must exceed the 90s backend review timeout so an in-flight delivery can finish, or at
+// least record its lease release, before the drain window closes.
+const DRAIN_BUDGET_MS = 120_000;
 
 function required(name: string): string {
   const value = process.env[name];
@@ -120,12 +124,23 @@ async function start() {
   let cleanupPromise: Promise<void> | undefined;
   // Dedicated controller so shutdown can cancel the long cleanup sleep immediately.
   const cleanupAbort = new AbortController();
+  // Separate controller so shutdown can cancel in-flight backend review work. The signal is
+  // threaded into the owned handler (not raced against it), so the worker settles before the
+  // lease is released and no detached review continues mutating GitHub/store.
+  const webhookAbort = new AbortController();
 
   async function workerLoop(): Promise<void> {
     while (!shuttingDown) {
       lastWorkerPollAt = Date.now();
-      const processed = await service.processNextWebhook(workerId);
-      if (!processed) await delay(1000);
+      const processed = await service.processNextWebhook(workerId, webhookAbort.signal);
+      if (processed || shuttingDown) continue;
+      try {
+        await delay(1000, undefined, { signal: webhookAbort.signal });
+      } catch (error) {
+        // Normal on SIGTERM/SIGINT: cancel the idle poll so the worker settles promptly.
+        if (error instanceof Error && error.name === "AbortError") return;
+        throw error;
+      }
     }
   }
 
@@ -349,24 +364,46 @@ async function start() {
     }
     const chunks: Buffer[] = [];
     let received = 0;
-    for await (const chunk of request) {
-      const buffer = Buffer.from(chunk);
-      received += buffer.length;
-      if (received > 2 * 1024 * 1024) {
-        response.writeHead(413).end();
-        request.destroy();
-        return;
+    try {
+      for await (const chunk of request) {
+        const buffer = Buffer.from(chunk);
+        received += buffer.length;
+        if (received > 2 * 1024 * 1024) {
+          response.writeHead(413).end();
+          request.destroy();
+          return;
+        }
+        chunks.push(buffer);
       }
-      chunks.push(buffer);
+    } catch {
+      // A client abort or reset rejects the request iterator. The socket is already
+      // gone, so there is nothing to answer; returning keeps the rejection from
+      // escaping this async handler and terminating the process.
+      return;
     }
     const body = Buffer.concat(chunks).toString("utf8");
+    let payload: Record<string, any>;
     try {
       service.authenticate(
         body,
         request.headers["x-hub-signature-256"] as string | undefined,
         String(request.headers["x-github-delivery"] ?? "")
       );
-      const payload = JSON.parse(body);
+      payload = JSON.parse(body);
+    } catch (error) {
+      // Fixed strings only: this caller is unauthenticated, so it learns nothing
+      // beyond which of the two checks rejected it.
+      const status = error instanceof WebhookAuthenticationError ? error.statusCode : 400;
+      response
+        .writeHead(status, { "content-type": "application/json" })
+        .end(
+          JSON.stringify({
+            error: status === 401 ? "invalid webhook signature" : "invalid webhook request"
+          })
+        );
+      return;
+    }
+    try {
       await service.enqueue(
         String(request.headers["x-github-event"]),
         payload,
@@ -374,11 +411,16 @@ async function start() {
       );
       response.writeHead(202).end();
     } catch (error) {
-      response
-        .writeHead(String(error).includes("signature") ? 401 : 400, {
-          "content-type": "application/json"
+      // Our own fault, not the sender's: answer 5xx so GitHub redelivers.
+      console.error(
+        JSON.stringify({
+          event: "guardianbot.webhook_enqueue_failed",
+          error: boundedErrorKind(error)
         })
-        .end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      );
+      response
+        .writeHead(503, { "content-type": "application/json" })
+        .end(JSON.stringify({ error: "webhook queue unavailable" }));
     }
   });
 
@@ -389,17 +431,58 @@ async function start() {
     if (shuttingDown) return;
     shuttingDown = true;
     cleanupAbort.abort();
+    // Abort in-flight backend review work so the owned handler can settle and requeue the
+    // delivery without consuming its attempt budget.
+    webhookAbort.abort();
     server.close();
-    await Promise.race([
-      Promise.all([workerPromise, cleanupPromise, monitoring.stop()]),
-      delay(15_000)
-    ]);
-    await store.close();
+    server.closeIdleConnections();
+    let drained = false;
+    const settled = Promise.all([workerPromise, cleanupPromise, monitoring.stop()]).then(
+      () => {
+        drained = true;
+      },
+      () => {
+        drained = true;
+      }
+    );
+    // The budget timer is cancellable so a prompt drain does not hold the event loop
+    // open for the remainder of the window.
+    const drainAbort = new AbortController();
+    const budget = delay(DRAIN_BUDGET_MS, undefined, { signal: drainAbort.signal }).catch(
+      () => {}
+    );
+    await Promise.race([settled, budget]);
+    drainAbort.abort();
+    // The worker needs the store to record its lease release, so only close once it
+    // has actually settled; on a blown budget the exiting process reclaims it.
+    if (drained) await store.close();
     if (signal) process.exitCode = process.exitCode ?? 0;
   }
 
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  // Defence in depth for the async request handlers: Node's default is to terminate on
+  // an unhandled rejection, which would abandon every leased delivery mid-flight.
+  process.on("unhandledRejection", (reason) => {
+    console.error(
+      JSON.stringify({
+        event: "guardianbot.unhandled_rejection",
+        error: boundedErrorKind(reason)
+      })
+    );
+    process.exitCode = 1;
+    void shutdown("unhandledRejection");
+  });
+  process.on("uncaughtException", (error) => {
+    console.error(
+      JSON.stringify({
+        event: "guardianbot.uncaught_exception",
+        error: boundedErrorKind(error)
+      })
+    );
+    process.exitCode = 1;
+    void shutdown("uncaughtException");
+  });
 }
 
 /** Bound production logs to error kind/name only — never raw driver messages. */

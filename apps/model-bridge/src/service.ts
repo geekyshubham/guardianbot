@@ -12,6 +12,7 @@ import { createAdapter } from "./adapters/index.js";
 import { buildRuntimeCapabilities, loadConfig, resolveRoutes } from "./config.js";
 import { BridgeError, sanitizeError } from "./errors.js";
 import { readJsonBody, sendJson } from "./http.js";
+import { promptOverheadCharacters } from "./prompt.js";
 import type {
   AdapterContext,
   BridgeAdapter,
@@ -129,7 +130,10 @@ export class ModelBridgeService {
           routeRuntime.route.binding.allowedClassifications,
           reviewRequest.repository.visibility
         );
-        if (JSON.stringify(reviewRequest).length > routeRuntime.route.maxInputCharacters) {
+        const budgetedSize =
+          JSON.stringify(reviewRequest).length +
+          maxPromptOverheadCharacters(reviewRequest, routeRuntime.route);
+        if (budgetedSize > routeRuntime.route.maxInputCharacters) {
           throw new BridgeError(
             "payload_too_large",
             "request exceeded route maxInputCharacters",
@@ -245,6 +249,25 @@ export class ModelBridgeService {
       }
     }
   }
+}
+
+// The service gate compares the serialized request against maxInputCharacters, while the
+// adapters measure the built prompt. Budgeting the worst-case fixed prompt overhead here
+// keeps the two measurements ordered, so clearing this gate cannot be followed by an
+// over-limit prompt build. The prompt's untrusted payload carries a subset of the request
+// fields and omits required ones (protocolVersion, repository, promptVersion), so it is
+// always shorter than the serialized request even after the profile key is renamed.
+function maxPromptOverheadCharacters(
+  request: ReviewRequest,
+  route: ResolvedRoute
+): number {
+  const primary = promptOverheadCharacters(request, route);
+  const fallbackBinding = route.fallbackBinding;
+  if (!fallbackBinding) return primary;
+  return Math.max(
+    primary,
+    promptOverheadCharacters(request, { ...route, binding: fallbackBinding })
+  );
 }
 
 // Adapter/fixture validateReviewResult failures are backend faults, not 400s.

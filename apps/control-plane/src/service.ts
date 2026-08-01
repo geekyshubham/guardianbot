@@ -33,7 +33,9 @@ import type { RepositoryIndexService } from "./repository-index-service.js";
 import {
   extractFindingMarker,
   findingMarker,
+  isClosedFindingComment,
   onboardingIssue,
+  renderClosedInlineFinding,
   renderInlineFinding,
   renderPlaceholder,
   renderReview,
@@ -42,7 +44,19 @@ import {
   type FindingLifecycleSummary,
   type ReviewFileGroup
 } from "./render.js";
-import type { ReviewState, Store, WebhookQueueCounts } from "./store.js";
+import {
+  REVIEW_FINDINGS_SCHEMA_VERSION,
+  evictTerminalReviewFindings,
+  reviewFindingRetentionOptionsFromEnvironment,
+  type EvictReviewFindingsResult,
+  type ReviewFindingLifecycleState,
+  type ReviewFindingRecord,
+  type ReviewFindingRetentionOptions,
+  type ReviewState,
+  type Store,
+  type WebhookJob,
+  type WebhookQueueCounts
+} from "./store.js";
 
 export interface ServiceOptions {
   appId: string;
@@ -64,6 +78,7 @@ export interface ServiceOptions {
   now?: () => Date;
   metrics?: GuardianMetrics;
   repositoryIndexService?: RepositoryIndexService;
+  reviewFindingRetention?: ReviewFindingRetentionOptions;
 }
 
 export interface GuardianScannerWorkflowRun {
@@ -109,6 +124,10 @@ interface GitHubReviewComment {
   commit_id?: string;
   path?: string;
   line?: number | null;
+  /** Author login, required before any comment is rewritten so reviewer text is never touched. */
+  user?: { login?: string };
+  /** Set on replies, which are reviewer conversation even when they quote an advisory. */
+  in_reply_to_id?: number;
 }
 
 interface GitHubClientLike {
@@ -147,8 +166,9 @@ interface GitHubClientLike {
 }
 
 export interface ReviewBackend {
-  capabilities(): Promise<BackendCapabilities>;
-  review(request: ReviewRequest): Promise<ReviewResult>;
+  /** Optional signal lets shutdown cancel in-flight backend work without breaking injected fakes. */
+  capabilities(signal?: AbortSignal): Promise<BackendCapabilities>;
+  review(request: ReviewRequest, signal?: AbortSignal): Promise<ReviewResult>;
 }
 
 interface RoutedReviewBackend {
@@ -210,20 +230,58 @@ const REQUEST_ENVELOPE_RESERVE = 12_000;
 const MAX_BACKEND_TIMEOUT_MS = 600_000;
 const MIN_WEBHOOK_LEASE_MS = MAX_BACKEND_TIMEOUT_MS + 120_000;
 const DEFAULT_WEBHOOK_LEASE_MS = 15 * 60_000;
+// Bounds the credited-attempt ledger so a throttling storm cannot grow it without limit.
+// Once full, attempts count normally and jobs stay able to dead-letter.
+const MAX_UNCOUNTED_ATTEMPT_DELIVERIES = 10_000;
 const MAX_REVIEW_COMMENT_PAGES = 20;
 const DEFAULT_INLINE_LIMIT = 8;
+// Bounds the closing rewrites issued per review so a pull request carrying a large terminal
+// backlog cannot turn one review into an unbounded run of GitHub writes. Remaining comments are
+// closed by later reviews, which converge because rewritten comments are skipped. Held above the
+// default retention limit's per-review turnover so a terminal finding is closed on the pull
+// request before eviction can drop the record that identifies its comment.
+const MAX_CLOSED_INLINE_UPDATES = 100;
+// GitHub App identities always carry this login suffix, which is what separates GuardianBot's own
+// advisories from reviewer comments that merely quote one.
+const BOT_LOGIN_SUFFIX = "[bot]";
 const REPOSITORY_CONTEXT_LIMIT = 24;
 const ONBOARDING_ISSUE_TITLE = "GuardianBot onboarding inventory";
 const ONBOARDING_ISSUE_MARKER = "<!-- guardianbot-onboarding-inventory -->";
 const MAX_ONBOARDING_ISSUE_PAGES = 10;
+
+/**
+ * Typed authentication failure so the HTTP edge can pick a status code without
+ * substring-matching error text, and without echoing internal detail to callers.
+ */
+export class WebhookAuthenticationError extends Error {
+  constructor(
+    message: string,
+    readonly reason: "delivery" | "signature",
+    readonly statusCode: 400 | 401
+  ) {
+    super(message);
+    this.name = "WebhookAuthenticationError";
+  }
+}
+
+/** Raised when shutdown cancels an in-flight job so the lease is released at once. */
+export class WebhookAbortedError extends Error {
+  constructor() {
+    super("webhook processing aborted for shutdown");
+    this.name = "WebhookAbortedError";
+  }
+}
 
 export class GuardianService {
   readonly metrics: GuardianMetrics;
   private readonly maxWebhookAttempts: number;
   private readonly webhookLeaseMs: number;
   private readonly now: () => Date;
+  private readonly reviewFindingRetention: ReviewFindingRetentionOptions;
   private readonly backendRegistry?: ReviewBackendRegistry;
   private readonly onboardingIssuePromises = new Map<number, Promise<void>>();
+  // Claims that must not count against maxWebhookAttempts: throttling and shutdown.
+  private readonly uncountedAttempts = new Map<string, number>();
 
   constructor(private readonly options: ServiceOptions, private readonly store: Store) {
     this.metrics = options.metrics ?? new GuardianMetrics();
@@ -236,6 +294,8 @@ export class GuardianService {
     }
     this.webhookLeaseMs = webhookLeaseMs;
     this.now = options.now ?? (() => new Date());
+    this.reviewFindingRetention = options.reviewFindingRetention ??
+      reviewFindingRetentionOptionsFromEnvironment(options.backendEnvironment ?? process.env);
     this.backendRegistry = options.backendRegistry ??
       (options.backendRegistryConfig
         ? new ReviewBackendRegistry(
@@ -256,14 +316,14 @@ export class GuardianService {
   authenticate(body: string, signature: string | undefined, delivery: string): void {
     if (!delivery || delivery.length > 100) {
       this.metrics.increment("webhook_invalid_total");
-      throw new Error("invalid delivery identifier");
+      throw new WebhookAuthenticationError("invalid delivery identifier", "delivery", 400);
     }
     if (
       !signature ||
       !verifyWebhookSignature(Buffer.from(body), signature, this.options.webhookSecret)
     ) {
       this.metrics.increment("webhook_invalid_total");
-      throw new Error("invalid webhook signature");
+      throw new WebhookAuthenticationError("invalid webhook signature", "signature", 401);
     }
     this.metrics.increment("webhook_verified_total");
   }
@@ -290,7 +350,8 @@ export class GuardianService {
     }
   }
 
-  async processNextWebhook(workerId: string): Promise<boolean> {
+  async processNextWebhook(workerId: string, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return false;
     const job = await this.store.claimWebhook(workerId, this.webhookLeaseMs, this.now());
     if (!job) {
       await this.refreshQueueMetricsBestEffort();
@@ -300,32 +361,70 @@ export class GuardianService {
     this.metrics.setInFlight(1);
     const startedAt = this.now().getTime();
     try {
-      await this.handle(job.eventName, job.payload);
+      // Await the owned handler fully — never race it against abort. Racing left handle()
+      // detached after lease release, so a late backend/GitHub write could still mutate state.
+      await this.handle(job.eventName, job.payload, signal);
       await this.store.completeWebhook(job.deliveryId, workerId);
+      this.uncountedAttempts.delete(job.deliveryId);
       this.metrics.increment("webhook_succeeded_total");
       this.metrics.observeWebhookLatency(this.now().getTime() - startedAt);
     } catch (error) {
-      const attempt = job.attempts;
-      const permanentBackendFailure = error instanceof BackendError && !error.retryable;
-      const deadLetter = permanentBackendFailure || attempt >= this.maxWebhookAttempts;
-      const retryAt = deadLetter
-        ? undefined
-        : new Date(this.now().getTime() + computeBackoffMs(attempt));
-      await this.store.failWebhook(
-        job.deliveryId,
-        workerId,
-        error instanceof Error ? error.message : String(error),
-        retryAt,
-        deadLetter
-      );
-      this.metrics.increment(deadLetter ? "webhook_dead_letter_total" : "webhook_failed_total");
-      if (String(error).startsWith("GitHub ")) this.metrics.increment("github_failures_total");
-      if (error instanceof BackendError) this.metrics.increment("backend_failures_total");
+      await this.failClaimedWebhook(job, workerId, error);
     } finally {
       this.metrics.setInFlight(0);
       await this.refreshQueueMetricsBestEffort();
     }
     return true;
+  }
+
+  /**
+   * Records a failed delivery. Throttling and shutdown carry no information about the
+   * delivery itself, so neither consumes an attempt and neither can dead-letter a job.
+   */
+  private async failClaimedWebhook(
+    job: WebhookJob,
+    workerId: string,
+    error: unknown
+  ): Promise<void> {
+    const rateLimit = rateLimitDetails(error);
+    const aborted = error instanceof WebhookAbortedError;
+    if (rateLimit?.remaining !== undefined) {
+      this.metrics.setGitHubRateLimitRemaining(rateLimit.remaining);
+    }
+    if (rateLimit || aborted) {
+      // Attempts are incremented when the job is claimed, so credit this claim back.
+      const credited = (this.uncountedAttempts.get(job.deliveryId) ?? 0) + 1;
+      if (this.uncountedAttempts.size < MAX_UNCOUNTED_ATTEMPT_DELIVERIES) {
+        this.uncountedAttempts.set(job.deliveryId, credited);
+      }
+      await this.store.failWebhook(
+        job.deliveryId,
+        workerId,
+        aborted ? "webhook processing aborted for shutdown" : "GitHub rate limit exceeded",
+        rateLimit ? rateLimit.retryAt : this.now(),
+        false
+      );
+      this.metrics.increment("webhook_failed_total");
+      if (rateLimit) this.metrics.increment("github_rate_limited_total");
+      return;
+    }
+    const attempt = Math.max(1, job.attempts - (this.uncountedAttempts.get(job.deliveryId) ?? 0));
+    const permanentBackendFailure = error instanceof BackendError && !error.retryable;
+    const deadLetter = permanentBackendFailure || attempt >= this.maxWebhookAttempts;
+    const retryAt = deadLetter
+      ? undefined
+      : new Date(this.now().getTime() + computeBackoffMs(attempt));
+    await this.store.failWebhook(
+      job.deliveryId,
+      workerId,
+      error instanceof Error ? error.message : String(error),
+      retryAt,
+      deadLetter
+    );
+    if (deadLetter) this.uncountedAttempts.delete(job.deliveryId);
+    this.metrics.increment(deadLetter ? "webhook_dead_letter_total" : "webhook_failed_total");
+    if (String(error).startsWith("GitHub ")) this.metrics.increment("github_failures_total");
+    if (error instanceof BackendError) this.metrics.increment("backend_failures_total");
   }
 
   async ready(): Promise<boolean> {
@@ -359,7 +458,7 @@ export class GuardianService {
     return resolved ? { alias: resolved.alias, backend: resolved.client } : undefined;
   }
 
-  private async handle(name: string, event: GitHubEvent): Promise<void> {
+  private async handle(name: string, event: GitHubEvent, signal?: AbortSignal): Promise<void> {
     if (name === "installation") {
       if (event.action === "deleted") {
         await this.store.setInstallationState(event.installation.id, "removed");
@@ -408,7 +507,7 @@ export class GuardianService {
       name === "pull_request" &&
       ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)
     ) {
-      await this.reviewPullRequest(event);
+      await this.reviewPullRequest(event, {}, signal);
       return;
     }
 
@@ -417,8 +516,13 @@ export class GuardianService {
       return;
     }
 
+    if (name === "pull_request_review_comment" && event.action === "created") {
+      await this.captureReviewCommentFeedback(event);
+      return;
+    }
+
     if (name === "issue_comment" && event.action === "created") {
-      await this.command(event);
+      await this.command(event, signal);
     }
   }
 
@@ -648,8 +752,10 @@ export class GuardianService {
 
   private async reviewPullRequest(
     event: GitHubEvent,
-    execution: ReviewExecutionOptions = {}
+    execution: ReviewExecutionOptions = {},
+    signal?: AbortSignal
   ): Promise<void> {
+    throwIfAborted(signal);
     const pull = event.pull_request as GitHubPull;
 
     const repositoryRecord = await this.store.getRepository(event.repository.id);
@@ -679,6 +785,7 @@ export class GuardianService {
     }
     if (!execution.manual && repositoryContext.config?.review.automatic === false) return;
 
+    throwIfAborted(signal);
     const existing = await this.store.getReview(event.repository.id, pull.number);
     const placeholder = existing?.placeholderCommentId
       ? { id: existing.placeholderCommentId }
@@ -724,6 +831,7 @@ export class GuardianService {
       indexVisibility === "internal" ? "restricted" : indexVisibility;
     const routed = this.reviewClient(profile, classification);
     if (!routed) {
+      throwIfAborted(signal);
       await this.publishUnavailable(
         github,
         owner,
@@ -740,9 +848,13 @@ export class GuardianService {
 
     let capabilities: BackendCapabilities;
     try {
-      capabilities = await routed.backend.capabilities();
+      throwIfAborted(signal);
+      capabilities = await routed.backend.capabilities(signal);
+      throwIfAborted(signal);
       this.assertCapabilities(capabilities, profile, classification);
     } catch (error) {
+      // Shutdown must requeue without publishing "AI review unavailable".
+      if (isShutdownAbort(error, signal)) throw asWebhookAborted(error);
       const backendError = normalizeBackendFailure(error, "capability");
       await this.publishUnavailable(
         github,
@@ -929,13 +1041,17 @@ export class GuardianService {
 
     let result: ReviewResult;
     try {
-      result = await routed.backend.review(request);
+      throwIfAborted(signal);
+      result = await routed.backend.review(request, signal);
+      throwIfAborted(signal);
       validateReviewResult(result, request);
       result = {
         ...result,
         findings: canonicalizeFindingFingerprints(result.findings)
       };
     } catch (error) {
+      // Shutdown must requeue without publishing "AI review unavailable".
+      if (isShutdownAbort(error, signal)) throw asWebhookAborted(error);
       const backendError = normalizeBackendFailure(error, "review");
       await this.publishUnavailable(
         github,
@@ -951,8 +1067,10 @@ export class GuardianService {
       throw backendError;
     }
 
+    throwIfAborted(signal);
     const latestPull = await this.getCurrentPull(github, owner, repo, pull.number);
     if (!latestPull || latestPull.head.sha !== pull.head.sha) {
+      throwIfAborted(signal);
       await this.publishStale(
         github,
         owner,
@@ -967,12 +1085,28 @@ export class GuardianService {
       return;
     }
 
-    const evidenceBackedFindings = result.findings
-      .filter((finding) => finding.severity === "P0" ||
-        finding.severity === "P1" ||
-        finding.severity === "P2")
-      .slice(0, maxInlineComments);
-    const findingStates = mergeFindingStates(existing, pull.head.sha, evidenceBackedFindings);
+    // Cooperative cancellation after the head re-check succeeds: stop before lifecycle
+    // merge and store writes so shutdown does not persist findings for a cancelled job.
+    throwIfAborted(signal);
+
+    const selectedFindings = selectReviewFindings(result.findings, maxInlineComments);
+    const evidenceBackedFindings = selectedFindings.inline;
+    const now = this.now();
+    const lifecycle = mergeFindingStates(
+      existing,
+      pull.head.sha,
+      // Lifecycle state is derived from every reported finding, not the inline selection, so a
+      // finding ranking below the inline cap is never mistaken for one that stopped being
+      // reported and announced as resolved while the model still reports it.
+      selectedFindings.lifecycle,
+      now,
+      this.reviewFindingRetention
+    );
+    const findingStates = lifecycle.findings;
+    const reappeared = countReappearances(existing?.findings, findingStates);
+    if (reappeared) {
+      this.metrics.increment("finding_reappeared_total", reappeared);
+    }
     const saved = await this.store.saveReview(
       {
         repositoryId: event.repository.id,
@@ -980,7 +1114,12 @@ export class GuardianService {
         headSha: pull.head.sha,
         reviewedHeadSha: pull.head.sha,
         placeholderCommentId: placeholder.id,
-        findings: findingStates
+        findings: findingStates,
+        findingsSchemaVersion: REVIEW_FINDINGS_SCHEMA_VERSION,
+        findingsEvictedTotal: lifecycle.evicted,
+        findingsLastEvictedAt: lifecycle.evicted
+          ? now.toISOString()
+          : existing?.findingsLastEvictedAt
       },
       pull.head.sha
     );
@@ -997,6 +1136,14 @@ export class GuardianService {
     );
     const publishedMarkers = new Set(
       publishedComments
+        // Only GuardianBot's own top-level advisories count as published: a reviewer quoting an
+        // advisory carries its marker in the quote, and reading that as a published advisory
+        // would silently withhold the real one.
+        .filter((comment) => this.isOwnInlineAdvisory(comment))
+        // A comment already rewritten to closed form must not suppress a reappearing finding:
+        // that advisory reads as resolved, so a finding returning at the same fingerprint needs
+        // a fresh comment rather than silent omission.
+        .filter((comment) => !isClosedFindingComment(comment.body))
         .map((comment) => extractFindingMarker(comment.body))
         .filter((marker): marker is string => Boolean(marker))
     );
@@ -1005,6 +1152,7 @@ export class GuardianService {
     );
     const stillCurrent = await this.getCurrentPull(github, owner, repo, pull.number);
     if (!stillCurrent || stillCurrent.head.sha !== pull.head.sha) {
+      throwIfAborted(signal);
       await this.publishStale(
         github,
         owner,
@@ -1018,6 +1166,7 @@ export class GuardianService {
       );
       return;
     }
+    throwIfAborted(signal);
     if (newFindings.length) {
       await github.request(
         "POST",
@@ -1038,6 +1187,17 @@ export class GuardianService {
         }
       );
     }
+    // After inline publication, stop before closing rewrites and the final summary
+    // update so shutdown does not keep mutating GitHub state past a safe boundary.
+    throwIfAborted(signal);
+    const inlineClosed = await this.closeTerminalInlineComments(
+      github,
+      owner,
+      repo,
+      publishedComments,
+      findingStates,
+      pull.head.sha
+    );
 
     const reviewedChangedLines = includedDiffFiles.reduce(
       (sum, file) => sum + countChangedLines(file),
@@ -1062,6 +1222,7 @@ export class GuardianService {
       findings: evidenceBackedFindings
     };
     const changeGroups = groupChangedFiles(fileScope.files);
+    throwIfAborted(signal);
     await github.updateComment(
       owner,
       repo,
@@ -1076,8 +1237,10 @@ export class GuardianService {
         linkedIssues,
         codeOwners,
         lifecycle: lifecycleSummary(findingStates),
+        lifecycleFindings: findingStates,
         inlinePosted: newFindings.length,
         inlineAlreadyPresent: evidenceBackedFindings.length - newFindings.length,
+        inlineClosed,
         backendAlias: routed.alias,
         contextIndexSha: bundle.manifestSha256,
         reviewScope: fileScope.summary,
@@ -1098,7 +1261,7 @@ export class GuardianService {
     );
   }
 
-  private async command(event: GitHubEvent): Promise<void> {
+  private async command(event: GitHubEvent, signal?: AbortSignal): Promise<void> {
     if (!event.issue.pull_request) return;
     const text = String(event.comment.body).trim();
     const parsed = /^@guardianbot(?:\s+([a-z-]+))?(?:\s+([\s\S]*))?$/i.exec(text);
@@ -1160,7 +1323,7 @@ export class GuardianService {
         owner,
         repo,
         event.issue.number,
-        `GuardianBot advisory state: **${state}**. App lifecycle: **${repository?.repositoryState ?? "unknown"}**. Last reviewed head: \`${review?.reviewedHeadSha?.slice(0, 12) ?? "none"}\`. Findings: ${lifecycle.open} open, ${lifecycle.resolved} resolved, ${lifecycle.superseded} superseded. Routine route: ${this.hasReviewRoute("routine-review") ? "configured" : "unavailable"}; high-risk route: ${this.hasReviewRoute("high-risk-review") ? "configured" : "unavailable"}. Scanner state: ${repository?.scannerState ?? "unknown"}. Use \`guardianctl doctor ${event.repository.full_name}\` for deterministic workflow diagnostics.`
+        `GuardianBot advisory state: **${state}**. App lifecycle: **${repository?.repositoryState ?? "unknown"}**. Last reviewed head: \`${review?.reviewedHeadSha?.slice(0, 12) ?? "none"}\`. Findings: ${lifecycle.open} open (${lifecycle.reappeared} returned after closing), ${lifecycle.resolved} resolved, ${lifecycle.superseded} superseded. Routine route: ${this.hasReviewRoute("routine-review") ? "configured" : "unavailable"}; high-risk route: ${this.hasReviewRoute("high-risk-review") ? "configured" : "unavailable"}. Scanner state: ${repository?.scannerState ?? "unknown"}. Use \`guardianctl doctor ${event.repository.full_name}\` for deterministic workflow diagnostics.`
       );
       return;
     }
@@ -1206,7 +1369,8 @@ export class GuardianService {
           action: "guardianbot-command",
           pull_request: pull
         },
-        { manual: true, full: command === "full-review" }
+        { manual: true, full: command === "full-review" },
+        signal
       );
       return;
     }
@@ -1407,6 +1571,12 @@ export class GuardianService {
           warning: "repository index context was rejected by repository isolation checks"
         };
       }
+      // Durable retrieval needs both halves to be reachable: a ranker bound to this
+      // repository, and a provider that can put the review query into the stored
+      // index's own embedding space. Retrieval ignores a ranker it has no query
+      // vector for, so supplying only one of the two would leave the durable path
+      // dormant — which is precisely how it went unnoticed before.
+      const embeddingProvider = repositoryIndexService.retrievalEmbeddingProvider(index);
       const result = await retrieveRepositoryContext({
         index,
         repositoryScope: `github:${input.repositoryId}`,
@@ -1419,7 +1589,15 @@ export class GuardianService {
           visibility: input.visibility,
           allowedRelatedRepositories: []
         },
-        related: []
+        related: [],
+        embeddingProvider,
+        // Only with a provider, so the pair is always supplied together or not at
+        // all. Records the loaded document omits become retrievable; nothing the
+        // document does contain is reordered, because every candidate is scored by
+        // the same local cosine either way.
+        vectorRanker: embeddingProvider
+          ? repositoryIndexService.repositoryVectorRanker(input.repositoryId)
+          : undefined
       });
       const adapted = retrievalToReviewContextCandidates(result);
       const candidates = adapted.map((candidate, contextIndex) => {
@@ -1472,7 +1650,14 @@ export class GuardianService {
     scannerConfigured: boolean,
     reason: "no-route" | "capability" | "transport" | "invalid-output"
   ): Promise<void> {
-    const findings = preserveFindingStates(existing, pull.head.sha);
+    const now = this.now();
+    const lifecycle = preserveFindingStates(
+      existing,
+      pull.head.sha,
+      now,
+      this.reviewFindingRetention
+    );
+    const findings = lifecycle.findings;
     const saved = await this.store.saveReview(
       {
         repositoryId,
@@ -1480,7 +1665,12 @@ export class GuardianService {
         headSha: pull.head.sha,
         reviewedHeadSha: existing?.reviewedHeadSha,
         placeholderCommentId,
-        findings
+        findings,
+        findingsSchemaVersion: REVIEW_FINDINGS_SCHEMA_VERSION,
+        findingsEvictedTotal: lifecycle.evicted,
+        findingsLastEvictedAt: lifecycle.evicted
+          ? now.toISOString()
+          : existing?.findingsLastEvictedAt
       },
       pull.head.sha
     );
@@ -1513,10 +1703,19 @@ export class GuardianService {
     scannerConfigured: boolean
   ): Promise<void> {
     this.metrics.increment("review_stale_total");
-    const findings = (existing?.findings ?? []).map((finding) => ({
-      fingerprint: finding.fingerprint,
-      state: finding.state === "open" ? ("superseded" as const) : finding.state
-    }));
+    const now = this.now();
+    // Output for this head never published, so every still-open finding is superseded rather
+    // than resolved regardless of where the reviewed head sits.
+    const lifecycle = evictTerminalReviewFindings(
+      (existing?.findings ?? []).map((finding) =>
+        finding.state === "open"
+          ? transitionFindingState(finding, "superseded", pull.head.sha, now)
+          : finding
+      ),
+      this.reviewFindingRetention,
+      now
+    );
+    const findings = lifecycle.findings;
     const saved = await this.store.saveReview(
       {
         repositoryId,
@@ -1524,7 +1723,12 @@ export class GuardianService {
         headSha: pull.head.sha,
         reviewedHeadSha: existing?.reviewedHeadSha,
         placeholderCommentId,
-        findings
+        findings,
+        findingsSchemaVersion: REVIEW_FINDINGS_SCHEMA_VERSION,
+        findingsEvictedTotal: lifecycle.evicted,
+        findingsLastEvictedAt: lifecycle.evicted
+          ? now.toISOString()
+          : existing?.findingsLastEvictedAt
       },
       pull.head.sha
     );
@@ -1673,6 +1877,158 @@ export class GuardianService {
     return comments;
   }
 
+  /**
+   * True only for a top-level inline comment GuardianBot itself published. A reviewer using
+   * GitHub's "Quote reply" on an advisory copies the quoted body verbatim, HTML comments included,
+   * so the fingerprint marker alone does not establish authorship: rewriting such a comment would
+   * bury a reviewer's own words in a closed-finding block. Replies are excluded outright because
+   * they are reviewer conversation, and the author must be an App identity.
+   */
+  private isOwnInlineAdvisory(comment: GitHubReviewComment): boolean {
+    if (comment.in_reply_to_id !== undefined && comment.in_reply_to_id !== null) return false;
+    return Boolean(comment.user?.login?.endsWith(BOT_LOGIN_SUFFIX));
+  }
+
+  /**
+   * Rewrites published inline comments whose findings reached a terminal state, so stale
+   * advisories stop accumulating on long-lived pull requests. Comments are located by the
+   * existing fingerprint marker and updated in place rather than deleted, which preserves any
+   * reviewer conversation hanging off them. Only GuardianBot's own top-level advisories are
+   * eligible, so a reviewer quoting an advisory keeps their comment intact and does not consume
+   * the rewrite budget. Already-rewritten comments are skipped, so repeated reviews of the same
+   * pull request converge instead of rewriting every time.
+   *
+   * Per-comment failures are absorbed: a reviewer may delete a comment between listing and
+   * patching, and that must not fail a review whose advisory summary is otherwise publishable.
+   */
+  private async closeTerminalInlineComments(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    comments: readonly GitHubReviewComment[],
+    findings: readonly ReviewFindingRecord[],
+    headSha: string
+  ): Promise<number> {
+    const terminal = new Map(
+      findings
+        .filter((finding) => finding.state !== "open")
+        .map((finding) => [markerDigest(finding.fingerprint), finding.state])
+    );
+    if (!terminal.size) return 0;
+    let closed = 0;
+    for (const comment of comments) {
+      if (closed >= MAX_CLOSED_INLINE_UPDATES) break;
+      if (!this.isOwnInlineAdvisory(comment)) continue;
+      if (isClosedFindingComment(comment.body)) continue;
+      const marker = extractFindingMarker(comment.body);
+      const state = marker ? terminal.get(marker) : undefined;
+      if (!state || state === "open") continue;
+      try {
+        // Inline review comments live under /pulls/comments, not the /issues/comments path the
+        // shared updateComment helper targets.
+        await github.request(
+          "PATCH",
+          `/repos/${owner}/${repo}/pulls/comments/${comment.id}`,
+          { body: renderClosedInlineFinding(comment.body, state, headSha) }
+        );
+        closed += 1;
+      } catch (error) {
+        if (String(error).startsWith("GitHub ")) {
+          this.metrics.increment("github_failures_total");
+        }
+      }
+    }
+    return closed;
+  }
+
+  /**
+   * Fetches one inline review comment. A reviewer may delete the advisory between the reply
+   * landing and this lookup, which is an ordinary race rather than a failure, so a missing comment
+   * reads as absent instead of raising.
+   */
+  private async getReviewComment(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    commentId: number
+  ): Promise<GitHubReviewComment | undefined> {
+    try {
+      return await github.request<GitHubReviewComment>(
+        "GET",
+        `/repos/${owner}/${repo}/pulls/comments/${commentId}`
+      );
+    } catch (error) {
+      if (String(error).includes("returned 404")) return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * Records that a human engaged with a published advisory, keyed by the advisory's own finding
+   * fingerprint. Only the derived signal is retained — that an engagement happened, and when — so
+   * no reviewer identity and no comment text reaches the store.
+   *
+   * The author gate is deliberately the inverse of the closing path's. Closure rewrites only
+   * GuardianBot's own comments, because rewriting a reviewer's words would destroy them. Feedback
+   * is the opposite: the interesting event is a *human* responding to a GuardianBot advisory, so a
+   * bot-authored comment is skipped here and GuardianBot replying to itself never counts as
+   * engagement. Both gates are needed at once, on different comments: the new comment must be
+   * human-authored, and its parent must be GuardianBot's own top-level advisory.
+   *
+   * The fingerprint marker is read from that parent, never from the reply. `extractFindingMarker`
+   * is anchored to the start of a body, and a reply — including one produced by "Quote reply" —
+   * does not carry the marker there, so reading the reply would capture nothing at all.
+   *
+   * Every unexpected shape returns rather than throwing: this event is not subscribed on the live
+   * installation, so the first real payloads will arrive only after an operator applies the
+   * manifest change, and an unfamiliar field must not turn into a failed delivery.
+   */
+  private async captureReviewCommentFeedback(event: GitHubEvent): Promise<void> {
+    const comment = event.comment;
+    if (!comment || typeof comment !== "object") return;
+    const commentId = positiveIdentifier(comment.id);
+    // Absent on a top-level comment, which is not a response to anything and is ignored before
+    // any store read or GitHub call.
+    const parentId = positiveIdentifier(comment.in_reply_to_id);
+    const pullNumber = positiveIdentifier(event.pull_request?.number);
+    const login = typeof comment.user?.login === "string" ? comment.user.login : "";
+    if (!commentId || !parentId || !pullNumber || !login) return;
+    if (login.endsWith(BOT_LOGIN_SUFFIX)) return;
+    const repositoryId = positiveIdentifier(event.repository?.id);
+    const fullName =
+      typeof event.repository?.full_name === "string" ? event.repository.full_name : "";
+    const [owner, repo] = fullName.split("/");
+    // The installation identifier is what the client is minted from, so it is checked here rather
+    // than left to fail inside the client factory on a payload missing it.
+    if (!repositoryId || !owner || !repo || !positiveIdentifier(event.installation?.id)) return;
+    const repository = await this.store.getRepository(repositoryId);
+    if (repository && repository.repositoryState !== "active") return;
+    const review = await this.store.getReview(repositoryId, pullNumber);
+    if (!review?.findings.length) return;
+    // Markers carry the digest of a fingerprint, so the retained findings of this repository's own
+    // review are what resolve one back to a fingerprint. A marker from an unrelated advisory has
+    // no entry here and is dropped.
+    const fingerprintsByDigest = new Map(
+      review.findings.map((finding) => [markerDigest(finding.fingerprint), finding.fingerprint])
+    );
+    const github = await this.client(event, [repositoryId]);
+    const parent = await this.getReviewComment(github, owner, repo, parentId);
+    if (!parent || typeof parent.body !== "string") return;
+    if (!this.isOwnInlineAdvisory(parent)) return;
+    const marker = extractFindingMarker(parent.body);
+    const fingerprint = marker ? fingerprintsByDigest.get(marker) : undefined;
+    if (!fingerprint) return;
+    const recorded = await this.store.recordFindingFeedback({
+      repositoryId,
+      pullNumber,
+      fingerprint,
+      commentId,
+      observedAt: this.now()
+    });
+    // Counted only on a state change, so a redelivered comment cannot inflate the signal.
+    if (recorded) this.metrics.increment("finding_feedback_total");
+  }
+
   private async getActorPermission(
     github: GitHubClientLike,
     owner: string,
@@ -1754,6 +2110,50 @@ function unavailableReason(
 
 function computeBackoffMs(attempt: number): number {
   return Math.min(30_000 * 2 ** Math.max(0, attempt - 1), 30 * 60_000);
+}
+
+/**
+ * Rate limits are matched by name and shape rather than class identity because the
+ * error crosses a workspace package boundary, where a duplicate module instance would
+ * defeat instanceof. Mirrors the existing AbortError/TimeoutError checks.
+ */
+function rateLimitDetails(
+  error: unknown
+): { retryAt: Date; remaining: number | undefined } | undefined {
+  if (!(error instanceof Error) || error.name !== "GitHubRateLimitError") return undefined;
+  const { retryAt, remaining } = error as { retryAt?: unknown; remaining?: unknown };
+  if (!(retryAt instanceof Date) || !Number.isFinite(retryAt.getTime())) return undefined;
+  return {
+    retryAt,
+    remaining: typeof remaining === "number" && Number.isFinite(remaining) ? remaining : undefined
+  };
+}
+
+/** Cooperative cancellation checkpoint — never used to detach work from its lease owner. */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new WebhookAbortedError();
+}
+
+function isShutdownAbort(error: unknown, signal?: AbortSignal): boolean {
+  if (error instanceof WebhookAbortedError) return true;
+  // Once the external shutdown signal is aborted, treat any error as cancellation so
+  // a wrapped/translated failure cannot become "AI review unavailable" output.
+  return Boolean(signal?.aborted);
+}
+
+function asWebhookAborted(error: unknown): WebhookAbortedError {
+  return error instanceof WebhookAbortedError ? error : new WebhookAbortedError();
+}
+
+/**
+ * Reads a positive integer identifier out of an untrusted payload field. Webhook payloads are
+ * attacker-influenced and, for an event this instance may never have received before, of unproven
+ * shape, so anything that is not a usable identifier reads as absent rather than as zero or NaN.
+ */
+function positiveIdentifier(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
 }
 
 function repositoryVisibility(repository: any): RepositoryVisibility {
@@ -1903,17 +2303,89 @@ export function redactUntrustedText(value: string): string {
     );
 }
 
+/**
+ * Records a lifecycle transition. Provenance is only touched when the state actually changes, so
+ * a re-render of an unchanged record neither inflates the transition count nor resets the
+ * observation timestamps that eviction ages findings against.
+ */
+function transitionFindingState(
+  finding: ReviewFindingRecord,
+  state: ReviewFindingLifecycleState,
+  headSha: string,
+  now: Date
+): ReviewFindingRecord {
+  if (finding.state === state) return finding;
+  return {
+    ...finding,
+    state,
+    lastSeenHeadSha: headSha,
+    lastSeenAt: now.toISOString(),
+    transitions: (finding.transitions ?? 0) + 1
+  };
+}
+
+/**
+ * Merges a freshly reported finding into its retained provenance. Identity is refreshed from the
+ * current report so presentation reflects where the finding now sits, while first-seen provenance
+ * is preserved. A finding arriving `open` after a terminal state is a genuine reappearance and is
+ * counted as such, which is what makes a regression after a resolved finding detectable.
+ */
+function observeFindingState(
+  retained: ReviewFindingRecord | undefined,
+  finding: ReviewFinding,
+  headSha: string,
+  now: Date
+): ReviewFindingRecord {
+  const nowIso = now.toISOString();
+  const identity = {
+    path: finding.path,
+    startLine: finding.startLine,
+    endLine: finding.endLine,
+    category: finding.category,
+    severity: finding.severity,
+    title: finding.title
+  };
+  if (!retained) {
+    return {
+      fingerprint: finding.fingerprint,
+      state: "open",
+      firstSeenHeadSha: headSha,
+      lastSeenHeadSha: headSha,
+      firstSeenAt: nowIso,
+      lastSeenAt: nowIso,
+      transitions: 0,
+      reappearances: 0,
+      ...identity
+    };
+  }
+  const reappeared = retained.state !== "open";
+  return {
+    ...retained,
+    ...identity,
+    fingerprint: finding.fingerprint,
+    state: "open",
+    // Pre-migration rows carry no first-seen provenance; this head is the earliest known sighting.
+    firstSeenHeadSha: retained.firstSeenHeadSha ?? headSha,
+    firstSeenAt: retained.firstSeenAt ?? nowIso,
+    lastSeenHeadSha: headSha,
+    lastSeenAt: nowIso,
+    transitions: (retained.transitions ?? 0) + (reappeared ? 1 : 0),
+    reappearances: (retained.reappearances ?? 0) + (reappeared ? 1 : 0)
+  };
+}
+
 function preserveFindingStates(
   existing: ReviewState | undefined,
-  headSha: string
-): ReviewState["findings"] {
-  return (existing?.findings ?? []).map((finding) => ({
-    fingerprint: finding.fingerprint,
-    state:
-      existing?.reviewedHeadSha !== headSha && finding.state === "open"
-        ? ("superseded" as const)
-        : finding.state
-  }));
+  headSha: string,
+  now: Date,
+  retention: ReviewFindingRetentionOptions
+): EvictReviewFindingsResult {
+  const preserved = (existing?.findings ?? []).map((finding) =>
+    existing?.reviewedHeadSha !== headSha && finding.state === "open"
+      ? transitionFindingState(finding, "superseded", headSha, now)
+      : finding
+  );
+  return evictTerminalReviewFindings(preserved, retention, now);
 }
 
 function canonicalizeFindingFingerprints(
@@ -1945,36 +2417,92 @@ function canonicalizeFindingFingerprints(
 function mergeFindingStates(
   existing: ReviewState | undefined,
   headSha: string,
-  findings: ReviewFinding[]
-): ReviewState["findings"] {
+  findings: ReviewFinding[],
+  now: Date,
+  retention: ReviewFindingRetentionOptions
+): EvictReviewFindingsResult {
   const current = new Set(findings.map((finding) => finding.fingerprint));
+  const retained = new Map(
+    (existing?.findings ?? []).map((finding) => [finding.fingerprint, finding])
+  );
   const previous = (existing?.findings ?? [])
     .filter((finding) => !current.has(finding.fingerprint))
-    .map((finding) => ({
-      fingerprint: finding.fingerprint,
-      state:
-        finding.state !== "open"
-          ? finding.state
-          : existing?.reviewedHeadSha === headSha
-            ? ("resolved" as const)
-            : ("superseded" as const)
-    }));
-  return [
+    .map((finding) =>
+      finding.state !== "open"
+        ? finding
+        : transitionFindingState(
+            finding,
+            // A finding that vanished while the reviewed head stayed put is genuinely resolved;
+            // one that vanished across a head move is merely superseded.
+            existing?.reviewedHeadSha === headSha ? "resolved" : "superseded",
+            headSha,
+            now
+          )
+    );
+  const merged = [
     ...previous,
-    ...findings.map((finding) => ({
-      fingerprint: finding.fingerprint,
-      state: "open" as const
-    }))
+    ...findings.map((finding) =>
+      observeFindingState(retained.get(finding.fingerprint), finding, headSha, now)
+    )
   ];
+  return evictTerminalReviewFindings(merged, retention, now);
+}
+
+/**
+ * Splits the reported findings into the set that drives lifecycle state and the smaller set that
+ * is published inline. Both start from the same P0–P2 filter, and only the inline set is capped:
+ * lifecycle state must see everything the model reported, because a finding absent from it is
+ * treated as no longer reported and closed, which would tell a reviewer that a finding from this
+ * very run was resolved and would rewrite its still-valid inline comment.
+ */
+export function selectReviewFindings(
+  findings: readonly ReviewFinding[],
+  maxInlineComments: number
+): { lifecycle: ReviewFinding[]; inline: ReviewFinding[] } {
+  const lifecycle = findings.filter(
+    (finding) =>
+      finding.severity === "P0" || finding.severity === "P1" || finding.severity === "P2"
+  );
+  return { lifecycle, inline: lifecycle.slice(0, maxInlineComments) };
+}
+
+/**
+ * Counts findings that returned to `open` from a terminal state in this review. Reappearance is
+ * the regression signal the retained provenance exists to expose, so it is measured at the moment
+ * it happens rather than inferred later from a cumulative counter.
+ */
+function countReappearances(
+  previous: readonly ReviewFindingRecord[] | undefined,
+  merged: readonly ReviewFindingRecord[]
+): number {
+  const before = new Map(
+    (previous ?? []).map((finding) => [finding.fingerprint, finding.reappearances ?? 0])
+  );
+  return merged.filter(
+    (finding) =>
+      finding.state === "open" &&
+      (finding.reappearances ?? 0) > (before.get(finding.fingerprint) ?? 0)
+  ).length;
 }
 
 function lifecycleSummary(
-  findings: ReviewState["findings"]
+  findings: readonly ReviewFindingRecord[]
 ): FindingLifecycleSummary {
+  const open = findings.filter((finding) => finding.state === "open");
   return {
-    open: findings.filter((finding) => finding.state === "open").length,
+    open: open.length,
+    // Counted among the open findings, not alongside them: a returned finding is live advisory
+    // state, and it is surfaced here so the regression is visible while it still matters rather
+    // than only once the finding closes a second time.
+    reappeared: open.filter((finding) => (finding.reappearances ?? 0) > 0).length,
     resolved: findings.filter((finding) => finding.state === "resolved").length,
-    superseded: findings.filter((finding) => finding.state === "superseded").length
+    superseded: findings.filter((finding) => finding.state === "superseded").length,
+    // Retained findings carrying engagement, counted across all states: a reviewer replying to an
+    // advisory that later resolved is exactly the signal worth keeping. Left undefined when
+    // nothing is recorded, so an installation not subscribed to the review-comment event renders
+    // no engagement segment rather than a zero that would read as measured-and-none.
+    engaged:
+      findings.filter((finding) => (finding.feedbackCount ?? 0) > 0).length || undefined
   };
 }
 

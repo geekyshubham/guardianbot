@@ -1,8 +1,31 @@
 import { createHash } from "node:crypto";
 import type { ReviewFinding, ReviewResult } from "@guardianbot/protocol";
+import type { ReviewFindingLifecycleState, ReviewFindingRecord } from "./store.js";
 
 export const REVIEW_MARKER = "<!-- guardianbot-review -->";
 const FINDING_MARKER_PREFIX = "guardianbot-finding:";
+/**
+ * Marks an inline comment already rewritten to closed form. Terminal findings are rewritten
+ * rather than deleted so reviewer replies survive, and this marker keeps the rewrite idempotent
+ * across repeated reviews of the same pull request.
+ */
+const CLOSED_FINDING_MARKER = "<!-- guardianbot-finding-closed -->";
+const MAX_PRESENTED_LIFECYCLE_FINDINGS = 20;
+/**
+ * Ceiling for the whole advisory body, held below GitHub's 65536-character comment limit. A body
+ * over the limit is rejected outright, which would lose the entire advisory, so the lowest-value
+ * sections are dropped first and the comment degrades instead of failing.
+ */
+const MAX_REVIEW_BODY_CHARACTERS = 60_000;
+const LIFECYCLE_DETAIL_OMITTED =
+  "_Per-finding lifecycle detail omitted to keep this comment inside GitHub's size limit. The counts on the finding lifecycle line above remain the complete tally._";
+const CHANGED_FILE_DETAIL_OMITTED =
+  "_Changed-file grouping omitted to keep this comment inside GitHub's size limit._";
+const LIFECYCLE_LABELS: Record<ReviewFindingLifecycleState, string> = {
+  open: "Returned after closing",
+  resolved: "Resolved",
+  superseded: "Superseded"
+};
 
 export interface ReviewFileGroup {
   title: string;
@@ -12,8 +35,16 @@ export interface ReviewFileGroup {
 
 export interface FindingLifecycleSummary {
   open: number;
+  /** Open findings that returned after reaching a terminal state; the live regression signal. */
+  reappeared: number;
   resolved: number;
   superseded: number;
+  /**
+   * Retained findings a human has engaged with, as a count only. Optional because a summary
+   * assembled by an older instance carries no engagement figure, and absent is not the same claim
+   * as zero, so the segment is omitted rather than rendered as none.
+   */
+  engaged?: number;
 }
 
 export interface ReviewRenderContext {
@@ -26,8 +57,11 @@ export interface ReviewRenderContext {
   linkedIssues: string[];
   codeOwners: string[];
   lifecycle: FindingLifecycleSummary;
+  /** Retained lifecycle records, used for per-finding closed-finding presentation. */
+  lifecycleFindings: readonly ReviewFindingRecord[];
   inlinePosted: number;
   inlineAlreadyPresent: number;
+  inlineClosed: number;
   backendAlias: string;
   contextIndexSha: string;
   reviewScope: string;
@@ -46,8 +80,8 @@ function safeText(value: unknown, maximum = 2_000): string {
   return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
 }
 
-function inlineCode(value: unknown): string {
-  return `\`${safeText(value, 500).replace(/`/g, "ˋ")}\``;
+function inlineCode(value: unknown, maximum = 500): string {
+  return `\`${safeText(value, maximum).replace(/`/g, "ˋ")}\``;
 }
 
 function renderList(values: string[], empty: string): string {
@@ -59,8 +93,130 @@ export function findingMarker(fingerprint: string): string {
   return `<!-- ${FINDING_MARKER_PREFIX}${digest} -->`;
 }
 
+/**
+ * Renders one lifecycle finding as a human-meaningful line from retained provenance alone, so a
+ * reviewer sees what closed or returned, and where, without the model being re-run. Identity
+ * fields are optional on rows written before the provenance migration, so each degrades
+ * independently.
+ */
+function lifecycleFindingLine(finding: ReviewFindingRecord): string {
+  const state = LIFECYCLE_LABELS[finding.state];
+  const severity = finding.severity ? `${safeText(finding.severity, 8)} ` : "";
+  // Title and path are held to a tighter budget here than in the inline advisory: this section
+  // presents up to MAX_PRESENTED_LIFECYCLE_FINDINGS lines at once, so per-line width is what
+  // decides whether the whole comment stays inside GitHub's limit.
+  const title = finding.title
+    ? safeText(finding.title, 200)
+    : "Retained finding without provenance detail";
+  const location = finding.path
+    ? ` — ${inlineCode(
+        finding.startLine ? `${finding.path}:${finding.startLine}` : finding.path,
+        200
+      )}`
+    : "";
+  const firstSeen = finding.firstSeenHeadSha
+    ? ` · first seen ${inlineCode(finding.firstSeenHeadSha.slice(0, 12))}`
+    : "";
+  const lastSeen = finding.lastSeenHeadSha
+    ? ` · last seen ${inlineCode(finding.lastSeenHeadSha.slice(0, 12))}`
+    : "";
+  const reappearances = finding.reappearances
+    ? ` · returned ${finding.reappearances}× after closing`
+    : "";
+  return `- **${state}:** ${severity}${title}${location}${firstSeen}${lastSeen}${reappearances} · ${inlineCode(
+    finding.fingerprint.slice(0, 12)
+  )}`;
+}
+
+/** Complete lifecycle tally, rendered identically wherever an advisory reports it. */
+export function lifecycleLine(lifecycle: FindingLifecycleSummary): string {
+  // Appended last and only when an engagement was actually recorded, so an installation without
+  // the review-comment event subscribed renders exactly the line it renders today rather than a
+  // zero that would read as "no reviewer has engaged" when the truth is that nothing is measured.
+  const engaged = lifecycle.engaged
+    ? ` · ${lifecycle.engaged} with reviewer feedback`
+    : "";
+  return (
+    `${lifecycle.open} open · ` +
+    `${lifecycle.reappeared} returned · ` +
+    `${lifecycle.resolved} resolved · ` +
+    `${lifecycle.superseded} superseded${engaged}`
+  );
+}
+
+/**
+ * Per-finding lifecycle presentation. Terminal findings are listed so a reviewer sees what closed
+ * and where, and open findings that returned after closing are listed too: a reappearance is the
+ * regression signal this provenance exists to expose, and waiting for a second closure to surface
+ * it would report it only after it stopped mattering. Bounded so a long-lived pull request with
+ * heavy fingerprint churn cannot grow the advisory comment past what GitHub will accept; the
+ * counts in the lifecycle line remain the complete tally.
+ */
+export function renderLifecycleFindings(
+  findings: readonly ReviewFindingRecord[]
+): string {
+  const presented = findings.filter(
+    (finding) => finding.state !== "open" || (finding.reappearances ?? 0) > 0
+  );
+  if (!presented.length) {
+    return "No finding has been resolved, superseded, or returned on this pull request.";
+  }
+  // "open" sorts ahead of both terminal states, so returned findings lead the section.
+  const ordered = [...presented].sort(
+    (left, right) =>
+      left.state.localeCompare(right.state) ||
+      (left.path ?? "").localeCompare(right.path ?? "") ||
+      (left.startLine ?? 0) - (right.startLine ?? 0) ||
+      left.fingerprint.localeCompare(right.fingerprint)
+  );
+  const shown = ordered.slice(0, MAX_PRESENTED_LIFECYCLE_FINDINGS);
+  const remainder = ordered.length - shown.length;
+  const overflow = remainder > 0
+    ? `\n- _${remainder} further lifecycle finding${remainder === 1 ? "" : "s"} retained but not listed._`
+    : "";
+  return `${shown.map(lifecycleFindingLine).join("\n")}${overflow}`;
+}
+
+/**
+ * Rewrites a published inline comment to a clearly-closed form. The original advisory body is
+ * retained verbatim below the notice and the comment is never deleted, so reviewer replies and
+ * conversation history survive. `resolved` means the finding disappeared while the reviewed head
+ * stayed put; `superseded` means the head moved underneath it.
+ */
+export function renderClosedInlineFinding(
+  body: string,
+  state: "resolved" | "superseded",
+  headSha: string
+): string {
+  const notice = state === "resolved"
+    ? `No longer reported as of ${inlineCode(headSha.slice(0, 12))}. The changed range this advisory referenced is clean.`
+    : `Superseded at ${inlineCode(headSha.slice(0, 12))}. The pull request advanced past the range this advisory referenced.`;
+  return `${CLOSED_FINDING_MARKER}
+**✅ ${state === "resolved" ? "Resolved" : "Superseded"}** — ${notice}
+
+This comment is retained rather than deleted so the discussion below it stays readable. Deterministic scanner results are unaffected.
+
+<details><summary>Original advisory</summary>
+
+${body}
+
+</details>`;
+}
+
+/** True when a comment body has already been rewritten to closed form. */
+export function isClosedFindingComment(body: string): boolean {
+  return body.includes(CLOSED_FINDING_MARKER);
+}
+
+/**
+ * Reads the fingerprint marker out of a comment body GuardianBot itself published. The match is
+ * anchored to the start of the body: GitHub's "Quote reply" copies the quoted body verbatim,
+ * including HTML comments, so a reviewer quoting an advisory produces a comment containing
+ * `> <!-- guardianbot-finding:… -->`. An unanchored match would read that quote as the advisory
+ * itself and let the closing rewrite overwrite the reviewer's own words.
+ */
 export function extractFindingMarker(body: string): string | undefined {
-  return new RegExp(`<!--\\s*${FINDING_MARKER_PREFIX}([a-f0-9]{64})\\s*-->`).exec(body)?.[1];
+  return new RegExp(`^<!--\\s*${FINDING_MARKER_PREFIX}([a-f0-9]{64})\\s*-->`).exec(body)?.[1];
 }
 
 export function exactSuggestion(finding: ReviewFinding): string | undefined {
@@ -131,12 +287,11 @@ export function renderReview(result: ReviewResult, context: ReviewRenderContext)
   const reasons = context.riskReasons.length
     ? ` (${context.riskReasons.map((reason) => safeText(reason, 300)).join("; ")})`
     : "";
-  const lifecycle =
-    `${context.lifecycle.open} open · ` +
-    `${context.lifecycle.resolved} resolved · ` +
-    `${context.lifecycle.superseded} superseded`;
-
-  return `${REVIEW_MARKER}
+  const lifecycle = lifecycleLine(context.lifecycle);
+  const compose = (sections: {
+    changedFiles: string;
+    lifecycleFindings: string;
+  }): string => `${REVIEW_MARKER}
 ## GuardianBot review
 
 ${safeText(result.summary.intent, 2_000)}
@@ -147,18 +302,22 @@ ${safeText(result.summary.intent, 2_000)}
 **Review scope:** ${safeText(context.reviewScope, 500)}
 **Impacted components:** ${context.impactedComponents.length ? context.impactedComponents.map(inlineCode).join(", ") : "No component claim available"}
 **Finding lifecycle:** ${lifecycle}
-**Inline comments:** ${context.inlinePosted} posted · ${context.inlineAlreadyPresent} already present
+**Inline comments:** ${context.inlinePosted} posted · ${context.inlineAlreadyPresent} already present · ${context.inlineClosed} marked closed
 **AI route:** ${inlineCode(context.backendAlias)} · advisory only
 **Context manifest:** ${inlineCode(context.contextIndexSha.slice(0, 16))}
 **Deterministic scans:** ${context.scannerConfigured ? "reported by the security gate" : "not configured"}
 
 ### Changed files
 
-${groups.join("\n") || "No changed-file grouping available."}
+${sections.changedFiles}
 
 ### Findings
 
 ${findings.join("\n") || "No evidence-backed P0–P2 findings."}
+
+### Resolved, superseded, and returned findings
+
+${sections.lifecycleFindings}
 
 ### Linked issues
 
@@ -177,6 +336,29 @@ ${requirements.join("\n") || "No requirement evidence reported."}
 ${renderList(result.testGaps, "No evidence-backed test gap reported.")}${partial}
 
 Malformed, stale, or unavailable model output is discarded and never changes the deterministic gate. GuardianBot never merges code or waives scanner findings.`;
+
+  const changedFiles = groups.join("\n") || "No changed-file grouping available.";
+  const body = compose({
+    changedFiles,
+    lifecycleFindings: renderLifecycleFindings(context.lifecycleFindings)
+  });
+  if (body.length <= MAX_REVIEW_BODY_CHARACTERS) return body;
+  // Over budget the per-finding lifecycle detail goes first: it is the only section whose loss
+  // costs nothing verifiable, because the finding lifecycle line above it carries the full tally.
+  const withoutLifecycleDetail = compose({
+    changedFiles,
+    lifecycleFindings: LIFECYCLE_DETAIL_OMITTED
+  });
+  if (withoutLifecycleDetail.length <= MAX_REVIEW_BODY_CHARACTERS) return withoutLifecycleDetail;
+  const reduced = compose({
+    changedFiles: CHANGED_FILE_DETAIL_OMITTED,
+    lifecycleFindings: LIFECYCLE_DETAIL_OMITTED
+  });
+  // A body GitHub rejects loses the advisory outright, so the last resort truncates rather than
+  // returning something unpublishable.
+  return reduced.length <= MAX_REVIEW_BODY_CHARACTERS
+    ? reduced
+    : `${reduced.slice(0, MAX_REVIEW_BODY_CHARACTERS - 1)}…`;
 }
 
 export function renderUnavailable(
@@ -196,7 +378,7 @@ export function renderUnavailable(
 
 AI review unavailable for ${inlineCode(headSha.slice(0, 12))}: ${reasons[reason]}.
 
-**Finding lifecycle:** ${lifecycle.open} open · ${lifecycle.resolved} resolved · ${lifecycle.superseded} superseded
+**Finding lifecycle:** ${lifecycleLine(lifecycle)}
 **AI backend:** advisory only
 **Deterministic scans:** ${scannerConfigured ? "reported by the security gate" : "not configured"}
 
@@ -214,7 +396,7 @@ export function renderStaleReview(
 
 Review output for ${inlineCode(reviewedHeadSha.slice(0, 12))} became stale before publication because the pull request advanced to ${inlineCode(currentHeadSha.slice(0, 12))}. No inline comments were posted.
 
-**Finding lifecycle:** ${lifecycle.open} open · ${lifecycle.resolved} resolved · ${lifecycle.superseded} superseded
+**Finding lifecycle:** ${lifecycleLine(lifecycle)}
 **AI backend:** advisory only
 **Deterministic scans:** ${scannerConfigured ? "reported by the security gate" : "not configured"}
 

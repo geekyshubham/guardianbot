@@ -57,22 +57,29 @@ export class GuardianReviewClient {
     }
   }
 
-  async capabilities(): Promise<BackendCapabilities> {
-    const response = await this.fetch("/v1/capabilities", { method: "GET" });
+  async capabilities(signal?: AbortSignal): Promise<BackendCapabilities> {
+    const response = await this.fetch("/v1/capabilities", { method: "GET" }, signal);
     return validateBackendCapabilities(
       await readJsonResponseLimited(response, 128 * 1024)
     );
   }
 
-  async review(request: ReviewRequest): Promise<ReviewResult> {
+  async review(request: ReviewRequest, signal?: AbortSignal): Promise<ReviewResult> {
     let response: Response;
     try {
-      response = await this.fetch("/v1/reviews", {
-        method: "POST",
-        body: JSON.stringify(request)
-      });
+      response = await this.fetch(
+        "/v1/reviews",
+        {
+          method: "POST",
+          body: JSON.stringify(request)
+        },
+        signal
+      );
     } catch (error) {
       if (error instanceof BackendError) throw error;
+      // Preserve external cancellation so the control plane can requeue without
+      // publishing "AI review unavailable".
+      if (error instanceof Error && error.name === "AbortError") throw error;
       throw new BackendError("unavailable", String(error), true);
     }
 
@@ -81,6 +88,11 @@ export class GuardianReviewClient {
       body = await readJsonResponseLimited(response, 2 * 1024 * 1024);
     } catch (error) {
       if (error instanceof BackendError) throw error;
+      // Preserve external cancellation during body read so shutdown requeues without
+      // treating a cancelled stream as invalid_output.
+      if (signal?.aborted && error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
       throw new BackendError("invalid_output", "Backend returned invalid JSON", true);
     }
 
@@ -94,16 +106,29 @@ export class GuardianReviewClient {
     }
   }
 
-  private async fetch(path: string, init: RequestInit): Promise<Response> {
+  private async fetch(
+    path: string,
+    init: RequestInit,
+    externalSignal?: AbortSignal
+  ): Promise<Response> {
+    const timeoutSignal = AbortSignal.timeout(this.backend.timeoutMs);
+    const signal = externalSignal
+      ? AbortSignal.any([timeoutSignal, externalSignal])
+      : timeoutSignal;
     let response: Response;
     try {
       response = await fetch(new URL(path, this.backend.baseUrl), {
         ...init,
         headers: { ...this.headers(), ...(init.headers ?? {}) },
-        signal: AbortSignal.timeout(this.backend.timeoutMs)
+        signal
       });
     } catch (error) {
+      // Prefer external abort classification when shutdown cancelled the request.
+      if (externalSignal?.aborted) throw error;
       if (error instanceof DOMException && error.name === "TimeoutError") {
+        throw new BackendError("timeout", "Backend request timed out", true);
+      }
+      if (timeoutSignal.aborted) {
         throw new BackendError("timeout", "Backend request timed out", true);
       }
       throw error;

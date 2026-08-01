@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ReviewRequest } from "@guardianbot/protocol";
+import { BackendError, type ReviewRequest } from "@guardianbot/protocol";
 import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { ReviewBackendRegistry } from "../src/backend-registry.js";
 import { GuardianMetrics } from "../src/metrics.js";
-import { GuardianService, addedLineRanges, redactUntrustedText } from "../src/service.js";
+import { findingMarker, renderReview } from "../src/render.js";
+import {
+  GuardianService,
+  WebhookAuthenticationError,
+  addedLineRanges,
+  redactUntrustedText,
+  selectReviewFindings
+} from "../src/service.js";
 import { MemoryStore } from "../src/store.js";
 
 class FakeGitHub {
@@ -12,7 +19,20 @@ class FakeGitHub {
   comments: Array<{ owner: string; repo: string; issueNumber: number; body: string }> = [];
   updates: Array<{ owner: string; repo: string; commentId: number; body: string }> = [];
   reviews: Array<Record<string, any>> = [];
-  reviewComments: Array<{ id: number; body: string; commit_id: string; path: string; line: number }> = [];
+  reviewComments: Array<{
+    id: number;
+    body: string;
+    commit_id: string;
+    path: string;
+    line: number;
+    user: { login: string };
+    in_reply_to_id?: number;
+  }> = [];
+  reviewCommentUpdates: Array<{ id: number; body: string }> = [];
+  reviewCommentReads: string[] = [];
+  // GitHub attributes App-authored review comments to the App's bot identity, which is what
+  // separates GuardianBot's own advisories from reviewer comments that quote one.
+  botLogin = "guardianbot[bot]";
   currentPulls: Array<Record<string, any>> = [];
   pullFiles: Array<Array<Record<string, any>>> = [];
   comparisons: Array<Record<string, any>> = [];
@@ -158,6 +178,25 @@ class FakeGitHub {
     if (method === "GET" && path.includes("/collaborators/")) {
       return { permission: this.permission } as T;
     }
+    if (method === "GET" && /\/pulls\/comments\/\d+$/.test(path)) {
+      this.reviewCommentReads.push(path);
+      const commentId = Number(path.split("/").at(-1));
+      const existing = this.reviewComments.find((comment) => comment.id === commentId);
+      if (!existing) {
+        throw new Error(`GitHub GET ${path} returned 404: missing`);
+      }
+      return existing as T;
+    }
+    if (method === "PATCH" && /\/pulls\/comments\/\d+$/.test(path)) {
+      const commentId = Number(path.split("/").at(-1));
+      const existing = this.reviewComments.find((comment) => comment.id === commentId);
+      if (!existing) {
+        throw new Error(`GitHub PATCH ${path} returned 404: missing`);
+      }
+      existing.body = String(body.body);
+      this.reviewCommentUpdates.push({ id: commentId, body: existing.body });
+      return { id: commentId } as T;
+    }
     if (method === "POST" && /\/pulls\/\d+\/reviews$/.test(path)) {
       this.reviews.push(body);
       for (const comment of body.comments ?? []) {
@@ -166,7 +205,8 @@ class FakeGitHub {
           body: comment.body,
           commit_id: body.commit_id,
           path: comment.path,
-          line: comment.line
+          line: comment.line,
+          user: { login: this.botLogin }
         });
       }
       return { id: this.reviews.length } as T;
@@ -1669,5 +1709,1343 @@ test("administrative backend registry routes profiles without implicit fallback"
         routes: { "routine-review": "routine" }
       }),
     /must not contain credentials/
+  );
+});
+
+test("rate limited deliveries retry at the reset instant without spending the attempt budget", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const metrics = new GuardianMetrics();
+  let nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  const resetAt = new Date(nowMs + 300_000);
+  let throttle = true;
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      metrics,
+      maxWebhookAttempts: 2,
+      githubClientFactory: async () => ({
+        ...github,
+        getTree: async () => {
+          if (!throttle) throw new Error("GitHub GET /tree returned 500");
+          // Shaped like the core GitHubRateLimitError, which crosses a package boundary.
+          const error = new Error("GitHub GET /tree was rate limited");
+          error.name = "GitHubRateLimitError";
+          Object.assign(error, { retryAt: resetAt, remaining: 0 });
+          throw error;
+        }
+      }),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+  const event = {
+    action: "created",
+    installation: { id: 1 },
+    repositories: [
+      { id: 99, full_name: "Geekyshubham/guardianbot", default_branch: "main", private: false }
+    ]
+  };
+  await service.enqueue("installation", event, "throttled-1");
+
+  // Three throttled claims exceed a budget of two, yet none may dead-letter.
+  for (let round = 0; round < 3; round += 1) {
+    assert.equal(await service.processNextWebhook("worker-1"), true);
+    const job = await store.getWebhook("throttled-1");
+    assert.equal(job?.status, "pending");
+    assert.equal(job?.attempts, round + 1);
+    assert.equal(new Date(job?.availableAt ?? 0).getTime(), resetAt.getTime());
+    nowMs = resetAt.getTime();
+  }
+  const rendered = metrics.render();
+  assert.match(rendered, /guardianbot_github_rate_limited_total 3/);
+  assert.match(rendered, /guardianbot_github_ratelimit_remaining 0/);
+  assert.match(rendered, /guardianbot_webhook_dead_letter_total 0/);
+
+  // The budget survived the throttling, so genuine failures still dead-letter.
+  throttle = false;
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("throttled-1"))?.status, "pending");
+  nowMs += 600_000;
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("throttled-1"))?.status, "dead-letter");
+});
+
+test("shutdown abort settles the owned review handler and requeues without publishing", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  let observedSignal: AbortSignal | undefined;
+  let reviewEntered = false;
+  let reviewSettled = false;
+  let reviewStillRunningAfterProcess = false;
+
+  const blockingBackend = {
+    async capabilities() {
+      return {
+        protocolVersion: "guardian.review.v1" as const,
+        backendId: "blocking",
+        structuredOutput: true,
+        maxInputCharacters: 200_000,
+        supportedProfiles: ["routine-review", "high-risk-review"],
+        supportedDataClassifications: ["public", "private"],
+        retention: "none" as const,
+        usageReporting: true
+      };
+    },
+    async review(_request: ReviewRequest, signal?: AbortSignal) {
+      observedSignal = signal;
+      reviewEntered = true;
+      try {
+        await new Promise<void>((_resolve, reject) => {
+          if (!signal) {
+            reject(new Error("expected shutdown AbortSignal"));
+            return;
+          }
+          if (signal.aborted) {
+            reject(new DOMException("The operation was aborted", "AbortError"));
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("The operation was aborted", "AbortError")),
+            { once: true }
+          );
+        });
+      } finally {
+        reviewSettled = true;
+      }
+      return createResult(_request);
+    }
+  };
+
+  github.pullFiles = [
+    [{ filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }]
+  ];
+  github.currentPulls = [{ head: { sha: "head-sha" } }];
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => blockingBackend,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "aborted-review-1");
+
+  const processing = service.processNextWebhook("worker-1", controller.signal);
+  // Wait until the owned handler is blocked inside the backend call.
+  while (!reviewEntered) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  controller.abort();
+  assert.equal(await processing, true);
+  // processNextWebhook must not return while the handler is still running.
+  reviewStillRunningAfterProcess = !reviewSettled;
+  assert.equal(reviewStillRunningAfterProcess, false);
+  assert.equal(reviewSettled, true);
+  assert.ok(observedSignal);
+  assert.equal(observedSignal.aborted, true);
+
+  const job = await store.getWebhook("aborted-review-1");
+  assert.equal(job?.status, "pending");
+  assert.equal(job?.leaseOwner, undefined);
+  assert.equal(new Date(job?.availableAt ?? 0).getTime() <= nowMs, true);
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+  // Abort is no-attempt: maxWebhookAttempts of 1 must not dead-letter on shutdown alone.
+  assert.notEqual(job?.status, "dead-letter");
+
+  // Placeholder may exist; unavailable/final review output must not.
+  for (const update of github.updates) {
+    assert.doesNotMatch(update.body, /AI review unavailable/);
+    assert.doesNotMatch(update.body, /\*\*Finding lifecycle:\*\*/);
+    assert.doesNotMatch(update.body, /\*\*Problem\*\*/);
+  }
+  assert.equal(github.reviews.length, 0);
+
+  // An already-aborted signal claims nothing at all.
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), false);
+});
+
+test("shutdown wins over wrapped backend errors and requeues without unavailable", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  let reviewEntered = false;
+
+  const wrappingBackend = {
+    async capabilities() {
+      return {
+        protocolVersion: "guardian.review.v1" as const,
+        backendId: "wrapping",
+        structuredOutput: true,
+        maxInputCharacters: 200_000,
+        supportedProfiles: ["routine-review", "high-risk-review"],
+        supportedDataClassifications: ["public", "private"],
+        retention: "none" as const,
+        usageReporting: true
+      };
+    },
+    async review(_request: ReviewRequest, signal?: AbortSignal) {
+      reviewEntered = true;
+      await new Promise<void>((_resolve, reject) => {
+        if (!signal) {
+          reject(new Error("expected shutdown AbortSignal"));
+          return;
+        }
+        const failWrapped = () =>
+          // Simulate a protocol client that translated AbortError into BackendError
+          // after the external shutdown signal already aborted.
+          reject(new BackendError("unavailable", "translated abort", true));
+        if (signal.aborted) {
+          failWrapped();
+          return;
+        }
+        signal.addEventListener("abort", failWrapped, { once: true });
+      });
+      return createResult(_request);
+    }
+  };
+
+  github.pullFiles = [
+    [{ filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }]
+  ];
+  github.currentPulls = [{ head: { sha: "head-sha" } }];
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => wrappingBackend,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "aborted-wrapped-1");
+  const processing = service.processNextWebhook("worker-1", controller.signal);
+  while (!reviewEntered) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  controller.abort();
+  assert.equal(await processing, true);
+
+  const job = await store.getWebhook("aborted-wrapped-1");
+  assert.equal(job?.status, "pending");
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+  for (const update of github.updates) {
+    assert.doesNotMatch(update.body, /AI review unavailable/);
+  }
+});
+
+test("shutdown after latestPull succeeds stops before lifecycle save and final publish", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 6, 27, 0, 0, 0);
+  let pullGets = 0;
+
+  const originalRequest = github.request.bind(github);
+  github.request = async <T>(method: string, path: string, body?: any): Promise<T> => {
+    if (method === "GET" && /\/pulls\/\d+$/.test(path)) {
+      pullGets += 1;
+      const result = await originalRequest(method, path, body);
+      // First GET is the opening freshness check; second is latestPull after backend review.
+      // Abort after latestPull data is ready so the post-latestPull checkpoint fires next.
+      if (pullGets === 2) {
+        controller.abort();
+      }
+      return result as T;
+    }
+    return originalRequest(method, path, body);
+  };
+
+  github.pullFiles = [
+    [{ filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }]
+  ];
+  github.currentPulls = [
+    { head: { sha: "head-sha" } },
+    { head: { sha: "head-sha" } }
+  ];
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => new FakeBackend((request) => createResult(request)),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "aborted-after-latest-1");
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+
+  const job = await store.getWebhook("aborted-after-latest-1");
+  assert.equal(job?.status, "pending");
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // Placeholder may exist; lifecycle findings and final/unavailable publish must not.
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings.length ?? 0, 0);
+  assert.equal(github.reviews.length, 0);
+  for (const update of github.updates) {
+    assert.doesNotMatch(update.body, /AI review unavailable/);
+    assert.doesNotMatch(update.body, /\*\*Finding lifecycle:\*\*/);
+    assert.doesNotMatch(update.body, /\*\*Problem\*\*/);
+  }
+});
+
+test("webhook authentication failures carry a typed reason and status", () => {
+  const service = new GuardianService(
+    { appId: "1", privateKey: "private", webhookSecret: "secret" },
+    new MemoryStore()
+  );
+
+  assert.throws(
+    () => service.authenticate("{}", undefined, "delivery-1"),
+    (error: unknown) =>
+      error instanceof WebhookAuthenticationError &&
+      error.reason === "signature" &&
+      error.statusCode === 401
+  );
+  assert.throws(
+    () => service.authenticate("{}", "sha256=deadbeef", ""),
+    (error: unknown) =>
+      error instanceof WebhookAuthenticationError &&
+      error.reason === "delivery" &&
+      error.statusCode === 400
+  );
+});
+
+test("resolved findings retain provenance and reappearance is detectable", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file], [file]];
+  // The head never moves, so a finding that stops being reported is genuinely resolved rather
+  // than superseded, and one that returns afterwards is a true reappearance.
+  let reportFinding = true;
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return reportFinding ? result : { ...result, findings: [] };
+  });
+  const clock = [
+    new Date("2026-07-01T00:00:00.000Z"),
+    new Date("2026-07-02T00:00:00.000Z"),
+    new Date("2026-07-03T00:00:00.000Z")
+  ];
+  let tick = 0;
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      now: () => clock[Math.min(tick, clock.length - 1)]!
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+
+  const opened = await store.getReview(99, 12);
+  assert.equal(opened?.findings.length, 1);
+  const first = opened!.findings[0]!;
+  assert.equal(first.state, "open");
+  // Identity is retained so a later terminal state renders without re-running the model.
+  assert.equal(first.path, "src/a.ts");
+  assert.equal(first.startLine, 10);
+  assert.equal(first.title, "Problem");
+  assert.equal(first.severity, "P1");
+  assert.equal(first.firstSeenHeadSha, "head-sha");
+  assert.equal(first.firstSeenAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(first.reappearances, 0);
+
+  tick = 1;
+  reportFinding = false;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-resolve");
+  await service.processNextWebhook("worker-1");
+
+  const resolved = await store.getReview(99, 12);
+  const closed = resolved!.findings[0]!;
+  assert.equal(closed.state, "resolved");
+  assert.equal(closed.transitions, 1);
+  // First-seen provenance survives the transition; last-seen advances to the closing head.
+  assert.equal(closed.firstSeenAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(closed.lastSeenAt, "2026-07-02T00:00:00.000Z");
+  assert.equal(closed.path, "src/a.ts");
+
+  tick = 2;
+  reportFinding = true;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-reappear");
+  await service.processNextWebhook("worker-1");
+
+  const reappeared = await store.getReview(99, 12);
+  assert.equal(reappeared?.findings.length, 1);
+  const again = reappeared!.findings[0]!;
+  assert.equal(again.state, "open");
+  // The regression is what makes a finding returning after being resolved detectable at all.
+  assert.equal(again.reappearances, 1);
+  assert.equal(again.transitions, 2);
+  assert.equal(again.firstSeenAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(again.lastSeenAt, "2026-07-03T00:00:00.000Z");
+  // A reappearing finding is advised again rather than silently suppressed by comment dedupe.
+  assert.equal(github.reviews.length, 2);
+});
+
+test("resolved findings are presented per finding, not only counted", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file]];
+  let reportFinding = true;
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return reportFinding ? result : { ...result, findings: [] };
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+  reportFinding = false;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-resolve");
+  await service.processNextWebhook("worker-1");
+
+  const body = github.updates.at(-1)?.body ?? "";
+  assert.match(body, /### Resolved, superseded, and returned findings/);
+  // The reviewer sees what closed and where, not just a count.
+  assert.match(body, /\*\*Resolved:\*\* P1 Problem/);
+  assert.match(body, /src\/a\.ts:10/);
+  assert.match(body, /first seen/);
+  assert.match(body, /0 open · 0 returned · 1 resolved · 0 superseded/);
+});
+
+test("inline comments for terminal findings are rewritten in place, never deleted", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file], [file]];
+  let reportFinding = true;
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return reportFinding ? result : { ...result, findings: [] };
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 1);
+  const originalBody = github.reviewComments[0]!.body;
+
+  reportFinding = false;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-resolve");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(github.reviewCommentUpdates.length, 1);
+  const rewritten = github.reviewComments[0]!.body;
+  assert.match(rewritten, /guardianbot-finding-closed/);
+  assert.match(rewritten, /Resolved/);
+  assert.match(rewritten, /head-sha/);
+  // The comment survives so reviewer conversation hanging off it is not lost.
+  assert.equal(github.reviewComments.length, 1);
+  assert.ok(rewritten.includes(originalBody));
+  assert.match(github.updates.at(-1)?.body ?? "", /1 marked closed/);
+
+  // A further review must not rewrite an already-closed comment again.
+  await service.enqueue("pull_request", createPullEvent(), "delivery-repeat");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewCommentUpdates.length, 1);
+  assert.match(github.updates.at(-1)?.body ?? "", /0 marked closed/);
+});
+
+test("finding eviction under a tight cap keeps the active finding and counts the drop", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const files = [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" },
+    { filename: "src/b.ts", status: "modified", patch: "@@ -1 +20 @@\n+line" }
+  ];
+  github.pullFiles = [files, files];
+  let current = 0;
+  const backend = new FakeBackend((request) =>
+    current === 0
+      ? createResult(request, { path: "src/a.ts", startLine: 10 })
+      : createResult(request, { path: "src/b.ts", startLine: 20 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      // A cap of one forces eviction on the second review, where one finding closes as another opens.
+      reviewFindingRetention: { retentionMs: 90 * 24 * 60 * 60_000, limit: 1 }
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-first");
+  await service.processNextWebhook("worker-1");
+  current = 1;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-second");
+  await service.processNextWebhook("worker-1");
+
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings.length, 1);
+  // Only the terminal finding is evictable; the active one is retained even at the cap.
+  assert.equal(review?.findings[0]?.state, "open");
+  assert.equal(review?.findings[0]?.path, "src/b.ts");
+  assert.equal(review?.findingsEvictedTotal, 1);
+  assert.ok(review?.findingsLastEvictedAt);
+});
+
+test("the evicted total accumulates across successive eviction events", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const files = [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" },
+    { filename: "src/b.ts", status: "modified", patch: "@@ -1 +20 @@\n+line" },
+    { filename: "src/c.ts", status: "modified", patch: "@@ -1 +30 @@\n+line" }
+  ];
+  github.pullFiles = [files, files, files];
+  const reported = [
+    { path: "src/a.ts", startLine: 10 },
+    { path: "src/b.ts", startLine: 20 },
+    { path: "src/c.ts", startLine: 30 }
+  ];
+  let current = 0;
+  const backend = new FakeBackend((request) =>
+    createResult(request, reported[current]!)
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      // A cap of one evicts the newly terminal finding on each subsequent review.
+      reviewFindingRetention: { retentionMs: 90 * 24 * 60 * 60_000, limit: 1 }
+    },
+    store
+  );
+
+  for (const index of [0, 1, 2]) {
+    current = index;
+    await service.enqueue("pull_request", createPullEvent(), `delivery-${index}`);
+    await service.processNextWebhook("worker-1");
+  }
+
+  const review = await store.getReview(99, 12);
+  // Two evictions happened, so the lifetime total is two. The store accumulates
+  // this column, so a caller passing a precomputed total would compound it.
+  assert.equal(review?.findingsEvictedTotal, 2);
+  assert.equal(review?.findings.length, 1);
+  assert.equal(review?.findings[0]?.path, "src/c.ts");
+});
+
+test("closing a finding never rewrites a reviewer comment that quotes the advisory", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file]];
+  let reportFinding = true;
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return reportFinding ? result : { ...result, findings: [] };
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 1);
+  const advisory = github.reviewComments[0]!;
+
+  // GitHub's "Quote reply" copies the quoted body verbatim, HTML comments included, so a reviewer
+  // engaging with an advisory produces a comment carrying its fingerprint marker.
+  const quoted = `${advisory.body
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n")}\n\nDisagree: this range is guarded upstream.`;
+  github.reviewComments.push({
+    id: 2,
+    body: quoted,
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "maintainer" },
+    in_reply_to_id: advisory.id
+  });
+  // A quote posted as its own top-level comment has no in_reply_to_id, so authorship is the only
+  // thing standing between it and the closing rewrite.
+  github.reviewComments.push({
+    id: 3,
+    body: quoted,
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "other-reviewer" }
+  });
+
+  reportFinding = false;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-resolve");
+  await service.processNextWebhook("worker-1");
+
+  // Only GuardianBot's own advisory is rewritten; reviewer text is left exactly as written.
+  assert.deepEqual(
+    github.reviewCommentUpdates.map((update) => update.id),
+    [1]
+  );
+  assert.equal(github.reviewComments.find((comment) => comment.id === 2)?.body, quoted);
+  assert.equal(github.reviewComments.find((comment) => comment.id === 3)?.body, quoted);
+  assert.match(github.updates.at(-1)?.body ?? "", /1 marked closed/);
+});
+
+test("a reviewer quoting an advisory does not suppress a reappearing finding's comment", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file]];
+  const backend = new FakeBackend((request) => createResult(request));
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+  const advisory = github.reviewComments[0]!;
+  // The bot's own advisory is rewritten to closed form, so it can no longer stand in for a live
+  // one, and the reviewer's quote of it must not stand in either.
+  advisory.body = `<!-- guardianbot-finding-closed -->\nclosed earlier\n\n${advisory.body}`;
+  github.reviewComments.push({
+    id: 2,
+    body: `> ${advisory.body}`,
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "maintainer" }
+  });
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-reappear");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(github.reviews.length, 2);
+});
+
+function createReviewCommentEvent(
+  comment: Record<string, any>,
+  overrides: Record<string, any> = {}
+): Record<string, any> {
+  return {
+    action: "created",
+    installation: { id: 1 },
+    repository: {
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    },
+    pull_request: { number: 12 },
+    comment,
+    ...overrides
+  };
+}
+
+/** Publishes one advisory and returns the harness, so each feedback test starts from a real one. */
+async function publishAdvisory(): Promise<{
+  service: GuardianService;
+  store: MemoryStore;
+  github: FakeGitHub;
+  advisory: { id: number; body: string; commit_id: string; path: string; line: number };
+  fingerprint: string;
+}> {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file], [file]];
+  const backend = new FakeBackend((request) => createResult(request));
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-advisory");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 1);
+  const review = await store.getReview(99, 12);
+  const fingerprint = review?.findings[0]?.fingerprint ?? "";
+  assert.ok(fingerprint);
+  return {
+    service,
+    store,
+    github,
+    advisory: github.reviewComments[0]!,
+    fingerprint
+  };
+}
+
+test("a human reply to a GuardianBot advisory is captured against that advisory's fingerprint", async () => {
+  const { service, store, github, advisory, fingerprint } = await publishAdvisory();
+
+  // The reply carries no marker of its own: markers are anchored to the start of a body and a
+  // reply does not begin with one, which is exactly why the marker is read from the parent.
+  github.reviewComments.push({
+    id: 2,
+    body: "This range is guarded upstream, please re-check.",
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "maintainer" },
+    in_reply_to_id: advisory.id
+  });
+
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 2,
+      in_reply_to_id: advisory.id,
+      user: { login: "maintainer" },
+      body: "This range is guarded upstream, please re-check."
+    }),
+    "delivery-feedback"
+  );
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("delivery-feedback"))?.status, "succeeded");
+
+  const review = await store.getReview(99, 12);
+  const engaged = review?.findings.find((finding) => finding.fingerprint === fingerprint);
+  assert.equal(engaged?.feedbackCount, 1);
+  assert.ok(engaged?.feedbackFirstAt);
+  assert.equal(review?.feedbackTotal, 1);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 1$/m);
+  // The derived signal is all that is retained: no reviewer login and no comment text reaches the
+  // store, so the retained record cannot be read back as who said what.
+  const retained = JSON.stringify(review);
+  assert.ok(!retained.includes("maintainer"));
+  assert.ok(!retained.includes("guarded upstream"));
+  // No identifier reaches a metric label either, at any point on this path.
+  assert.doesNotMatch(service.metrics.render(), /maintainer|guardianbot\/guardianbot|\{repository/);
+
+  // A redelivery of the same comment must not inflate the only signal this path produces.
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 2,
+      in_reply_to_id: advisory.id,
+      user: { login: "maintainer" },
+      body: "This range is guarded upstream, please re-check."
+    }),
+    "delivery-feedback-replay"
+  );
+  await service.processNextWebhook("worker-1");
+  const replayed = await store.getReview(99, 12);
+  assert.equal(
+    replayed?.findings.find((finding) => finding.fingerprint === fingerprint)?.feedbackCount,
+    1
+  );
+  assert.equal(replayed?.feedbackTotal, 1);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 1$/m);
+});
+
+test("GuardianBot replying to its own advisory is never counted as reviewer feedback", async () => {
+  const { service, store, github, advisory } = await publishAdvisory();
+
+  // The author gate here is the inverse of the closing path's. Closure acts only on GuardianBot's
+  // own comments; feedback is interesting only when a human responds, so a bot-authored reply must
+  // not register — otherwise GuardianBot talking to itself would manufacture engagement.
+  github.reviewComments.push({
+    id: 2,
+    body: "Follow-up from the bot.",
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: github.botLogin },
+    in_reply_to_id: advisory.id
+  });
+  const readsBefore = github.reviewCommentReads.length;
+
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 2,
+      in_reply_to_id: advisory.id,
+      user: { login: github.botLogin },
+      body: "Follow-up from the bot."
+    }),
+    "delivery-bot-reply"
+  );
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("delivery-bot-reply"))?.status, "succeeded");
+
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings[0]?.feedbackCount, undefined);
+  assert.equal(review?.feedbackTotal ?? 0, 0);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 0$/m);
+  // Rejected on the payload alone, before any GitHub call is spent on it.
+  assert.equal(github.reviewCommentReads.length, readsBefore);
+});
+
+test("a reply to something that is not a GuardianBot advisory records nothing", async () => {
+  const { service, store, github, advisory } = await publishAdvisory();
+
+  // A bot-authored parent carrying no marker at all: another App's comment, or one of
+  // GuardianBot's own non-advisory comments.
+  github.reviewComments.push({
+    id: 2,
+    body: "Unrelated automation comment with no finding marker.",
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: github.botLogin }
+  });
+  // A bot-authored parent whose marker belongs to an advisory this review never reported. Marker
+  // digests are content-addressed, so this is also what another repository's advisory looks like.
+  github.reviewComments.push({
+    id: 3,
+    body: `${findingMarker("fingerprint-from-another-review")}\n**P1 · Elsewhere**`,
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: github.botLogin }
+  });
+  // A human parent: a reviewer's own thread, which is conversation rather than engagement with a
+  // GuardianBot advisory even though a reply hangs off it.
+  github.reviewComments.push({
+    id: 4,
+    body: "Reviewer's own thread.",
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "other-reviewer" }
+  });
+
+  for (const parentId of [2, 3, 4]) {
+    await service.enqueue(
+      "pull_request_review_comment",
+      createReviewCommentEvent({
+        id: 100 + parentId,
+        in_reply_to_id: parentId,
+        user: { login: "maintainer" },
+        body: "reply"
+      }),
+      `delivery-unrelated-${parentId}`
+    );
+    assert.equal(await service.processNextWebhook("worker-1"), true);
+    assert.equal(
+      (await store.getWebhook(`delivery-unrelated-${parentId}`))?.status,
+      "succeeded"
+    );
+  }
+
+  // A parent that has since been deleted is an ordinary race, not a failure.
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 500,
+      in_reply_to_id: 4_242,
+      user: { login: "maintainer" },
+      body: "reply to a deleted advisory"
+    }),
+    "delivery-deleted-parent"
+  );
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("delivery-deleted-parent"))?.status, "succeeded");
+
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings[0]?.feedbackCount, undefined);
+  assert.equal(review?.feedbackTotal ?? 0, 0);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 0$/m);
+});
+
+test("a top-level review comment is ignored before any store read or GitHub call", async () => {
+  const { service, store, github } = await publishAdvisory();
+  const readsBefore = github.reviewCommentReads.length;
+
+  // No in_reply_to_id means the comment is not a response to anything, so there is no advisory to
+  // attribute engagement to and nothing worth spending a GitHub call to discover.
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 7,
+      user: { login: "maintainer" },
+      body: "A fresh top-level review comment."
+    }),
+    "delivery-top-level"
+  );
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal((await store.getWebhook("delivery-top-level"))?.status, "succeeded");
+
+  assert.equal(github.reviewCommentReads.length, readsBefore);
+  assert.equal((await store.getReview(99, 12))?.feedbackTotal ?? 0, 0);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 0$/m);
+});
+
+test("a malformed review-comment payload is ignored safely rather than failing the delivery", async () => {
+  const { service, store, github, advisory } = await publishAdvisory();
+  const malformed: Array<Record<string, any>> = [
+    // No comment at all, and a comment that is not an object.
+    createReviewCommentEvent(undefined as any),
+    createReviewCommentEvent("not-an-object" as any),
+    // Identifiers of the wrong type, non-integral, negative, or zero.
+    createReviewCommentEvent({ id: "2", in_reply_to_id: advisory.id, user: { login: "m" } }),
+    createReviewCommentEvent({ id: 2.5, in_reply_to_id: advisory.id, user: { login: "m" } }),
+    createReviewCommentEvent({ id: 2, in_reply_to_id: -1, user: { login: "m" } }),
+    createReviewCommentEvent({ id: 2, in_reply_to_id: 0, user: { login: "m" } }),
+    // Author absent, null, or of the wrong type.
+    createReviewCommentEvent({ id: 2, in_reply_to_id: advisory.id }),
+    createReviewCommentEvent({ id: 2, in_reply_to_id: advisory.id, user: null }),
+    createReviewCommentEvent({ id: 2, in_reply_to_id: advisory.id, user: { login: 42 } }),
+    // Pull request, repository, and installation context missing or unusable.
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { pull_request: undefined }
+    ),
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { pull_request: { number: "twelve" } }
+    ),
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { repository: undefined }
+    ),
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { repository: { id: 99, full_name: "no-slash" } }
+    ),
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { installation: undefined }
+    ),
+    // An action this path does not handle, and a review record that does not exist.
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { action: "deleted" }
+    ),
+    createReviewCommentEvent(
+      { id: 2, in_reply_to_id: advisory.id, user: { login: "m" } },
+      { pull_request: { number: 4_242 } }
+    )
+  ];
+
+  for (const [index, event] of malformed.entries()) {
+    const delivery = `delivery-malformed-${index}`;
+    await service.enqueue("pull_request_review_comment", event, delivery);
+    assert.equal(await service.processNextWebhook("worker-1"), true);
+    // Fail-closed means ignored, not thrown: a shape this instance has never seen must not turn
+    // into a failed delivery GitHub then redelivers, nor a dead letter.
+    assert.equal(
+      (await store.getWebhook(delivery))?.status,
+      "succeeded",
+      `payload ${index} did not settle cleanly`
+    );
+  }
+
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings[0]?.feedbackCount, undefined);
+  assert.equal(review?.feedbackTotal ?? 0, 0);
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 0$/m);
+  assert.equal(github.reviewCommentUpdates.length, 0);
+});
+
+test("an installation without the review-comment event subscribed behaves exactly as before", async () => {
+  const { service, store, github } = await publishAdvisory();
+
+  // Nothing is delivered, which is what an unsubscribed installation looks like: the manifest
+  // change is a repository change and an operator must apply it before any payload arrives.
+  await service.enqueue("pull_request", createPullEvent(), "delivery-second-review");
+  await service.processNextWebhook("worker-1");
+
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.feedbackTotal ?? 0, 0);
+  assert.ok(review?.findings.every((finding) => finding.feedbackCount === undefined));
+  // Absent is not the same claim as zero: rendering a zero would read as "measured, and no
+  // reviewer engaged" when the truth is that nothing is being measured at all.
+  const body = github.updates.at(-1)?.body ?? "";
+  assert.match(body, /\*\*Finding lifecycle:\*\* 1 open · 0 returned · 0 resolved · 0 superseded$/m);
+  assert.doesNotMatch(body, /with reviewer feedback/);
+  // The counter is still registered at zero so an alert can tell an idle path from a missing one.
+  assert.match(service.metrics.render(), /^guardianbot_finding_feedback_total 0$/m);
+});
+
+test("captured feedback survives a re-review and surfaces as an aggregate on the advisory", async () => {
+  const { service, store, github, advisory, fingerprint } = await publishAdvisory();
+
+  github.reviewComments.push({
+    id: 2,
+    body: "Reviewer reply.",
+    commit_id: advisory.commit_id,
+    path: advisory.path,
+    line: advisory.line,
+    user: { login: "maintainer" },
+    in_reply_to_id: advisory.id
+  });
+  await service.enqueue(
+    "pull_request_review_comment",
+    createReviewCommentEvent({
+      id: 2,
+      in_reply_to_id: advisory.id,
+      user: { login: "maintainer" },
+      body: "Reviewer reply."
+    }),
+    "delivery-feedback"
+  );
+  await service.processNextWebhook("worker-1");
+
+  // The lifecycle merge refreshes finding identity from the fresh report, so the engagement
+  // recorded out of band has to survive being merged over.
+  await service.enqueue("pull_request", createPullEvent(), "delivery-re-review");
+  await service.processNextWebhook("worker-1");
+
+  const review = await store.getReview(99, 12);
+  assert.equal(
+    review?.findings.find((finding) => finding.fingerprint === fingerprint)?.feedbackCount,
+    1
+  );
+  assert.equal(review?.feedbackTotal, 1);
+  // Surfaced as a count only. A per-reviewer breakdown is not rendered anywhere.
+  const body = github.updates.at(-1)?.body ?? "";
+  assert.match(body, /1 open · 0 returned · 0 resolved · 0 superseded · 1 with reviewer feedback/);
+  assert.ok(!body.includes("maintainer"));
+});
+
+test("lifecycle state is derived from every reported finding, not the inline selection", () => {
+  const findings = [
+    { severity: "P1", fingerprint: "fp-1" },
+    { severity: "P3", fingerprint: "fp-2" },
+    { severity: "P2", fingerprint: "fp-3" }
+  ] as any;
+
+  const selected = selectReviewFindings(findings, 1);
+
+  // Only the inline budget is capped. A finding ranking below the cap stays in the lifecycle set,
+  // so it is never treated as no longer reported and announced as resolved in the same run that
+  // reported it.
+  assert.deepEqual(
+    selected.lifecycle.map((finding) => finding.fingerprint),
+    ["fp-1", "fp-3"]
+  );
+  assert.deepEqual(
+    selected.inline.map((finding) => finding.fingerprint),
+    ["fp-1"]
+  );
+});
+
+test("a returned finding is surfaced while it is still open", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const metrics = new GuardianMetrics();
+  const file = {
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +10 @@\n+line"
+  };
+  github.pullFiles = [[file], [file], [file]];
+  let reportFinding = true;
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return reportFinding ? result : { ...result, findings: [] };
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      metrics
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open");
+  await service.processNextWebhook("worker-1");
+  assert.match(metrics.render(), /^guardianbot_finding_reappeared_total 0$/m);
+
+  reportFinding = false;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-resolve");
+  await service.processNextWebhook("worker-1");
+  reportFinding = true;
+  await service.enqueue("pull_request", createPullEvent(), "delivery-reappear");
+  await service.processNextWebhook("worker-1");
+
+  const body = github.updates.at(-1)?.body ?? "";
+  // The regression is reported on the run that reappears, not only once the finding closes again.
+  assert.match(body, /1 open · 1 returned · 0 resolved · 0 superseded/);
+  assert.match(body, /\*\*Returned after closing:\*\* P1 Problem/);
+  assert.match(body, /returned 1× after closing/);
+  assert.match(metrics.render(), /^guardianbot_finding_reappeared_total 1$/m);
+});
+
+test("the advisory body degrades below GitHub's comment limit instead of failing", () => {
+  const lifecycleFindings = Array.from({ length: 20 }, (_, index) => ({
+    fingerprint: `${index}`.padStart(64, "f"),
+    state: "resolved" as const,
+    path: `src/${"deeply-nested-directory/".repeat(40)}file-${index}.ts`,
+    startLine: index + 1,
+    severity: "P1",
+    title: `Retained finding ${index} ${"detail ".repeat(200)}`,
+    firstSeenHeadSha: "a".repeat(40),
+    lastSeenHeadSha: "b".repeat(40),
+    reappearances: 2
+  }));
+  const changeGroups = Array.from({ length: 60 }, (_, index) => ({
+    title: `group-${index}`,
+    paths: Array.from({ length: 40 }, (_, path) => `src/${"nested/".repeat(30)}f-${index}-${path}.ts`),
+    summary: `summary ${"churn ".repeat(300)}`
+  }));
+  const context = {
+    scannerConfigured: true,
+    riskScore: 10,
+    reviewEffort: 2 as const,
+    riskReasons: [],
+    changeGroups,
+    impactedComponents: [],
+    linkedIssues: [],
+    codeOwners: [],
+    lifecycle: { open: 3, reappeared: 1, resolved: 20, superseded: 4 },
+    lifecycleFindings,
+    inlinePosted: 0,
+    inlineAlreadyPresent: 0,
+    inlineClosed: 0,
+    backendAlias: "injected",
+    contextIndexSha: "c".repeat(64),
+    reviewScope: "full pull-request diff"
+  };
+  const result = {
+    summary: { intent: "reviewed", partialReview: false },
+    findings: [],
+    requirements: [],
+    testGaps: []
+  } as any;
+
+  const body = renderReview(result, context as any);
+
+  // GitHub rejects a body past 65536 characters outright, which would lose the whole advisory.
+  assert.ok(body.length <= 60_000, `body length ${body.length} exceeds the review comment budget`);
+  // The counts remain the complete tally even when the per-finding detail is dropped for size.
+  assert.match(body, /\*\*Finding lifecycle:\*\* 3 open · 1 returned · 20 resolved · 4 superseded/);
+  // Lifecycle detail is surrendered first; this churn needs the changed-file grouping dropped too.
+  assert.match(body, /Per-finding lifecycle detail omitted/);
+  assert.match(body, /Changed-file grouping omitted/);
+});
+
+/**
+ * Serves a snapshot document that is missing one path's symbols while leaving that
+ * path's durable vector and record rows intact, and counts the durable reads.
+ *
+ * This is the one shape that can tell a wired durable retrieval path apart from an
+ * unwired one. Every record being both materialised and durable — the ordinary case
+ * — produces identical output either way, which is exactly why the missing wiring
+ * went unnoticed: the core tests exercised a ranker they supplied themselves, so
+ * they passed whether or not any production caller ever supplied one.
+ */
+class PartialDocumentStore extends MemoryStore {
+  vectorQueries: string[] = [];
+  hydrations: string[] = [];
+
+  constructor(private readonly omittedPath: string) {
+    super();
+  }
+
+  override async getRepositoryIndex(
+    ...args: Parameters<MemoryStore["getRepositoryIndex"]>
+  ) {
+    const index = await super.getRepositoryIndex(...args);
+    if (!index) return index;
+    return {
+      ...index,
+      symbols: index.symbols.filter((symbol) => symbol.path !== this.omittedPath)
+    };
+  }
+
+  override async queryRepositoryIndexVectors(
+    ...args: Parameters<MemoryStore["queryRepositoryIndexVectors"]>
+  ) {
+    this.vectorQueries.push(args[1].repositoryScope);
+    return super.queryRepositoryIndexVectors(...args);
+  }
+
+  override async hydrateRepositoryIndexRecords(
+    ...args: Parameters<MemoryStore["hydrateRepositoryIndexRecords"]>
+  ) {
+    this.hydrations.push(args[1].repositoryScope);
+    return super.hydrateRepositoryIndexRecords(...args);
+  }
+}
+
+test("the review path supplies a durable ranker, so a record absent from the loaded snapshot is still retrieved", async () => {
+  const baseSha = "e".repeat(40);
+  const store = new PartialDocumentStore("src/auth.ts");
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", "src/tenant.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(user) { return checkTenant(user); }\n"
+      ),
+      "src/tenant.ts": Buffer.from(
+        "export function checkTenant(user) { return user.tenant != null; }\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  // The premise the assertions rest on: the document a review loads does not carry
+  // this symbol, but durable storage does.
+  const served = await store.getRepositoryIndex(99, "github:99", baseSha);
+  assert.ok(served);
+  assert.equal(served.symbols.some((symbol) => symbol.path === "src/auth.ts"), false);
+  const durableRows = await store.hydrateRepositoryIndexRecords(99, {
+    repositoryScope: "github:99",
+    commitSha: baseSha,
+    records: [{ recordType: "symbol", recordId: "auth-probe" }]
+  });
+  assert.deepEqual(durableRows, []);
+  store.hydrations.length = 0;
+
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+    patch: "@@ -1 +1 @@\n-export function authorize(user) { return user; }\n+export function authorize(user) { return checkTenant(user); }"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 1 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", event, "review-durable-ranker");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(backend.requests.length, 1);
+  // A ranker was actually supplied and used on the real review path, and the read
+  // was scoped to this repository.
+  assert.deepEqual(store.vectorQueries, ["github:99"]);
+  assert.deepEqual(store.hydrations, ["github:99"]);
+  // And the durable record reached the model, which it cannot do without wiring
+  // because the loaded document does not contain it.
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  assert.ok(indexed.some((context) => context.path === "src/auth.ts"));
+  assert.ok(
+    indexed
+      .find((context) => context.path === "src/auth.ts")!
+      .content.includes("checkTenant")
   );
 });

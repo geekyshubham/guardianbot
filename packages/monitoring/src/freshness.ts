@@ -67,6 +67,42 @@ export interface IndexFreshnessInput {
   failAfterMs: number;
   expectedCommitSha?: string | null;
   indexedCommitSha?: string | null;
+  /**
+   * Fraction of indexable files the published index does not cover, 0-1. A fresh
+   * index at the expected commit can still be a poor index if most of the
+   * repository was dropped by a cap, so coverage is reported independently of age.
+   */
+  truncationRatio?: number | null;
+  /** Ratio at or above which under-indexing is reported as a warning. */
+  truncationWarnRatio?: number;
+}
+
+/**
+ * Under-indexing is invisible in an age-based check: a repository truncated to a
+ * fraction of its files still looks perfectly fresh. This reports the ratio as
+ * check metadata always, and raises a warning once it crosses the threshold, so
+ * the gap is legible without changing how staleness is judged.
+ */
+function withIndexCoverage(
+  check: MonitoringCheckResult,
+  input: IndexFreshnessInput
+): MonitoringCheckResult {
+  const ratio = input.truncationRatio;
+  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio <= 0) {
+    return check;
+  }
+  const bounded = Math.min(Math.max(ratio, 0), 1);
+  const warnRatio = input.truncationWarnRatio ?? 0.1;
+  const metadata = { ...(check.metadata ?? {}), truncationRatio: bounded };
+  if (check.status === "failing" || bounded < warnRatio) {
+    return { ...check, metadata };
+  }
+  return {
+    ...check,
+    status: "warning",
+    summary: `${check.summary}; index covers only ${Math.round((1 - bounded) * 100)}% of indexable files`,
+    metadata
+  };
 }
 
 export function evaluateIndexFreshness(
@@ -91,24 +127,30 @@ export function evaluateIndexFreshness(
     input.indexedCommitSha &&
     input.expectedCommitSha !== input.indexedCommitSha
   ) {
-    return {
-      ...freshness,
-      status: "warning",
-      summary: "Repository index is fresh but trails the expected commit",
-      metadata: {
-        ...(freshness.metadata ?? {}),
-        expectedCommitSha: input.expectedCommitSha,
-        indexedCommitSha: input.indexedCommitSha
-      }
-    };
+    return withIndexCoverage(
+      {
+        ...freshness,
+        status: "warning",
+        summary: "Repository index is fresh but trails the expected commit",
+        metadata: {
+          ...(freshness.metadata ?? {}),
+          expectedCommitSha: input.expectedCommitSha,
+          indexedCommitSha: input.indexedCommitSha
+        }
+      },
+      input
+    );
   }
 
-  return {
-    ...freshness,
-    metadata: {
-      ...(freshness.metadata ?? {}),
-      expectedCommitSha: input.expectedCommitSha ?? null,
-      indexedCommitSha: input.indexedCommitSha ?? null
-    }
-  };
+  return withIndexCoverage(
+    {
+      ...freshness,
+      metadata: {
+        ...(freshness.metadata ?? {}),
+        expectedCommitSha: input.expectedCommitSha ?? null,
+        indexedCommitSha: input.indexedCommitSha ?? null
+      }
+    },
+    input
+  );
 }

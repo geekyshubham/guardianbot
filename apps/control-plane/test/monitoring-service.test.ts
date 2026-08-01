@@ -1094,10 +1094,40 @@ test("repository vector batch placeholders cover every value in both storage mod
 
   const pgvector = buildRepositoryIndexVectorBatchStatement(20, vectors, true);
   assert.ok(pgvector);
+  // One bound literal per row still feeds both vector columns, so the value count
+  // is unchanged and row two continues to start at $13.
   assert.equal(pgvector.values.length, 24);
-  assert.match(pgvector.text, /\$12::vector\),\(\$13/);
-  assert.match(pgvector.text, /\$24::vector\)/);
+  assert.match(pgvector.text, /\$12::vector,NULL\),\(\$13/);
+  assert.match(pgvector.text, /\$24::vector,NULL\)/);
   assert.equal(maxPlaceholder(pgvector.text), pgvector.values.length);
+  // These rows are 2-wide, so the dimensioned ANN column must stay NULL rather
+  // than fail the insert against a vector(96) column.
+  assert.ok(!/::vector\(96\)/.test(pgvector.text));
+});
+
+test("only vectors matching the ANN column width are written to it, from the same bound value", () => {
+  const wide: PersistedVectorRow = {
+    storageKey: "ann",
+    repositoryScope: "github:20",
+    commitSha: "b".repeat(40),
+    visibility: "private",
+    providerId: "guardianbot-lexical-sha256-v1-96",
+    dimensions: 96,
+    recordType: "symbol",
+    recordId: "symbol:wide",
+    path: "src/wide.ts",
+    vector: Array.from({ length: 96 }, (_, index) => index / 96)
+  };
+
+  const statement = buildRepositoryIndexVectorBatchStatement(20, [wide], true);
+  assert.ok(statement);
+  // The dimensioned column reuses $12 rather than binding the literal twice.
+  assert.match(statement.text, /\$12::vector,\$12::vector\(96\)\)/);
+  assert.equal(statement.values.length, 12);
+  assert.equal(maxPlaceholder(statement.text), statement.values.length);
+  // The vector reaches PostgreSQL as a bound parameter, never as inlined SQL.
+  assert.ok(!statement.text.includes("0.010416666666666666"));
+  assert.equal(statement.values[11], `[${wide.vector.join(",")}]`);
 });
 
 function maxPlaceholder(query: string): number {

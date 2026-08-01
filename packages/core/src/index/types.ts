@@ -218,6 +218,46 @@ export interface PersistedVectorRow {
   vector: number[];
 }
 
+/**
+ * Everything retrieval needs to build one candidate without the materialised
+ * index document: where the record is, what it is called, and its content. A
+ * nearest-neighbour match names a record; this is how that name becomes a
+ * candidate through a bounded fetch rather than a full-document load.
+ *
+ * `summary` carries a history record's raw summary because the in-memory path
+ * matches changed names and the query against the summary alone, not against the
+ * rendered content, which also carries commit, path, and author headers. Symbol
+ * records leave it undefined and are matched against `content`.
+ */
+export interface PersistedRecordRow {
+  storageKey: string;
+  repositoryScope: string;
+  commitSha: string;
+  recordType: "symbol" | "history";
+  recordId: string;
+  path: string;
+  line: number;
+  endLine: number;
+  name: string;
+  content: string;
+  contentSha256: string;
+  summary?: string;
+}
+
+export interface RepositoryRecordReference {
+  recordType: PersistedRecordRow["recordType"];
+  recordId: string;
+}
+
+/**
+ * A batched hydration request. Retrieval issues one of these per repository for
+ * all of that repository's matches together, so hydrating N matches costs one
+ * round trip rather than N.
+ */
+export interface RepositoryRecordHydrationRequest extends RepositoryIndexReference {
+  records: readonly RepositoryRecordReference[];
+}
+
 export interface RepositoryVectorQuery extends RepositoryIndexReference {
   providerId: string;
   vector: readonly number[];
@@ -231,6 +271,19 @@ export interface RepositoryVectorMatch {
 }
 
 /**
+ * One incremental index publication. `upserts` carries only the rows whose
+ * content changed; `deletedRecordIds` names rows that no longer exist at the new
+ * head. Unchanged rows are re-published under the new commit's storage key by
+ * the caller because both the storage key and every record id are commit-scoped,
+ * so no row can be silently retained across commits.
+ */
+export interface RepositoryIndexVectorDelta {
+  index: RepositoryIndex;
+  upserts: readonly PersistedVectorRow[];
+  deletedRecordIds: readonly string[];
+}
+
+/**
  * Deliberately database-neutral. A PostgreSQL implementation can map `vector`
  * to a pgvector column while retaining repository scope and commit predicates
  * in every read.
@@ -239,4 +292,7 @@ export interface RepositoryIndexPersistence {
   replace(index: RepositoryIndex, vectors: readonly PersistedVectorRow[]): Promise<void>;
   load(reference: RepositoryIndexReference): Promise<RepositoryIndex | undefined>;
   query(request: RepositoryVectorQuery): Promise<RepositoryVectorMatch[]>;
+  hydrateRecords(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]>;
 }

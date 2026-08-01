@@ -302,6 +302,52 @@ test("schema-invalid fixture results are not client bad_request and do not leak 
   }
 });
 
+test("route size gate budgets fixed prompt overhead, not just the serialized request", async () => {
+  const request = sampleRequest({ requestId: "req-oversize-prompt" });
+  const fixtureFile = writeFixtureFile({
+    defaultResult: sampleResult(request)
+  });
+  // The serialized request is well under this limit, but the prompt the bridge would
+  // build around it is not, so the gate must reject rather than admit the request.
+  const maxInputCharacters = 2_000;
+  assert.ok(JSON.stringify(request).length < maxInputCharacters);
+  const { server, baseUrl } = await startService({
+    protocolVersion: "guardian.review.v1",
+    bindings: {
+      fixtures: {
+        adapter: "fixture-provider",
+        fixtureFile,
+        allowedClassifications: ["public", "private"],
+        retention: "none"
+      }
+    },
+    routes: {
+      "routine-review": {
+        binding: "fixtures",
+        maxInputCharacters
+      }
+    }
+  });
+
+  try {
+    const review = await fetch(`${baseUrl}/v1/reviews`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request)
+    });
+    assert.equal(review.status, 413);
+    assert.deepEqual(await review.json(), {
+      error: {
+        code: "payload_too_large",
+        message: "Payload exceeded bridge limits.",
+        retryable: false
+      }
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("explicit fallback route is used only for retryable failures", async () => {
   const request = sampleRequest({ requestId: "req-timeout" });
   const primaryFixture = writeFixtureFile({
