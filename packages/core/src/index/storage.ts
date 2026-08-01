@@ -277,25 +277,62 @@ export function callTargetSimpleName(target: string): string {
   return (target.match(/[A-Za-z_$][\w$]*/g)?.at(-1) ?? "").toLowerCase();
 }
 
+function samePersistedCallEdge(left: PersistedCallEdge, right: PersistedCallEdge): boolean {
+  return (
+    left.storageKey === right.storageKey &&
+    left.repositoryScope === right.repositoryScope &&
+    left.commitSha === right.commitSha &&
+    left.edgeId === right.edgeId &&
+    left.path === right.path &&
+    left.line === right.line &&
+    left.target === right.target &&
+    left.targetName === right.targetName &&
+    left.callerSymbolId === right.callerSymbolId &&
+    left.resolution === right.resolution &&
+    left.resolvedSymbolIds.length === right.resolvedSymbolIds.length &&
+    left.resolvedSymbolIds.every((id, offset) => id === right.resolvedSymbolIds[offset])
+  );
+}
+
 /**
  * Projects call edges into durable rows. Write-side counterpart of
  * `queryCallEdges`: retrieval reconstructs caller/callee without `index.calls`.
+ *
+ * Exact duplicate edge ids are collapsed so a single SQL upsert batch never
+ * targets `(storage_key, edge_id)` twice. Disagreeing rows that share an id
+ * fail closed instead of silently picking a winner.
  */
 export function toPersistedCallEdges(index: RepositoryIndex): PersistedCallEdge[] {
   assertIndexReference(index, index);
-  return index.calls.map((call) => ({
-    storageKey: index.storageKey,
-    repositoryScope: index.repositoryScope,
-    commitSha: index.commitSha,
-    edgeId: call.id,
-    path: call.path,
-    line: call.line,
-    target: call.target,
-    targetName: callTargetSimpleName(call.target),
-    callerSymbolId: call.callerSymbolId,
-    resolvedSymbolIds: [...call.resolvedSymbolIds],
-    resolution: call.resolution
-  }));
+  const edges: PersistedCallEdge[] = [];
+  const seenByEdgeId = new Map<string, PersistedCallEdge>();
+  for (const call of index.calls) {
+    const edge: PersistedCallEdge = {
+      storageKey: index.storageKey,
+      repositoryScope: index.repositoryScope,
+      commitSha: index.commitSha,
+      edgeId: call.id,
+      path: call.path,
+      line: call.line,
+      target: call.target,
+      targetName: callTargetSimpleName(call.target),
+      callerSymbolId: call.callerSymbolId,
+      resolvedSymbolIds: [...call.resolvedSymbolIds],
+      resolution: call.resolution
+    };
+    const existing = seenByEdgeId.get(edge.edgeId);
+    if (existing) {
+      if (!samePersistedCallEdge(existing, edge)) {
+        throw new Error(
+          `conflicting call edges share edge id ${JSON.stringify(edge.edgeId)} under storage key ${JSON.stringify(edge.storageKey)}`
+        );
+      }
+      continue;
+    }
+    seenByEdgeId.set(edge.edgeId, edge);
+    edges.push(edge);
+  }
+  return edges;
 }
 
 export function compareCallEdges(left: PersistedCallEdge, right: PersistedCallEdge): number {

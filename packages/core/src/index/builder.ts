@@ -352,7 +352,9 @@ function prepareIndex(
   }
   for (const matches of symbolsBySimpleName.values()) matches.sort(compareText);
 
-  const calls = pendingCalls.map((call): IndexedCall => {
+  const calls: IndexedCall[] = [];
+  const seenCallIds = new Set<string>();
+  for (const call of pendingCalls) {
     const resolvedSymbolIds = symbolsBySimpleName.get(simpleTargetName(call.target)) ?? [];
     const id = sha256(
       [
@@ -366,7 +368,13 @@ function prepareIndex(
         resolvedSymbolIds.join(",")
       ].join("\u0000")
     );
-    return {
+    // Parsers can report the same call site through overlapping grammar
+    // queries (and a prior index may carry those duplicates). Keep one
+    // canonical edge per content-derived identity so PostgreSQL edge
+    // upserts remain unique within a batch.
+    if (seenCallIds.has(id)) continue;
+    seenCallIds.add(id);
+    calls.push({
       id,
       repositoryScope: identity.scope,
       commitSha,
@@ -377,8 +385,8 @@ function prepareIndex(
       callerSymbolId: call.callerSymbolId,
       resolvedSymbolIds: [...resolvedSymbolIds],
       resolution: resolvedSymbolIds.length ? "name-match" : "unresolved"
-    };
-  });
+    });
+  }
   sortByStableKey(
     calls,
     (call) =>

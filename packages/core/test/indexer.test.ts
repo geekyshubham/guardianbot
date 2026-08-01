@@ -11,6 +11,7 @@ import {
   planRepositoryReviewScope,
   retrieveRepositoryContext,
   retrievalToReviewContextCandidates,
+  toPersistedCallEdges,
   toPersistedRecordRows,
   toPersistedVectorRows,
   type RepositoryAccessPolicy,
@@ -199,6 +200,146 @@ test("deduplicates identical parser symbols before vector persistence", async ()
 
   assert.equal(index.symbols.length, 1);
   assert.equal(toPersistedVectorRows(index).length, 1);
+});
+
+test("deduplicates identical parser calls before edge persistence", async () => {
+  const duplicateCallParser: RepositorySourceParser = {
+    id: "duplicate-calls",
+    async parse(path, content) {
+      const call = {
+        line: 2,
+        target: "checkPermission",
+        callerSymbolLocalId: "authorize"
+      };
+      return {
+        path,
+        language: "typescript",
+        parser: "tree-sitter",
+        parserId: this.id,
+        contentSha256: "c".repeat(64),
+        lineCount: 2,
+        symbols: [
+          {
+            localId: "authorize",
+            name: "authorize",
+            qualifiedName: "authorize",
+            kind: "function",
+            line: 1,
+            endLine: 2,
+            content
+          }
+        ],
+        imports: [],
+        // Overlapping grammar observations of the same call site.
+        calls: [call, { ...call }, { ...call }]
+      };
+    }
+  };
+  const index = await indexRepositorySyntaxAware(
+    {
+      repository: "Acme/DuplicateCalls",
+      repositoryId: 45,
+      commitSha,
+      files: {
+        "src/auth.ts":
+          "export function authorize(user) { return checkPermission(user); }"
+      }
+    },
+    { parser: duplicateCallParser }
+  );
+
+  assert.equal(index.calls.length, 1);
+  const edges = toPersistedCallEdges(index);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0]?.edgeId, index.calls[0]?.id);
+  // The PostgreSQL upsert key is (storage_key, edge_id); the batch must not
+  // contain the same key twice or ON CONFLICT DO UPDATE fails mid-statement.
+  const batchKeys = edges.map((edge) => `${edge.storageKey}\u0000${edge.edgeId}`);
+  assert.equal(new Set(batchKeys).size, batchKeys.length);
+});
+
+test("incremental rebuild sanitizes duplicate calls carried from a prior index", async () => {
+  const previous = await indexRepositorySyntaxAware({
+    repository: "Acme/CarryDupCalls",
+    repositoryId: 46,
+    commitSha,
+    files: {
+      "src/keep.ts":
+        "export function authorize(user) { return checkPermission(user); }",
+      "src/change.ts": "export function change() { return 1; }"
+    }
+  });
+  assert.ok(previous.calls.length >= 1);
+  // Simulate a prior snapshot that stored exact duplicate call rows (the
+  // production failure mode before call-id deduplication).
+  const corruptedPrevious = structuredClone(previous);
+  const seed = corruptedPrevious.calls[0]!;
+  corruptedPrevious.calls.push(
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] },
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] }
+  );
+  assert.ok(
+    corruptedPrevious.calls.filter((call) => call.id === seed.id).length >= 3
+  );
+
+  const headSha = "b".repeat(40);
+  const result = await buildRepositoryIndexIncremental(
+    {
+      previous: corruptedPrevious,
+      changedFiles: {
+        "src/change.ts": "export function change() { return 2; }"
+      },
+      commitSha: headSha,
+      repositoryId: 46
+    },
+    { embeddingProvider: new LexicalHashEmbeddingProvider() }
+  );
+
+  const callIds = result.index.calls.map((call) => call.id);
+  assert.equal(new Set(callIds).size, callIds.length);
+  const edges = toPersistedCallEdges(result.index);
+  assert.equal(new Set(edges.map((edge) => edge.edgeId)).size, edges.length);
+  assert.deepEqual(result.carriedPaths, ["src/keep.ts"]);
+});
+
+test("toPersistedCallEdges collapses exact duplicates and rejects conflicts", () => {
+  const index = indexRepository({
+    repository: "Acme/EdgeDedupe",
+    repositoryId: 47,
+    commitSha,
+    files: {
+      "src/auth.ts":
+        "export function authorize(user) { return checkPermission(user); }"
+    }
+  });
+  assert.ok(index.calls.length >= 1);
+  const seed = index.calls[0]!;
+
+  const exactDupes = structuredClone(index);
+  exactDupes.calls = [
+    seed,
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] },
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] }
+  ];
+  const edges = toPersistedCallEdges(exactDupes);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0]?.edgeId, seed.id);
+  assert.equal(edges[0]?.storageKey, index.storageKey);
+
+  const conflicting = structuredClone(index);
+  conflicting.calls = [
+    seed,
+    {
+      ...seed,
+      // Same durable id, disagreeing path — fail closed rather than pick a row.
+      path: "src/other.ts",
+      resolvedSymbolIds: [...seed.resolvedSymbolIds]
+    }
+  ];
+  assert.throws(
+    () => toPersistedCallEdges(conflicting),
+    /conflicting call edges share edge id/
+  );
 });
 
 test("retrieves changed symbols, graph neighbors, tests, config, schemas, ownership, and history", async () => {
