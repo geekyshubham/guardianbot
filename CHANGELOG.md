@@ -5,6 +5,23 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Live GuardianBot v0.2.39 signed release, exact-digest control-plane
+  deployment, and guarded index recovery (hotfix PR #34
+  `704c9041c78b6e0dfee1d481f9de6cc33b2040f6`, release commit
+  `7524547700e4c3994353f5c61d1625b2bd5e5428`, image
+  `sha256:49e8e47741337e20b0fe6cf05acb8eef8121e065d0c1293efb9745f1de3625a1`,
+  ACTIVE deployment `d69ed8bf-1ed8-4669-8cea-4175513a7527`, delivery
+  `76eb6aa6-8dd9-11f1-9979-156df2276e83` replayed to `succeeded`, snapshot
+  17,256 document calls / 17,256 distinct call IDs / 17,256 durable edges).
+  Proves live fix of the duplicate durable edge publication defect and atomic
+  non-empty durable publication for the current snapshot. Does not claim live
+  PR descriptor-first consumption, ANN, production AI review, fleet v0.2.39
+  pins, seven-day enforcement, authenticated-full DAST, or DefectDojo
+  reimport. Evidence:
+  [v0.2.39 live index recovery](docs/evidence/v0.2.39-live-index-recovery.md).
+
 ## [0.2.39] - 2026-08-02
 
 ### Fixed
