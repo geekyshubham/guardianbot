@@ -20,6 +20,15 @@ closed-form advisories, descriptor-first durable repository-index candidate
 sourcing on the review path, migration and webhook hardening, base-commit
 onboarding path binding, and related automated fixes.
 
+**Release candidate (not published):** package/changelog version `0.2.39` is
+prepared on this branch with local source/test evidence for the call-edge
+duplicate `ON CONFLICT` fix (merged hotfix PR #34 at
+`704c9041c78b6e0dfee1d481f9de6cc33b2040f6`). `v0.2.39` is **not** yet merged,
+tagged, published, signed, deployed, or live-verified. Publication, exact-digest
+deployment, and live index-refresh replay remain pending. The live failed
+delivery remains dead-lettered; descriptor-first live proof remains open. The
+published/signed/deployed release stays `v0.2.38` above.
+
 Fleet consumer pins remain on immutable `v0.2.37` via prior generic
 `guardianctl upgrade --all`: 18 reviewed green PRs merged; direct
 default-branch reads prove config and every managed caller reference use
@@ -162,18 +171,22 @@ the stated live evidence must also be captured where required.
   PostgreSQL `ON CONFLICT DO UPDATE command cannot affect row a second time`.
   The exact live materialized index had 17,266 calls but 17,169 distinct call
   IDs (97 duplicate call IDs), so durable call-edge publication did not
-  complete and live descriptor-first retrieval remains unproven. **Unreleased
-  source/test fix only:** computed call IDs are deterministically deduplicated
-  in full and incremental index builds; `toPersistedCallEdges` collapses exact
+  complete and live descriptor-first retrieval remains unproven. **Source/test
+  fix prepared as `0.2.39` release candidate only** (merged hotfix PR #34
+  `704c9041c78b6e0dfee1d481f9de6cc33b2040f6`; package/changelog versioned on
+  this branch): computed call IDs are deterministically deduplicated in full
+  and incremental index builds; `toPersistedCallEdges` collapses exact
   duplicates and fails closed when the same edge ID disagrees in persisted
   semantics; the PostgreSQL edge batch statement fails closed if any duplicate
   `(storage_key, edge_id)` ON CONFLICT target reaches it. Regression tests
   cover parser duplicates, incremental sanitation of a prior duplicate
   snapshot, exact duplicate normalization, conflicting duplicate rejection,
   unique generated batch keys, and final SQL-boundary duplicate rejection;
-  full core and control-plane suites passed locally. No fixed release,
-  deployment, or live re-proof is claimed. Post-deployment index refresh,
-  non-empty durable edges, live descriptor-first review, and live
+  full core and control-plane suites passed locally. `v0.2.39` is not yet
+  merged, tagged, published, signed, deployed, or live-verified; publication,
+  deployment, and live index-refresh replay remain pending. The live failed
+  delivery remains dead-lettered. Post-deployment index refresh, non-empty
+  durable edges, live descriptor-first review, and live
   PostgreSQL/pgvector/ANN performance remain incomplete. Remaining repo-wide
   support or test semantics that are bounded or linear are not fully unbounded
   durable coverage.

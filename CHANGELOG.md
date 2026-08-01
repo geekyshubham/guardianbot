@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.39] - 2026-08-02
+
 ### Fixed
 
 - Repository-index call-edge publication no longer produces duplicate call IDs
@@ -12,16 +14,16 @@ reusable workflow commits remain immutable.
   second time". The first post-v0.2.38 default-branch index refresh failed in
   production on that error; the live materialized index had 17,266 calls but
   only 17,169 distinct call IDs (97 duplicates), so durable call-edge
-  publication did not complete. The unreleased fix deterministically
-  deduplicates computed call IDs in full and incremental index builds;
-  `toPersistedCallEdges` collapses exact duplicates and fails closed when the
-  same edge ID disagrees in persisted semantics; and the PostgreSQL edge batch
-  statement fails closed if any duplicate `(storage_key, edge_id)` ON CONFLICT
-  target reaches it. Regression tests cover parser duplicates, incremental
-  sanitation of a prior duplicate snapshot, exact duplicate normalization,
-  conflicting duplicate rejection, unique generated batch keys, and final
-  SQL-boundary duplicate rejection. Source/test evidence only; no fixed
-  release, deployment, or live re-proof is claimed.
+  publication did not complete. The fix deterministically deduplicates computed
+  call IDs in full and incremental index builds; `toPersistedCallEdges`
+  collapses exact duplicates and fails closed when the same edge ID disagrees
+  in persisted semantics; and the PostgreSQL edge batch statement fails closed
+  if any duplicate `(storage_key, edge_id)` ON CONFLICT target reaches it.
+  Regression tests cover parser duplicates, incremental sanitation of a prior
+  duplicate snapshot, exact duplicate normalization, conflicting duplicate
+  rejection, unique generated batch keys, and final SQL-boundary duplicate
+  rejection. Source/test evidence only; no signed release publication,
+  deployment, or live re-proof is claimed yet.
 
 ### Evidence
 
