@@ -9,6 +9,20 @@ reusable workflow commits remain immutable.
 
 - GuardianBot self-consumer config/workflow is pinned to immutable v0.2.37
   commit `f2a7f5410bd5d8b140378a7c722b74ba0b455727`.
+- Fleet pin upgrade to immutable v0.2.37
+  (`f2a7f5410bd5d8b140378a7c722b74ba0b455727`) completed via generic
+  `guardianctl upgrade --all`: 18 reviewed green PRs merged; direct
+  default-branch reads confirm config and every managed caller reference use
+  that SHA; 20 superseded July draft upgrade PRs closed. RouteLens and
+  AstraNull exact-digest generic promotions and ACTIVE DigitalOcean staging
+  deployments are live on the post-merge push runs (signed digests
+  `sha256:35519bf4f6db309604108916c1c331b8860b8b9a9757c298a8ff8f350cf6aadd`
+  and
+  `sha256:425d4761b3ee644180fa2734fd35350edad5aac5aad30a4c8d5c7794de65dbb0`).
+  Evidence:
+  [v0.2.37 live control-plane, fleet, and promotion](docs/evidence/v0.2.37-live-control-plane-fleet-and-promotion.md).
+  Does not claim production AI review, seven-day enforcement, scheduled
+  authenticated-full DAST, or a new DefectDojo reimport.
 
 ## [0.2.37] - 2026-08-01
 
