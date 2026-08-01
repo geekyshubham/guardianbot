@@ -188,6 +188,9 @@ test("external abort reaches fetch and is distinguishable from timeout", async (
   assert.equal(observedSignal.aborted, true);
 
   // Timeout classification must remain distinct from external AbortError.
+  // Node's AbortSignal.timeout timer is unref'd; without a referenced handle the
+  // event loop can drain before the timeout fires (CI flake: "Promise resolution
+  // is still pending but the event loop has already resolved").
   globalThis.fetch = fetchPendingUntilAbort();
   const shortTimeout = new GuardianReviewClient({
     id: "bridge",
@@ -195,10 +198,15 @@ test("external abort reaches fetch and is distinguishable from timeout", async (
     allowedClassifications: ["public"],
     timeoutMs: 20
   });
-  await assert.rejects(
-    () => shortTimeout.capabilities(),
-    (error: unknown) => error instanceof BackendError && error.code === "timeout"
-  );
+  const keepAlive = setTimeout(() => {}, 1_000);
+  try {
+    await assert.rejects(
+      () => shortTimeout.capabilities(),
+      (error: unknown) => error instanceof BackendError && error.code === "timeout"
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("external abort during stalled body read preserves AbortError", async () => {
