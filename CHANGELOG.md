@@ -5,6 +5,15 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Changed
+
+- GuardianBot self-consumer declarative config and reusable workflow references
+  are upgraded in draft PR #37 to immutable published release `v0.2.39` exact
+  commit `7524547700e4c3994353f5c61d1625b2bd5e5428` (from `v0.2.37`
+  `f2a7f5410bd5d8b140378a7c722b74ba0b455727`). Pending merge and green
+  verification; does not claim fleet-wide v0.2.39 pins or completed live
+  acceptance.
+
 ### Evidence
 
 - Live GuardianBot v0.2.39 signed release, exact-digest control-plane
