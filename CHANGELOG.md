@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.40] - 2026-08-02
+
 ### Added
 
 - Authenticated read-only operator ledger `GET /operations/monitoring`
@@ -19,7 +21,8 @@ reusable workflow commits remain immutable.
   webhook payloads, resolved rows, or raw provider text; explicit length caps
   on alert full name/key/summary. Public Caddy returns `404` for `/metrics`
   and `/operations/monitoring`; private Compose access stays internal. Source
-  and automated tests only—**not released or deployed**; do not claim live
+  and automated tests ship in this release; **live operator endpoint
+  deployment and weekly-report acceptance are not claimed**. Do not claim live
   ledger output or alert identities. Direct database/SSH firewall broadening
   is not required. See
   [operations](docs/operations.md#private-metrics-and-operator-monitoring-status)
@@ -50,6 +53,21 @@ reusable workflow commits remain immutable.
   production AI review, seven-day enforcement, authenticated-full DAST,
   DefectDojo current-run import, or GitHub App review-comment permission.
 
+- Current-binding RouteLens scheduled `authenticated-baseline` on head
+  `55eeead5b7306972abfff1b30a32b5cae95e96eb` / deployed digest
+  `sha256:7ac78ef0d9ab23c14f7e3665a834f21fd73a9be3ceed040b4c76b7a06532dceb`:
+  genuine GitHub `schedule` run
+  [`30718271723`](https://github.com/geekyshubham/RouteLens/actions/runs/30718271723)
+  (staging contract, one-time session, bounded ZAP, provenance attestation,
+  and artifact upload all passed; `guardianbot/dast-nightly` skipped; artifact
+  `8824056295` digest
+  `sha256:19afaae9c663dc3a8f8261a50870672023d3c95967efd50ae561d00c85a689af`;
+  provenance binds repository `geekyshubham/routelens`, run/attempt
+  `30718271723/1`, workflow SHA `7524547700e4c3994353f5c61d1625b2bd5e5428`).
+  Authenticated-baseline only; does not close full DAST acceptance, DefectDojo
+  current-run proof, production AI review, seven-day enforcement, or GitHub
+  App review-comment permission. Evidence:
+  [v0.2.39 live fleet upgrade](docs/evidence/v0.2.39-live-fleet-upgrade.md).
 - Current-binding AstraNull scheduled `authenticated-baseline` on head
   `3664cff061398c1bf3efc0c937a2470746d60e3d` / deployed digest
   `sha256:6c4f2e9cb3a497fe0871cb73cfd7b2aa0f072c2f7e54626d19a6b81a67ce087a`:
