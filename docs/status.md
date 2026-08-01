@@ -1,13 +1,19 @@
 # Capability status
 
-Release: `0.2.36`
+Release: `0.2.37`
 Last verified: 2026-08-01
 
-**Release control:** Automated code/test verification, the signed `v0.2.36`
-release, DigitalOcean control-plane deployment, fleet consumer upgrades (18
-merged immutable-pin PRs), healthy 19-repo inventory, and RouteLens/AstraNull
-exact-digest generic promotions with ACTIVE deployments are live through
-`v0.2.36` (2026-07-30):
+**Release control:** `v0.2.37` is the release candidate being prepared for
+code and documentation automated verification (hardening already reflected in
+this matrix: lifecycle provenance and closed-form advisories, durable
+repository-index candidate sourcing on the review path, migration and webhook
+hardening, base-commit onboarding path binding, and related automated fixes).
+No signed `v0.2.37` release, tag, or container image is claimed yet.
+
+The live DigitalOcean control plane, fleet consumer pins, RouteLens/AstraNull
+exact-digest promotions, and ACTIVE deployments remain at verified signed
+`v0.2.36` (2026-07-30) until post-release deployment and upgrade evidence is
+captured:
 https://github.com/geekyshubham/guardianbot/releases/tag/v0.2.36. See
 [live v0.2.36 control-plane and fleet upgrade evidence](evidence/v0.2.36-live-control-plane-and-fleet-upgrade.md).
 On 2026-08-01, genuine scheduled authenticated-baseline smoke completed for
@@ -15,10 +21,13 @@ both current default-branch SHAs and exact DigitalOcean deployed digests
 (AstraNull run `30684302779`, RouteLens run `30684781163`); each skipped
 `authenticated-full` / `dast-nightly`. No new DefectDojo import/reimport was
 independently verified for those runs. Scheduled authenticated-full acceptance
-and a current DefectDojo reimport remain open. This does not claim production
-AI review, live enforcement, seven-day completion, baseline, ruleset readiness,
-scheduled authenticated-full success, a new DefectDojo reimport, or a
-`v0.2.37` release/deployment.
+and a current DefectDojo reimport remain open.
+
+This does not claim a signed `v0.2.37` release/tag/image, DigitalOcean
+deployment of `v0.2.37`, fleet upgrade to `v0.2.37`, GitHub App event
+application, live PostgreSQL/pgvector/ANN performance, production model-backed
+review, seven-day enforcement completion, authenticated-full DAST success, or a
+new DefectDojo import.
 
 This matrix is the authoritative distinction between implemented behavior and
 roadmap intent. A local automated test is evidence that a contract works in the
@@ -36,10 +45,9 @@ the stated live evidence must also be captured where required.
 
 - Reconcile the in-progress control-plane, durable retrieval, privacy,
   retention, rate-limit, shutdown, and webhook-hardening changes into one
-  stable worktree.
-- Pass the full repository build, test, lint, documentation, schema, workflow,
-  and `git diff --check` gates after concurrent work has stopped changing the
-  source tree.
+  stable worktree. **Done locally/GitHub:** the stable branch, full repository
+  build/test/lint/documentation/schema/workflow gates, and PR merge for this
+  hardening set are complete for the `v0.2.37` release candidate.
 - Independently review cancellation behavior so shutdown cannot leave a
   detached model request or webhook handler mutating state after its lease is
   released.
@@ -48,13 +56,17 @@ the stated live evidence must also be captured where required.
   barrier (durable ANN recall, batch hydration, production review-path
   wiring), but live PostgreSQL/pgvector verification, live ANN performance,
   and production deployment of that path remain incomplete.
-- Publish a new signed GuardianBot release, immutable reusable-workflow commit,
-  container image, changelog, and release evidence. Deploy it only to the
-  approved DigitalOcean control plane and verify `/healthz` and `/readyz`.
+- **Still pending:** publish a new signed GuardianBot release, immutable
+  reusable-workflow commit, container image, changelog, and release evidence.
+  Deploy it only to the approved DigitalOcean control plane and verify
+  `/healthz` and `/readyz`. Capture post-release deployment and fleet-upgrade
+  evidence; live control plane and consumers remain on verified `v0.2.36`
+  until that evidence exists.
 
-**Completion evidence:** clean full CI on the release commit, signed release
-artifacts, immutable workflow SHA, exact deployed image digest, ACTIVE
-DigitalOcean deployment, and updated versioned evidence in this repository.
+**Completion evidence:** clean full CI on the release commit (local/GitHub
+gates for the candidate are complete), signed release artifacts, immutable
+workflow SHA, exact deployed image digest, ACTIVE DigitalOcean deployment, and
+updated versioned evidence in this repository.
 
 ### 2. Apply and verify the GitHub App permission/event update
 
