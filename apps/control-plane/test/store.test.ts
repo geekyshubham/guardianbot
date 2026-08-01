@@ -7,6 +7,7 @@ import {
   indexRepository,
   lexicalFeatureVector,
   repositoryIndexStorageKey,
+  toPersistedCallEdges,
   toPersistedRecordRows,
   toPersistedVectorRows
 } from "@guardianbot/core";
@@ -1987,6 +1988,65 @@ test("path-record and call-edge statements bind repository_id and storage_key", 
   assert.match(edgeBatch.text, /INSERT INTO repository_index_edges/);
   assert.equal(edgeBatch.values[1], 42);
   assert.equal(edgeBatch.values[0], storageKey);
+});
+
+test("edge batch from toPersistedCallEdges collapses exact duplicates and builds", () => {
+  const commitSha = "a".repeat(40);
+  const index = indexRepository({
+    repository: "Acme/EdgeBatchDedupe",
+    repositoryId: 42,
+    commitSha,
+    files: {
+      "src/auth.ts":
+        "export function authorize(user) { return checkPermission(user); }"
+    }
+  });
+  assert.ok(index.calls.length >= 1);
+  const seed = index.calls[0]!;
+  // Exact durable duplicates — the core normalizer owns collapse.
+  const withDupes = structuredClone(index);
+  withDupes.calls = [
+    seed,
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] },
+    { ...seed, resolvedSymbolIds: [...seed.resolvedSymbolIds] }
+  ];
+
+  const edges = toPersistedCallEdges(withDupes);
+  const batchKeys = edges.map((edge) => `${edge.storageKey}\u0000${edge.edgeId}`);
+  assert.equal(new Set(batchKeys).size, batchKeys.length);
+  assert.equal(edges.length, 1);
+
+  const statement = buildRepositoryIndexEdgeBatchStatement(42, edges);
+  assert.ok(statement);
+  assert.match(statement.text, /INSERT INTO repository_index_edges/);
+  assert.match(statement.text, /ON CONFLICT \(storage_key, edge_id\) DO UPDATE SET/);
+  assert.equal(statement.values[0], index.storageKey);
+  assert.equal(statement.values[1], 42);
+  assert.equal(statement.values[4], seed.id);
+});
+
+test("edge batch statement rejects duplicate ON CONFLICT targets before SQL", () => {
+  const storageKey = repositoryIndexStorageKey({
+    repositoryScope: "github:42",
+    commitSha: "a".repeat(40)
+  });
+  const edge = {
+    storageKey,
+    repositoryScope: "github:42",
+    commitSha: "a".repeat(40),
+    edgeId: "e-dup",
+    path: "src/a.ts",
+    line: 1,
+    target: "foo",
+    targetName: "foo",
+    resolvedSymbolIds: ["sym-1"] as string[],
+    resolution: "name-match" as const
+  };
+
+  assert.throws(
+    () => buildRepositoryIndexEdgeBatchStatement(42, [edge, { ...edge }]),
+    /duplicate ON CONFLICT target \(storage_key, edge_id\).*e-dup/
+  );
 });
 
 test("memory store path and edge queries are repository isolated and respect limits", async () => {

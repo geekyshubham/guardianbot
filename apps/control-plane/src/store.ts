@@ -5223,15 +5223,30 @@ export interface RepositoryIndexEdgeBatchStatement {
 /**
  * Upserts call-graph edges for one snapshot. Same repository_id + storage_key
  * boundary as vector/record rows; written in the same publication transaction.
+ *
+ * Fail closed on duplicate `(storage_key, edge_id)` inputs: PostgreSQL rejects a
+ * single INSERT whose ON CONFLICT target appears more than once. Exact-duplicate
+ * collapse belongs in `toPersistedCallEdges`; this builder only enforces the
+ * invariant and never silently deduplicates.
  */
 export function buildRepositoryIndexEdgeBatchStatement(
   repositoryId: number,
   edges: readonly PersistedCallEdge[]
 ): RepositoryIndexEdgeBatchStatement | undefined {
   if (!edges.length) return undefined;
+  const seenKeys = new Set<string>();
   const values: unknown[] = [];
   const rows: string[] = [];
   for (const edge of edges) {
+    const compositeKey = `${edge.storageKey}\u0000${edge.edgeId}`;
+    if (seenKeys.has(compositeKey)) {
+      // Reject before emitting INSERT: PostgreSQL ON CONFLICT cannot target the
+      // same (storage_key, edge_id) twice in one statement. No silent dedupe.
+      throw new Error(
+        `repository index edge batch contains duplicate ON CONFLICT target (storage_key, edge_id): storage key ${JSON.stringify(edge.storageKey)} edge id ${JSON.stringify(edge.edgeId)}`
+      );
+    }
+    seenKeys.add(compositeKey);
     const firstPosition = values.length + 1;
     values.push(
       edge.storageKey,
