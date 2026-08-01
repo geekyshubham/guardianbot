@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.38] - 2026-08-01
+
 ### Added
 
 - Review orchestration is implemented descriptor-first. The control plane loads
