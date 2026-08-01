@@ -803,6 +803,13 @@ class ForeignRowStore extends MemoryStore {
     const rows = await super.hydrateRepositoryIndexRecords(...args);
     return rows.map((row) => ({ ...row, repositoryScope: this.foreignScope }));
   }
+
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    return descriptor ? { ...descriptor, repositoryScope: this.foreignScope } : undefined;
+  }
 }
 
 async function publishIndex(
@@ -919,6 +926,54 @@ test("the durable ranker adapter rejects a foreign row instead of ranking it", a
         recordId: symbol.id
       }))
     }),
+    RepositoryIsolationError
+  );
+});
+
+test("the index descriptor load answers identity without the materialised document", async () => {
+  const store = new MemoryStore();
+  const index = await publishIndex(store);
+  const service = new RepositoryIndexService(store);
+
+  const descriptor = await service.loadRepositoryIndexDescriptor(
+    defaultRepository.repositoryId,
+    index.commitSha
+  );
+  assert.ok(descriptor);
+
+  // Sourced from columns rather than from index_document, and it must agree with the
+  // document field for field. That agreement is what makes the two usable as
+  // independent witnesses to one identity; if they could disagree for a normally
+  // published snapshot, comparing them would prove nothing.
+  assert.equal(descriptor.storageKey, index.storageKey);
+  assert.equal(descriptor.repository, index.repository);
+  assert.equal(descriptor.repositoryScope, index.repositoryScope);
+  assert.equal(descriptor.commitSha, index.commitSha);
+  assert.equal(descriptor.visibility, index.visibility);
+  assert.deepEqual(descriptor.embedding, index.embedding);
+
+  // A commit nobody published is absent rather than an error, matching the sibling read.
+  assert.equal(
+    await service.loadRepositoryIndexDescriptor(
+      defaultRepository.repositoryId,
+      "1".repeat(40)
+    ),
+    undefined
+  );
+});
+
+test("the index descriptor load rejects a foreign row instead of returning its identity", async () => {
+  // The descriptor is meant to be a trustworthy identity source for an isolation
+  // check, so a row carrying another repository's scope must raise rather than be
+  // returned. Were it returned, a later comparison against it would authorize the
+  // wrong repository's visibility.
+  const foreignScope = `github:${defaultRepository.repositoryId + 1}`;
+  const store = new ForeignRowStore(foreignScope);
+  const index = await publishIndex(store);
+  const service = new RepositoryIndexService(store);
+
+  await assert.rejects(
+    service.loadRepositoryIndexDescriptor(defaultRepository.repositoryId, index.commitSha),
     RepositoryIsolationError
   );
 });

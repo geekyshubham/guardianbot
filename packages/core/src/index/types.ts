@@ -205,6 +205,27 @@ export interface RepositoryIndexReference {
   commitSha: string;
 }
 
+/**
+ * A snapshot's identity without its content.
+ *
+ * Every scalar identity field retrieval reads is already a first-class column on
+ * `repository_indexes`, so all of this is answerable by a SELECT that omits
+ * `index_document`. It exists to be a second, independent, DB-sourced witness to
+ * a snapshot's identity: a caller that already holds the document can compare the
+ * two, and a caller that only needs identity can skip the document entirely.
+ *
+ * It deliberately carries no `files`, `symbols`, `imports`, or `calls`. This is
+ * not a trimmed `RepositoryIndex` and must never be substituted for one — a
+ * distinct type is what keeps "identity only" from being indistinguishable from
+ * "an index that happens to be empty".
+ */
+export interface RepositoryIndexDescriptor extends RepositoryIndexReference {
+  storageKey: string;
+  repository: string;
+  visibility: RepositoryVisibility;
+  embedding: IndexEmbeddingMetadata;
+}
+
 export interface PersistedVectorRow {
   storageKey: string;
   repositoryScope: string;

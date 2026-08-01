@@ -7,6 +7,7 @@ import {
   type PersistedRecordRow,
   type PersistedVectorRow,
   type RepositoryIndex,
+  type RepositoryIndexDescriptor,
   type RepositoryRecordHydrationRequest,
   type RepositoryVectorMatch,
   type RepositoryVectorQuery,
@@ -551,6 +552,42 @@ export class RepositoryIndexService {
     commitSha: string
   ): Promise<RepositoryIndex | undefined> {
     return this.store.getRepositoryIndex(repositoryId, `github:${repositoryId}`, commitSha);
+  }
+
+  /**
+   * The same snapshot's identity, read from columns instead of from the
+   * materialised document.
+   *
+   * This is a second, independent witness to the identity `loadExactRepositoryIndex`
+   * also carries. Its value is that the two are sourced differently: the document is
+   * a JSONB blob written by the publish path, while this is the row's own columns.
+   * A caller holding both can compare them, and a disagreement is then a real
+   * storage inconsistency rather than a restatement of one source.
+   *
+   * Isolation is enforced by comparing the row's scope against the scope derived
+   * from the numeric repository id the caller asked about — two values with
+   * independent origins. Unlike the sibling read it is *not* expressed as a
+   * predicate, so a foreign row raises instead of silently reading as "no such
+   * snapshot". There is deliberately no request-side scope assertion to pair with
+   * it: this method takes no caller-supplied scope, so such a check would compare a
+   * derived value against itself and assert nothing.
+   *
+   * It does NOT narrow the document load. Nothing consumes it yet; the production
+   * review path still loads the full document.
+   */
+  async loadRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    const descriptor = await this.store.getRepositoryIndexDescriptor(repositoryId, commitSha);
+    if (!descriptor) return undefined;
+    const repositoryScope = `github:${repositoryId}`;
+    if (descriptor.repositoryScope !== repositoryScope) {
+      throw new RepositoryIsolationError(
+        "repository index descriptor load returned a row outside the requested repository"
+      );
+    }
+    return descriptor;
   }
 
   /**

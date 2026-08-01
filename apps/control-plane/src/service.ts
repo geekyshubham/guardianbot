@@ -1,4 +1,5 @@
 import {
+  assertDescriptorReference,
   buildReviewBundle,
   detectRepository,
   parseGuardianConfig,
@@ -10,6 +11,7 @@ import {
   type GitHubClient,
   type GuardianConfig,
   type IndexChangedFile,
+  type RepositoryIndexDescriptor,
   type RepositoryVisibility,
   type ReviewBundleContextCandidate
 } from "@guardianbot/core";
@@ -1660,6 +1662,97 @@ export class GuardianService {
         index.visibility !== input.visibility ||
         index.commitSha !== input.baseSha
       ) {
+        return {
+          candidates: [],
+          partial: true,
+          warning: "repository index context was rejected by repository isolation checks"
+        };
+      }
+      // A second projection of the same row, checked against the request as well as
+      // the document, and added rather than substituted so this can only tighten the
+      // boundary.
+      //
+      // What it is NOT: a third *independent* witness. The identity columns and
+      // `index_document` are written by a single `INSERT ... ON CONFLICT DO UPDATE`
+      // (see `upsertRepositoryIndexDocument`), so they share one write origin and one
+      // transaction. A writer that got the scope wrong would write it wrong in both
+      // places, and this check would agree with itself. There remain two genuinely
+      // independent sources here — what storage holds, and what the request asserts —
+      // exactly as before.
+      //
+      // What it DOES buy: the two projections are read back by different queries, so a
+      // divergence between them is caught rather than assumed impossible. That covers
+      // a partially-applied update, a manual repair that touched one representation,
+      // and a document whose embedded identity disagrees with the columns keying its
+      // own row — none of which the document-only check above can see.
+      //
+      // The descriptor is loaded from the database and is NEVER reconstructed from
+      // `input`. Rebuilding it from the request would make every comparison below
+      // compare the request to itself: it would still typecheck, still pass the
+      // existing isolation test, and assert nothing. `authorizeRelatedRepository`
+      // rests on `visibility`, so a tautological visibility check is a real
+      // weakening of a security boundary rather than a style preference.
+      //
+      // The duplicated warning string is deliberate. The document-sourced block
+      // above is kept verbatim so that deleting it is a visible deletion rather than
+      // a refactor, and both rejections are indistinguishable to a caller: which
+      // witness disagreed is not something a pull request author should learn.
+      let descriptor: RepositoryIndexDescriptor | undefined;
+      try {
+        descriptor = await repositoryIndexService.loadRepositoryIndexDescriptor(
+          input.repositoryId,
+          input.baseSha
+        );
+      } catch (error) {
+        // Two different failures reach here and they must not read the same way to an
+        // operator. A cross-repository row, or a non-canonical storage key, is an
+        // isolation rejection. But `parseEmbeddingKind` rejects an unrecognised
+        // `embedding_kind`, and the visibility check inside `assertDescriptorReference`
+        // rejects a value outside the union — those are stored-data faults in this
+        // repository's own row, with no foreign repository involved. Reporting them as
+        // isolation would send an operator hunting a security problem that is not
+        // there, and would hide a real one: a column that has drifted out of its
+        // expected domain.
+        //
+        // Matched by name rather than `instanceof`, as `rateLimitDetails` already is,
+        // because the class crosses a workspace package boundary where a duplicate
+        // module instance would defeat identity.
+        const isolated =
+          error instanceof Error && error.name === "RepositoryIsolationError";
+        return {
+          candidates: [],
+          partial: true,
+          warning: isolated
+            ? "repository index context was rejected by repository isolation checks"
+            : "repository index context was rejected because its stored identity could not be read"
+        };
+      }
+      // Absent is a rejection, never "nothing to find". The document above was read
+      // from the same primary-key row, so a missing descriptor means the columns and
+      // the document disagree about the row's existence — a storage inconsistency
+      // that must not be resolved in favour of proceeding.
+      if (
+        !descriptor ||
+        descriptor.repository !== input.repositoryFullName ||
+        descriptor.repositoryScope !== `github:${input.repositoryId}` ||
+        descriptor.visibility !== input.visibility ||
+        descriptor.commitSha !== input.baseSha
+      ) {
+        return {
+          candidates: [],
+          partial: true,
+          warning: "repository index context was rejected by repository isolation checks"
+        };
+      }
+      try {
+        // Canonicality, on the descriptor's own terms: the storage key is re-derived
+        // from the requested scope and commit and the stored column must equal that
+        // derivation. The stored key is confirmed, never trusted.
+        assertDescriptorReference(descriptor, {
+          repositoryScope: `github:${input.repositoryId}`,
+          commitSha: input.baseSha
+        });
+      } catch {
         return {
           candidates: [],
           partial: true,

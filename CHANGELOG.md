@@ -5,6 +5,38 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Repository index identity can be read without parsing the materialised
+  snapshot. `Store.getRepositoryIndexDescriptor` projects scope, commit SHA,
+  visibility, storage key, full name, and the embedding provider/kind/dimensions
+  triple from first-class columns on `repository_indexes`, and the statement never
+  names `index_document`. No schema change was required: every column it reads
+  already existed. The review path loads that descriptor and compares it against
+  the request in addition to the existing document check, so a divergence between
+  the two stored projections is caught rather than assumed impossible. The stored
+  `storage_key` is still compared against the value `repositoryIndexStorageKey()`
+  derives, so the canonicality invariant is unchanged, and a cross-repository row
+  still raises `RepositoryIsolationError`. The two projections are **not**
+  independent witnesses — a single `INSERT ... ON CONFLICT DO UPDATE` writes the
+  columns and the document together — so the genuinely independent sources remain
+  what storage holds and what the request asserts, exactly as before.
+- Retrieval declares the durability of every candidate kind in
+  `retrievedContextKindCoverage`, a partition enforced in both directions by test
+  against the runtime kind list and the review-bundle mapping. This exists because
+  `classifyDurableRecord` is deliberately a strict subset of the document-side
+  candidate walk, and the gap between them is invisible at runtime: no error is
+  raised when a kind stops being produced, the review is simply thinner. Three
+  classes are named — reproducible exactly from durable rows, enumerated repo-wide
+  from the document but answerable durably only within nearest-neighbour recall,
+  and not reproducible durably at all. `caller` and `callee` are in the last class
+  and say why: no durable row carries a call edge. The exact class is currently
+  **empty**, and is retained rather than deleted because it names the property a
+  future path-scoped record query would earn.
+- The review path no longer passes `index.files` or `index.imports` into
+  retrieval, which reads neither. This removes transfer and parse weight per
+  review and changes no retrieved context.
+
 ### Changed
 
 - GuardianBot self-consumer config/workflow is pinned to immutable v0.2.37

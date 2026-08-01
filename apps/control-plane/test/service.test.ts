@@ -3341,3 +3341,198 @@ test("a discovery-triggered index rebuild is cancellable, not just the push arm"
   assert.ok(await store.getRepositoryIndex(99, "github:99", refSha));
   assert.equal((await store.getRepository(99))?.indexSha, refSha);
 });
+
+/**
+ * Drives a real `pull_request` webhook through `processNextWebhook` against a
+ * caller-supplied store, and returns what the backend and GitHub observed.
+ *
+ * The store is a parameter because the property under test is which SOURCE of
+ * identity the review path consults. Every assertion below therefore has to reach
+ * production through the queue rather than through a seam the test supplies: a
+ * barrier in this project was previously reported closed while a grep proved the
+ * production path never reached the new code, because the tests handed retrieval
+ * its own inputs.
+ */
+async function runIndexedReview(store: MemoryStore, deliveryId: string) {
+  const baseSha = "d".repeat(40);
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", "test/auth.test.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(role) {\n  const token = \"secret\";\n  return role === 'admin';\n}\nexport function handler(role) { return authorize(role); }\n"
+      ),
+      "test/auth.test.ts": Buffer.from(
+        "import { authorize } from '../src/auth';\ntest('authorize', () => authorize('admin'));\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+    patch: "@@ -2 +2 @@\n-  const token = \"old\";\n+  const token = \"secret\";"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 2 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, deliveryId);
+  await service.processNextWebhook("worker-1");
+  assert.equal(backend.requests.length, 1);
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  return { indexed, body: github.updates.at(-1)?.body ?? "" };
+}
+
+/**
+ * Diverges the column-sourced identity from the document-sourced one.
+ *
+ * `full_name` and `index_document.repository` are written from the same value
+ * (store.ts upsertRepositoryIndexDocument) but land in two separate storage
+ * locations, so disagreement between them is genuinely representable rather than
+ * contrived. `repository` is the probe field because retrieval reads it zero times
+ * and `assertIndexReference` does not check it: a mismatch there can only be caught
+ * by the service's own identity comparison, so nothing downstream can mask a
+ * missing check and make this test pass for the wrong reason.
+ */
+class ForeignDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, repository: "attacker/other-repo" };
+  }
+}
+
+/** The mirror image: the document is foreign while the columns are correct. */
+class ForeignDocumentStore extends MemoryStore {
+  override async getRepositoryIndex(
+    ...args: Parameters<MemoryStore["getRepositoryIndex"]>
+  ) {
+    const index = await super.getRepositoryIndex(...args);
+    if (!index) return index;
+    return { ...index, repository: "attacker/other-repo" };
+  }
+}
+
+/** A row belonging to a different repository than the one being reviewed. */
+class ForeignScopeDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, repositoryScope: "github:1234" };
+  }
+}
+
+/** A stored storage key that is not canonical for its own scope and commit. */
+class NonCanonicalDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, storageKey: `${descriptor.storageKey}-tampered` };
+  }
+}
+
+test("the fixture yields index contexts when both identity sources agree", async () => {
+  // Non-vacuity guard for every rejection test below. Without this, "no repository
+  // index contexts" would be indistinguishable from a fixture that never produced
+  // any, and each rejection assertion could pass while asserting nothing.
+  const { indexed, body } = await runIndexedReview(new MemoryStore(), "review-descriptor-agree");
+  assert.ok(indexed.length > 0);
+  assert.doesNotMatch(body, /repository index context was rejected by repository isolation checks/);
+});
+
+test("a column-sourced identity that disagrees with the request is rejected even though the document agrees", async () => {
+  // This is the test that fails if the descriptor is rebuilt from `input` instead of
+  // read from the database: a descriptor derived from the request agrees with the
+  // request by construction, so the divergence becomes unobservable and the review
+  // proceeds. The document is untouched here, so the pre-existing document check
+  // cannot account for the rejection.
+  const { indexed, body } = await runIndexedReview(
+    new ForeignDescriptorStore(),
+    "review-descriptor-foreign"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});
+
+test("a document-sourced identity that disagrees with the request is rejected even though the columns agree", async () => {
+  // The other half of the pair, and the reason the document check is retained rather
+  // than replaced: here the columns agree with the request, so the descriptor check
+  // alone would accept this row. Deleting the document-sourced check fails this test
+  // while leaving the visibility-mismatch test above passing, which is what pins
+  // three-source comparison as the asserted property instead of an accident.
+  const { indexed, body } = await runIndexedReview(
+    new ForeignDocumentStore(),
+    "review-document-foreign"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});
+
+test("a cross-repository descriptor row is rejected and degrades the review rather than crashing", async () => {
+  // RepositoryIsolationError still fires for a foreign-scoped row. It is raised
+  // inside the descriptor load and must surface as an explicit degradation, not as
+  // an unhandled throw and not as a silent success.
+  const { indexed, body } = await runIndexedReview(
+    new ForeignScopeDescriptorStore(),
+    "review-descriptor-cross-repository"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});
+
+test("a stored storage key that is not canonical for its scope and commit is rejected", async () => {
+  // The stored key is confirmed against `repositoryIndexStorageKey()`, never trusted.
+  // This fails if the derived-key comparison is dropped and the column is believed.
+  const { indexed, body } = await runIndexedReview(
+    new NonCanonicalDescriptorStore(),
+    "review-descriptor-noncanonical"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});

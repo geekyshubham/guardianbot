@@ -12,6 +12,7 @@ import {
 } from "@guardianbot/core";
 import {
   applyFindingFeedback,
+  buildRepositoryIndexDescriptorStatement,
   buildRepositoryIndexRecordBatchStatement,
   buildRepositoryIndexRecordDeleteStatement,
   buildRepositoryIndexRecordQueryStatement,
@@ -1880,6 +1881,202 @@ test("record hydration binds every value and is scoped by the canonical storage 
   ]);
   assert.equal(hostile.text, single.text);
   assert.ok(!hostile.text.includes("DROP TABLE"));
+});
+
+// A stored identity row as the descriptor projection would return it. `__repositoryId`
+// stands in for the column the projection deliberately omits; the stub needs it to
+// emulate the predicate, and it is stripped before the row is handed to the store.
+function descriptorRow(
+  repositoryId: number,
+  commitSha: string,
+  overrides: Record<string, unknown> = {}
+) {
+  const repositoryScope = `github:${repositoryId}`;
+  return {
+    __repositoryId: repositoryId,
+    repository_scope: repositoryScope,
+    commit_sha: commitSha,
+    visibility: "private",
+    storage_key: repositoryIndexStorageKey({ repositoryScope, commitSha }),
+    full_name: `Acme/repo-${repositoryId}`,
+    embedding_provider_id: "lexical-hash-96",
+    embedding_kind: "lexical-fallback",
+    embedding_dimensions: 96,
+    ...overrides
+  };
+}
+
+/**
+ * Stands in for the server by applying only the predicates the statement actually
+ * carries. This is what gives the isolation test teeth: dropping a predicate from
+ * the builder changes which rows come back, rather than leaving a text assertion
+ * that still matches. It is still only text matching — nothing parses the SQL.
+ */
+function respondWithDescriptorRows(rows: ReturnType<typeof descriptorRow>[]) {
+  return (text: string, values?: unknown[]) => {
+    if (!text.includes("FROM repository_indexes")) return undefined;
+    let matched = [...rows];
+    if (/repository_id=\$1/.test(text)) {
+      matched = matched.filter((row) => row.__repositoryId === values?.[0]);
+    }
+    if (/commit_sha=\$2/.test(text)) {
+      matched = matched.filter((row) => row.commit_sha === values?.[1]);
+    }
+    return {
+      rows: matched.map(({ __repositoryId, ...rest }) => rest)
+    };
+  };
+}
+
+test("the index descriptor statement omits the document and binds repository and commit", () => {
+  const commitSha = "a".repeat(40);
+  const statement = buildRepositoryIndexDescriptorStatement(42, commitSha);
+
+  // The entire point of the projection: identity without the materialised snapshot.
+  assert.ok(!statement.text.includes("index_document"));
+  for (const column of [
+    "repository_scope",
+    "commit_sha",
+    "visibility",
+    "storage_key",
+    "full_name",
+    "embedding_provider_id",
+    "embedding_kind",
+    "embedding_dimensions"
+  ]) {
+    assert.match(statement.text, new RegExp(`\\b${column}\\b`));
+  }
+
+  // (repository_id, commit_sha) is the table's PRIMARY KEY, so this is a single-row
+  // lookup. repository_scope is deliberately absent from the predicates: a scope
+  // mismatch must surface as a returned row that fails comparison, not as an empty
+  // result indistinguishable from "no such snapshot".
+  assert.match(statement.text, /WHERE repository_id=\$1 AND commit_sha=\$2/);
+  // Checked against the WHERE clause SEMANTICALLY, not against one spelling of it.
+  // A predicate spelled `repository_scope = $3`, or one needing no placeholder at all
+  // like `repository_scope = 'github:' || $1::text`, is the same design mistake and a
+  // regex for the literal `repository_scope=$` misses both. The scope legitimately
+  // appears in the SELECT list, so only the text after WHERE is examined.
+  const whereClause = statement.text.slice(statement.text.indexOf("WHERE"));
+  assert.ok(
+    !/\brepository_scope\b/.test(whereClause),
+    "repository_scope must not be a predicate in any spelling: filtering on it turns a " +
+      "cross-repository row into an empty result indistinguishable from 'no such snapshot'"
+  );
+  assert.deepEqual(statement.values, [42, commitSha]);
+  assert.equal(maxPlaceholder(statement.text), 2);
+  assert.ok(!statement.text.includes(commitSha));
+});
+
+test("the index descriptor read refuses another repository's row at the same commit", async () => {
+  // Two repositories hold a snapshot at the same commit sha, which is what a fork or
+  // a shared-history mirror produces. The foreign row is returned first, because
+  // without the repository predicate the server may answer in any order and the read
+  // takes the first row.
+  const commitSha = "b".repeat(40);
+  const harness = stubbedPostgresStore(
+    undefined,
+    respondWithDescriptorRows([descriptorRow(43, commitSha), descriptorRow(42, commitSha)])
+  );
+
+  const descriptor = await harness.store.getRepositoryIndexDescriptor(42, commitSha);
+  assert.ok(descriptor);
+  // Fails if the repository predicate is dropped from the builder: the read would
+  // answer with repository 43's identity for a request about repository 42.
+  assert.equal(descriptor.repositoryScope, "github:42");
+  assert.equal(descriptor.repository, "Acme/repo-42");
+  assert.equal(
+    descriptor.storageKey,
+    repositoryIndexStorageKey({ repositoryScope: "github:42", commitSha })
+  );
+  assert.equal(descriptor.commitSha, commitSha);
+  assert.equal(descriptor.visibility, "private");
+  assert.deepEqual(descriptor.embedding, {
+    providerId: "lexical-hash-96",
+    kind: "lexical-fallback",
+    dimensions: 96
+  });
+});
+
+test("the index descriptor read rejects a stored storage key that is not canonical", async () => {
+  // The stored key is never trusted, only ever confirmed against the key derived
+  // from the scope and commit. A row written with a non-canonical key is the shape a
+  // buggy or hostile writer produces, and following it would let one snapshot's
+  // identity point at another snapshot's rows.
+  const commitSha = "c".repeat(40);
+  const harness = stubbedPostgresStore(
+    undefined,
+    respondWithDescriptorRows([
+      descriptorRow(42, commitSha, {
+        storage_key: "guardianbot/repository-index/v2/github:42/" + "c".repeat(40)
+      })
+    ])
+  );
+
+  await assert.rejects(
+    harness.store.getRepositoryIndexDescriptor(42, commitSha),
+    /storage key is not canonical/
+  );
+});
+
+test("the index descriptor read rejects an unrecognised stored embedding kind", async () => {
+  // embedding_kind is a bare TEXT column, so a value outside the union is
+  // representable. Casting it would let an unknown embedding space be treated as a
+  // known one during provider reconstruction.
+  const commitSha = "d".repeat(40);
+  const harness = stubbedPostgresStore(
+    undefined,
+    respondWithDescriptorRows([descriptorRow(42, commitSha, { embedding_kind: "remote-api" })])
+  );
+
+  await assert.rejects(
+    harness.store.getRepositoryIndexDescriptor(42, commitSha),
+    /unrecognised embedding kind/
+  );
+});
+
+test("the index descriptor agrees with the materialised document it was published beside", async () => {
+  // What licenses a later stage to compare the two as independent witnesses: for a
+  // snapshot published through the normal path they must agree field for field. If
+  // they can disagree, a cross-check between them proves nothing.
+  const commitSha = "e".repeat(40);
+  const store = new MemoryStore();
+  await store.upsertRepository({
+    repositoryId: 42,
+    installationId: 7,
+    fullName: "Acme/Descriptor",
+    visibility: "private",
+    defaultBranch: "main",
+    scannerState: "not-configured",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const index = indexRepository({
+    repository: "Acme/Descriptor",
+    repositoryId: 42,
+    commitSha,
+    visibility: "private",
+    files: { "src/a.ts": "export function a() { return 1; }" }
+  });
+  await store.replaceRepositoryIndex(42, index, toPersistedVectorRows(index));
+
+  const descriptor = await store.getRepositoryIndexDescriptor(42, commitSha);
+  assert.ok(descriptor);
+  assert.equal(descriptor.storageKey, index.storageKey);
+  assert.equal(descriptor.repository, index.repository);
+  assert.equal(descriptor.repositoryScope, index.repositoryScope);
+  assert.equal(descriptor.commitSha, index.commitSha);
+  assert.equal(descriptor.visibility, index.visibility);
+  assert.deepEqual(descriptor.embedding, index.embedding);
+
+  // Identity only. A descriptor is not a thin RepositoryIndex, and nothing should be
+  // able to mistake it for one.
+  assert.ok(!("symbols" in descriptor));
+  assert.ok(!("files" in descriptor));
+  assert.ok(!("calls" in descriptor));
+
+  // A commit that was never published is absent, not an error.
+  assert.equal(await store.getRepositoryIndexDescriptor(42, "f".repeat(40)), undefined);
 });
 
 test("the record content batch binds every value and never interpolates content", () => {

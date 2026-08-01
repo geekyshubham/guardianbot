@@ -1,16 +1,20 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import {
+  assertDescriptorReference,
   assertIndexReference,
   compareRecordRows,
   cosineSimilarity,
+  normalizeCommitSha,
   repositoryIndexStorageKey,
   toPersistedRecordRows
 } from "@guardianbot/core";
 import type {
+  IndexEmbeddingMetadata,
   PersistedRecordRow,
   PersistedVectorRow,
   RepositoryIndex,
+  RepositoryIndexDescriptor,
   RepositoryIndexVectorDelta,
   RepositoryRecordHydrationRequest,
   RepositoryRecordReference,
@@ -1175,6 +1179,18 @@ export interface Store {
     commitSha: string
   ): Promise<RepositoryIndex | undefined>;
   /**
+   * A snapshot's identity without its content, read from columns rather than from
+   * the materialised document. It is a second independent witness to the identity
+   * the document also carries, so a caller holding both can compare them.
+   *
+   * It does not narrow the document load on its own: nothing in retrieval consumes
+   * it yet.
+   */
+  getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined>;
+  /**
    * Ranked nearest-neighbour read over one repository's persisted vectors. The
    * canonical storage key derived from `request` is the isolation boundary: it
    * pins both the repository scope and the commit, so no other repository's rows
@@ -1575,6 +1591,35 @@ export class MemoryStore implements Store {
       ) {
         return structuredClone(entry.index);
       }
+    }
+    return undefined;
+  }
+
+  async getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    const normalizedCommitSha = normalizeCommitSha(commitSha);
+    for (const entry of this.repositoryIndexes.values()) {
+      if (entry.repositoryId !== repositoryId || entry.index.commitSha !== normalizedCommitSha) {
+        continue;
+      }
+      // Projected field by field rather than spread, so this mirrors the column
+      // projection the PostgreSQL path performs and cannot accidentally carry the
+      // document's content through in memory where the real store would not.
+      const descriptor: RepositoryIndexDescriptor = {
+        storageKey: entry.index.storageKey,
+        repository: entry.index.repository,
+        repositoryScope: entry.index.repositoryScope,
+        commitSha: entry.index.commitSha,
+        visibility: entry.index.visibility,
+        embedding: { ...entry.index.embedding }
+      };
+      assertDescriptorReference(descriptor, {
+        repositoryScope: descriptor.repositoryScope,
+        commitSha: normalizedCommitSha
+      });
+      return descriptor;
     }
     return undefined;
   }
@@ -2854,6 +2899,42 @@ export class PostgresStore implements Store {
     );
     const row = result.rows[0];
     return row ? (row.index_document as RepositoryIndex) : undefined;
+  }
+
+  async getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    // Normalised before it reaches the predicate so a mixed-case request matches
+    // the lowercase sha the write path stored, and so the commit compared below is
+    // the same one the storage key is derived from.
+    const normalizedCommitSha = normalizeCommitSha(commitSha);
+    const statement = buildRepositoryIndexDescriptorStatement(repositoryId, normalizedCommitSha);
+    const result = await this.pool.query(statement.text, statement.values);
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const descriptor: RepositoryIndexDescriptor = {
+      storageKey: row.storage_key as string,
+      repository: row.full_name as string,
+      repositoryScope: row.repository_scope as string,
+      commitSha: row.commit_sha as string,
+      visibility: row.visibility as RepositoryIndexDescriptor["visibility"],
+      embedding: {
+        providerId: row.embedding_provider_id as string,
+        kind: parseEmbeddingKind(row.embedding_kind),
+        dimensions: Number(row.embedding_dimensions)
+      }
+    };
+    // Validated against the row's own scope, so the storage key is confirmed
+    // canonical for the scope and commit the row itself claims rather than merely
+    // trusted as stored. The scope is not checked here because this method takes no
+    // expected scope; binding the scope to the numeric repository id is the
+    // caller's boundary, and RepositoryIndexService does it.
+    assertDescriptorReference(descriptor, {
+      repositoryScope: descriptor.repositoryScope,
+      commitSha: normalizedCommitSha
+    });
+    return descriptor;
   }
 
   async queryRepositoryIndexVectors(
@@ -4636,6 +4717,57 @@ export function buildRepositoryIndexRecordQueryStatement(
       records.map((record) => record.recordId)
     ]
   };
+}
+
+export interface RepositoryIndexDescriptorStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * A snapshot's identity read from columns alone, with `index_document` omitted
+ * from the projection.
+ *
+ * Every column here is already NOT NULL on `repository_indexes` (see the DDL
+ * above), so the descriptor needs no optional modelling. `content_sha256` and
+ * `vector_storage` are deliberately absent: nothing in the identity contract
+ * reads them, and projecting only what is consumed keeps the row narrow.
+ *
+ * The predicate pair is `(repository_id, commit_sha)`, which is the table's
+ * PRIMARY KEY, so this is a single-row primary-key lookup. `repository_scope` is
+ * deliberately *not* a predicate: filtering on it would turn a scope mismatch
+ * into an empty result that reads as "no such snapshot", whereas returning the
+ * row and comparing its scope lets a mismatch be raised. A silent miss and a
+ * cross-repository row must not be the same observation.
+ *
+ * NOTE: this statement is only ever exercised against a stubbed pool in tests.
+ * No live PostgreSQL exists in this environment, so its behaviour on a real
+ * server is reasoned about, not verified.
+ */
+export function buildRepositoryIndexDescriptorStatement(
+  repositoryId: number,
+  commitSha: string
+): RepositoryIndexDescriptorStatement {
+  return {
+    text: `SELECT repository_scope, commit_sha, visibility, storage_key, full_name,
+            embedding_provider_id, embedding_kind, embedding_dimensions
+       FROM repository_indexes
+       WHERE repository_id=$1 AND commit_sha=$2`,
+    values: [repositoryId, commitSha]
+  };
+}
+
+/**
+ * The stored embedding kind, rejected rather than cast when unrecognised.
+ *
+ * `embedding_kind` is a bare TEXT column, so a value outside the union is
+ * representable in storage. Casting it would produce a well-typed lie that flows
+ * into embedding-provider reconstruction; failing here keeps an unknown embedding
+ * space from being silently treated as a known one.
+ */
+function parseEmbeddingKind(value: unknown): IndexEmbeddingMetadata["kind"] {
+  if (value === "local-model" || value === "lexical-fallback") return value;
+  throw new Error("repository index descriptor has an unrecognised embedding kind");
 }
 
 export interface RepositoryIndexRecordDeleteStatement {

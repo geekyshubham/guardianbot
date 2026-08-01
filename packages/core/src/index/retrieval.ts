@@ -136,6 +136,170 @@ export type RetrievedContextKind =
   | "ownership"
   | "history";
 
+/**
+ * Every `RetrievedContextKind` as a runtime value, pinned to the union in BOTH
+ * directions by the two checks below.
+ *
+ * A runtime list is required because the union is erased: the test runner strips
+ * types rather than checking them, so a test comparing a table against a type
+ * would compare it against nothing. Pinning is what gives the list teeth — adding
+ * a member to the union without adding it here is a compile error, and adding it
+ * here without classifying it below fails the partition test.
+ */
+export const retrievedContextKinds = [
+  "changed-symbol",
+  "caller",
+  "callee",
+  "test",
+  "config",
+  "schema",
+  "ownership",
+  "history"
+] as const satisfies readonly RetrievedContextKind[];
+
+/** Fails to compile if a union member is missing from `retrievedContextKinds`. */
+type UnclassifiedContextKind = Exclude<
+  RetrievedContextKind,
+  (typeof retrievedContextKinds)[number]
+>;
+const _everyKindIsListed: UnclassifiedContextKind extends never ? true : never = true;
+void _everyKindIsListed;
+
+/**
+ * How completely durable per-record storage can reproduce one candidate kind.
+ *
+ * These names are the vocabulary for a distinction that is otherwise easy to lose:
+ * "the document is no longer loaded" and "the same candidates are still found" are
+ * different claims, and only one of them is about storage.
+ */
+export type RetrievedContextKindDurability =
+  /**
+   * Reproducible from durable rows exactly, for the same inputs. The diff bounds
+   * it, and `repository_index_records` already stores every field it needs.
+   */
+  | "durably-exact"
+  /**
+   * Enumerated repo-wide from the document, and answerable durably only within
+   * whatever nearest-neighbour recall returned.
+   *
+   * The document path scans EVERY symbol (`addRepositorySupportContexts`, and the
+   * test scan in `primaryCandidates`); the durable path sees only recalled rows.
+   * So this is not equivalence — it is
+   * "bounded by recall instead of by the repository". Widening recall widens it;
+   * nothing about it makes review cost sublinear in repository size, because the
+   * document-side scan is repo-wide by SEMANTICS and not by storage accident.
+   */
+  | "exhaustive-from-document-recall-bounded-durably"
+  /**
+   * Not reproducible from durable storage at all: it needs a call edge, and no
+   * durable row carries one.
+   *
+   * There is no `index_calls` table, and neither `PersistedVectorRow` nor
+   * `PersistedRecordRow` carries a call target or a resolved callee. A kind in this
+   * class disappears SILENTLY when the document is absent — `classifyDurableRecord`
+   * simply does not emit it, and nothing raises.
+   */
+  | "document-only";
+
+export interface RetrievedContextKindCoverage {
+  durability: RetrievedContextKindDurability;
+  /**
+   * Relations within this kind that need the materialised document even when the
+   * kind itself has a durable route. A non-empty list means a candidate of this
+   * kind can still be MISSED durably, so the kind's presence in a durable result
+   * is not evidence that its document-side counterpart was fully reproduced.
+   */
+  documentOnlyRelations: readonly string[];
+  why: string;
+}
+
+/**
+ * The declared durability of every candidate kind: a partition, one class each.
+ *
+ * It exists so drift is mechanically detectable rather than a matter of reading
+ * comments. `classifyDurableRecord` is deliberately a strict SUBSET of
+ * `primaryCandidates`, and the gap between them is invisible at runtime — no error
+ * is raised when a kind vanishes, the review is just thinner. This table names the
+ * gap so a test can assert it, and so a future change that closes it has to say so
+ * here.
+ *
+ * Where a kind has both a durable and a document-only route, it is classified by
+ * its WEAKEST guarantee and the lost relation is named in `documentOnlyRelations`.
+ * Nothing in retrieval reads this table; it is a declaration, not a control path.
+ */
+export const retrievedContextKindCoverage: Record<
+  RetrievedContextKind,
+  RetrievedContextKindCoverage
+> = {
+  "changed-symbol": {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "From the document this kind is exact and bounded by the diff, not by the " +
+      "repository, which is what separates it from the repo-wide scans below. Its " +
+      "DURABLE route is not exact, however: durable rows reach retrieval only " +
+      "through `sourceThroughDurableStorage`, which is bounded by " +
+      "`vectorRankerLimit` (200 by default), so a changed symbol outside that " +
+      "recall window is missed. `repository_index_records` does store path, line, " +
+      "endLine, name, content, and contentSha256, so a path-scoped record query " +
+      "WOULD make this durably exact — but no such query exists in retrieval, and " +
+      "declaring exactness on the strength of an unwritten query is the specific " +
+      "overstatement this table exists to prevent."
+  },
+  caller: {
+    durability: "document-only",
+    documentOnlyRelations: ["call-edge inbound"],
+    why:
+      "Produced only by the index.calls walk in primaryCandidates (and its " +
+      "relatedCandidates counterpart). No durable row carries a caller, so " +
+      "classifyDurableRecord never emits this kind on any path."
+  },
+  callee: {
+    durability: "document-only",
+    documentOnlyRelations: ["call-edge outbound"],
+    why:
+      "The primary route resolves index.calls through resolvedSymbolIds. " +
+      "classifyDurableRecord DOES emit the literal label 'callee', but only as a " +
+      "RELATED-source lexical relevance match on name and content, reached with " +
+      "resolvedSymbolIds empty and no edge consulted. That label is not call-edge " +
+      "coverage and must never be counted as such: asserting on the kind string alone " +
+      "would pass while every real edge was missing."
+  },
+  test: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: ["call-based test relation (relatedByCall)"],
+    why:
+      "Two disjuncts. relatedByName has a durable counterpart in classifyDurableRecord, but " +
+      "relatedByCall needs index.calls. A test reaching a changed symbol only through a call " +
+      "— its content not naming the symbol, which the builder's 8000-character content " +
+      "truncation makes reachable — is durably invisible."
+  },
+  config: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "Path classification is exact on a durable row, but the document path scans every " +
+      "symbol in the repository while the durable path sees only recalled rows."
+  },
+  schema: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why: "Path classification is exact per row; enumeration is repo-wide only from the document."
+  },
+  ownership: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why: "Path classification is exact per row; enumeration is repo-wide only from the document."
+  },
+  history: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "Summary matching is exact on a durable row because the row carries the raw summary, " +
+      "but which history rows are considered is bounded by recall."
+  }
+};
+
 export interface RetrievedRepositoryContext {
   id: string;
   repositoryScope: string;
@@ -1156,7 +1320,13 @@ export async function retrieveRepositoryContext(
   };
 }
 
-const reviewKindByRetrievedKind: Record<
+/**
+ * Exported so the kind-partition invariant has a THIRD independent runtime
+ * witness of the union. The union itself is erased at test time, so a table can
+ * only be checked against another table; this one is load-bearing for review
+ * bundles, so a new kind cannot compile without appearing here.
+ */
+export const reviewKindByRetrievedKind: Record<
   RetrievedContextKind,
   ReviewBundleContextCandidate["kind"]
 > = {

@@ -6,6 +6,7 @@ import type {
   PersistedVectorRow,
   RepositoryIdentity,
   RepositoryIndex,
+  RepositoryIndexDescriptor,
   RepositoryIndexInput,
   RepositoryIndexPersistence,
   RepositoryIndexReference,
@@ -102,21 +103,65 @@ export function repositoryIndexStorageKey(reference: RepositoryIndexReference): 
   return `${INDEX_STORAGE_PREFIX}/${encodeURIComponent(scope)}/${commitSha}`;
 }
 
+/**
+ * The identity fields a stored snapshot must agree with its reference on. Both
+ * the materialised document and the column-sourced descriptor carry these, which
+ * is what makes the two comparable.
+ */
+type IndexIdentityFields = Pick<
+  RepositoryIndex,
+  "storageKey" | "repositoryScope" | "commitSha" | "visibility"
+>;
+
+/**
+ * The three checks that make a stored identity trustworthy, shared by the
+ * document and descriptor asserts so the two can never drift.
+ *
+ * The storage key check is the load-bearing one and it is deliberately not a
+ * read of the stored value: the key is *derived* from the requested scope and
+ * commit, and the stored key must equal that derivation. A stored key is
+ * therefore never trusted, only ever confirmed, so a row whose key was written
+ * non-canonically is rejected rather than followed.
+ */
+function assertIndexIdentity(
+  identity: IndexIdentityFields,
+  reference: RepositoryIndexReference,
+  subject: string
+): void {
+  if (!["public", "private", "internal"].includes(identity.visibility)) {
+    throw new Error(`${subject} has an invalid visibility`);
+  }
+  const commitSha = normalizeCommitSha(reference.commitSha);
+  if (identity.repositoryScope !== reference.repositoryScope || identity.commitSha !== commitSha) {
+    throw new Error(`${subject} does not match the explicitly requested scope and commit`);
+  }
+  const expectedStorageKey = repositoryIndexStorageKey(reference);
+  if (identity.storageKey !== expectedStorageKey) {
+    throw new Error(`${subject} storage key is not canonical for its scope and commit`);
+  }
+}
+
 export function assertIndexReference(
   index: RepositoryIndex,
   reference: RepositoryIndexReference
 ): void {
-  if (!["public", "private", "internal"].includes(index.visibility)) {
-    throw new Error("repository index has an invalid visibility");
-  }
-  const commitSha = normalizeCommitSha(reference.commitSha);
-  if (index.repositoryScope !== reference.repositoryScope || index.commitSha !== commitSha) {
-    throw new Error("repository index does not match the explicitly requested scope and commit");
-  }
-  const expectedStorageKey = repositoryIndexStorageKey(reference);
-  if (index.storageKey !== expectedStorageKey) {
-    throw new Error("repository index storage key is not canonical for its scope and commit");
-  }
+  assertIndexIdentity(index, reference, "repository index");
+}
+
+/**
+ * The descriptor counterpart of `assertIndexReference`.
+ *
+ * A descriptor is read from columns rather than from the document, so it is an
+ * independent witness to the same identity. It is validated identically and by
+ * the same code, which is what licenses a caller holding both to compare them:
+ * any disagreement is then a real storage inconsistency and not an artefact of
+ * two different validation rules.
+ */
+export function assertDescriptorReference(
+  descriptor: RepositoryIndexDescriptor,
+  reference: RepositoryIndexReference
+): void {
+  assertIndexIdentity(descriptor, reference, "repository index descriptor");
 }
 
 export function toPersistedVectorRows(index: RepositoryIndex): PersistedVectorRow[] {
