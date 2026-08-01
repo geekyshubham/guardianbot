@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { toPersistedVectorRows } from "@guardianbot/core";
 import { BackendError, type ReviewRequest } from "@guardianbot/protocol";
 import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { ReviewBackendRegistry } from "../src/backend-registry.js";
@@ -2914,52 +2915,32 @@ test("the advisory body degrades below GitHub's comment limit instead of failing
 });
 
 /**
- * Serves a snapshot document that is missing one path's symbols while leaving that
- * path's durable vector and record rows intact, and counts the durable reads.
- *
- * This is the one shape that can tell a wired durable retrieval path apart from an
- * unwired one. Every record being both materialised and durable — the ordinary case
- * — produces identical output either way, which is exactly why the missing wiring
- * went unnoticed: the core tests exercised a ranker they supplied themselves, so
- * they passed whether or not any production caller ever supplied one.
+ * Production review must never materialise index_document. A store whose document
+ * load throws proves the path is descriptor-first: a valid review still produces
+ * indexed context from durable rows alone.
  */
-class PartialDocumentStore extends MemoryStore {
-  vectorQueries: string[] = [];
-  hydrations: string[] = [];
-
-  constructor(private readonly omittedPath: string) {
-    super();
-  }
+class DocumentLoadForbiddenStore extends MemoryStore {
+  documentLoads = 0;
+  pathQueries: string[] = [];
 
   override async getRepositoryIndex(
     ...args: Parameters<MemoryStore["getRepositoryIndex"]>
   ) {
-    const index = await super.getRepositoryIndex(...args);
-    if (!index) return index;
-    return {
-      ...index,
-      symbols: index.symbols.filter((symbol) => symbol.path !== this.omittedPath)
-    };
+    this.documentLoads += 1;
+    throw new Error("index_document materialisation is forbidden on the review path");
   }
 
-  override async queryRepositoryIndexVectors(
-    ...args: Parameters<MemoryStore["queryRepositoryIndexVectors"]>
+  override async queryRepositoryIndexRecordsByPath(
+    ...args: Parameters<MemoryStore["queryRepositoryIndexRecordsByPath"]>
   ) {
-    this.vectorQueries.push(args[1].repositoryScope);
-    return super.queryRepositoryIndexVectors(...args);
-  }
-
-  override async hydrateRepositoryIndexRecords(
-    ...args: Parameters<MemoryStore["hydrateRepositoryIndexRecords"]>
-  ) {
-    this.hydrations.push(args[1].repositoryScope);
-    return super.hydrateRepositoryIndexRecords(...args);
+    this.pathQueries.push(args[1].repositoryScope);
+    return super.queryRepositoryIndexRecordsByPath(...args);
   }
 }
 
-test("the review path supplies a durable ranker, so a record absent from the loaded snapshot is still retrieved", async () => {
+test("production review produces indexed context without loading index_document", async () => {
   const baseSha = "e".repeat(40);
-  const store = new PartialDocumentStore("src/auth.ts");
+  const store = new DocumentLoadForbiddenStore();
   await store.upsertRepository({
     installationId: 1,
     repositoryId: 99,
@@ -2982,8 +2963,20 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       )
     }
   });
-  const repositoryIndexService = new RepositoryIndexService(store);
-  await repositoryIndexService.refreshDefaultBranchIndex({
+  // Publish through a store that can load documents for indexing refresh only.
+  const publishStore = new MemoryStore();
+  await publishStore.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const publisher = new RepositoryIndexService(publishStore);
+  await publisher.refreshDefaultBranchIndex({
     github,
     repositoryId: 99,
     installationId: 1,
@@ -2991,18 +2984,12 @@ test("the review path supplies a durable ranker, so a record absent from the loa
     defaultBranch: "main",
     visibility: "public"
   });
-  // The premise the assertions rest on: the document a review loads does not carry
-  // this symbol, but durable storage does.
-  const served = await store.getRepositoryIndex(99, "github:99", baseSha);
-  assert.ok(served);
-  assert.equal(served.symbols.some((symbol) => symbol.path === "src/auth.ts"), false);
-  const durableRows = await store.hydrateRepositoryIndexRecords(99, {
-    repositoryScope: "github:99",
-    commitSha: baseSha,
-    records: [{ recordType: "symbol", recordId: "auth-probe" }]
-  });
-  assert.deepEqual(durableRows, []);
-  store.hydrations.length = 0;
+  // Copy durable rows into the review store without going through getRepositoryIndex
+  // during review. Re-publish via replace so vectors/records/edges/descriptor exist.
+  const index = await publishStore.getRepositoryIndex(99, "github:99", baseSha);
+  assert.ok(index);
+  await store.replaceRepositoryIndex(99, index, toPersistedVectorRows(index));
+  store.documentLoads = 0;
 
   const event = createPullEvent();
   event.pull_request.base.sha = baseSha;
@@ -3024,21 +3011,17 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       webhookSecret: "secret",
       githubClientFactory: async () => github,
       reviewClientFactory: () => backend,
-      repositoryIndexService
+      repositoryIndexService: new RepositoryIndexService(store)
     },
     store
   );
 
-  await service.enqueue("pull_request", event, "review-durable-ranker");
+  await service.enqueue("pull_request", event, "review-descriptor-first");
   await service.processNextWebhook("worker-1");
 
   assert.equal(backend.requests.length, 1);
-  // A ranker was actually supplied and used on the real review path, and the read
-  // was scoped to this repository.
-  assert.deepEqual(store.vectorQueries, ["github:99"]);
-  assert.deepEqual(store.hydrations, ["github:99"]);
-  // And the durable record reached the model, which it cannot do without wiring
-  // because the loaded document does not contain it.
+  assert.equal(store.documentLoads, 0, "review path must not call getRepositoryIndex");
+  assert.deepEqual(store.pathQueries, ["github:99"]);
   const indexed = backend.requests[0]!.contexts.filter((context) =>
     context.id.startsWith(`repository-index:github:99:${baseSha}:`)
   );
@@ -3048,4 +3031,552 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       .find((context) => context.path === "src/auth.ts")!
       .content.includes("checkTenant")
   );
+});
+
+test("a push-triggered index rebuild stops at a round trip boundary and publishes nothing", async () => {
+  const store = new MemoryStore();
+  const refSha = "f".repeat(40);
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", ".guardianbot/config.yml"],
+    refSha,
+    contents: {
+      "src/auth.ts": Buffer.from("export function authorize(u) { return u.role === 'admin'; }\n")
+    },
+    config: "review:\n  incremental: true\n"
+  });
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 7, 1, 0, 0, 0);
+  // Shutdown lands while the rebuild is between GitHub round trips: the branch head and the tree
+  // listing are already resolved, the per-file content reads have not started.
+  const getTree = github.getTree.bind(github);
+  let treeReads = 0;
+  github.getTree = async function (owner?: string, repo?: string, ref?: string) {
+    const paths = await getTree(owner, repo, ref);
+    treeReads += 1;
+    controller.abort();
+    return paths;
+  };
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      repositoryIndexService: new RepositoryIndexService(store),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/main",
+      deleted: false,
+      repository: {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        default_branch: "main",
+        private: false
+      }
+    },
+    "delivery-push-abort"
+  );
+
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+  assert.equal(treeReads, 1);
+
+  // The whole point: a rebuild cancelled by SIGTERM must not publish an index.
+  assert.equal(await store.getRepositoryIndex(99, "github:99", refSha), undefined);
+  assert.equal((await store.getRepository(99))?.indexSha, undefined);
+
+  // Cancellation is not a delivery failure, so the job is requeued rather than spending its only
+  // attempt and dead-lettering.
+  const job = await store.getWebhook("delivery-push-abort");
+  assert.equal(job?.status, "pending");
+  assert.equal(job?.leaseOwner, undefined);
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // Re-running without an aborted signal completes the rebuild, so the work was only deferred.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.ok(await store.getRepositoryIndex(99, "github:99", refSha));
+  assert.equal((await store.getRepository(99))?.indexSha, refSha);
+});
+
+test("the inline closing loop stops at a comment boundary on shutdown and resumes later", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const files = [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" },
+    { filename: "src/b.ts", status: "modified", patch: "@@ -1 +20 @@\n+line" }
+  ];
+  github.pullFiles = [files, files, files];
+  let reportFindings = true;
+  const backend = new FakeBackend((request) => {
+    const base = createResult(request, { path: "src/a.ts", startLine: 10 });
+    if (!reportFindings) return { ...base, findings: [] };
+    const [first] = base.findings;
+    return {
+      ...base,
+      findings: [
+        first,
+        {
+          ...first,
+          id: "F2",
+          fingerprint: "fp-2",
+          path: "src/b.ts",
+          startLine: 20,
+          endLine: 20,
+          evidence:
+            request.contexts.find((context) => context.path === "src/b.ts")?.content.slice(0, 500) ??
+            "Changed file src/b.ts contains an unsafe operation."
+        }
+      ]
+    };
+  });
+
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 7, 1, 0, 0, 0);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open-two");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 2);
+
+  // Both findings are gone next time, so both advisories become closeable and the loop has two
+  // PATCHes to make. Shutdown lands after the first one.
+  reportFindings = false;
+  const request = github.request.bind(github);
+  github.request = async function <T>(method: string, path: string, body?: any): Promise<T> {
+    const response = await request<T>(method, path, body);
+    if (method === "PATCH" && /\/pulls\/comments\/\d+$/.test(path)) controller.abort();
+    return response;
+  };
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-close-two");
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+
+  // Stopped at the boundary: the second PATCH never went out. Without the in-loop checkpoint the
+  // per-comment catch swallows nothing here, so the loop would run to completion past the budget.
+  assert.equal(github.reviewCommentUpdates.length, 1);
+  const [closed, stillOpen] = github.reviewComments;
+  assert.match(closed!.body, /guardianbot-finding-closed/);
+  assert.doesNotMatch(stillOpen!.body, /guardianbot-finding-closed/);
+
+  const job = await store.getWebhook("delivery-close-two");
+  assert.equal(job?.status, "pending");
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // Resumable and convergent: the retry re-lists the comments, skips the one already rewritten,
+  // and finishes the remainder rather than redoing it.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.equal(github.reviewCommentUpdates.length, 2);
+  for (const comment of github.reviewComments) {
+    assert.match(comment.body, /guardianbot-finding-closed/);
+  }
+});
+
+test("a review whose webhook lease was reclaimed mid-handler commits and publishes nothing", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  github.pullFiles = [[{ filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }]];
+  const leaseMs = 900_000;
+  let clock = Date.UTC(2026, 7, 1, 0, 0, 0);
+  let reclaimedBy: string | undefined;
+  const backend = new FakeBackend((request) => createResult(request));
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      webhookLeaseMs: leaseMs,
+      now: () => new Date(clock)
+    },
+    store
+  );
+
+  const claimWebhook = store.claimWebhook.bind(store);
+  const request = github.request.bind(github);
+  github.request = async function <T>(method: string, path: string, body?: any): Promise<T> {
+    const response = await request<T>(method, path, body);
+    // This is the head re-check that runs after the backend review and immediately before the
+    // review is committed. The handler has now overrun its 15-minute lease, so a second instance
+    // legitimately claims the same delivery — the exact interleaving the fence has to stop.
+    if (
+      method === "GET" &&
+      /\/pulls\/\d+$/.test(path) &&
+      backend.requests.length > 0 &&
+      !reclaimedBy
+    ) {
+      clock += leaseMs + 1;
+      reclaimedBy = (await claimWebhook("worker-2", leaseMs, new Date(clock)))?.leaseOwner;
+    }
+    return response;
+  };
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-reclaimed");
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal(reclaimedBy, "worker-2");
+
+  // saveReviewHead ran while the lease was still held, so the row exists — but the evicted
+  // handler's findings must not have been committed to it.
+  const review = await store.getReview(99, 12);
+  assert.deepEqual(review?.findings ?? [], []);
+  // And nothing was published to GitHub: no inline advisory, no final summary.
+  assert.equal(github.reviews.length, 0);
+  for (const update of github.updates) {
+    assert.doesNotMatch(update.body, /\*\*Finding lifecycle:\*\*/);
+    assert.doesNotMatch(update.body, /\*\*Problem\*\*/);
+  }
+});
+
+test("a discovery-triggered index rebuild is cancellable, not just the push arm", async () => {
+  const store = new MemoryStore();
+  const refSha = "e".repeat(40);
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", ".guardianbot/config.yml"],
+    refSha,
+    contents: {
+      "src/auth.ts": Buffer.from("export function authorize(u) { return u.role === 'admin'; }\n")
+    },
+    config: "review:\n  incremental: true\n"
+  });
+  const controller = new AbortController();
+
+  // Abort on the SECOND tree read, not the first. discover() reads the tree itself for language
+  // detection before it rebuilds, so the entry checkpoint has already passed by then; only the
+  // signal threaded into the rebuild can observe this abort. Aborting on the first read would
+  // pass even with the rebuild left uncancellable.
+  const getTree = github.getTree.bind(github);
+  let treeReads = 0;
+  github.getTree = async function (owner?: string, repo?: string, ref?: string) {
+    const paths = await getTree(owner, repo, ref);
+    treeReads += 1;
+    if (treeReads === 2) controller.abort();
+    return paths;
+  };
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      repositoryIndexService: new RepositoryIndexService(store)
+    },
+    store
+  );
+
+  await service.enqueue(
+    "installation",
+    {
+      action: "created",
+      installation: { id: 1 },
+      repositories: [
+        {
+          id: 99,
+          full_name: "Geekyshubham/guardianbot",
+          default_branch: "main",
+          private: false
+        }
+      ]
+    },
+    "delivery-discover-abort"
+  );
+
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+  // Two reads: discovery's own language detection, then the rebuild's.
+  assert.equal(treeReads, 2);
+
+  // Discovery got far enough to register the repository, which is what makes the absent index
+  // the discriminating signal rather than a no-op.
+  assert.equal((await store.getRepository(99))?.fullName, "Geekyshubham/guardianbot");
+  assert.equal(await store.getRepositoryIndex(99, "github:99", refSha), undefined);
+  assert.equal((await store.getRepository(99))?.indexSha, undefined);
+
+  // Shutdown is not a delivery fault: with maxWebhookAttempts at 1, consuming the attempt would
+  // dead-letter this job instead of requeueing it.
+  const job = await store.getWebhook("delivery-discover-abort");
+  assert.equal(job?.status, "pending");
+  assert.equal(job?.leaseOwner, undefined);
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // The work was deferred, not lost.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.ok(await store.getRepositoryIndex(99, "github:99", refSha));
+  assert.equal((await store.getRepository(99))?.indexSha, refSha);
+});
+
+/**
+ * Drives a real `pull_request` webhook through `processNextWebhook` against a
+ * caller-supplied store, and returns what the backend and GitHub observed.
+ *
+ * The store is a parameter because the property under test is which SOURCE of
+ * identity the review path consults. Every assertion below therefore has to reach
+ * production through the queue rather than through a seam the test supplies: a
+ * barrier in this project was previously reported closed while a grep proved the
+ * production path never reached the new code, because the tests handed retrieval
+ * its own inputs.
+ */
+async function runIndexedReview(store: MemoryStore, deliveryId: string) {
+  const baseSha = "d".repeat(40);
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", "test/auth.test.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(role) {\n  const token = \"secret\";\n  return role === 'admin';\n}\nexport function handler(role) { return authorize(role); }\n"
+      ),
+      "test/auth.test.ts": Buffer.from(
+        "import { authorize } from '../src/auth';\ntest('authorize', () => authorize('admin'));\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+    patch: "@@ -2 +2 @@\n-  const token = \"old\";\n+  const token = \"secret\";"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 2 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, deliveryId);
+  await service.processNextWebhook("worker-1");
+  assert.equal(backend.requests.length, 1);
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  return { indexed, body: github.updates.at(-1)?.body ?? "" };
+}
+
+/**
+ * Diverges the column-sourced identity from the document-sourced one.
+ *
+ * `full_name` and `index_document.repository` are written from the same value
+ * (store.ts upsertRepositoryIndexDocument) but land in two separate storage
+ * locations, so disagreement between them is genuinely representable rather than
+ * contrived. `repository` is the probe field because retrieval reads it zero times
+ * and `assertIndexReference` does not check it: a mismatch there can only be caught
+ * by the service's own identity comparison, so nothing downstream can mask a
+ * missing check and make this test pass for the wrong reason.
+ */
+class ForeignDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, repository: "attacker/other-repo" };
+  }
+}
+
+/**
+ * Document identity is foreign while columns are correct. Under descriptor-first
+ * review this must NOT reject: the document is never loaded.
+ */
+class ForeignDocumentStore extends MemoryStore {
+  documentLoads = 0;
+
+  override async getRepositoryIndex(
+    ...args: Parameters<MemoryStore["getRepositoryIndex"]>
+  ) {
+    this.documentLoads += 1;
+    const index = await super.getRepositoryIndex(...args);
+    if (!index) return index;
+    return { ...index, repository: "attacker/other-repo" };
+  }
+}
+
+/** A row belonging to a different repository than the one being reviewed. */
+class ForeignScopeDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, repositoryScope: "github:1234" };
+  }
+}
+
+/** A stored storage key that is not canonical for its own scope and commit. */
+class NonCanonicalDescriptorStore extends MemoryStore {
+  override async getRepositoryIndexDescriptor(
+    ...args: Parameters<MemoryStore["getRepositoryIndexDescriptor"]>
+  ) {
+    const descriptor = await super.getRepositoryIndexDescriptor(...args);
+    if (!descriptor) return descriptor;
+    return { ...descriptor, storageKey: `${descriptor.storageKey}-tampered` };
+  }
+}
+
+test("the fixture yields index contexts when both identity sources agree", async () => {
+  // Non-vacuity guard for every rejection test below. Without this, "no repository
+  // index contexts" would be indistinguishable from a fixture that never produced
+  // any, and each rejection assertion could pass while asserting nothing.
+  const { indexed, body } = await runIndexedReview(new MemoryStore(), "review-descriptor-agree");
+  assert.ok(indexed.length > 0);
+  assert.doesNotMatch(body, /repository index context was rejected by repository isolation checks/);
+});
+
+test("a column-sourced identity that disagrees with the request is rejected even though the document agrees", async () => {
+  // This is the test that fails if the descriptor is rebuilt from `input` instead of
+  // read from the database: a descriptor derived from the request agrees with the
+  // request by construction, so the divergence becomes unobservable and the review
+  // proceeds. The document is untouched here, so the pre-existing document check
+  // cannot account for the rejection.
+  const { indexed, body } = await runIndexedReview(
+    new ForeignDescriptorStore(),
+    "review-descriptor-foreign"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});
+
+test("a foreign index_document is ignored because the review path never loads it", async () => {
+  const store = new ForeignDocumentStore();
+  // Indexing refresh may still load the document; the production review path must not.
+  const baseSha = "d".repeat(40);
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts"],
+    refSha: baseSha,
+    contents: {
+      "src/auth.ts": Buffer.from(
+        "export function authorize(role) {\n  return role === 'admin';\n}\n"
+      )
+    }
+  });
+  const repositoryIndexService = new RepositoryIndexService(store);
+  await repositoryIndexService.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 99,
+    installationId: 1,
+    fullName: "Geekyshubham/guardianbot",
+    defaultBranch: "main",
+    visibility: "public"
+  });
+  store.documentLoads = 0;
+  const event = createPullEvent();
+  event.pull_request.base.sha = baseSha;
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = [[{
+    filename: "src/auth.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    patch: "@@ -1 +1 @@\n+export function authorize(role) { return role === 'admin'; }"
+  }]];
+  const backend = new FakeBackend((request) =>
+    createResult(request, { path: "src/auth.ts", startLine: 1 })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      repositoryIndexService
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, "review-document-foreign-ignored");
+  await service.processNextWebhook("worker-1");
+  const indexed = backend.requests[0]!.contexts.filter((context) =>
+    context.id.startsWith(`repository-index:github:99:${baseSha}:`)
+  );
+  assert.ok(indexed.length > 0);
+  assert.equal(store.documentLoads, 0);
+  assert.doesNotMatch(
+    github.updates.at(-1)?.body ?? "",
+    /repository index context was rejected by repository isolation checks/
+  );
+});
+
+test("a cross-repository descriptor row is rejected and degrades the review rather than crashing", async () => {
+  // RepositoryIsolationError still fires for a foreign-scoped row. It is raised
+  // inside the descriptor load and must surface as an explicit degradation, not as
+  // an unhandled throw and not as a silent success.
+  const { indexed, body } = await runIndexedReview(
+    new ForeignScopeDescriptorStore(),
+    "review-descriptor-cross-repository"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
+});
+
+test("a stored storage key that is not canonical for its scope and commit is rejected", async () => {
+  // The stored key is confirmed against `repositoryIndexStorageKey()`, never trusted.
+  // This fails if the derived-key comparison is dropped and the column is believed.
+  const { indexed, body } = await runIndexedReview(
+    new NonCanonicalDescriptorStore(),
+    "review-descriptor-noncanonical"
+  );
+  assert.deepEqual(indexed, []);
+  assert.match(body, /repository index context was rejected by repository isolation checks/);
+  assert.match(body, /Partial review/);
 });

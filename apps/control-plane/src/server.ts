@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   createEvidenceAttestationService,
@@ -29,6 +29,25 @@ import {
 // Must exceed the 90s backend review timeout so an in-flight delivery can finish, or at
 // least record its lease release, before the drain window closes.
 const DRAIN_BUDGET_MS = 120_000;
+
+// Node's defaults (requestTimeout 300s) outlive the whole drain budget, so a client that
+// sends complete headers and then stalls mid-body would hold the event loop open past the
+// orchestrator's stop grace and earn a SIGKILL. Bounded well under DRAIN_BUDGET_MS so such
+// a socket is always reaped from inside the drain window.
+// Grace between a blown drain budget and a forced exit. DRAIN_BUDGET_MS + this must stay
+// strictly under the orchestrator's stop_grace_period (130s) so the process always chooses
+// its own exit rather than being SIGKILLed.
+const FORCE_EXIT_GRACE_MS = 5_000;
+// How long the drain waits for in-flight requests to answer before destroying their sockets.
+// This cannot be delegated to server.requestTimeout: server.close() runs httpServerPreClose(),
+// which clears the connections-checking interval, so Node stops enforcing requestTimeout and
+// headersTimeout for the rest of the drain. Verified on node v26.4.0 — a stalled request is
+// reaped in ~1s while the server is open and never reaped after close(). So shutdown owns this
+// deadline itself.
+const REQUEST_DRAIN_BUDGET_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const HEADERS_TIMEOUT_MS = 15_000;
+const KEEP_ALIVE_TIMEOUT_MS = 5_000;
 
 function required(name: string): string {
   const value = process.env[name];
@@ -128,6 +147,10 @@ async function start() {
   // threaded into the owned handler (not raced against it), so the worker settles before the
   // lease is released and no detached review continues mutating GitHub/store.
   const webhookAbort = new AbortController();
+  // Requests are counted so the drain can wait for an in-flight webhook POST to answer its
+  // 202 before shutdown destroys live sockets.
+  let inFlightRequests = 0;
+  let notifyRequestsIdle: (() => void) | undefined;
 
   async function workerLoop(): Promise<void> {
     while (!shuttingDown) {
@@ -197,7 +220,10 @@ async function start() {
     );
   });
 
-  const server = createServer(async (request, response) => {
+  async function handleRequest(
+    request: IncomingMessage,
+    response: ServerResponse
+  ): Promise<void> {
     if (request.url === "/healthz") {
       response.writeHead(200, { "content-type": "application/json" }).end('{"status":"ok"}');
       return;
@@ -422,7 +448,22 @@ async function start() {
         .writeHead(503, { "content-type": "application/json" })
         .end(JSON.stringify({ error: "webhook queue unavailable" }));
     }
+  }
+
+  const server = createServer((request, response) => {
+    inFlightRequests += 1;
+    response.on("close", () => {
+      inFlightRequests -= 1;
+      if (inFlightRequests === 0) notifyRequestsIdle?.();
+    });
+    void handleRequest(request, response);
   });
+
+  // A stalled request must be reaped by the server itself; closeIdleConnections() by
+  // definition skips a socket whose request has already begun.
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
   const port = Number(process.env.PORT ?? 3000);
   server.listen(port, "0.0.0.0");
@@ -437,7 +478,29 @@ async function start() {
     server.close();
     server.closeIdleConnections();
     let drained = false;
-    const settled = Promise.all([workerPromise, cleanupPromise, monitoring.stop()]).then(
+    // In-flight requests are part of the drain: an accepted webhook POST must still receive
+    // its 202 before any socket is destroyed. A request stalled mid-body cannot pin this
+    // forever because server.requestTimeout reaps it well inside DRAIN_BUDGET_MS.
+    const requestDrainAbort = new AbortController();
+    const requestsIdle =
+      inFlightRequests === 0
+        ? Promise.resolve()
+        : Promise.race([
+            new Promise<void>((resolve) => {
+              notifyRequestsIdle = resolve;
+            }),
+            // Bounded so a client that stalls mid-body cannot pin the drain: once this
+            // elapses the drain proceeds and closeAllConnections() destroys the socket.
+            delay(REQUEST_DRAIN_BUDGET_MS, undefined, {
+              signal: requestDrainAbort.signal
+            }).catch(() => {})
+          ]);
+    const settled = Promise.all([
+      workerPromise,
+      cleanupPromise,
+      monitoring.stop(),
+      requestsIdle
+    ]).then(
       () => {
         drained = true;
       },
@@ -453,14 +516,42 @@ async function start() {
     );
     await Promise.race([settled, budget]);
     drainAbort.abort();
+    // Cancel the request deadline too, or a prompt drain still waits it out.
+    requestDrainAbort.abort();
+    if (signal) process.exitCode = process.exitCode ?? 0;
+    if (!drained) {
+      // The budget bounds observation only: nothing here can stop a continuation that
+      // ignored the abort, and there is no other exit path in this process. Force one so a
+      // rogue continuation cannot outlive the orchestrator's stop grace and earn a SIGKILL.
+      // store.close() stays skipped so a still-live handler keeps its lease connection.
+      console.error(
+        JSON.stringify({
+          event: "guardianbot.shutdown_drain_budget_exceeded",
+          signal,
+          drainBudgetMs: DRAIN_BUDGET_MS,
+          forceExitGraceMs: FORCE_EXIT_GRACE_MS
+        })
+      );
+      const code = process.exitCode ?? 0;
+      // Unref'd: a process that manages to settle on its own still exits naturally and
+      // early, but a pinned event loop is cut off at a bounded deadline.
+      setTimeout(() => process.exit(typeof code === "number" ? code : 0), FORCE_EXIT_GRACE_MS)
+        .unref();
+      return;
+    }
+    // Only once the drain has finished, so an in-flight webhook POST has already written its
+    // 202. closeIdleConnections() alone leaves a begun-but-unfinished request's socket open.
+    server.closeAllConnections();
     // The worker needs the store to record its lease release, so only close once it
     // has actually settled; on a blown budget the exiting process reclaims it.
-    if (drained) await store.close();
-    if (signal) process.exitCode = process.exitCode ?? 0;
+    await store.close();
   }
 
-  process.once("SIGINT", () => void shutdown("SIGINT"));
-  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  // process.on, not process.once: a once listener is removed after the first signal, so a
+  // second SIGTERM would hit Node's default terminate action mid-drain while a lease is
+  // held. The shuttingDown guard absorbs repeats only if a listener is still registered.
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
   // Defence in depth for the async request handlers: Node's default is to terminate on
   // an unhandled rejection, which would abandon every leased delivery mid-flight.
   process.on("unhandledRejection", (reason) => {

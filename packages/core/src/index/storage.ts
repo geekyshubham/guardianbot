@@ -2,13 +2,20 @@ import { posix } from "node:path";
 import { cosineSimilarity, sha256 } from "./lexical.js";
 import type {
   IndexedHistory,
+  PersistedCallEdge,
+  PersistedPathRecordRow,
   PersistedRecordRow,
   PersistedVectorRow,
+  RepositoryCallEdgeQuery,
+  RepositoryCallEdgeQueryResult,
   RepositoryIdentity,
   RepositoryIndex,
+  RepositoryIndexDescriptor,
   RepositoryIndexInput,
   RepositoryIndexPersistence,
   RepositoryIndexReference,
+  RepositoryPathRecordQuery,
+  RepositoryPathRecordQueryResult,
   RepositoryRecordHydrationRequest,
   RepositoryVectorMatch,
   RepositoryVectorQuery
@@ -102,21 +109,65 @@ export function repositoryIndexStorageKey(reference: RepositoryIndexReference): 
   return `${INDEX_STORAGE_PREFIX}/${encodeURIComponent(scope)}/${commitSha}`;
 }
 
+/**
+ * The identity fields a stored snapshot must agree with its reference on. Both
+ * the materialised document and the column-sourced descriptor carry these, which
+ * is what makes the two comparable.
+ */
+type IndexIdentityFields = Pick<
+  RepositoryIndex,
+  "storageKey" | "repositoryScope" | "commitSha" | "visibility"
+>;
+
+/**
+ * The three checks that make a stored identity trustworthy, shared by the
+ * document and descriptor asserts so the two can never drift.
+ *
+ * The storage key check is the load-bearing one and it is deliberately not a
+ * read of the stored value: the key is *derived* from the requested scope and
+ * commit, and the stored key must equal that derivation. A stored key is
+ * therefore never trusted, only ever confirmed, so a row whose key was written
+ * non-canonically is rejected rather than followed.
+ */
+function assertIndexIdentity(
+  identity: IndexIdentityFields,
+  reference: RepositoryIndexReference,
+  subject: string
+): void {
+  if (!["public", "private", "internal"].includes(identity.visibility)) {
+    throw new Error(`${subject} has an invalid visibility`);
+  }
+  const commitSha = normalizeCommitSha(reference.commitSha);
+  if (identity.repositoryScope !== reference.repositoryScope || identity.commitSha !== commitSha) {
+    throw new Error(`${subject} does not match the explicitly requested scope and commit`);
+  }
+  const expectedStorageKey = repositoryIndexStorageKey(reference);
+  if (identity.storageKey !== expectedStorageKey) {
+    throw new Error(`${subject} storage key is not canonical for its scope and commit`);
+  }
+}
+
 export function assertIndexReference(
   index: RepositoryIndex,
   reference: RepositoryIndexReference
 ): void {
-  if (!["public", "private", "internal"].includes(index.visibility)) {
-    throw new Error("repository index has an invalid visibility");
-  }
-  const commitSha = normalizeCommitSha(reference.commitSha);
-  if (index.repositoryScope !== reference.repositoryScope || index.commitSha !== commitSha) {
-    throw new Error("repository index does not match the explicitly requested scope and commit");
-  }
-  const expectedStorageKey = repositoryIndexStorageKey(reference);
-  if (index.storageKey !== expectedStorageKey) {
-    throw new Error("repository index storage key is not canonical for its scope and commit");
-  }
+  assertIndexIdentity(index, reference, "repository index");
+}
+
+/**
+ * The descriptor counterpart of `assertIndexReference`.
+ *
+ * A descriptor is read from columns rather than from the document, so it is an
+ * independent witness to the same identity. It is validated identically and by
+ * the same code, which is what licenses a caller holding both to compare them:
+ * any disagreement is then a real storage inconsistency and not an artefact of
+ * two different validation rules.
+ */
+export function assertDescriptorReference(
+  descriptor: RepositoryIndexDescriptor,
+  reference: RepositoryIndexReference
+): void {
+  assertIndexIdentity(descriptor, reference, "repository index descriptor");
 }
 
 export function toPersistedVectorRows(index: RepositoryIndex): PersistedVectorRow[] {
@@ -218,14 +269,54 @@ export function compareRecordRows(left: PersistedRecordRow, right: PersistedReco
   return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
 }
 
+/**
+ * The simple identifier a call target reduces to, shared with the index builder so
+ * durable name-based edge lookup matches the document path's `changedNames` check.
+ */
+export function callTargetSimpleName(target: string): string {
+  return (target.match(/[A-Za-z_$][\w$]*/g)?.at(-1) ?? "").toLowerCase();
+}
+
+/**
+ * Projects call edges into durable rows. Write-side counterpart of
+ * `queryCallEdges`: retrieval reconstructs caller/callee without `index.calls`.
+ */
+export function toPersistedCallEdges(index: RepositoryIndex): PersistedCallEdge[] {
+  assertIndexReference(index, index);
+  return index.calls.map((call) => ({
+    storageKey: index.storageKey,
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha,
+    edgeId: call.id,
+    path: call.path,
+    line: call.line,
+    target: call.target,
+    targetName: callTargetSimpleName(call.target),
+    callerSymbolId: call.callerSymbolId,
+    resolvedSymbolIds: [...call.resolvedSymbolIds],
+    resolution: call.resolution
+  }));
+}
+
+export function compareCallEdges(left: PersistedCallEdge, right: PersistedCallEdge): number {
+  return left.edgeId < right.edgeId ? -1 : left.edgeId > right.edgeId ? 1 : 0;
+}
+
 function cloneIndex(index: RepositoryIndex): RepositoryIndex {
   return structuredClone(index);
+}
+
+function assertBoundedLimit(limit: number, field: string): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+    throw new RangeError(`${field} must be between 1 and 1000`);
+  }
 }
 
 export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersistence {
   readonly #indexes = new Map<string, RepositoryIndex>();
   readonly #vectors = new Map<string, PersistedVectorRow[]>();
   readonly #records = new Map<string, Map<string, PersistedRecordRow>>();
+  readonly #edges = new Map<string, PersistedCallEdge[]>();
 
   async replace(index: RepositoryIndex, vectors: readonly PersistedVectorRow[]): Promise<void> {
     assertIndexReference(index, index);
@@ -270,6 +361,10 @@ export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersis
       new Map(
         toPersistedRecordRows(index).map((row) => [`${row.recordType}:${row.recordId}`, row])
       )
+    );
+    this.#edges.set(
+      index.storageKey,
+      toPersistedCallEdges(index).map((edge) => structuredClone(edge))
     );
   }
 
@@ -344,5 +439,114 @@ export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersis
             : 0;
       })
       .slice(0, request.limit);
+  }
+
+  /**
+   * Path-scoped exact record fetch with a hard limit. Fetches `limit + 1` so
+   * truncation is observable rather than silent.
+   */
+  async queryRecordsByPath(
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult> {
+    assertBoundedLimit(request.limit, "path record query limit");
+    if (request.paths.length > 1_000) {
+      throw new RangeError("path record query is limited to 1000 paths per request");
+    }
+    if (!request.paths.length) return { rows: [], truncated: false };
+    const key = repositoryIndexStorageKey(request);
+    const index = this.#indexes.get(key);
+    if (!index) return { rows: [], truncated: false };
+    assertIndexReference(index, request);
+    const pathSet = new Set(request.paths.map((path) => normalizeRepositoryPath(path)));
+    const acceptedTypes = request.recordTypes ? new Set(request.recordTypes) : undefined;
+    const vectors = new Map(
+      (this.#vectors.get(key) ?? []).map((row) => [`${row.recordType}:${row.recordId}`, row])
+    );
+    const matched: PersistedPathRecordRow[] = [];
+    for (const row of this.#records.get(key)?.values() ?? []) {
+      if (!pathSet.has(row.path)) continue;
+      if (acceptedTypes && !acceptedTypes.has(row.recordType)) continue;
+      const vector = vectors.get(`${row.recordType}:${row.recordId}`);
+      if (!vector) continue;
+      matched.push({
+        ...structuredClone(row),
+        vector: [...vector.vector],
+        visibility: vector.visibility,
+        providerId: vector.providerId,
+        dimensions: vector.dimensions
+      });
+    }
+    matched.sort((left, right) => {
+      if (left.path !== right.path) return left.path < right.path ? -1 : 1;
+      return compareRecordRows(left, right);
+    });
+    const truncated = matched.length > request.limit;
+    return {
+      rows: truncated ? matched.slice(0, request.limit) : matched,
+      truncated
+    };
+  }
+
+  async queryCallEdges(
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult> {
+    assertBoundedLimit(request.limit, "call edge query limit");
+    if (request.symbolIds.length > 1_000 || request.targetNames.length > 1_000) {
+      throw new RangeError("call edge query is limited to 1000 symbol ids and target names");
+    }
+    if (!request.symbolIds.length && !request.targetNames.length) {
+      return { edges: [], truncated: false };
+    }
+    const key = repositoryIndexStorageKey(request);
+    const index = this.#indexes.get(key);
+    if (!index) return { edges: [], truncated: false };
+    assertIndexReference(index, request);
+    const symbolIds = new Set(request.symbolIds);
+    const targetNames = new Set(
+      request.targetNames.map((name) => name.trim().toLowerCase()).filter(Boolean)
+    );
+    const matched = (this.#edges.get(key) ?? []).filter((edge) => {
+      if (edge.callerSymbolId && symbolIds.has(edge.callerSymbolId)) return true;
+      if (edge.resolvedSymbolIds.some((id) => symbolIds.has(id))) return true;
+      return Boolean(edge.targetName && targetNames.has(edge.targetName));
+    });
+    matched.sort(compareCallEdges);
+    const truncated = matched.length > request.limit;
+    return {
+      edges: (truncated ? matched.slice(0, request.limit) : matched).map((edge) =>
+        structuredClone(edge)
+      ),
+      truncated
+    };
+  }
+
+  async hydrateVectors(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]> {
+    if (request.records.length > 1_000) {
+      throw new RangeError("vector hydration is limited to 1000 records per request");
+    }
+    if (!request.records.length) return [];
+    const key = repositoryIndexStorageKey(request);
+    const index = this.#indexes.get(key);
+    if (!index) return [];
+    assertIndexReference(index, request);
+    const byKey = new Map(
+      (this.#vectors.get(key) ?? []).map((row) => [`${row.recordType}:${row.recordId}`, row])
+    );
+    const hydrated = new Map<string, PersistedVectorRow>();
+    for (const reference of request.records) {
+      const recordKey = `${reference.recordType}:${reference.recordId}`;
+      const row = byKey.get(recordKey);
+      if (row && !hydrated.has(recordKey)) {
+        hydrated.set(recordKey, structuredClone(row));
+      }
+    }
+    return [...hydrated.values()].sort((left, right) => {
+      if (left.recordType !== right.recordType) {
+        return left.recordType < right.recordType ? -1 : 1;
+      }
+      return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+    });
   }
 }

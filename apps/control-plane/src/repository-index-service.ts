@@ -4,9 +4,16 @@ import {
   LexicalHashEmbeddingProvider,
   RepositoryIsolationError,
   toPersistedVectorRows,
+  type DurableRepositoryContextSource,
+  type IndexEmbeddingMetadata,
   type PersistedRecordRow,
   type PersistedVectorRow,
+  type RepositoryCallEdgeQuery,
+  type RepositoryCallEdgeQueryResult,
   type RepositoryIndex,
+  type RepositoryIndexDescriptor,
+  type RepositoryPathRecordQuery,
+  type RepositoryPathRecordQueryResult,
   type RepositoryRecordHydrationRequest,
   type RepositoryVectorMatch,
   type RepositoryVectorQuery,
@@ -131,6 +138,12 @@ export interface RepositoryIndexRefreshInput {
   fullName: string;
   defaultBranch: string;
   visibility: "public" | "private" | "internal";
+  /**
+   * Cancels a rebuild that shutdown no longer has budget for. Checked between GitHub round trips
+   * and immediately before each store write, so a cancelled refresh never publishes a partial
+   * index. Raises the platform `AbortError`; the caller normalises it.
+   */
+  signal?: AbortSignal;
 }
 
 /** Whether the published index was rebuilt wholesale or advanced from a prior head. */
@@ -224,6 +237,7 @@ export class RepositoryIndexService {
   async refreshDefaultBranchIndex(
     input: RepositoryIndexRefreshInput
   ): Promise<RepositoryIndexRefreshResult> {
+    input.signal?.throwIfAborted();
     const [owner, repo] = splitFullName(input.fullName);
     const commitSha = await this.resolveBranchHead(
       input.github,
@@ -231,6 +245,7 @@ export class RepositoryIndexService {
       repo,
       input.defaultBranch
     );
+    input.signal?.throwIfAborted();
     const repositoryScope = `github:${input.repositoryId}`;
     const existing = await this.store.getRepositoryIndex(
       input.repositoryId,
@@ -245,6 +260,7 @@ export class RepositoryIndexService {
       existing.visibility === input.visibility &&
       existing.commitSha === commitSha
     ) {
+      input.signal?.throwIfAborted();
       await this.store.replaceRepositoryIndex(
         input.repositoryId,
         existing,
@@ -268,6 +284,7 @@ export class RepositoryIndexService {
     }
 
     const tree = await this.readTree(input.github, owner, repo, commitSha);
+    input.signal?.throwIfAborted();
     const supported = tree.blobs
       .flatMap((entry): IndexCandidate[] => {
         const priority = classifyIndexCandidate(entry.path);
@@ -306,7 +323,8 @@ export class RepositoryIndexService {
       owner,
       repo,
       commitSha,
-      readTargets
+      readTargets,
+      input.signal
     );
     const files = new Map<string, string>();
     for (const read of reads) {
@@ -365,6 +383,10 @@ export class RepositoryIndexService {
     const removedRecordIds = existing
       ? recordIdsRemovedFrom(existing, vectors)
       : [];
+    // Last checkpoint before the index becomes visible. Everything above is pure computation over
+    // already-fetched content, so aborting here costs only work-in-progress; aborting after would
+    // leave a published index the drain budget never accounted for.
+    input.signal?.throwIfAborted();
     if (existing && removedRecordIds.length) {
       await this.store.applyRepositoryIndexDelta(input.repositoryId, {
         index,
@@ -539,6 +561,41 @@ export class RepositoryIndexService {
   }
 
   /**
+   * The same snapshot's identity, read from columns instead of from the
+   * materialised document.
+   *
+   * This is a second, independent witness to the identity `loadExactRepositoryIndex`
+   * also carries. Its value is that the two are sourced differently: the document is
+   * a JSONB blob written by the publish path, while this is the row's own columns.
+   * A caller holding both can compare them, and a disagreement is then a real
+   * storage inconsistency rather than a restatement of one source.
+   *
+   * Isolation is enforced by comparing the row's scope against the scope derived
+   * from the numeric repository id the caller asked about — two values with
+   * independent origins. Unlike the sibling read it is *not* expressed as a
+   * predicate, so a foreign row raises instead of silently reading as "no such
+   * snapshot". There is deliberately no request-side scope assertion to pair with
+   * it: this method takes no caller-supplied scope, so such a check would compare a
+   * derived value against itself and assert nothing.
+   *
+   * The production review path loads this instead of the materialised document.
+   */
+  async loadRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    const descriptor = await this.store.getRepositoryIndexDescriptor(repositoryId, commitSha);
+    if (!descriptor) return undefined;
+    const repositoryScope = `github:${repositoryId}`;
+    if (descriptor.repositoryScope !== repositoryScope) {
+      throw new RepositoryIsolationError(
+        "repository index descriptor load returned a row outside the requested repository"
+      );
+    }
+    return descriptor;
+  }
+
+  /**
    * Binds durable vector reads to one repository so retrieval can consume them.
    *
    * This adapter exists because the two sides cannot meet directly:
@@ -557,6 +614,20 @@ export class RepositoryIndexService {
    * id the caller asked about rather than against the document.
    */
   repositoryVectorRanker(repositoryId: number): RepositoryVectorRanker {
+    const source = this.durableRepositoryContextSource(repositoryId);
+    return {
+      query: source.query.bind(source),
+      hydrateRecords: source.hydrateRecords.bind(source)
+    };
+  }
+
+  /**
+   * Binds every durable read needed by descriptor-first review retrieval to one
+   * numeric repository id. Path records, call edges, vectors, and content all
+   * share the same scope guard: the request must name `github:{repositoryId}`,
+   * and every returned row must carry that scope.
+   */
+  durableRepositoryContextSource(repositoryId: number): DurableRepositoryContextSource {
     const repositoryScope = `github:${repositoryId}`;
     const assertRowScope = (row: { repositoryScope: string }, what: string): void => {
       if (row.repositoryScope !== repositoryScope) {
@@ -590,6 +661,39 @@ export class RepositoryIndexService {
           assertRowScope(row, "durable record hydration");
         }
         return rows;
+      },
+      hydrateVectors: async (
+        request: RepositoryRecordHydrationRequest
+      ): Promise<PersistedVectorRow[]> => {
+        assertRequestScope(request.repositoryScope, "durable vector hydration");
+        const rows = await this.store.hydrateRepositoryIndexVectors(repositoryId, request);
+        for (const row of rows) {
+          assertRowScope(row, "durable vector hydration");
+        }
+        return rows;
+      },
+      queryRecordsByPath: async (
+        request: RepositoryPathRecordQuery
+      ): Promise<RepositoryPathRecordQueryResult> => {
+        assertRequestScope(request.repositoryScope, "durable path-record retrieval");
+        const result = await this.store.queryRepositoryIndexRecordsByPath(
+          repositoryId,
+          request
+        );
+        for (const row of result.rows) {
+          assertRowScope(row, "durable path-record retrieval");
+        }
+        return result;
+      },
+      queryCallEdges: async (
+        request: RepositoryCallEdgeQuery
+      ): Promise<RepositoryCallEdgeQueryResult> => {
+        assertRequestScope(request.repositoryScope, "durable call-edge retrieval");
+        const result = await this.store.queryRepositoryIndexCallEdges(repositoryId, request);
+        for (const edge of result.edges) {
+          assertRowScope(edge, "durable call-edge retrieval");
+        }
+        return result;
       }
     };
   }
@@ -598,19 +702,19 @@ export class RepositoryIndexService {
    * The provider that can re-embed a review query into the same space a stored
    * index was built in, or nothing when it cannot be reconstructed.
    *
-   * Retrieval only consults a ranker when it holds a query vector in the index's
-   * own space, so without this the wired ranker would be dormant. The lexical
-   * provider is a pure function of its dimension count, so it reconstructs exactly;
-   * the id is compared rather than assumed, because a provider whose id differs is
-   * by definition a different embedding space and comparing across the two would
-   * return confident nonsense instead of an error.
+   * Accepts either a full index or embedding metadata (from a descriptor) so the
+   * production review path need not load the materialised document.
    */
   retrievalEmbeddingProvider(
-    index: RepositoryIndex
+    indexOrEmbedding: RepositoryIndex | RepositoryIndexDescriptor | IndexEmbeddingMetadata
   ): LexicalHashEmbeddingProvider | undefined {
-    const dimensions = index.embedding.dimensions;
+    const embedding =
+      "embedding" in indexOrEmbedding
+        ? indexOrEmbedding.embedding
+        : indexOrEmbedding;
+    const dimensions = embedding.dimensions;
     if (
-      index.embedding.kind !== "lexical-fallback" ||
+      embedding.kind !== "lexical-fallback" ||
       !Number.isSafeInteger(dimensions) ||
       dimensions < 8 ||
       dimensions > 4_096
@@ -618,7 +722,7 @@ export class RepositoryIndexService {
       return undefined;
     }
     const provider = new LexicalHashEmbeddingProvider(dimensions);
-    return provider.id === index.embedding.providerId ? provider : undefined;
+    return provider.id === embedding.providerId ? provider : undefined;
   }
 
   private async resolveBranchHead(
@@ -643,7 +747,8 @@ export class RepositoryIndexService {
     owner: string,
     repo: string,
     ref: string,
-    candidates: readonly IndexCandidate[]
+    candidates: readonly IndexCandidate[],
+    signal?: AbortSignal
   ): Promise<RepositoryFileRead[]> {
     const results = new Array<RepositoryFileRead>(candidates.length);
     let nextIndex = 0;
@@ -654,6 +759,10 @@ export class RepositoryIndexService {
     await Promise.all(
       Array.from({ length: workerCount }, async () => {
         while (true) {
+          // This is the bulk of a rebuild's wall time: one fetch per indexed file. Checking per
+          // iteration lets every worker stop at a file boundary, so shutdown ends the read phase
+          // in one round trip rather than after the whole candidate list.
+          signal?.throwIfAborted();
           const current = nextIndex;
           nextIndex += 1;
           if (current >= candidates.length) return;

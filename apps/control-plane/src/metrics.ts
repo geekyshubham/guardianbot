@@ -23,7 +23,12 @@ type CounterName =
   | "commands_rejected_total"
   | "github_failures_total"
   | "github_rate_limited_total"
-  | "backend_failures_total";
+  | "backend_failures_total"
+  // Descriptor-first durable review retrieval outcomes. No repository labels:
+  // success, truncation, and unavailable/fallback are bare aggregates only.
+  | "repository_index_durable_success_total"
+  | "repository_index_durable_truncated_total"
+  | "repository_index_durable_unavailable_total";
 
 export class GuardianMetrics {
   private readonly counters = new Map<CounterName, number>();
@@ -69,7 +74,10 @@ export class GuardianMetrics {
       "commands_rejected_total",
       "github_failures_total",
       "github_rate_limited_total",
-      "backend_failures_total"
+      "backend_failures_total",
+      "repository_index_durable_success_total",
+      "repository_index_durable_truncated_total",
+      "repository_index_durable_unavailable_total"
     ] as CounterName[]) {
       this.counters.set(name, 0);
     }

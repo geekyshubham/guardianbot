@@ -1,17 +1,30 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import {
+  assertDescriptorReference,
   assertIndexReference,
+  compareCallEdges,
   compareRecordRows,
   cosineSimilarity,
+  normalizeCommitSha,
+  normalizeRepositoryPath,
   repositoryIndexStorageKey,
+  toPersistedCallEdges,
   toPersistedRecordRows
 } from "@guardianbot/core";
 import type {
+  IndexEmbeddingMetadata,
+  PersistedCallEdge,
+  PersistedPathRecordRow,
   PersistedRecordRow,
   PersistedVectorRow,
+  RepositoryCallEdgeQuery,
+  RepositoryCallEdgeQueryResult,
   RepositoryIndex,
+  RepositoryIndexDescriptor,
   RepositoryIndexVectorDelta,
+  RepositoryPathRecordQuery,
+  RepositoryPathRecordQueryResult,
   RepositoryRecordHydrationRequest,
   RepositoryRecordReference,
   RepositoryVectorMatch,
@@ -222,6 +235,29 @@ export interface ReviewState {
  * Pass the increment this write is responsible for — typically `lifecycle.evicted` — or omit the
  * field entirely. Never pass a value that was read from the store.
  */
+/**
+ * Binds a review write to the webhook lease that authorised it.
+ *
+ * The head-SHA compare-and-set alone cannot separate two workers running the *same* delivery:
+ * both derive `expectedHeadSha` from the same payload, so the predicate holds for both and both
+ * commit. Because the row's counters are accumulated server-side (`findings_evicted_total`,
+ * `feedback_total` are incremented, not assigned), a duplicated commit inflates lifetime totals
+ * rather than merely repeating itself. Naming the lease in the predicate closes that gap: a
+ * worker whose lease lapsed and was reclaimed by another instance fails the fence and writes
+ * nothing, so only the current lease holder can publish.
+ */
+export interface WebhookLeaseFence {
+  deliveryId: string;
+  /** Must still match `webhook_jobs.lease_owner`, and the lease must not have expired. */
+  leaseOwner: string;
+  /**
+   * Instant the expiry is judged against, as ISO-8601. Supplied by the caller so it comes from the
+   * same clock that minted the lease in `claimWebhook`; reading wall time here instead would make
+   * every lease look expired under an injected test clock.
+   */
+  asOf?: string;
+}
+
 export interface ReviewStateWrite extends Omit<ReviewState, "findingsEvictedTotal" | "feedbackTotal"> {
   /** DELTA: terminal findings this write evicted. Added to the stored lifetime total. */
   findingsEvictedTotal?: number;
@@ -1152,6 +1188,18 @@ export interface Store {
     commitSha: string
   ): Promise<RepositoryIndex | undefined>;
   /**
+   * A snapshot's identity without its content, read from columns rather than from
+   * the materialised document. It is a second independent witness to the identity
+   * the document also carries, so a caller holding both can compare them.
+   *
+   * It does not narrow the document load on its own: nothing in retrieval consumes
+   * it yet.
+   */
+  getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined>;
+  /**
    * Ranked nearest-neighbour read over one repository's persisted vectors. The
    * canonical storage key derived from `request` is the isolation boundary: it
    * pins both the repository scope and the commit, so no other repository's rows
@@ -1171,6 +1219,29 @@ export interface Store {
     request: RepositoryRecordHydrationRequest
   ): Promise<PersistedRecordRow[]>;
   /**
+   * Vectors for named records of one snapshot. Call-edge reconstruction loads
+   * content and vectors separately so a missing vector cannot invent content.
+   */
+  hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]>;
+  /**
+   * Exact path-scoped record fetch with a hard limit. Used by descriptor-first
+   * review retrieval so changed-path candidates do not depend on ANN recall.
+   */
+  queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult>;
+  /**
+   * Bounded call-edge fetch for caller/callee reconstruction without the document.
+   */
+  queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult>;
+  /**
    * Partial publication beside `replaceRepositoryIndex`. It upserts only changed
    * records and deletes only named ones, so a large repository's unchanged rows
    * are never rewritten.
@@ -1189,8 +1260,18 @@ export interface Store {
     headSha: string,
     placeholderCommentId?: number
   ): Promise<void>;
-  /** Counters in `state` are per-write deltas, not lifetime totals; see `ReviewStateWrite`. */
-  saveReview(state: ReviewStateWrite, expectedHeadSha?: string): Promise<boolean>;
+  /**
+   * Counters in `state` are per-write deltas, not lifetime totals; see `ReviewStateWrite`.
+   *
+   * `fence`, when supplied, additionally requires the named webhook lease to still be held and
+   * unexpired. `expectedHeadSha` cannot do that job for two workers replaying one delivery, since
+   * both compute the same head SHA. See `WebhookLeaseFence`.
+   */
+  saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ): Promise<boolean>;
   getReview(repositoryId: number, pullNumber: number): Promise<ReviewState | undefined>;
   recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean>;
   enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>): Promise<boolean>;
@@ -1324,6 +1405,7 @@ export class MemoryStore implements Store {
   >();
   private repositoryIndexVectors = new Map<string, PersistedVectorRow[]>();
   private repositoryIndexRecords = new Map<string, Map<string, PersistedRecordRow>>();
+  private repositoryIndexEdges = new Map<string, PersistedCallEdge[]>();
   private scannerRuns = new Map<string, ScannerWorkflowRunRecord>();
   private scannerArtifacts = new Map<string, ScannerArtifactRecord>();
   private scannerEvidence = new Map<string, ScannerEvidenceRecord>();
@@ -1368,10 +1450,11 @@ export class MemoryStore implements Store {
       .slice(0, options.limit);
     for (const [storageKey] of candidates) {
       this.repositoryIndexes.delete(storageKey);
-      // Mirrors the ON DELETE CASCADE from repository_indexes to its vectors and
-      // its per-record content rows.
+      // Mirrors the ON DELETE CASCADE from repository_indexes to its vectors,
+      // per-record content rows, and call edges.
       this.repositoryIndexVectors.delete(storageKey);
       this.repositoryIndexRecords.delete(storageKey);
+      this.repositoryIndexEdges.delete(storageKey);
     }
     return { deleted: candidates.length };
   }
@@ -1410,6 +1493,10 @@ export class MemoryStore implements Store {
         toPersistedRecordRows(index).map((row) => [`${row.recordType}:${row.recordId}`, row])
       )
     );
+    this.repositoryIndexEdges.set(
+      index.storageKey,
+      toPersistedCallEdges(index).map((edge) => structuredClone(edge))
+    );
     this.repositories.set(repositoryId, {
       ...repository,
       indexSha: index.commitSha,
@@ -1442,6 +1529,111 @@ export class MemoryStore implements Store {
       }
     }
     return [...hydrated.values()].sort(compareRecordRows);
+  }
+
+  async hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return [];
+    const byKey = new Map(
+      (this.repositoryIndexVectors.get(storageKey) ?? []).map((row) => [
+        `${row.recordType}:${row.recordId}`,
+        row
+      ])
+    );
+    const hydrated = new Map<string, PersistedVectorRow>();
+    for (const reference of request.records) {
+      const recordKey = `${reference.recordType}:${reference.recordId}`;
+      const row = byKey.get(recordKey);
+      if (row && row.storageKey === storageKey && !hydrated.has(recordKey)) {
+        hydrated.set(recordKey, structuredClone(row));
+      }
+    }
+    return [...hydrated.values()].sort((left, right) => {
+      if (left.recordType !== right.recordType) {
+        return left.recordType < right.recordType ? -1 : 1;
+      }
+      return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+    });
+  }
+
+  async queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult> {
+    assertPathRecordQuery(request);
+    if (!request.paths.length) return { rows: [], truncated: false };
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return { rows: [], truncated: false };
+    const pathSet = new Set(request.paths.map((path) => normalizeRepositoryPath(path)));
+    const acceptedTypes = request.recordTypes ? new Set(request.recordTypes) : undefined;
+    const vectors = new Map(
+      (this.repositoryIndexVectors.get(storageKey) ?? []).map((row) => [
+        `${row.recordType}:${row.recordId}`,
+        row
+      ])
+    );
+    const matched: PersistedPathRecordRow[] = [];
+    for (const row of this.repositoryIndexRecords.get(storageKey)?.values() ?? []) {
+      if (row.storageKey !== storageKey) continue;
+      if (!pathSet.has(row.path)) continue;
+      if (acceptedTypes && !acceptedTypes.has(row.recordType)) continue;
+      const vector = vectors.get(`${row.recordType}:${row.recordId}`);
+      if (!vector) continue;
+      matched.push({
+        ...structuredClone(row),
+        vector: [...vector.vector],
+        visibility: vector.visibility,
+        providerId: vector.providerId,
+        dimensions: vector.dimensions
+      });
+    }
+    matched.sort((left, right) => {
+      if (left.path !== right.path) return left.path < right.path ? -1 : 1;
+      return compareRecordRows(left, right);
+    });
+    const truncated = matched.length > request.limit;
+    return {
+      rows: truncated ? matched.slice(0, request.limit) : matched,
+      truncated
+    };
+  }
+
+  async queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult> {
+    assertCallEdgeQuery(request);
+    if (!request.symbolIds.length && !request.targetNames.length) {
+      return { edges: [], truncated: false };
+    }
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return { edges: [], truncated: false };
+    const symbolIds = new Set(request.symbolIds);
+    const targetNames = new Set(
+      request.targetNames.map((name) => name.trim().toLowerCase()).filter(Boolean)
+    );
+    const matched = (this.repositoryIndexEdges.get(storageKey) ?? []).filter((edge) => {
+      if (edge.storageKey !== storageKey) return false;
+      if (edge.callerSymbolId && symbolIds.has(edge.callerSymbolId)) return true;
+      if (edge.resolvedSymbolIds.some((id) => symbolIds.has(id))) return true;
+      return Boolean(edge.targetName && targetNames.has(edge.targetName));
+    });
+    matched.sort(compareCallEdges);
+    const truncated = matched.length > request.limit;
+    return {
+      edges: (truncated ? matched.slice(0, request.limit) : matched).map((edge) =>
+        structuredClone(edge)
+      ),
+      truncated
+    };
   }
 
   async queryRepositoryIndexVectors(
@@ -1522,6 +1714,12 @@ export class MemoryStore implements Store {
       }
     }
     this.repositoryIndexRecords.set(storageKey, records);
+    // Edges are commit-scoped under a new storage key, so publish the full edge
+    // set for this generation rather than attempting a partial merge.
+    this.repositoryIndexEdges.set(
+      storageKey,
+      toPersistedCallEdges(delta.index).map((edge) => structuredClone(edge))
+    );
     this.repositories.set(repositoryId, {
       ...repository,
       indexSha: delta.index.commitSha,
@@ -1542,6 +1740,35 @@ export class MemoryStore implements Store {
       ) {
         return structuredClone(entry.index);
       }
+    }
+    return undefined;
+  }
+
+  async getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    const normalizedCommitSha = normalizeCommitSha(commitSha);
+    for (const entry of this.repositoryIndexes.values()) {
+      if (entry.repositoryId !== repositoryId || entry.index.commitSha !== normalizedCommitSha) {
+        continue;
+      }
+      // Projected field by field rather than spread, so this mirrors the column
+      // projection the PostgreSQL path performs and cannot accidentally carry the
+      // document's content through in memory where the real store would not.
+      const descriptor: RepositoryIndexDescriptor = {
+        storageKey: entry.index.storageKey,
+        repository: entry.index.repository,
+        repositoryScope: entry.index.repositoryScope,
+        commitSha: entry.index.commitSha,
+        visibility: entry.index.visibility,
+        embedding: { ...entry.index.embedding }
+      };
+      assertDescriptorReference(descriptor, {
+        repositoryScope: descriptor.repositoryScope,
+        commitSha: normalizedCommitSha
+      });
+      return descriptor;
     }
     return undefined;
   }
@@ -1617,10 +1844,26 @@ export class MemoryStore implements Store {
     });
   }
 
-  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
+  /** True while `fence` still names the live, unexpired holder of its delivery's lease. */
+  private holdsWebhookLease(fence: WebhookLeaseFence): boolean {
+    const job = this.webhooks.get(fence.deliveryId);
+    if (!job || job.status !== "leased" || job.leaseOwner !== fence.leaseOwner) return false;
+    // A lease with no expiry is treated as already lapsed, matching claimWebhook's reclaim rule.
+    if (!job.leaseExpiresAt) return false;
+    const asOf = fence.asOf ? Date.parse(fence.asOf) : Date.now();
+    if (!Number.isFinite(asOf)) return false;
+    return new Date(job.leaseExpiresAt).getTime() > asOf;
+  }
+
+  async saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ) {
     const key = `${state.repositoryId}:${state.pullNumber}`;
     const current = this.reviews.get(key);
     if (expectedHeadSha && current && current.headSha !== expectedHeadSha) return false;
+    if (fence && !this.holdsWebhookLease(fence)) return false;
     this.reviews.set(key, {
       ...state,
       findings: normalizeReviewFindings(state.findings),
@@ -2502,6 +2745,29 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS repository_index_records_scope_commit_idx
         ON repository_index_records (repository_scope, commit_sha);
+      CREATE INDEX IF NOT EXISTS repository_index_records_path_idx
+        ON repository_index_records (repository_id, storage_key, path);
+
+      CREATE TABLE IF NOT EXISTS repository_index_edges (
+        storage_key TEXT NOT NULL REFERENCES repository_indexes(storage_key) ON DELETE CASCADE,
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        repository_scope TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        edge_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        target TEXT NOT NULL,
+        target_name TEXT NOT NULL,
+        caller_symbol_id TEXT,
+        resolved_symbol_ids TEXT[] NOT NULL,
+        resolution TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (storage_key, edge_id)
+      );
+      CREATE INDEX IF NOT EXISTS repository_index_edges_scope_commit_idx
+        ON repository_index_edges (repository_scope, commit_sha);
+      CREATE INDEX IF NOT EXISTS repository_index_edges_caller_idx
+        ON repository_index_edges (repository_id, storage_key, caller_symbol_id);
 
       CREATE TABLE IF NOT EXISTS scanner_workflow_runs (
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -2777,6 +3043,20 @@ export class PostgresStore implements Store {
           records.slice(start, start + 100)
         );
       }
+      // Call edges for caller/callee reconstruction. Same transaction as the
+      // snapshot so a durable review never sees vectors without their graph.
+      await client.query(
+        "DELETE FROM repository_index_edges WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
+      );
+      const edges = toPersistedCallEdges(index);
+      for (let start = 0; start < edges.length; start += 100) {
+        await this.insertRepositoryIndexEdgeBatch(
+          client,
+          repositoryId,
+          edges.slice(start, start + 100)
+        );
+      }
       await client.query(
         `UPDATE repositories
          SET index_sha=$2, index_updated_at=$3, updated_at=now()
@@ -2805,6 +3085,42 @@ export class PostgresStore implements Store {
     );
     const row = result.rows[0];
     return row ? (row.index_document as RepositoryIndex) : undefined;
+  }
+
+  async getRepositoryIndexDescriptor(
+    repositoryId: number,
+    commitSha: string
+  ): Promise<RepositoryIndexDescriptor | undefined> {
+    // Normalised before it reaches the predicate so a mixed-case request matches
+    // the lowercase sha the write path stored, and so the commit compared below is
+    // the same one the storage key is derived from.
+    const normalizedCommitSha = normalizeCommitSha(commitSha);
+    const statement = buildRepositoryIndexDescriptorStatement(repositoryId, normalizedCommitSha);
+    const result = await this.pool.query(statement.text, statement.values);
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const descriptor: RepositoryIndexDescriptor = {
+      storageKey: row.storage_key as string,
+      repository: row.full_name as string,
+      repositoryScope: row.repository_scope as string,
+      commitSha: row.commit_sha as string,
+      visibility: row.visibility as RepositoryIndexDescriptor["visibility"],
+      embedding: {
+        providerId: row.embedding_provider_id as string,
+        kind: parseEmbeddingKind(row.embedding_kind),
+        dimensions: Number(row.embedding_dimensions)
+      }
+    };
+    // Validated against the row's own scope, so the storage key is confirmed
+    // canonical for the scope and commit the row itself claims rather than merely
+    // trusted as stored. The scope is not checked here because this method takes no
+    // expected scope; binding the scope to the numeric repository id is the
+    // caller's boundary, and RepositoryIndexService does it.
+    assertDescriptorReference(descriptor, {
+      repositoryScope: descriptor.repositoryScope,
+      commitSha: normalizedCommitSha
+    });
+    return descriptor;
   }
 
   async queryRepositoryIndexVectors(
@@ -2883,6 +3199,101 @@ export class PostgresStore implements Store {
       .sort(compareRecordRows);
   }
 
+  async hydrateRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedVectorRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexVectorHydrationStatement(
+      repositoryId,
+      storageKey,
+      request.records
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    return result.rows
+      .map((row) => {
+        const persisted = toPersistedVectorRow(row);
+        if (
+          persisted.storageKey !== storageKey ||
+          persisted.repositoryScope !== request.repositoryScope
+        ) {
+          throw new Error("repository index vector hydration returned a foreign storage key");
+        }
+        return persisted;
+      })
+      .sort((left, right) => {
+        if (left.recordType !== right.recordType) {
+          return left.recordType < right.recordType ? -1 : 1;
+        }
+        return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+      });
+  }
+
+  async queryRepositoryIndexRecordsByPath(
+    repositoryId: number,
+    request: RepositoryPathRecordQuery
+  ): Promise<RepositoryPathRecordQueryResult> {
+    assertPathRecordQuery(request);
+    if (!request.paths.length) return { rows: [], truncated: false };
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexPathRecordQueryStatement(
+      repositoryId,
+      storageKey,
+      request
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    const rows = result.rows.map((row) => {
+      const persisted = toPersistedPathRecordRow(row);
+      if (
+        persisted.storageKey !== storageKey ||
+        persisted.repositoryScope !== request.repositoryScope
+      ) {
+        throw new Error("repository index path-record query returned a foreign storage key");
+      }
+      return persisted;
+    });
+    // limit+1 fetch: drop the sentinel row and report truncation.
+    const truncated = rows.length > request.limit;
+    return {
+      rows: truncated ? rows.slice(0, request.limit) : rows,
+      truncated
+    };
+  }
+
+  async queryRepositoryIndexCallEdges(
+    repositoryId: number,
+    request: RepositoryCallEdgeQuery
+  ): Promise<RepositoryCallEdgeQueryResult> {
+    assertCallEdgeQuery(request);
+    if (!request.symbolIds.length && !request.targetNames.length) {
+      return { edges: [], truncated: false };
+    }
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexCallEdgeQueryStatement(
+      repositoryId,
+      storageKey,
+      request
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    const edges = result.rows.map((row) => {
+      const persisted = toPersistedCallEdge(row);
+      if (
+        persisted.storageKey !== storageKey ||
+        persisted.repositoryScope !== request.repositoryScope
+      ) {
+        throw new Error("repository index call-edge query returned a foreign storage key");
+      }
+      return persisted;
+    });
+    const truncated = edges.length > request.limit;
+    return {
+      edges: truncated ? edges.slice(0, request.limit) : edges,
+      truncated
+    };
+  }
+
   async applyRepositoryIndexDelta(
     repositoryId: number,
     delta: RepositoryIndexVectorDelta,
@@ -2933,6 +3344,20 @@ export class PostgresStore implements Store {
           client,
           repositoryId,
           records.slice(start, start + 100)
+        );
+      }
+      // Full edge set for the new generation. Storage key is commit-scoped, so
+      // this cannot rewrite a previous generation's edges.
+      await client.query(
+        "DELETE FROM repository_index_edges WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
+      );
+      const edges = toPersistedCallEdges(index);
+      for (let start = 0; start < edges.length; start += 100) {
+        await this.insertRepositoryIndexEdgeBatch(
+          client,
+          repositoryId,
+          edges.slice(start, start + 100)
         );
       }
       await client.query(
@@ -3025,11 +3450,29 @@ export class PostgresStore implements Store {
     );
   }
 
-  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
+  async saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ) {
     const result = await this.pool.query(
+      // The lease fence gates the *source row* rather than riding on the ON CONFLICT predicate:
+      // `DO UPDATE ... WHERE` filters only the update branch, so a fence expressed there would
+      // still let a worker whose lease lapsed INSERT a brand-new row. Selecting the row through
+      // the fence suppresses both branches, and the EXISTS probe shares this statement's snapshot
+      // so the check cannot drift from the write it authorises.
       `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings,
         findings_schema_version,findings_evicted_total,findings_last_evicted_at,feedback_total)
-       VALUES ($1,$2,$3,$4,$5,$6,$8,$9,$10,$11)
+       SELECT $1::bigint,$2::int,$3::text,$4::text,$5::bigint,$6::jsonb,$8::int,$9::int,
+              $10::timestamptz,$11::int
+       WHERE $12::text IS NULL OR EXISTS (
+         SELECT 1 FROM webhook_jobs
+         WHERE delivery_id=$12
+           AND lease_owner=$13
+           AND status='leased'
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at > COALESCE($14::timestamptz, now())
+       )
        ON CONFLICT (repository_id,pull_number) DO UPDATE SET
        head_sha=excluded.head_sha,
        reviewed_head_sha=excluded.reviewed_head_sha,
@@ -3059,7 +3502,10 @@ export class PostgresStore implements Store {
         state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
         state.findingsEvictedTotal ?? 0,
         state.findingsLastEvictedAt ?? null,
-        state.feedbackTotal ?? 0
+        state.feedbackTotal ?? 0,
+        fence?.deliveryId ?? null,
+        fence?.leaseOwner ?? null,
+        fence?.asOf ?? null
       ]
     );
     return (result.rowCount ?? 0) > 0;
@@ -4340,6 +4786,16 @@ export class PostgresStore implements Store {
     if (!statement) return;
     await client.query(statement.text, statement.values);
   }
+
+  private async insertRepositoryIndexEdgeBatch(
+    client: PoolClient,
+    repositoryId: number,
+    edges: readonly PersistedCallEdge[]
+  ): Promise<void> {
+    const statement = buildRepositoryIndexEdgeBatchStatement(repositoryId, edges);
+    if (!statement) return;
+    await client.query(statement.text, statement.values);
+  }
 }
 
 /**
@@ -4372,6 +4828,37 @@ function assertVectorQuery(request: RepositoryVectorQuery): void {
     request.vector.some((value) => !Number.isFinite(value))
   ) {
     throw new Error("vector query must supply a finite, non-empty vector");
+  }
+}
+
+function assertPathRecordQuery(request: RepositoryPathRecordQuery): void {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 1_000) {
+    throw new RangeError("path record query limit must be between 1 and 1000");
+  }
+  if (request.paths.length > 1_000) {
+    throw new RangeError("path record query is limited to 1000 paths per request");
+  }
+  for (const path of request.paths) {
+    normalizeRepositoryPath(path);
+  }
+  if (request.recordTypes) {
+    for (const recordType of request.recordTypes) {
+      if (recordType !== "symbol" && recordType !== "history") {
+        throw new Error("path record query accepts only symbol and history records");
+      }
+    }
+  }
+}
+
+function assertCallEdgeQuery(request: RepositoryCallEdgeQuery): void {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 1_000) {
+    throw new RangeError("call edge query limit must be between 1 and 1000");
+  }
+  if (request.symbolIds.length > 1_000 || request.targetNames.length > 1_000) {
+    throw new RangeError("call edge query is limited to 1000 symbol ids and target names");
+  }
+  for (const id of request.symbolIds) {
+    if (!id.trim()) throw new Error("call edge query requires non-empty symbol ids");
   }
 }
 
@@ -4530,6 +5017,39 @@ function toPersistedRecordRow(row: Record<string, any>): PersistedRecordRow {
   };
 }
 
+function toPersistedPathRecordRow(row: Record<string, any>): PersistedPathRecordRow {
+  const base = toPersistedRecordRow(row);
+  const vector = Array.isArray(row.vector_json)
+    ? (row.vector_json as number[])
+    : (JSON.parse(String(row.vector_json)) as number[]);
+  return {
+    ...base,
+    vector,
+    visibility: row.visibility,
+    providerId: row.provider_id,
+    dimensions: Number(row.dimensions)
+  };
+}
+
+function toPersistedCallEdge(row: Record<string, any>): PersistedCallEdge {
+  const resolved = Array.isArray(row.resolved_symbol_ids)
+    ? (row.resolved_symbol_ids as string[])
+    : [];
+  return {
+    storageKey: row.storage_key,
+    repositoryScope: row.repository_scope,
+    commitSha: row.commit_sha,
+    edgeId: row.edge_id,
+    path: row.path,
+    line: Number(row.line),
+    target: row.target,
+    targetName: row.target_name,
+    callerSymbolId: row.caller_symbol_id ?? undefined,
+    resolvedSymbolIds: resolved,
+    resolution: row.resolution === "name-match" ? "name-match" : "unresolved"
+  };
+}
+
 export interface RepositoryIndexRecordQueryStatement {
   text: string;
   values: unknown[];
@@ -4566,6 +5086,57 @@ export function buildRepositoryIndexRecordQueryStatement(
       records.map((record) => record.recordId)
     ]
   };
+}
+
+export interface RepositoryIndexDescriptorStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * A snapshot's identity read from columns alone, with `index_document` omitted
+ * from the projection.
+ *
+ * Every column here is already NOT NULL on `repository_indexes` (see the DDL
+ * above), so the descriptor needs no optional modelling. `content_sha256` and
+ * `vector_storage` are deliberately absent: nothing in the identity contract
+ * reads them, and projecting only what is consumed keeps the row narrow.
+ *
+ * The predicate pair is `(repository_id, commit_sha)`, which is the table's
+ * PRIMARY KEY, so this is a single-row primary-key lookup. `repository_scope` is
+ * deliberately *not* a predicate: filtering on it would turn a scope mismatch
+ * into an empty result that reads as "no such snapshot", whereas returning the
+ * row and comparing its scope lets a mismatch be raised. A silent miss and a
+ * cross-repository row must not be the same observation.
+ *
+ * NOTE: this statement is only ever exercised against a stubbed pool in tests.
+ * No live PostgreSQL exists in this environment, so its behaviour on a real
+ * server is reasoned about, not verified.
+ */
+export function buildRepositoryIndexDescriptorStatement(
+  repositoryId: number,
+  commitSha: string
+): RepositoryIndexDescriptorStatement {
+  return {
+    text: `SELECT repository_scope, commit_sha, visibility, storage_key, full_name,
+            embedding_provider_id, embedding_kind, embedding_dimensions
+       FROM repository_indexes
+       WHERE repository_id=$1 AND commit_sha=$2`,
+    values: [repositoryId, commitSha]
+  };
+}
+
+/**
+ * The stored embedding kind, rejected rather than cast when unrecognised.
+ *
+ * `embedding_kind` is a bare TEXT column, so a value outside the union is
+ * representable in storage. Casting it would produce a well-typed lie that flows
+ * into embedding-provider reconstruction; failing here keeps an unknown embedding
+ * space from being silently treated as a known one.
+ */
+function parseEmbeddingKind(value: unknown): IndexEmbeddingMetadata["kind"] {
+  if (value === "local-model" || value === "lexical-fallback") return value;
+  throw new Error("repository index descriptor has an unrecognised embedding kind");
 }
 
 export interface RepositoryIndexRecordDeleteStatement {
@@ -4641,6 +5212,166 @@ export function buildRepositoryIndexRecordBatchStatement(
          summary=excluded.summary,
          updated_at=now()`,
     values
+  };
+}
+
+export interface RepositoryIndexEdgeBatchStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Upserts call-graph edges for one snapshot. Same repository_id + storage_key
+ * boundary as vector/record rows; written in the same publication transaction.
+ */
+export function buildRepositoryIndexEdgeBatchStatement(
+  repositoryId: number,
+  edges: readonly PersistedCallEdge[]
+): RepositoryIndexEdgeBatchStatement | undefined {
+  if (!edges.length) return undefined;
+  const values: unknown[] = [];
+  const rows: string[] = [];
+  for (const edge of edges) {
+    const firstPosition = values.length + 1;
+    values.push(
+      edge.storageKey,
+      repositoryId,
+      edge.repositoryScope,
+      edge.commitSha,
+      edge.edgeId,
+      edge.path,
+      edge.line,
+      edge.target,
+      edge.targetName,
+      edge.callerSymbolId ?? null,
+      edge.resolvedSymbolIds,
+      edge.resolution
+    );
+    rows.push(
+      `(${Array.from({ length: 12 }, (_, offset) => `$${firstPosition + offset}`).join(",")})`
+    );
+  }
+  return {
+    text: `INSERT INTO repository_index_edges
+       (storage_key, repository_id, repository_scope, commit_sha, edge_id, path, line,
+        target, target_name, caller_symbol_id, resolved_symbol_ids, resolution)
+       VALUES ${rows.join(",")}
+       ON CONFLICT (storage_key, edge_id) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         repository_scope=excluded.repository_scope,
+         commit_sha=excluded.commit_sha,
+         path=excluded.path,
+         line=excluded.line,
+         target=excluded.target,
+         target_name=excluded.target_name,
+         caller_symbol_id=excluded.caller_symbol_id,
+         resolved_symbol_ids=excluded.resolved_symbol_ids,
+         resolution=excluded.resolution,
+         updated_at=now()`,
+    values
+  };
+}
+
+export interface RepositoryIndexPathRecordQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Exact path-scoped record fetch with vector join. Fetches `limit + 1` rows so
+ * truncation is observable. Predicates: repository_id + canonical storage_key.
+ */
+export function buildRepositoryIndexPathRecordQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  request: RepositoryPathRecordQuery
+): RepositoryIndexPathRecordQueryStatement {
+  const paths = request.paths.map((path) => normalizeRepositoryPath(path));
+  const values: unknown[] = [repositoryId, storageKey, paths];
+  let typePredicate = "";
+  if (request.recordTypes?.length) {
+    values.push([...request.recordTypes]);
+    typePredicate = ` AND r.record_type = ANY($${values.length}::text[])`;
+  }
+  values.push(request.limit + 1);
+  return {
+    text: `SELECT r.storage_key, r.repository_scope, r.commit_sha, r.record_type, r.record_id,
+            r.path, r.line, r.end_line, r.name, r.content, r.content_sha256, r.summary,
+            v.vector_json, v.visibility, v.provider_id, v.dimensions
+       FROM repository_index_records AS r
+       INNER JOIN repository_index_vectors AS v
+         ON v.storage_key = r.storage_key
+        AND v.record_type = r.record_type
+        AND v.record_id = r.record_id
+       WHERE r.repository_id=$1 AND r.storage_key=$2
+         AND r.path = ANY($3::text[])${typePredicate}
+       ORDER BY r.path ASC, r.record_type ASC, r.record_id ASC
+       LIMIT $${values.length}`,
+    values
+  };
+}
+
+export interface RepositoryIndexCallEdgeQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Bounded call-edge fetch. Predicates: repository_id + canonical storage_key, plus
+ * caller/resolved/target-name filters. Fetches `limit + 1` for truncation.
+ */
+export function buildRepositoryIndexCallEdgeQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  request: RepositoryCallEdgeQuery
+): RepositoryIndexCallEdgeQueryStatement {
+  const symbolIds = [...request.symbolIds];
+  const targetNames = request.targetNames
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean);
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, edge_id, path, line, target,
+            target_name, caller_symbol_id, resolved_symbol_ids, resolution
+       FROM repository_index_edges
+       WHERE repository_id=$1 AND storage_key=$2
+         AND (
+           caller_symbol_id = ANY($3::text[])
+           OR resolved_symbol_ids && $3::text[]
+           OR target_name = ANY($4::text[])
+         )
+       ORDER BY edge_id ASC
+       LIMIT $5`,
+    values: [repositoryId, storageKey, symbolIds, targetNames, request.limit + 1]
+  };
+}
+
+export interface RepositoryIndexVectorHydrationStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Vectors for named records of one snapshot. Same two-predicate isolation as
+ * record hydration.
+ */
+export function buildRepositoryIndexVectorHydrationStatement(
+  repositoryId: number,
+  storageKey: string,
+  records: readonly RepositoryRecordReference[]
+): RepositoryIndexVectorHydrationStatement {
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, visibility, provider_id, dimensions,
+            record_type, record_id, path, vector_json
+       FROM repository_index_vectors
+       WHERE repository_id=$1 AND storage_key=$2
+         AND (record_type, record_id) IN (SELECT * FROM unnest($3::text[], $4::text[]))
+       ORDER BY record_type ASC, record_id ASC`,
+    values: [
+      repositoryId,
+      storageKey,
+      records.map((record) => record.recordType),
+      records.map((record) => record.recordId)
+    ]
   };
 }
 

@@ -8,17 +8,23 @@ import {
   validateEmbeddingVectors
 } from "./lexical.js";
 import {
+  assertDescriptorReference,
   assertIndexReference,
   HISTORY_RECORD_PATH,
   normalizeRepositoryPath,
   renderHistoryRecordContent
 } from "./storage.js";
 import type {
+  DurableRepositoryContextSource,
   IndexedHistory,
   IndexedSymbol,
   LocalEmbeddingProvider,
+  PersistedCallEdge,
+  PersistedPathRecordRow,
   PersistedRecordRow,
+  PersistedVectorRow,
   RepositoryIndex,
+  RepositoryIndexDescriptor,
   RepositoryRecordHydrationRequest,
   RepositoryVectorMatch,
   RepositoryVectorQuery,
@@ -43,9 +49,9 @@ import type {
  * What a ranker does NOT do is decide rank. See `candidateRelevance`: scores are
  * always recomputed locally, because a store's score has store-specific polarity.
  *
- * Graph edges still come from the materialised document: `caller` and `callee`
- * candidates are derived from `index.calls`, which no per-record durable row can
- * reconstruct. See `sourceThroughDurableStorage` for what is and is not durable.
+ * The full-document path still walks `index.calls` for caller/callee. The
+ * descriptor-first path reconstructs those edges from durable call-edge rows
+ * via `retrieveDurableRepositoryContext`.
  */
 export interface RepositoryVectorRanker {
   /**
@@ -136,6 +142,152 @@ export type RetrievedContextKind =
   | "ownership"
   | "history";
 
+/**
+ * Every `RetrievedContextKind` as a runtime value, pinned to the union in BOTH
+ * directions by the two checks below.
+ *
+ * A runtime list is required because the union is erased: the test runner strips
+ * types rather than checking them, so a test comparing a table against a type
+ * would compare it against nothing. Pinning is what gives the list teeth — adding
+ * a member to the union without adding it here is a compile error, and adding it
+ * here without classifying it below fails the partition test.
+ */
+export const retrievedContextKinds = [
+  "changed-symbol",
+  "caller",
+  "callee",
+  "test",
+  "config",
+  "schema",
+  "ownership",
+  "history"
+] as const satisfies readonly RetrievedContextKind[];
+
+/** Fails to compile if a union member is missing from `retrievedContextKinds`. */
+type UnclassifiedContextKind = Exclude<
+  RetrievedContextKind,
+  (typeof retrievedContextKinds)[number]
+>;
+const _everyKindIsListed: UnclassifiedContextKind extends never ? true : never = true;
+void _everyKindIsListed;
+
+/**
+ * How completely durable per-record storage can reproduce one candidate kind.
+ *
+ * These names are the vocabulary for a distinction that is otherwise easy to lose:
+ * "the document is no longer loaded" and "the same candidates are still found" are
+ * different claims, and only one of them is about storage.
+ */
+export type RetrievedContextKindDurability =
+  /**
+   * Reproducible from durable rows exactly, for the same inputs. Bounded by the
+   * diff (or by the call edges that touch the changed set), not by ANN recall.
+   */
+  | "durably-exact"
+  /**
+   * Enumerated repo-wide from the document, and answerable durably only within
+   * whatever nearest-neighbour recall returned.
+   *
+   * The document path scans EVERY symbol (`addRepositorySupportContexts`, and the
+   * test scan in `primaryCandidates`); the durable path sees only recalled rows.
+   * So this is not equivalence — it is
+   * "bounded by recall instead of by the repository". Widening recall widens it;
+   * nothing about it makes review cost sublinear in repository size, because the
+   * document-side scan is repo-wide by SEMANTICS and not by storage accident.
+   */
+  | "exhaustive-from-document-recall-bounded-durably"
+  /**
+   * Not reproducible from durable storage at all on any production path.
+   *
+   * Reserved for kinds that still require the materialised document after path
+   * queries and call-edge rows exist. Currently empty: caller/callee reconstruct
+   * from durable edges, and changed-symbol is path-exact.
+   */
+  | "document-only";
+
+export interface RetrievedContextKindCoverage {
+  durability: RetrievedContextKindDurability;
+  /**
+   * Relations within this kind that need the materialised document even when the
+   * kind itself has a durable route. A non-empty list means a candidate of this
+   * kind can still be MISSED durably, so the kind's presence in a durable result
+   * is not evidence that its document-side counterpart was fully reproduced.
+   */
+  documentOnlyRelations: readonly string[];
+  why: string;
+}
+
+/**
+ * The declared durability of every candidate kind: a partition, one class each.
+ *
+ * It exists so drift is mechanically detectable rather than a matter of reading
+ * comments. The descriptor-first path (`retrieveDurableRepositoryContext`) closes
+ * changed-symbol via path-scoped queries and caller/callee via durable edges; the
+ * remaining kinds are still recall-bounded. Nothing in retrieval reads this table;
+ * it is a declaration, not a control path.
+ */
+export const retrievedContextKindCoverage: Record<
+  RetrievedContextKind,
+  RetrievedContextKindCoverage
+> = {
+  "changed-symbol": {
+    durability: "durably-exact",
+    documentOnlyRelations: [],
+    why:
+      "Path-scoped durable record queries fetch every symbol on selected changed " +
+      "paths up to an explicit hard limit. Truncation is surfaced as partial " +
+      "coverage rather than silent loss. This no longer depends on ANN recall."
+  },
+  caller: {
+    durability: "durably-exact",
+    documentOnlyRelations: [],
+    why:
+      "Durable call-edge rows carry caller_symbol_id and resolved_symbol_ids. " +
+      "retrieveDurableRepositoryContext walks those edges for the changed symbol " +
+      "set and hydrates caller records. Truncation of the edge query is partial."
+  },
+  callee: {
+    durability: "durably-exact",
+    documentOnlyRelations: [],
+    why:
+      "Outbound edges from changed callers are durable. The related-source lexical " +
+      "'callee' label from classifyDurableRecord remains recall-bounded and is not " +
+      "counted as call-edge coverage; the primary call-edge route is exact."
+  },
+  test: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "relatedByName is durable on recalled rows; relatedByCall reconstructs from " +
+      "durable edges when the test symbol is the caller. Discovery of name-related " +
+      "tests still depends on ANN recall (or the test path being selected)."
+  },
+  config: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "Path classification is exact on a durable row, but the document path scans every " +
+      "symbol in the repository while the durable path sees only recalled rows."
+  },
+  schema: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why: "Path classification is exact per row; enumeration is repo-wide only from the document."
+  },
+  ownership: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why: "Path classification is exact per row; enumeration is repo-wide only from the document."
+  },
+  history: {
+    durability: "exhaustive-from-document-recall-bounded-durably",
+    documentOnlyRelations: [],
+    why:
+      "Summary matching is exact on a durable row because the row carries the raw summary, " +
+      "but which history rows are considered outside selected paths is bounded by recall."
+  }
+};
+
 export interface RetrievedRepositoryContext {
   id: string;
   repositoryScope: string;
@@ -176,6 +328,28 @@ export interface RepositoryContextRequest {
   vectorRankerLimit?: number;
 }
 
+/**
+ * Descriptor-first retrieval for the production review path. Requires durable
+ * path-record and call-edge queries; never reads a materialised index document.
+ */
+export interface DurableRepositoryContextRequest {
+  descriptor: RepositoryIndexDescriptor;
+  repositoryScope: string;
+  commitSha: string;
+  changes: readonly IndexChangedFile[];
+  query?: string;
+  limit?: number;
+  primaryPolicy?: RepositoryAccessPolicy;
+  embeddingProvider?: LocalEmbeddingProvider;
+  source: DurableRepositoryContextSource;
+  /** ANN recall bound per repository. Defaults to 200. */
+  vectorRankerLimit?: number;
+  /** Hard cap on path-scoped exact records. Defaults to 500. */
+  pathRecordLimit?: number;
+  /** Hard cap on call edges for the changed symbol set. Defaults to 500. */
+  callEdgeLimit?: number;
+}
+
 export interface RepositoryContextResult {
   repositoryScope: string;
   commitSha: string;
@@ -185,11 +359,27 @@ export interface RepositoryContextResult {
   scope: RepositoryReviewScope;
   contexts: RetrievedRepositoryContext[];
   droppedContextCount: number;
+  /**
+   * Operator-facing reasons the durable path returned partial coverage. Empty
+   * when coverage is complete within the declared durability of each kind.
+   * Deliberately free of repository-identifying labels.
+   */
+  warnings?: string[];
 }
 
 export class RepositoryIsolationError extends Error {
   override readonly name = "RepositoryIsolationError";
 }
+
+/**
+ * Identity + embedding fields scoring needs. A full `RepositoryIndex` satisfies
+ * this; so does a descriptor. Keeping the type narrow is what lets the
+ * descriptor-first path score candidates without materialising the document.
+ */
+type CandidateIndexRef = Pick<
+  RepositoryIndex,
+  "storageKey" | "repositoryScope" | "commitSha" | "embedding"
+>;
 
 interface Candidate {
   id: string;
@@ -209,7 +399,7 @@ interface Candidate {
   content: string;
   contentSha256: string;
   vector: readonly number[];
-  index: RepositoryIndex;
+  index: CandidateIndexRef;
   baseScore: number;
 }
 
@@ -400,7 +590,7 @@ export function planRepositoryReviewScope(
 
 function assertPolicyMatchesIndex(
   policy: RepositoryAccessPolicy,
-  index: RepositoryIndex
+  index: Pick<RepositoryIndex, "repositoryScope" | "visibility">
 ): void {
   if (
     policy.repositoryScope !== index.repositoryScope ||
@@ -827,7 +1017,7 @@ function materialisedRecordKeys(indexes: readonly RepositoryIndex[]): Set<string
 
 function providerMatchesIndex(
   provider: LocalEmbeddingProvider | undefined,
-  index: RepositoryIndex
+  index: CandidateIndexRef
 ): boolean {
   return Boolean(
     provider &&
@@ -864,7 +1054,7 @@ interface DurableSourcingResult {
 
 function assertRowWithinRepository(
   row: { storageKey: string; repositoryScope: string; commitSha: string },
-  index: RepositoryIndex,
+  index: CandidateIndexRef,
   what: string
 ): void {
   if (
@@ -874,6 +1064,23 @@ function assertRowWithinRepository(
   ) {
     throw new RepositoryIsolationError(
       `${what} returned a row outside the requested repository and commit`
+    );
+  }
+}
+
+function assertVectorMatchesDescriptor(
+  row: Pick<PersistedVectorRow, "providerId" | "dimensions" | "vector">,
+  descriptor: RepositoryIndexDescriptor,
+  what: string
+): void {
+  if (
+    row.providerId !== descriptor.embedding.providerId ||
+    row.dimensions !== descriptor.embedding.dimensions ||
+    row.vector.length !== descriptor.embedding.dimensions ||
+    row.vector.some((value) => !Number.isFinite(value))
+  ) {
+    throw new RepositoryIsolationError(
+      `${what} returned a vector outside the snapshot embedding space`
     );
   }
 }
@@ -1017,6 +1224,384 @@ function candidateRelevance(
   return lexicalOverlapScore(query, candidate.content);
 }
 
+function rankCandidates(
+  candidates: Candidate[],
+  query: string,
+  embeddingProvider: LocalEmbeddingProvider | undefined,
+  providerQueryVector: readonly number[] | undefined,
+  limit: number
+): {
+  contexts: RetrievedRepositoryContext[];
+  droppedContextCount: number;
+  partialByLimit: boolean;
+} {
+  const unique = new Map<string, Candidate & { score: number }>();
+  for (const candidate of candidates) {
+    const score =
+      candidate.baseScore +
+      candidateRelevance(candidate, query, embeddingProvider, providerQueryVector) * 20;
+    const existing = unique.get(candidate.id);
+    if (!existing || score > existing.score) {
+      unique.set(candidate.id, { ...candidate, score });
+    }
+  }
+  const ranked = [...unique.values()].sort((left, right) => {
+    if (left.score !== right.score) return right.score - left.score;
+    return binaryCompare(
+      `${left.repositoryScope}\u0000${left.kind}\u0000${left.path}\u0000${String(left.line).padStart(10, "0")}\u0000${left.id}`,
+      `${right.repositoryScope}\u0000${right.kind}\u0000${right.path}\u0000${String(right.line).padStart(10, "0")}\u0000${right.id}`
+    );
+  });
+  const selected = ranked.slice(0, limit);
+  return {
+    contexts: selected.map(
+      (candidate): RetrievedRepositoryContext => ({
+        id: candidate.id,
+        repositoryScope: candidate.repositoryScope,
+        commitSha: candidate.commitSha,
+        source: candidate.source,
+        path: candidate.path,
+        line: candidate.line,
+        kind: candidate.kind,
+        content: candidate.content,
+        contentSha256: candidate.contentSha256,
+        trust: "untrusted-repository-content",
+        score: candidate.score
+      })
+    ),
+    droppedContextCount: Math.max(0, ranked.length - selected.length),
+    partialByLimit: ranked.length > limit
+  };
+}
+
+function candidateFromPathRecord(
+  index: CandidateIndexRef,
+  row: PersistedPathRecordRow | (PersistedRecordRow & { vector: readonly number[] }),
+  kind: RetrievedContextKind,
+  source: Candidate["source"],
+  baseScore: number
+): Candidate {
+  return {
+    id: candidateId(index.repositoryScope, row.recordId, kind),
+    recordId: row.recordId,
+    recordType: row.recordType,
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha,
+    source,
+    path: row.path,
+    line: row.line,
+    kind,
+    content: row.content,
+    contentSha256: row.contentSha256,
+    vector: row.vector,
+    index,
+    baseScore
+  };
+}
+
+/**
+ * Descriptor-first production retrieval. Loads only durable rows/edges; never
+ * requires a materialised `RepositoryIndex` document.
+ *
+ * Exact changed-path records are fetched with a hard limit (not ANN). Call edges
+ * reconstruct caller/callee. Support kinds remain recall-bounded and are never
+ * silently claimed as equivalent to a full document scan — truncation and known
+ * recall bounds surface as `partial` plus warnings.
+ */
+export async function retrieveDurableRepositoryContext(
+  request: DurableRepositoryContextRequest
+): Promise<RepositoryContextResult> {
+  assertDescriptorReference(request.descriptor, {
+    repositoryScope: request.repositoryScope,
+    commitSha: request.commitSha
+  });
+  const limit = request.limit ?? 40;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new RangeError("repository context limit must be between 1 and 200");
+  }
+  if (request.primaryPolicy) {
+    assertPolicyMatchesIndex(request.primaryPolicy, request.descriptor);
+  }
+
+  const pathRecordLimit = request.pathRecordLimit ?? 500;
+  const callEdgeLimit = request.callEdgeLimit ?? 500;
+  const vectorRankerLimit = request.vectorRankerLimit ?? 200;
+  for (const [value, name] of [
+    [pathRecordLimit, "path record limit"],
+    [callEdgeLimit, "call edge limit"],
+    [vectorRankerLimit, "vector ranker limit"]
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 1_000) {
+      throw new RangeError(`${name} must be between 1 and 1000`);
+    }
+  }
+
+  const descriptor = request.descriptor;
+  const indexRef: CandidateIndexRef = {
+    storageKey: descriptor.storageKey,
+    repositoryScope: descriptor.repositoryScope,
+    commitSha: descriptor.commitSha,
+    embedding: descriptor.embedding
+  };
+  const normalizedChanges = normalizeChanges(request.changes);
+  const scope = planRepositoryReviewScope(normalizedChanges);
+  const query = normalizeSourceText(request.query ?? "").slice(0, 4_000);
+  const selectedPaths = new Set(scope.selectedPaths);
+  const changesByPath = new Map(normalizedChanges.map((change) => [change.path, change]));
+  const warnings: string[] = [];
+  let durablePartial = false;
+
+  const pathResult = await request.source.queryRecordsByPath({
+    repositoryScope: descriptor.repositoryScope,
+    commitSha: descriptor.commitSha,
+    paths: scope.selectedPaths,
+    limit: pathRecordLimit
+  });
+  if (pathResult.truncated) {
+    durablePartial = true;
+    warnings.push(
+      "durable path-record retrieval was truncated; changed-path coverage is partial"
+    );
+  }
+
+  const candidates: Candidate[] = [];
+  const knownRecords = new Set<string>();
+  const changedIds = new Set<string>();
+  const changedNames = new Set<string>();
+  const symbolsById = new Map<
+    string,
+    PersistedRecordRow & { vector: readonly number[] }
+  >();
+
+  for (const row of pathResult.rows) {
+    assertRowWithinRepository(row, indexRef, "durable path-record retrieval");
+    assertVectorMatchesDescriptor(row, descriptor, "durable path-record retrieval");
+    knownRecords.add(recordIdentityKey(row.repositoryScope, row.recordType, row.recordId));
+    if (row.recordType === "symbol") {
+      symbolsById.set(row.recordId, row);
+    }
+    for (const classification of classifyDurableRecord(
+      row,
+      "primary",
+      selectedPaths,
+      changesByPath,
+      changedNames,
+      query
+    )) {
+      // First pass uses empty changedNames; collect changed-symbols then re-run name matches.
+      if (classification.kind === "changed-symbol") {
+        changedIds.add(row.recordId);
+        changedNames.add(row.name.toLowerCase());
+      }
+      candidates.push(
+        candidateFromPathRecord(indexRef, row, classification.kind, "primary", classification.baseScore)
+      );
+    }
+  }
+
+  // Re-classify path history/test rows now that changedNames is populated.
+  for (const row of pathResult.rows) {
+    if (row.recordType === "history" || (row.recordType === "symbol" && isTestPath(row.path))) {
+      for (const classification of classifyDurableRecord(
+        row,
+        "primary",
+        selectedPaths,
+        changesByPath,
+        changedNames,
+        query
+      )) {
+        if (classification.kind === "changed-symbol") continue;
+        candidates.push(
+          candidateFromPathRecord(
+            indexRef,
+            row,
+            classification.kind,
+            "primary",
+            classification.baseScore
+          )
+        );
+      }
+    }
+  }
+
+  const edgeResult =
+    changedIds.size || changedNames.size
+      ? await request.source.queryCallEdges({
+          repositoryScope: descriptor.repositoryScope,
+          commitSha: descriptor.commitSha,
+          symbolIds: [...changedIds],
+          targetNames: [...changedNames],
+          limit: callEdgeLimit
+        })
+      : { edges: [] as PersistedCallEdge[], truncated: false };
+  if (edgeResult.truncated) {
+    durablePartial = true;
+    warnings.push("durable call-edge retrieval was truncated; caller/callee coverage is partial");
+  }
+
+  const relatedSymbolIds = new Set<string>();
+  for (const edge of edgeResult.edges) {
+    assertRowWithinRepository(edge, indexRef, "durable call-edge retrieval");
+    if (edge.callerSymbolId) relatedSymbolIds.add(edge.callerSymbolId);
+    for (const id of edge.resolvedSymbolIds) relatedSymbolIds.add(id);
+  }
+
+  const missingSymbolRefs = [...relatedSymbolIds]
+    .filter((id) => !symbolsById.has(id))
+    .map((recordId) => ({ recordType: "symbol" as const, recordId }));
+  if (missingSymbolRefs.length) {
+    const [hydrated, vectors] = await Promise.all([
+      request.source.hydrateRecords({
+        repositoryScope: descriptor.repositoryScope,
+        commitSha: descriptor.commitSha,
+        records: missingSymbolRefs
+      }),
+      request.source.hydrateVectors({
+        repositoryScope: descriptor.repositoryScope,
+        commitSha: descriptor.commitSha,
+        records: missingSymbolRefs
+      })
+    ]);
+    const vectorsById = new Map(vectors.map((row) => [row.recordId, row]));
+    for (const row of hydrated) {
+      assertRowWithinRepository(row, indexRef, "durable record hydration");
+      const vectorRow = vectorsById.get(row.recordId);
+      if (!vectorRow) continue;
+      assertRowWithinRepository(vectorRow, indexRef, "durable vector hydration");
+      assertVectorMatchesDescriptor(vectorRow, descriptor, "durable vector hydration");
+      knownRecords.add(recordIdentityKey(row.repositoryScope, row.recordType, row.recordId));
+      symbolsById.set(row.recordId, { ...row, vector: vectorRow.vector });
+    }
+  }
+
+  for (const edge of edgeResult.edges) {
+    const touchesChanged =
+      (edge.callerSymbolId && changedIds.has(edge.callerSymbolId)) ||
+      edge.resolvedSymbolIds.some((id) => changedIds.has(id)) ||
+      (edge.targetName && changedNames.has(edge.targetName));
+    if (!touchesChanged) continue;
+
+    if (
+      edge.resolvedSymbolIds.some((id) => changedIds.has(id)) ||
+      (edge.targetName && changedNames.has(edge.targetName))
+    ) {
+      const caller = edge.callerSymbolId ? symbolsById.get(edge.callerSymbolId) : undefined;
+      if (caller && !changedIds.has(caller.recordId)) {
+        candidates.push(
+          candidateFromPathRecord(indexRef, caller, "caller", "primary", 96)
+        );
+      }
+    }
+    if (edge.callerSymbolId && changedIds.has(edge.callerSymbolId)) {
+      for (const resolvedId of edge.resolvedSymbolIds) {
+        const callee = symbolsById.get(resolvedId);
+        if (callee && !changedIds.has(callee.recordId)) {
+          candidates.push(
+            candidateFromPathRecord(indexRef, callee, "callee", "primary", 94)
+          );
+        }
+      }
+    }
+    // Call-based test: a test symbol that calls a changed symbol.
+    if (edge.callerSymbolId && edge.resolvedSymbolIds.some((id) => changedIds.has(id))) {
+      const caller = symbolsById.get(edge.callerSymbolId);
+      if (caller && isTestPath(caller.path) && !changedIds.has(caller.recordId)) {
+        candidates.push(candidateFromPathRecord(indexRef, caller, "test", "primary", 90));
+      }
+    }
+  }
+
+  // ANN recall for support kinds (config/schema/ownership/history/name-related tests).
+  // These remain recall-bounded; surface that as partial rather than claiming parity.
+  const providerQueryVector = await queryVectorForProvider(request.embeddingProvider, query);
+  if (request.embeddingProvider && providerQueryVector && query) {
+    if (!providerMatchesIndex(request.embeddingProvider, indexRef)) {
+      throw new RepositoryIsolationError(
+        "retrieval embedding provider does not match the snapshot embedding space"
+      );
+    }
+    const matches = await request.source.query({
+      repositoryScope: descriptor.repositoryScope,
+      commitSha: descriptor.commitSha,
+      providerId: descriptor.embedding.providerId,
+      vector: providerQueryVector,
+      limit: vectorRankerLimit
+    });
+    const absent = new Map<string, RepositoryVectorMatch>();
+    for (const match of matches) {
+      assertRowWithinRepository(match.row, indexRef, "durable vector ranking");
+      assertVectorMatchesDescriptor(match.row, descriptor, "durable vector ranking");
+      if (!Number.isFinite(match.score)) continue;
+      const key = recordIdentityKey(
+        match.row.repositoryScope,
+        match.row.recordType,
+        match.row.recordId
+      );
+      if (knownRecords.has(key)) continue;
+      const recordKey = `${match.row.recordType}:${match.row.recordId}`;
+      const seen = absent.get(recordKey);
+      if (!seen || match.score > seen.score) absent.set(recordKey, match);
+    }
+    if (absent.size) {
+      const hydrated = await request.source.hydrateRecords({
+        repositoryScope: descriptor.repositoryScope,
+        commitSha: descriptor.commitSha,
+        records: [...absent.values()].map((match) => ({
+          recordType: match.row.recordType,
+          recordId: match.row.recordId
+        }))
+      });
+      for (const row of hydrated) {
+        assertRowWithinRepository(row, indexRef, "durable record hydration");
+        const recordKey = `${row.recordType}:${row.recordId}`;
+        const match = absent.get(recordKey);
+        if (!match) continue;
+        knownRecords.add(recordIdentityKey(row.repositoryScope, row.recordType, row.recordId));
+        for (const classification of classifyDurableRecord(
+          row,
+          "primary",
+          selectedPaths,
+          changesByPath,
+          changedNames,
+          query
+        )) {
+          candidates.push(
+            candidateFromPathRecord(
+              indexRef,
+              { ...row, vector: match.row.vector },
+              classification.kind,
+              "primary",
+              classification.baseScore
+            )
+          );
+        }
+      }
+    }
+    // Support kinds (config/schema/ownership/history beyond selected paths) remain
+    // recall-bounded; that limit is declared in retrievedContextKindCoverage rather
+    // than forced partial on every successful review.
+  }
+
+  const ranked = rankCandidates(
+    candidates,
+    query,
+    request.embeddingProvider,
+    providerQueryVector,
+    limit
+  );
+  return {
+    repositoryScope: descriptor.repositoryScope,
+    commitSha: descriptor.commitSha,
+    storageKey: descriptor.storageKey,
+    mode: scope.mode,
+    partial: scope.partial || durablePartial || ranked.partialByLimit,
+    scope,
+    contexts: ranked.contexts,
+    droppedContextCount: ranked.droppedContextCount,
+    warnings: warnings.length ? warnings : undefined
+  };
+}
+
 export async function retrieveRepositoryContext(
   request: RepositoryContextRequest
 ): Promise<RepositoryContextResult> {
@@ -1106,57 +1691,32 @@ export async function retrieveRepositoryContext(
   // the materialised path produced. Every candidate is then scored by the same
   // local cosine, so supplying a ranker changes recall and never ordering.
   candidates.push(...durable.candidates);
-  const unique = new Map<string, Candidate & { score: number }>();
-  for (const candidate of candidates) {
-    const score =
-      candidate.baseScore +
-      candidateRelevance(
-        candidate,
-        query,
-        request.embeddingProvider,
-        providerQueryVector
-      ) *
-        20;
-    const existing = unique.get(candidate.id);
-    if (!existing || score > existing.score) {
-      unique.set(candidate.id, { ...candidate, score });
-    }
-  }
-  const ranked = [...unique.values()].sort((left, right) => {
-    if (left.score !== right.score) return right.score - left.score;
-    return binaryCompare(
-      `${left.repositoryScope}\u0000${left.kind}\u0000${left.path}\u0000${String(left.line).padStart(10, "0")}\u0000${left.id}`,
-      `${right.repositoryScope}\u0000${right.kind}\u0000${right.path}\u0000${String(right.line).padStart(10, "0")}\u0000${right.id}`
-    );
-  });
-  const selected = ranked.slice(0, limit);
+  const ranked = rankCandidates(
+    candidates,
+    query,
+    request.embeddingProvider,
+    providerQueryVector,
+    limit
+  );
   return {
     repositoryScope: request.index.repositoryScope,
     commitSha: request.index.commitSha,
     storageKey: request.index.storageKey,
     mode: scope.mode,
-    partial: scope.partial || ranked.length > limit,
+    partial: scope.partial || ranked.partialByLimit,
     scope,
-    contexts: selected.map(
-      (candidate): RetrievedRepositoryContext => ({
-        id: candidate.id,
-        repositoryScope: candidate.repositoryScope,
-        commitSha: candidate.commitSha,
-        source: candidate.source,
-        path: candidate.path,
-        line: candidate.line,
-        kind: candidate.kind,
-        content: candidate.content,
-        contentSha256: candidate.contentSha256,
-        trust: "untrusted-repository-content",
-        score: candidate.score
-      })
-    ),
-    droppedContextCount: Math.max(0, ranked.length - selected.length)
+    contexts: ranked.contexts,
+    droppedContextCount: ranked.droppedContextCount
   };
 }
 
-const reviewKindByRetrievedKind: Record<
+/**
+ * Exported so the kind-partition invariant has a THIRD independent runtime
+ * witness of the union. The union itself is erased at test time, so a table can
+ * only be checked against another table; this one is load-bearing for review
+ * bundles, so a new kind cannot compile without appearing here.
+ */
+export const reviewKindByRetrievedKind: Record<
   RetrievedContextKind,
   ReviewBundleContextCandidate["kind"]
 > = {

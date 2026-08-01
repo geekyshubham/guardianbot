@@ -128,6 +128,12 @@ export interface MonitoringRunResult {
   failingRepositories: number;
   warningRepositories: number;
   activeAlerts: number;
+  /**
+   * True when shutdown cancelled the sweep partway through the inventory. A cancelled
+   * sweep is never a success: no weekly report is written and no aggregate gauge is
+   * republished, so a partial pass cannot be read as an authoritative complete one.
+   */
+  cancelled: boolean;
 }
 
 export function monitoringOptionsFromEnvironment(
@@ -160,6 +166,14 @@ export function monitoringOptionsFromEnvironment(
     );
   }
   return { enabled, intervalMs };
+}
+
+/** Raised when shutdown cancels a reconciliation sweep between repositories. */
+export class MonitoringAbortedError extends Error {
+  constructor() {
+    super("monitoring reconciliation aborted for shutdown");
+    this.name = "MonitoringAbortedError";
+  }
 }
 
 export class MonitoringService {
@@ -242,9 +256,9 @@ export class MonitoringService {
     this.state.running = false;
   }
 
-  async reconcileOnce(): Promise<MonitoringRunResult> {
+  async reconcileOnce(signal?: AbortSignal): Promise<MonitoringRunResult> {
     if (this.inFlight) return this.inFlight;
-    const run = this.performReconciliation();
+    const run = this.performReconciliation(signal);
     this.inFlight = run;
     try {
       return await run;
@@ -318,19 +332,21 @@ export class MonitoringService {
     while (!this.stopping) {
       const startedAt = this.clock.now().getTime();
       try {
-        await this.reconcileOnce();
+        await this.reconcileOnce(signal);
       } catch (error) {
         this.logger.error(
           `GuardianBot monitoring reconciliation failed (${boundedErrorKind(error)})`
         );
       }
-      if (this.stopping) break;
+      if (this.stopping || signal.aborted) break;
       const elapsedMs = Math.max(0, this.clock.now().getTime() - startedAt);
       await this.sleep(Math.max(0, this.options.intervalMs - elapsedMs), signal);
     }
   }
 
-  private async performReconciliation(): Promise<MonitoringRunResult> {
+  private async performReconciliation(
+    signal?: AbortSignal
+  ): Promise<MonitoringRunResult> {
     const startedAt = this.clock.now();
     this.state.lastAttemptAt = startedAt.toISOString();
     if (!this.options.enabled) return emptyRunResult(false);
@@ -356,6 +372,11 @@ export class MonitoringService {
     this.state.running = true;
     let result: MonitoringRunResult | undefined;
     let failure: unknown;
+    let cancelled = false;
+    let repositoriesEvaluated = 0;
+    let failingRepositories = 0;
+    let warningRepositories = 0;
+    let activeAlerts = 0;
     try {
       const observedAt = this.clock.now();
       const runClock: MonitoringClock = {
@@ -363,11 +384,11 @@ export class MonitoringService {
       };
       const inventory = await this.store.listMonitoringRepositoryInventory();
       await this.store.resolveMonitoringAlertsForInactiveRepositories(observedAt);
-      let failingRepositories = 0;
-      let warningRepositories = 0;
-      let activeAlerts = 0;
       const weeklyRepositories: RepositoryWeeklyMetrics[] = [];
       for (const item of inventory) {
+        // Checked before the item, never mid-write, so shutdown stops after the
+        // repository currently being persisted rather than tearing it.
+        throwIfMonitoringAborted(signal);
         const snapshot = evaluateInventoryItem(
           item,
           {
@@ -389,21 +410,26 @@ export class MonitoringService {
         const alerts = activeAlertsFor(snapshot.checks);
         activeAlerts += alerts.length;
         await this.store.saveMonitoringSnapshot(persisted, alerts);
+        repositoriesEvaluated += 1;
         weeklyRepositories.push(toWeeklyRepositoryMetrics(item, snapshot));
       }
+      // Reached only when every repository was persisted, so the aggregate report is
+      // built from a complete inventory and its "latest-reconciliation" provenance holds.
       const weeklyReport = toMonitoringWeeklyReport(weeklyRepositories, observedAt);
       if (weeklyReport) {
         await this.store.saveMonitoringWeeklyReport(weeklyReport);
       }
       result = {
         acquired: true,
-        repositoriesEvaluated: inventory.length,
+        repositoriesEvaluated,
         failingRepositories,
         warningRepositories,
-        activeAlerts
+        activeAlerts,
+        cancelled: false
       };
     } catch (error) {
-      failure = error;
+      if (error instanceof MonitoringAbortedError) cancelled = true;
+      else failure = error;
     }
     try {
       await lock.release();
@@ -415,6 +441,23 @@ export class MonitoringService {
     if (failure) {
       this.recordFailure(failure, startedAt);
       throw failure;
+    }
+    if (cancelled) {
+      // A cancelled sweep is neither a success nor a failure. It publishes no weekly
+      // report and leaves the aggregate gauges on the last COMPLETE sweep, so a partial
+      // pass can never be read as authoritative; consecutiveFailures is left untouched so
+      // shutdown does not look like an outage.
+      const cancelledAt = this.clock.now();
+      this.state.lastCycleAt = cancelledAt.toISOString();
+      this.state.lastDurationMs = elapsed(startedAt, cancelledAt);
+      return {
+        acquired: true,
+        repositoriesEvaluated,
+        failingRepositories,
+        warningRepositories,
+        activeAlerts,
+        cancelled: true
+      };
     }
     const completedAt = this.clock.now();
     this.state.lastCycleAt = completedAt.toISOString();
@@ -1144,8 +1187,18 @@ function emptyRunResult(acquired: boolean): MonitoringRunResult {
     repositoriesEvaluated: 0,
     failingRepositories: 0,
     warningRepositories: 0,
-    activeAlerts: 0
+    activeAlerts: 0,
+    cancelled: false
   };
+}
+
+/**
+ * Cooperative cancellation checkpoint for the reconciliation sweep. Only ever thrown
+ * between whole repositories, so the repository being written when shutdown arrives is
+ * always finished rather than torn.
+ */
+function throwIfMonitoringAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new MonitoringAbortedError();
 }
 
 async function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
