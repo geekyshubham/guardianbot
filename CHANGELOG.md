@@ -15,6 +15,23 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Current-binding AstraNull scheduled `authenticated-baseline` on head
+  `3664cff061398c1bf3efc0c937a2470746d60e3d` / deployed digest
+  `sha256:6c4f2e9cb3a497fe0871cb73cfd7b2aa0f072c2f7e54626d19a6b81a67ce087a`:
+  genuine GitHub `schedule` run
+  [`30717179796`](https://github.com/geekyshubham/AstraNull/actions/runs/30717179796)
+  (`guardianbot/dast-smoke / authenticated staging DAST` passed; `dast-nightly`
+  skipped; artifact `8823702700` digest
+  `sha256:0d7592fe5c23c37838733f63ebf7f716d30e6307822e29b08f1c3e570a82d45b`;
+  provenance binds `geekyshubham/astranull`, run/attempt `30717179796/1`,
+  workflow SHA `7524547700e4c3994353f5c61d1625b2bd5e5428`, profile
+  `authenticated-baseline`, 15 minutes, ZAP exit 2). GitHub environment
+  `guardianbot-dast` has custom `main` branch-only deployment policy in
+  RouteLens and AstraNull (re-read after AstraNull policy add). Baseline-only;
+  does not close full DAST acceptance, DefectDojo current-run proof, production
+  AI review, seven-day enforcement, or GitHub App review-comment permission.
+  Evidence:
+  [v0.2.39 live fleet upgrade](docs/evidence/v0.2.39-live-fleet-upgrade.md).
 - Live GuardianBot v0.2.39 fleet pin upgrade, control-plane trust of release
   commit `7524547700e4c3994353f5c61d1625b2bd5e5428` for security/image/DAST
   evidence (ACTIVE deployment `2a394a68-9c23-4fd0-8978-8d2018664f81`;
