@@ -69,3 +69,19 @@ Related counters:
 - `guardianbot_webhook_succeeded_total`, `guardianbot_webhook_failed_total`
 - `guardianbot_webhook_dead_letter_total`
 - `guardianbot_webhook_cleanup_deleted_total`, `guardianbot_webhook_cleanup_failures_total`
+- `guardianbot_github_rate_limited_total`: deliveries requeued because GitHub
+  reported a primary or secondary rate limit. These requeue at the reported
+  reset instant and do not consume the delivery attempt budget, so a sustained
+  rise here means slower reviews rather than dead-lettered work.
+- `guardianbot_finding_reappeared_total`: findings that returned after being
+  resolved or superseded. A rise indicates regressions reaching pull requests
+  again, not a GuardianBot fault.
+
+Rate-limit gauge:
+
+| Metric | Meaning |
+| --- | --- |
+| `guardianbot_github_ratelimit_remaining` | Remaining GitHub request budget last reported by an API response |
+
+This gauge is absent until GitHub reports a budget, so an unknown allowance is
+never scraped as an exhausted one. Alert on it only once present.

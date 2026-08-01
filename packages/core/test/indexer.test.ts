@@ -7,11 +7,14 @@ import {
   indexRepository,
   indexRepositorySyntaxAware,
   lexicalFeatureVector,
+  buildRepositoryIndexIncremental,
   planRepositoryReviewScope,
   retrieveRepositoryContext,
   retrievalToReviewContextCandidates,
+  toPersistedRecordRows,
   toPersistedVectorRows,
   type RepositoryAccessPolicy,
+  type RepositoryIndex,
   type RepositorySourceParser
 } from "../src/indexer.js";
 import { buildReviewBundle } from "../src/review-bundle.js";
@@ -574,4 +577,580 @@ test("accepts a deterministic local model provider without calling it semantic f
   });
   assert.deepEqual(index.symbols[0]?.vector.slice(1), [1, 0]);
   assert.equal(new LexicalHashEmbeddingProvider().kind, "lexical-fallback");
+});
+
+test("retrieval ranks through durable persistence and through memory identically", async () => {
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return checkTenant(user); }",
+    "src/tenant.ts": "export function checkTenant(user) { return user.tenant != null; }",
+    "test/auth.test.ts": "test('authorize', () => { authorize({}); });"
+  };
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/Seam",
+    repositoryId: 601,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+  const request = {
+    index,
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/auth.ts", additions: 1, deletions: 0 }],
+    query: "authorize tenant",
+    embeddingProvider: provider
+  };
+
+  const inMemory = await retrieveRepositoryContext(request);
+  // The same reference implementation, reached through the seam instead of a scan
+  // over the materialised vectors. Ranking must not depend on which path is used.
+  const durable = await retrieveRepositoryContext({
+    ...request,
+    vectorRanker: persistence
+  });
+
+  assert.ok(inMemory.contexts.length > 0);
+  assert.deepEqual(
+    durable.contexts.map((context) => `${context.kind}:${context.path}:${context.score}`),
+    inMemory.contexts.map((context) => `${context.kind}:${context.path}:${context.score}`)
+  );
+});
+
+test("a durable ranker cannot leak another repository's vectors into retrieval", async () => {
+  // Byte-identical content in both repositories, so nothing but the isolation
+  // boundary itself distinguishes them.
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return user.role === 'admin'; }"
+  };
+  const primary = await indexRepositorySyntaxAware({
+    repository: "Acme/Primary",
+    repositoryId: 701,
+    commitSha,
+    files
+  });
+  const foreign = await indexRepositorySyntaxAware({
+    repository: "Acme/Foreign",
+    repositoryId: 702,
+    commitSha,
+    files
+  });
+  assert.notEqual(primary.storageKey, foreign.storageKey);
+
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(primary, toPersistedVectorRows(primary));
+  await persistence.replace(foreign, toPersistedVectorRows(foreign));
+  const provider = new LexicalHashEmbeddingProvider(primary.embedding.dimensions);
+
+  const matches = await persistence.query({
+    repositoryScope: primary.repositoryScope,
+    commitSha,
+    providerId: primary.embedding.providerId,
+    vector: lexicalFeatureVector("authorize admin", primary.embedding.dimensions),
+    limit: 50
+  });
+  assert.ok(matches.length > 0);
+  // Identical content yields identical vectors, so this can only hold if the read
+  // is scoped by the canonical storage key rather than by content.
+  assert.ok(matches.every((match) => match.row.storageKey === primary.storageKey));
+  assert.ok(matches.every((match) => match.row.repositoryScope === "github:701"));
+  const foreignRecordIds = new Set(foreign.symbols.map((symbol) => symbol.id));
+  assert.ok(matches.every((match) => !foreignRecordIds.has(match.row.recordId)));
+
+  // A ranker that ignores scope must be rejected, not trusted.
+  const leakingRanker = {
+    async query() {
+      return [
+        {
+          row: toPersistedVectorRows(foreign)[0]!,
+          score: 99
+        }
+      ];
+    }
+  };
+  await assert.rejects(
+    retrieveRepositoryContext({
+      index: primary,
+      repositoryScope: primary.repositoryScope,
+      commitSha,
+      changes: [{ path: "src/auth.ts", additions: 1, deletions: 0 }],
+      query: "authorize",
+      embeddingProvider: provider,
+      vectorRanker: leakingRanker
+    }),
+    RepositoryIsolationError
+  );
+});
+
+test("incremental build re-embeds only changed paths and drops removed ones", async () => {
+  const provider = new LexicalHashEmbeddingProvider();
+  const previous = await indexRepositorySyntaxAware(
+    {
+      repository: "Acme/Incremental",
+      repositoryId: 801,
+      commitSha,
+      files: {
+        "src/keep.ts": "export function keep() { return 1; }",
+        "src/change.ts": "export function change() { return 2; }",
+        "src/drop.ts": "export function drop() { return 3; }"
+      }
+    },
+    { embeddingProvider: provider }
+  );
+  const headSha = "b".repeat(40);
+
+  let embedCalls: string[][] = [];
+  const countingProvider = {
+    id: provider.id,
+    kind: provider.kind,
+    locality: provider.locality,
+    deterministic: provider.deterministic,
+    dimensions: provider.dimensions,
+    async embed(texts: readonly string[]) {
+      embedCalls.push([...texts]);
+      return provider.embedSync(texts);
+    }
+  };
+
+  const result = await buildRepositoryIndexIncremental(
+    {
+      previous,
+      changedFiles: { "src/change.ts": "export function change() { return 22; }" },
+      removedPaths: ["src/drop.ts"],
+      commitSha: headSha,
+      repositoryId: 801
+    },
+    { embeddingProvider: countingProvider }
+  );
+
+  assert.deepEqual(result.reindexedPaths, ["src/change.ts"]);
+  assert.deepEqual(result.carriedPaths, ["src/keep.ts"]);
+  assert.deepEqual(result.removedPaths, ["src/drop.ts"]);
+  assert.deepEqual(
+    result.index.files.map((file) => file.path),
+    ["src/change.ts", "src/keep.ts"]
+  );
+  // Only the changed symbol needed a fresh embedding; the unchanged one was
+  // served from the prior index by content digest.
+  assert.equal(result.embeddedRecordCount, 1);
+  assert.equal(result.reusedRecordCount, 1);
+  assert.equal(embedCalls.length, 1);
+  assert.equal(embedCalls[0]?.length, 1);
+  assert.match(embedCalls[0]?.[0] ?? "", /return 22/);
+
+  // The result must be indistinguishable from a full rebuild over the same files.
+  const rebuilt = await indexRepositorySyntaxAware(
+    {
+      repository: "Acme/Incremental",
+      repositoryId: 801,
+      commitSha: headSha,
+      files: {
+        "src/keep.ts": "export function keep() { return 1; }",
+        "src/change.ts": "export function change() { return 22; }"
+      }
+    },
+    { embeddingProvider: provider }
+  );
+  assert.equal(result.index.contentSha256, rebuilt.contentSha256);
+  assert.equal(result.index.storageKey, rebuilt.storageKey);
+  // Every durable id is commit-scoped, so nothing is carried across commits.
+  assert.ok(result.index.symbols.every((symbol) => symbol.commitSha === headSha));
+  assert.ok(
+    result.index.symbols.every(
+      (symbol) => !previous.symbols.some((old) => old.id === symbol.id)
+    )
+  );
+});
+
+test("incremental build refuses to change the repository isolation scope", async () => {
+  const previous = await indexRepositorySyntaxAware({
+    repository: "Acme/Scoped",
+    repositoryId: 901,
+    commitSha,
+    files: { "src/a.ts": "export function a() { return 1; }" }
+  });
+
+  await assert.rejects(
+    buildRepositoryIndexIncremental(
+      {
+        previous,
+        changedFiles: { "src/a.ts": "export function a() { return 2; }" },
+        commitSha: "c".repeat(40),
+        repositoryScope: "github:999"
+      },
+      { embeddingProvider: new LexicalHashEmbeddingProvider() }
+    ),
+    /isolation scope/
+  );
+});
+
+/**
+ * Drops one record from the materialised document while leaving durable storage
+ * whole. It stands in for the production case the barrier was about: a snapshot
+ * too large to hold in memory, of which a query loads only part.
+ */
+function withoutRecord(index: RepositoryIndex, path: string): RepositoryIndex {
+  const pruned = structuredClone(index);
+  pruned.symbols = pruned.symbols.filter((symbol) => symbol.path !== path);
+  return pruned;
+}
+
+function countingRanker(persistence: InMemoryRepositoryIndexPersistence) {
+  const calls = { query: 0, hydrate: 0, hydratedRecords: 0 };
+  return {
+    calls,
+    ranker: {
+      async query(request: Parameters<InMemoryRepositoryIndexPersistence["query"]>[0]) {
+        calls.query += 1;
+        return persistence.query(request);
+      },
+      async hydrateRecords(
+        request: Parameters<InMemoryRepositoryIndexPersistence["hydrateRecords"]>[0]
+      ) {
+        calls.hydrate += 1;
+        calls.hydratedRecords += request.records.length;
+        return persistence.hydrateRecords(request);
+      }
+    }
+  };
+}
+
+test("durable candidate sourcing retrieves a record absent from the loaded document", async () => {
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return checkTenant(user); }",
+    "src/tenant.ts": "export function checkTenant(user) { return user.tenant != null; }"
+  };
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/Absent",
+    repositoryId: 1001,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+  // The document no longer carries src/auth.ts, but durable storage still does.
+  const partialDocument = withoutRecord(index, "src/auth.ts");
+  assert.ok(index.symbols.some((symbol) => symbol.path === "src/auth.ts"));
+  assert.ok(!partialDocument.symbols.some((symbol) => symbol.path === "src/auth.ts"));
+
+  const request = {
+    index: partialDocument,
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/auth.ts", additions: 1, deletions: 0 }],
+    query: "authorize tenant",
+    embeddingProvider: provider
+  };
+
+  // Without a ranker the record is simply unreachable: this is consequence (b) of
+  // enumerating candidates from the materialised document.
+  const documentOnly = await retrieveRepositoryContext(request);
+  assert.ok(!documentOnly.contexts.some((context) => context.path === "src/auth.ts"));
+
+  const durable = await retrieveRepositoryContext({
+    ...request,
+    vectorRanker: persistence
+  });
+  const sourced = durable.contexts.find((context) => context.path === "src/auth.ts");
+  assert.ok(sourced, "expected the durably-stored record to be retrievable");
+  assert.equal(sourced.kind, "changed-symbol");
+  assert.equal(sourced.repositoryScope, index.repositoryScope);
+  assert.equal(sourced.commitSha, commitSha);
+  // Hydrated content must be the record's own, byte-for-byte.
+  const expected = index.symbols.find((symbol) => symbol.path === "src/auth.ts");
+  assert.equal(sourced.content, expected?.content);
+  assert.equal(sourced.contentSha256, expected?.contentSha256);
+});
+
+test("durable sourcing leaves a fully materialised document's ordering identical", async () => {
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return checkTenant(user); }",
+    "src/tenant.ts": "export function checkTenant(user) { return user.tenant != null; }",
+    "test/auth.test.ts": "test('authorize', () => { authorize({}); });",
+    "config/settings.yml": "tenant: strict\n"
+  };
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/Parity",
+    repositoryId: 1002,
+    commitSha,
+    files,
+    history: [
+      { commitSha: "b".repeat(40), summary: "harden authorize tenant checks", path: "src/auth.ts" }
+    ]
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+  const request = {
+    index,
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/auth.ts", additions: 2, deletions: 1 }],
+    query: "authorize tenant",
+    embeddingProvider: provider
+  };
+
+  const inMemory = await retrieveRepositoryContext(request);
+  const counted = countingRanker(persistence);
+  const durable = await retrieveRepositoryContext({
+    ...request,
+    vectorRanker: counted.ranker
+  });
+
+  assert.ok(inMemory.contexts.length > 0);
+  const fingerprint = (result: Awaited<ReturnType<typeof retrieveRepositoryContext>>) =>
+    result.contexts.map(
+      (context) =>
+        `${context.kind}:${context.path}:${context.line}:${context.score}:${context.id}:${context.contentSha256}`
+    );
+  // Every record is materialised, so nothing is hydrated and the candidate set,
+  // the cosine scores, and the deterministic tie-breaks are all unchanged.
+  assert.deepEqual(fingerprint(durable), fingerprint(inMemory));
+  assert.equal(counted.calls.hydratedRecords, 0);
+  assert.equal(durable.droppedContextCount, inMemory.droppedContextCount);
+  assert.equal(durable.partial, inMemory.partial);
+});
+
+test("durable candidate hydration costs one round trip per repository", async () => {
+  const files = Object.fromEntries(
+    Array.from({ length: 12 }, (_, offset) => [
+      `src/module${offset}.ts`,
+      `export function authorize${offset}(user) { return user.tenant === ${offset}; }`
+    ])
+  );
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/Batched",
+    repositoryId: 1003,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+  // Every symbol is absent from the document, so all of them need hydrating.
+  const emptyDocument = structuredClone(index);
+  emptyDocument.symbols = [];
+  const counted = countingRanker(persistence);
+
+  await retrieveRepositoryContext({
+    index: emptyDocument,
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/module0.ts", additions: 1, deletions: 0 }],
+    query: "authorize tenant",
+    embeddingProvider: provider,
+    vectorRanker: counted.ranker
+  });
+
+  assert.equal(index.symbols.length, 12);
+  assert.equal(counted.calls.query, 1);
+  // The point of the batch: N absent matches must not become N fetches.
+  assert.equal(counted.calls.hydrate, 1);
+  assert.equal(counted.calls.hydratedRecords, 12);
+});
+
+test("durable candidate sourcing cannot cross a repository boundary", async () => {
+  // Byte-identical content in both repositories, so only the isolation boundary
+  // itself can keep them apart.
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return user.role === 'admin'; }"
+  };
+  const primary = await indexRepositorySyntaxAware({
+    repository: "Acme/CandidatePrimary",
+    repositoryId: 1101,
+    commitSha,
+    files
+  });
+  const foreign = await indexRepositorySyntaxAware({
+    repository: "Acme/CandidateForeign",
+    repositoryId: 1102,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(primary, toPersistedVectorRows(primary));
+  await persistence.replace(foreign, toPersistedVectorRows(foreign));
+  const provider = new LexicalHashEmbeddingProvider(primary.embedding.dimensions);
+
+  const emptyDocument = structuredClone(primary);
+  emptyDocument.symbols = [];
+  const result = await retrieveRepositoryContext({
+    index: emptyDocument,
+    repositoryScope: primary.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/auth.ts", additions: 1, deletions: 0 }],
+    query: "authorize admin",
+    embeddingProvider: provider,
+    vectorRanker: persistence
+  });
+
+  assert.ok(result.contexts.length > 0);
+  assert.ok(result.contexts.every((context) => context.repositoryScope === "github:1101"));
+  const foreignRecordContents = new Set(foreign.symbols.map((symbol) => symbol.contentSha256));
+  const foreignIds = new Set(
+    foreign.symbols.map((symbol) => symbol.id)
+  );
+  // Content hashes are equal across the two repositories by construction, so the
+  // identity that must not leak is the record id, not the content.
+  assert.ok(foreignRecordContents.size > 0);
+  assert.ok(!result.contexts.some((context) => foreignIds.has(context.id)));
+
+  const hydratedForeign = await persistence.hydrateRecords({
+    repositoryScope: primary.repositoryScope,
+    commitSha,
+    records: foreign.symbols.map((symbol) => ({
+      recordType: "symbol" as const,
+      recordId: symbol.id
+    }))
+  });
+  // Asking the primary snapshot for the foreign repository's record ids resolves
+  // nothing: the canonical storage key, not the record id, selects the rows.
+  assert.deepEqual(hydratedForeign, []);
+});
+
+test("a durable store that hydrates a foreign record is rejected, not trusted", async () => {
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return user.role === 'admin'; }"
+  };
+  const primary = await indexRepositorySyntaxAware({
+    repository: "Acme/HydratePrimary",
+    repositoryId: 1201,
+    commitSha,
+    files
+  });
+  const foreign = await indexRepositorySyntaxAware({
+    repository: "Acme/HydrateForeign",
+    repositoryId: 1202,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(primary, toPersistedVectorRows(primary));
+  await persistence.replace(foreign, toPersistedVectorRows(foreign));
+  const provider = new LexicalHashEmbeddingProvider(primary.embedding.dimensions);
+  const emptyDocument = structuredClone(primary);
+  emptyDocument.symbols = [];
+
+  const foreignRecords = toPersistedRecordRows(foreign);
+  const primaryRecordIds = new Set(primary.symbols.map((symbol) => symbol.id));
+  const leakingRanker = {
+    async query(request: Parameters<InMemoryRepositoryIndexPersistence["query"]>[0]) {
+      // Correctly scoped ranking, so only the hydration path is under test here.
+      return persistence.query(request);
+    },
+    async hydrateRecords() {
+      // A row carrying the foreign snapshot's storage key, returned under the
+      // record id the caller legitimately asked about.
+      return foreignRecords.map((row) => ({
+        ...row,
+        recordId: [...primaryRecordIds][0]!
+      }));
+    }
+  };
+
+  await assert.rejects(
+    retrieveRepositoryContext({
+      index: emptyDocument,
+      repositoryScope: primary.repositoryScope,
+      commitSha,
+      changes: [{ path: "src/auth.ts", additions: 1, deletions: 0 }],
+      query: "authorize admin",
+      embeddingProvider: provider,
+      vectorRanker: leakingRanker
+    }),
+    RepositoryIsolationError
+  );
+});
+
+test("a durable score's polarity cannot reorder retrieval", async () => {
+  // pgvector's `<=>` is cosine DISTANCE and the non-pgvector fallback computes
+  // cosine SIMILARITY, so the two storage paths report opposite polarities for the
+  // same pair of vectors. Ranking by a store-reported number would therefore invert
+  // the result order depending on which path answered, silently. Scoring every
+  // candidate locally is what makes the seam immune to that, and this is the test
+  // that would catch a regression back to trusting the store's number.
+  const files = {
+    "src/auth.ts": "export function authorize(user) { return checkTenant(user); }",
+    "src/tenant.ts": "export function checkTenant(user) { return user.tenant != null; }",
+    "test/auth.test.ts": "test('authorize', () => { authorize({}); });",
+    "config/settings.yml": "tenant: strict\n"
+  };
+  const index = await indexRepositorySyntaxAware({
+    repository: "Acme/Polarity",
+    repositoryId: 1101,
+    commitSha,
+    files
+  });
+  const persistence = new InMemoryRepositoryIndexPersistence();
+  await persistence.replace(index, toPersistedVectorRows(index));
+  const provider = new LexicalHashEmbeddingProvider(index.embedding.dimensions);
+  // src/auth.ts lives durably but not in the loaded document, so it can only be
+  // reached through hydration. That is what puts a durably-sourced candidate and
+  // materialised candidates in one ranked list, which is where a polarity
+  // disagreement between them would show up.
+  const partialDocument = withoutRecord(index, "src/auth.ts");
+  const request = {
+    index: partialDocument,
+    repositoryScope: index.repositoryScope,
+    commitSha,
+    changes: [{ path: "src/auth.ts", additions: 2, deletions: 1 }],
+    query: "authorize tenant",
+    embeddingProvider: provider
+  };
+
+  const similarityRanker = {
+    async query(vectorQuery: Parameters<InMemoryRepositoryIndexPersistence["query"]>[0]) {
+      return persistence.query(vectorQuery);
+    },
+    async hydrateRecords(
+      hydration: Parameters<InMemoryRepositoryIndexPersistence["hydrateRecords"]>[0]
+    ) {
+      return persistence.hydrateRecords(hydration);
+    }
+  };
+  // Same recall, same rows, opposite polarity: cosine distance is 1 - similarity.
+  const distanceRanker = {
+    async query(vectorQuery: Parameters<InMemoryRepositoryIndexPersistence["query"]>[0]) {
+      const matches = await persistence.query(vectorQuery);
+      return matches.map((match) => ({ row: match.row, score: 1 - match.score }));
+    },
+    async hydrateRecords(
+      hydration: Parameters<InMemoryRepositoryIndexPersistence["hydrateRecords"]>[0]
+    ) {
+      return persistence.hydrateRecords(hydration);
+    }
+  };
+
+  const fingerprint = (result: Awaited<ReturnType<typeof retrieveRepositoryContext>>) =>
+    result.contexts.map(
+      (context) => `${context.kind}:${context.path}:${context.line}:${context.score}`
+    );
+  const withoutRanker = await retrieveRepositoryContext(request);
+  const asSimilarity = await retrieveRepositoryContext({
+    ...request,
+    vectorRanker: similarityRanker
+  });
+  const asDistance = await retrieveRepositoryContext({
+    ...request,
+    vectorRanker: distanceRanker
+  });
+
+  // Not vacuous: hydration really happened, so a durably-sourced candidate is
+  // present in both ranked lists and had to be scored somehow.
+  assert.ok(!withoutRanker.contexts.some((context) => context.path === "src/auth.ts"));
+  assert.ok(asSimilarity.contexts.some((context) => context.path === "src/auth.ts"));
+  assert.ok(asDistance.contexts.some((context) => context.path === "src/auth.ts"));
+  // The whole point: which polarity the store reported changes nothing at all.
+  assert.deepEqual(fingerprint(asDistance), fingerprint(asSimilarity));
+
+  // And the candidates the document did materialise keep the exact scores and
+  // relative order they had with no ranker at all, so supplying one is purely a
+  // recall change.
+  const materialised = (result: Awaited<ReturnType<typeof retrieveRepositoryContext>>) =>
+    fingerprint(result).filter((entry) => !entry.includes(":src/auth.ts:"));
+  assert.ok(materialised(withoutRanker).length > 0);
+  assert.deepEqual(materialised(asSimilarity), materialised(withoutRanker));
+  assert.deepEqual(materialised(asDistance), materialised(withoutRanker));
 });

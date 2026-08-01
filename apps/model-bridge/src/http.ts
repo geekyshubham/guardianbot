@@ -60,26 +60,32 @@ export async function readResponseJsonLimited(
 
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      throw new BridgeError(
-        "invalid_output",
-        "response body too large",
-        503,
-        true
-      );
-    }
-    chunks.push(value);
-  }
-
   try {
-    return JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
-  } catch {
-    throw new BridgeError("invalid_output", "response body is not valid JSON", 503, true);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new BridgeError(
+          "invalid_output",
+          "response body too large",
+          503,
+          true
+        );
+      }
+      chunks.push(value);
+    }
+
+    try {
+      return JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
+    } catch {
+      throw new BridgeError("invalid_output", "response body is not valid JSON", 503, true);
+    }
+  } finally {
+    // Always release the upstream connection, including the oversize and parse-failure
+    // paths. Cleanup must never replace the original failure.
+    await reader.cancel().catch(() => undefined);
   }
 }
 

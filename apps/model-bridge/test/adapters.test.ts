@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { OpenAICompatibleAdapter } from "../src/adapters/openai-compatible.js";
 import { OpenAIResponsesAdapter } from "../src/adapters/openai-responses.js";
+import { BridgeError } from "../src/errors.js";
+import { readResponseJsonLimited } from "../src/http.js";
 import { strictModelOutputSchema } from "../src/strict-schema.js";
 import type { ResolvedBinding, ResolvedRoute } from "../src/types.js";
 import { sampleRequest, sampleResult } from "./helpers.js";
@@ -200,6 +202,73 @@ test("OpenAI-compatible probe honors startupProbeTimeoutMs", async () => {
     "utf8"
   );
   assert.doesNotMatch(adapterSource, /AbortSignal\.timeout/);
+});
+
+test("prompt exceeding route maxInputCharacters is non-retryable and never reaches the provider", async () => {
+  const request = sampleRequest();
+  let fetched = false;
+  const adapter = new OpenAIResponsesAdapter(binding("openai-responses"), {
+    responseBodyBytes: 100000,
+    startupProbeTimeoutMs: 5000,
+    fetchImpl: async () => {
+      fetched = true;
+      throw new Error("provider must not be contacted");
+    }
+  });
+
+  await assert.rejects(
+    () =>
+      adapter.review({
+        request,
+        route: { ...route(binding("openai-responses")), maxInputCharacters: 1_000 }
+      }),
+    (error: unknown) =>
+      error instanceof BridgeError &&
+      error.code === "payload_too_large" &&
+      error.statusCode === 413 &&
+      error.retryable === false
+  );
+  assert.equal(fetched, false);
+});
+
+test("oversized upstream response cancels the reader instead of leaking the connection", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new TextEncoder().encode("x".repeat(64)));
+    },
+    cancel() {
+      cancelled = true;
+    }
+  });
+
+  await assert.rejects(
+    () => readResponseJsonLimited(new Response(stream, { status: 200 }), 100),
+    (error: unknown) =>
+      error instanceof BridgeError &&
+      error.code === "invalid_output" &&
+      error.retryable === true
+  );
+  assert.equal(cancelled, true);
+});
+
+test("reader cleanup never replaces the original oversize failure", async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new TextEncoder().encode("x".repeat(64)));
+    },
+    cancel() {
+      throw new Error("upstream cancel failed");
+    }
+  });
+
+  await assert.rejects(
+    () => readResponseJsonLimited(new Response(stream, { status: 200 }), 100),
+    (error: unknown) =>
+      error instanceof BridgeError &&
+      error.code === "invalid_output" &&
+      error.retryable === true
+  );
 });
 
 test("strict model-output schema requires every object property and forbids extras", () => {

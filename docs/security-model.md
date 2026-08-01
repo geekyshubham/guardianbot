@@ -112,3 +112,87 @@ Residual PoC limitations and live-verification gaps are tracked in
 [capability status](status.md). Production operation additionally requires
 tested secret rotation, backups/restores, rate limits, audit export, dependency
 patching, alert delivery, and incident drills.
+
+## Reviewer feedback retention
+
+Reviewer engagement with a published advisory is personal data, so only a
+derived signal is retained: that a human replied to a specific advisory, and
+when. Capture requires the `pull_request_review_comment` event. Until an
+operator applies that event from the App manifest, nothing is delivered and
+nothing is retained.
+
+Against each retained finding, inside the existing review record, GuardianBot
+keeps a count of observed human replies, the first and last observation
+timestamps, and a bounded ring of the GitHub review-comment identifiers already
+counted. Against the review row it keeps one integer aggregate.
+
+Deliberately not retained: reviewer logins or any other reviewer identity,
+comment bodies or any excerpt of them, and any per-reviewer breakdown anywhere.
+Metric labels never carry a reviewer, repository, or comment identifier; the
+engagement metric is a bare unlabelled aggregate, because a label would be
+retained by every scraper indefinitely.
+
+That commitment covers the webhook queue as well, which is where it would
+otherwise be broken. A delivery is persisted to `webhook_jobs.payload` before it
+is processed, so it is durable for the queue's own retention window rather than
+for the moment the handler runs, and the raw
+`pull_request_review_comment` payload GitHub sends carries the full reply body
+and the reviewer's login, id, and avatar URL. A delivery of that event is
+therefore reduced to an allowlist before it is written: the action, the comment
+id and its `in_reply_to_id`, the pull-request number, the repository id and full
+name, and the installation id. The body, the diff hunk, the comment URL, the
+pull-request title and body, and the reviewer's id and avatar URL are dropped and
+never reach the database. The login is replaced by a fixed placeholder that
+preserves only whether the author was an App, which is the single bit the handler
+reads it for — a bot replying to its own advisory is not engagement. The reply
+body is not needed at all, because the finding is identified from the *parent*
+advisory, which is read back from the GitHub API.
+
+The reduction is an allowlist rather than a blacklist, so a field GitHub adds to
+this event later cannot silently reintroduce free text, and it is applied inside
+the store at the point the payload becomes durable rather than in the caller, so
+another enqueue path cannot bypass it. It is scoped to this one event: an
+`issue_comment` delivery carries the operator's slash command in `comment.body`
+and authorizes it by the author's login, so those fields are load-bearing there
+and every other event is persisted unchanged.
+
+What the queue does retain for the two comment identifiers above is bounded by
+`GUARDIANBOT_WEBHOOK_SUCCEEDED_RETENTION_MS` (default 7 days) and
+`GUARDIANBOT_WEBHOOK_DEAD_LETTER_RETENTION_MS` (default 30 days), after which the
+row is deleted. They are the same pseudonymous identifiers discussed below and
+are treated the same way. GitHub request paths embed such identifiers too, so a
+failed API call reports only its method and HTTP status: the path and the response
+body are left out of the error, because a delivery's error text is persisted to an
+unbounded column and would otherwise carry an identifier past the bounded records
+that are supposed to be its only home.
+
+The retained comment identifiers are the one exception to storing no
+identifier, and they exist solely to make counting idempotent: a webhook
+delivery can be retried, and without them a redelivery would inflate the only
+signal this path produces. They identify a comment rather than a person, but
+they are pseudonymous rather than anonymous — an authorized installation token
+could still resolve one back to its author through the GitHub API, so they are
+treated as personal data. The ring is capped at twenty per finding, covering the
+redelivery window rather than a conversation, and older identifiers are
+forgotten as it rolls over.
+
+Feedback lives inside the findings column, so it inherits the review-finding
+retention bounds — `GUARDIANBOT_REVIEW_FINDING_RETENTION_MS` (default 90 days)
+and `GUARDIANBOT_REVIEW_FINDING_LIMIT` (default 200 per review) — in the same
+idiom as the `GUARDIANBOT_WEBHOOK_*` bounds. Those two govern terminal findings
+only: an open finding is live advisory state and is retained while it is still
+reported, so its engagement signal persists for as long as the finding does.
+
+Liveness alone is not a retention bound, though, so two further rules apply to
+open findings. `GUARDIANBOT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS` (default 365
+days) is an absolute ceiling measured from when a finding was first seen rather
+than last observed, so continuing to re-report a finding on a long-lived pull
+request cannot extend it indefinitely. And because both TTLs are applied while a
+review is being published, a repository that is removed — or whose installation
+is uninstalled — would never be visited again and would retain its open findings
+for as long as the database exists; removal therefore discards the retained
+findings of every affected repository immediately. A suspension is reversible and
+does not discard.
+
+The integer aggregate is not per-person data and survives eviction of the
+per-finding records that produced it, including a removal discard.

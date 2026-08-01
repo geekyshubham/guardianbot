@@ -1,5 +1,22 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
-import type { PersistedVectorRow, RepositoryIndex } from "@guardianbot/core";
+import {
+  assertIndexReference,
+  compareRecordRows,
+  cosineSimilarity,
+  repositoryIndexStorageKey,
+  toPersistedRecordRows
+} from "@guardianbot/core";
+import type {
+  PersistedRecordRow,
+  PersistedVectorRow,
+  RepositoryIndex,
+  RepositoryIndexVectorDelta,
+  RepositoryRecordHydrationRequest,
+  RepositoryRecordReference,
+  RepositoryVectorMatch,
+  RepositoryVectorQuery
+} from "@guardianbot/core";
 import type {
   MonitoringStatus,
   RepositoryInventoryState,
@@ -10,10 +27,85 @@ export type RepositoryLifecycleState = "active" | "suspended" | "removed";
 export type WebhookJobStatus = "pending" | "leased" | "succeeded" | "dead-letter";
 export type RepositoryIndexStorageMode = "memory" | "pgvector" | "json-array-fallback";
 
+/**
+ * How retrieval is actually being served, as opposed to how it was configured.
+ *
+ * The storage mode alone cannot distinguish a healthy pgvector install from one
+ * where the ANN index is absent and every read is an exact scan, which is exactly
+ * the state a failed or skipped index build leaves behind. Reporting readiness
+ * beside the mode makes under-indexing visible instead of merely slow.
+ */
+export interface RepositoryIndexRetrievalStatus {
+  mode: RepositoryIndexStorageMode;
+  /** True only when the dimensioned column and its ANN index both exist. */
+  approximateIndexReady: boolean;
+  /**
+   * Rows with no durable vector, counted at migration time. Non-zero means those
+   * rows are served by the in-memory fallback rather than the database, so a
+   * persistent non-zero value is a signal, not noise. Null when not measured,
+   * so a scraper never reads "unknown" as "none".
+   */
+  uncoveredDurableVectorRows: number | null;
+}
+
 // Fixed two-int32 namespace/key pair for the database-wide monitoring scheduler lock.
 const MONITORING_LOCK_NAMESPACE = 1_196_572_738;
 const MONITORING_LOCK_KEY = 1_297_046_866;
 const ONBOARDING_ISSUE_LOCK_NAMESPACE = 1_196_572_739;
+// Fixed two-int32 namespace/key pair serialising schema migrations across booting instances.
+const MIGRATION_LOCK_NAMESPACE = 1_196_572_740;
+const MIGRATION_LOCK_KEY = 1_297_046_867;
+// Bounds on the migration session. `migrate()` runs inside `createStore()`, before the server
+// opens a port, so every wait it performs must be finite: a peer instance holding the lock with a
+// wedged session, or a slow reader queued ahead of an ACCESS EXCLUSIVE `ALTER TABLE reviews`,
+// must surface as a boot failure with a named error rather than as a silent hang.
+/**
+ * Dimension of the ANN-indexed vector column.
+ *
+ * pgvector can only build an ivfflat/hnsw index on a column declared with a
+ * fixed dimension, but the embedding dimension is a runtime property of the
+ * configured provider, not a compile-time constant: `indexRepositorySyntaxAware`
+ * defaults to `LexicalHashEmbeddingProvider`, whose default width is 96 and whose
+ * constructor accepts 8-4096. So the dimension is knowable for the production
+ * path and only for the production path.
+ *
+ * Rather than assume, the schema keeps both columns. `vector_pgvector` stays
+ * undimensioned and accepts any provider's output, and `vector_ann` is the
+ * dimensioned, ANN-indexed column written only when a row's own `dimensions`
+ * equals this value. A provider reconfigured to another width therefore keeps
+ * working through an exact scan instead of failing an insert, and re-widening the
+ * ANN column later is another additive migration.
+ */
+const INDEXED_VECTOR_ANN_DIMENSIONS = 96;
+/**
+ * Row ceiling for one boot's ANN backfill. Deliberately a different number from
+ * `ANN_INDEX_INLINE_BUILD_MAX_ROWS`: sharing one constant put the worst case
+ * exactly on the inline-build boundary, so a saturating backfill was followed by
+ * an inline index build over the whole backfilled set.
+ */
+const ANN_BACKFILL_MAX_ROWS = 50_000;
+/**
+ * Rows per backfill statement. The cap above is spent in batches of this size so
+ * no single `UPDATE` has to finish inside `MIGRATION_STATEMENT_TIMEOUT_MS`, and
+ * so the loop can stop as soon as a statement reports fewer rows than it asked
+ * for, which is the only signal available that the predicate has been drained.
+ */
+const ANN_BACKFILL_BATCH_ROWS = 5_000;
+/**
+ * Row ceiling for building the ANN index inline during migration. `CREATE INDEX`
+ * takes ACCESS EXCLUSIVE on the table, and `migrate()` runs before the port
+ * opens, so building over a large live table would stall boot and block reads
+ * meanwhile. An hnsw build is the expensive one in pgvector, so this ceiling sits
+ * far below the backfill cap: at or above it the index is left for an operator to
+ * build with `CREATE INDEX CONCURRENTLY` out of band, which is the normal path
+ * for any table that is not effectively empty. Queries stay correct either way
+ * because the ANN index only changes their cost, never their result.
+ */
+const ANN_INDEX_INLINE_BUILD_MAX_ROWS = 2_000;
+const MIGRATION_LOCK_TIMEOUT_MS = 10_000;
+const MIGRATION_STATEMENT_TIMEOUT_MS = 120_000;
+const MIGRATION_LOCK_ATTEMPTS = 30;
+const MIGRATION_LOCK_RETRY_DELAY_MS = 1_000;
 
 export interface RepositoryRecord {
   installationId: number;
@@ -28,13 +120,293 @@ export interface RepositoryRecord {
   automaticReviewPaused: boolean;
 }
 
+/**
+ * Lifecycle state of one content-addressed finding. `open` is the only active state; the
+ * other two are terminal and are the only states eviction may ever drop. The union stays at
+ * three values deliberately: a fourth would be unreadable to an instance running older code
+ * mid-deploy, so a finding that returns after a terminal state is recorded through
+ * `reappearances` provenance rather than through a new state value.
+ */
+export type ReviewFindingLifecycleState = "open" | "resolved" | "superseded";
+
+/**
+ * Durable provenance for one finding. Every field is optional because rows written before the
+ * provenance migration — and rows written by an older instance mid-deploy — carry only
+ * `fingerprint` and `state`. Presentation degrades to the fingerprint alone rather than failing.
+ */
+export interface ReviewFindingProvenance {
+  /** Head SHA the finding was first observed at. */
+  firstSeenHeadSha?: string;
+  /** Head SHA the finding was most recently observed or re-evaluated at. */
+  lastSeenHeadSha?: string;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  /** Number of lifecycle state changes observed for this fingerprint. */
+  transitions?: number;
+  /** Number of times the finding returned to `open` after reaching a terminal state. */
+  reappearances?: number;
+  /** Finding identity, retained so a resolved finding renders without re-running the model. */
+  path?: string;
+  startLine?: number;
+  endLine?: number;
+  category?: string;
+  severity?: string;
+  title?: string;
+  /**
+   * Derived reviewer-engagement signal: how many human review comments have been observed
+   * replying to this advisory. Deliberately a count and two timestamps rather than anything
+   * about who replied or what they said — whether a human engaged, and when relative to the
+   * finding's own lifecycle, is the whole analytic value, and reviewer identity and comment
+   * text are not needed to obtain it.
+   */
+  feedbackCount?: number;
+  feedbackFirstAt?: string;
+  feedbackLastAt?: string;
+  /**
+   * Bounded ring of the review-comment identifiers already counted, newest last. A webhook
+   * delivery can be retried after a mid-flight failure, so counting without this would inflate
+   * the signal on redelivery. These are opaque comment identifiers, never reviewer identities,
+   * and the ring is capped at `MAX_FEEDBACK_COMMENT_IDS` so the row cannot grow without bound.
+   */
+  feedbackCommentIds?: number[];
+}
+
+export interface ReviewFindingRecord extends ReviewFindingProvenance {
+  fingerprint: string;
+  state: ReviewFindingLifecycleState;
+}
+
 export interface ReviewState {
   repositoryId: number;
   pullNumber: number;
   headSha: string;
   reviewedHeadSha?: string;
   placeholderCommentId?: number;
-  findings: Array<{ fingerprint: string; state: "open" | "resolved" | "superseded" }>;
+  findings: ReviewFindingRecord[];
+  /**
+   * Records which code revision last wrote the findings column, as an operator signal only. It
+   * is not a guarantee about any individual finding's provenance in either direction: an older
+   * instance rewriting this row leaves the column at its previous value because that instance's
+   * upsert does not assign it, and a row created by `saveReviewHead` takes the column default
+   * even though the writer is provenance-capable. Readers treat provenance as optional at every
+   * version and revalidate each finding.
+   */
+  findingsSchemaVersion?: number;
+  /**
+   * LIFETIME TOTAL of terminal findings dropped from this record by eviction, as returned by
+   * `getReview`. This is not the value `saveReview` accepts: there the same field name carries a
+   * per-write DELTA. See `ReviewStateWrite.findingsEvictedTotal`.
+   */
+  findingsEvictedTotal?: number;
+  findingsLastEvictedAt?: string;
+  /**
+   * LIFETIME TOTAL of human engagements recorded against this pull request's advisories, as
+   * returned by `getReview`. As with `findingsEvictedTotal`, `saveReview` takes a per-write DELTA
+   * in the same field name. See `ReviewStateWrite.feedbackTotal`.
+   */
+  feedbackTotal?: number;
+}
+
+/**
+ * The shape `saveReview` accepts, which differs from the shape `getReview` returns in one
+ * dangerous way: the two counters are DELTAS here and LIFETIME TOTALS there.
+ *
+ * Both stores add the supplied value to the stored counter rather than assigning it, because the
+ * counter has to be server-authoritative — a writer that never read the row must not be able to
+ * reset a total it does not know, and the head-SHA CAS does not guard against that. The cost is
+ * that read and write are not symmetric, and feeding a value straight from `getReview` back into
+ * `saveReview` compounds it. That is not hypothetical: it is the bug this asymmetry already caused
+ * once, so the two directions are named apart here even though they are structurally identical and
+ * TypeScript cannot reject the mistake for us.
+ *
+ * Pass the increment this write is responsible for — typically `lifecycle.evicted` — or omit the
+ * field entirely. Never pass a value that was read from the store.
+ */
+export interface ReviewStateWrite extends Omit<ReviewState, "findingsEvictedTotal" | "feedbackTotal"> {
+  /** DELTA: terminal findings this write evicted. Added to the stored lifetime total. */
+  findingsEvictedTotal?: number;
+  /** DELTA: engagements this write observed. Added to the stored lifetime total. */
+  feedbackTotal?: number;
+}
+
+/** Provenance-bearing findings written by this revision. */
+export const REVIEW_FINDINGS_SCHEMA_VERSION = 2;
+
+/**
+ * The schema version a row carries when nothing ever assigned one: the PostgreSQL column default
+ * for `findings_schema_version`, meaning "written before provenance existed, trust nothing". Both
+ * stores use it so a row created by `saveReviewHead` reports the same version from either, and a
+ * MemoryStore-backed test is evidence about production rather than about MemoryStore.
+ */
+export const REVIEW_FINDINGS_SCHEMA_VERSION_DEFAULT = 1;
+
+/**
+ * Ceiling on the per-finding ring of already-counted review-comment identifiers. The ring exists
+ * only to make counting idempotent under webhook redelivery, so it needs to cover the retry
+ * window rather than the whole conversation: once it rolls over, the oldest identifiers are
+ * forgotten and a redelivery older than the ring could recount, which is strictly preferable to
+ * letting a busy advisory thread grow the retained row without bound.
+ */
+export const MAX_FEEDBACK_COMMENT_IDS = 20;
+
+const REVIEW_FINDING_STATES: readonly ReviewFindingLifecycleState[] = [
+  "open",
+  "resolved",
+  "superseded"
+];
+
+function optionalText(value: unknown, maximum: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.replace(/\u0000/g, "").trim();
+  return text ? text.slice(0, maximum) : undefined;
+}
+
+function optionalCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function optionalTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
+}
+
+/**
+ * Normalizes one stored finding at the JSONB boundary. The column is schemaless, so a row may
+ * predate the provenance migration or have been written by an older instance; a value that
+ * cannot be trusted is dropped rather than surfaced to rendering as an unchecked string.
+ */
+export function normalizeReviewFinding(value: unknown): ReviewFindingRecord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const fingerprint = optionalText(raw.fingerprint, 128);
+  if (!fingerprint) return undefined;
+  const state = REVIEW_FINDING_STATES.find((candidate) => candidate === raw.state);
+  if (!state) return undefined;
+  return {
+    fingerprint,
+    state,
+    firstSeenHeadSha: optionalText(raw.firstSeenHeadSha, 64),
+    lastSeenHeadSha: optionalText(raw.lastSeenHeadSha, 64),
+    firstSeenAt: optionalTimestamp(raw.firstSeenAt),
+    lastSeenAt: optionalTimestamp(raw.lastSeenAt),
+    transitions: optionalCount(raw.transitions),
+    reappearances: optionalCount(raw.reappearances),
+    path: optionalText(raw.path, 400),
+    startLine: optionalCount(raw.startLine),
+    endLine: optionalCount(raw.endLine),
+    category: optionalText(raw.category, 64),
+    severity: optionalText(raw.severity, 8),
+    title: optionalText(raw.title, 300),
+    ...feedbackProvenance(raw)
+  };
+}
+
+/**
+ * Reads the derived feedback signal, omitting it entirely when nothing was recorded. A finding no
+ * human has engaged with therefore normalizes to exactly the record it did before feedback capture
+ * existed, and the retained JSON does not grow a dead field on every finding — which is the common
+ * case, and the only case on an installation without the review-comment event subscribed.
+ *
+ * The count is authoritative: the identifier ring exists only to dedupe counted comments, so
+ * without a count there is nothing it could be deduping and it is dropped with the rest.
+ */
+function feedbackProvenance(raw: Record<string, unknown>): Partial<ReviewFindingProvenance> {
+  const feedbackCount = optionalCount(raw.feedbackCount);
+  if (!feedbackCount) return {};
+  return {
+    feedbackCount,
+    feedbackFirstAt: optionalTimestamp(raw.feedbackFirstAt),
+    feedbackLastAt: optionalTimestamp(raw.feedbackLastAt),
+    feedbackCommentIds: optionalCommentIds(raw.feedbackCommentIds)
+  };
+}
+
+/**
+ * Normalizes the counted-comment ring at the JSONB boundary. The column is schemaless, so the
+ * ring is re-bounded on every read rather than trusted: a row written by a future revision with
+ * a larger ceiling must not be able to grow this instance's rows past the ceiling it enforces.
+ */
+function optionalCommentIds(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const identifiers = value
+    .filter(
+      (entry): entry is number =>
+        typeof entry === "number" && Number.isSafeInteger(entry) && entry > 0
+    )
+    .slice(-MAX_FEEDBACK_COMMENT_IDS);
+  return identifiers.length ? identifiers : undefined;
+}
+
+/**
+ * One human engagement observed against a published advisory. Scoped by repository and pull
+ * request, so the update can only ever touch the review record that owns the advisory: a marker
+ * digest is content-addressed and therefore identical across repositories for identical findings,
+ * and these predicates are what stop one repository's reviewer activity landing on another's row.
+ */
+export interface FindingFeedbackInput {
+  repositoryId: number;
+  pullNumber: number;
+  fingerprint: string;
+  /** Opaque review-comment identifier, retained only to make redelivery idempotent. */
+  commentId: number;
+  observedAt: Date;
+}
+
+export interface ApplyFindingFeedbackResult {
+  findings: ReviewFindingRecord[];
+  /** True only when this call moved the signal, so a caller never counts a no-op delivery. */
+  recorded: boolean;
+}
+
+/**
+ * Records one human engagement against the lifecycle record for `fingerprint`. Kept pure and
+ * exported so the whole decision — including the idempotency and bounding rules — is testable
+ * without a server.
+ *
+ * Nothing is recorded when the fingerprint is not retained: the finding may have been evicted, or
+ * the marker may belong to another repository's advisory, and inventing a record for either would
+ * report engagement against a finding this review never had. A comment identifier already in the
+ * ring is likewise not recorded, so a redelivered webhook cannot inflate the count.
+ */
+export function applyFindingFeedback(
+  findings: readonly ReviewFindingRecord[],
+  fingerprint: string,
+  commentId: number,
+  observedAt: Date
+): ApplyFindingFeedbackResult {
+  const index = findings.findIndex((finding) => finding.fingerprint === fingerprint);
+  if (index === -1) return { findings: findings.map((finding) => ({ ...finding })), recorded: false };
+  const target = findings[index] as ReviewFindingRecord;
+  const counted = target.feedbackCommentIds ?? [];
+  if (counted.includes(commentId)) {
+    return { findings: findings.map((finding) => ({ ...finding })), recorded: false };
+  }
+  const observedIso = observedAt.toISOString();
+  const updated: ReviewFindingRecord = {
+    ...target,
+    feedbackCount: (target.feedbackCount ?? 0) + 1,
+    feedbackFirstAt: target.feedbackFirstAt ?? observedIso,
+    feedbackLastAt: observedIso,
+    // Newest last, oldest dropped: the ring covers the redelivery window, not the conversation.
+    feedbackCommentIds: [...counted, commentId].slice(-MAX_FEEDBACK_COMMENT_IDS)
+  };
+  return {
+    findings: findings.map((finding, position) =>
+      position === index ? updated : { ...finding }
+    ),
+    recorded: true
+  };
+}
+
+export function normalizeReviewFindings(value: unknown): ReviewFindingRecord[] {
+  return Array.isArray(value)
+    ? value
+        .map((entry) => normalizeReviewFinding(entry))
+        .filter((entry): entry is ReviewFindingRecord => Boolean(entry))
+    : [];
 }
 
 export type ScannerWorkflowValidationStatus = "pending" | "accepted" | "rejected" | "failed";
@@ -247,6 +619,71 @@ export interface PurgeTerminalWebhookJobsResult {
   deleted: number;
 }
 
+/**
+ * Placeholder logins substituted for a real reviewer login before a review-comment delivery is
+ * persisted. `captureReviewCommentFeedback` reads the author login for exactly one bit — is this a
+ * bot replying to itself, or a human? — by testing the `[bot]` suffix, so that bit is all the queue
+ * needs to carry. Preserving the suffix semantics keeps the handler's decision byte-identical
+ * while no reviewer identity is written to the database.
+ */
+const SCRUBBED_BOT_LOGIN = "scrubbed[bot]";
+const SCRUBBED_HUMAN_LOGIN = "scrubbed";
+
+/**
+ * Strips personal data from a webhook payload before it is persisted.
+ *
+ * `webhook_jobs.payload` is a durable JSONB column, so anything left in it is retained for the
+ * whole succeeded/dead-letter window — days, not the milliseconds a delivery takes to process.
+ * A `pull_request_review_comment` body is raw reviewer prose and its author login is reviewer
+ * identity, and the reviewer-feedback path deliberately retains neither: it keeps only a derived
+ * signal. Persisting the delivery unfiltered would put both in the database anyway, behind the
+ * bounded store that is supposed to be the only retention point.
+ *
+ * The reduction is an allowlist rather than a blacklist, so a field GitHub adds later cannot
+ * silently reintroduce free text. It is deliberately scoped to this one event: `issue_comment`
+ * carries the slash command in `comment.body` and authorizes it by `comment.user.login`, so those
+ * fields are load-bearing there and every other event is persisted unchanged.
+ *
+ * The kept fields are exactly the ones `captureReviewCommentFeedback` and the dispatcher read.
+ * Anything a future handler needs for this event must be added here as well, or it will not be
+ * present when the job is claimed.
+ */
+export function scrubWebhookPayloadForRetention(
+  eventName: string,
+  payload: Record<string, any>
+): Record<string, any> {
+  if (eventName !== "pull_request_review_comment") return payload;
+  const comment = payload.comment;
+  const login = typeof comment?.user?.login === "string" ? comment.user.login : undefined;
+  return {
+    action: payload.action,
+    ...(comment && typeof comment === "object"
+      ? {
+          comment: {
+            id: comment.id,
+            in_reply_to_id: comment.in_reply_to_id,
+            ...(login === undefined
+              ? {}
+              : {
+                  user: {
+                    login: login.endsWith("[bot]") ? SCRUBBED_BOT_LOGIN : SCRUBBED_HUMAN_LOGIN
+                  }
+                })
+          }
+        }
+      : {}),
+    ...(payload.pull_request && typeof payload.pull_request === "object"
+      ? { pull_request: { number: payload.pull_request.number } }
+      : {}),
+    ...(payload.repository && typeof payload.repository === "object"
+      ? { repository: { id: payload.repository.id, full_name: payload.repository.full_name } }
+      : {}),
+    ...(payload.installation && typeof payload.installation === "object"
+      ? { installation: { id: payload.installation.id } }
+      : {})
+  };
+}
+
 export const DEFAULT_WEBHOOK_SUCCEEDED_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export const DEFAULT_WEBHOOK_DEAD_LETTER_RETENTION_MS = 30 * 24 * 60 * 60_000;
 export const DEFAULT_WEBHOOK_CLEANUP_INTERVAL_MS = 60 * 60_000;
@@ -334,6 +771,245 @@ export function assertWebhookPurgeLimit(limit: number): void {
   }
 }
 
+export const DEFAULT_REVIEW_FINDING_RETENTION_MS = 90 * 24 * 60 * 60_000;
+export const DEFAULT_REVIEW_FINDING_LIMIT = 200;
+export const MIN_REVIEW_FINDING_RETENTION_MS = 24 * 60 * 60_000;
+export const MAX_REVIEW_FINDING_RETENTION_MS = 365 * 24 * 60 * 60_000;
+export const MIN_REVIEW_FINDING_LIMIT = 1;
+export const MAX_REVIEW_FINDING_LIMIT = 5_000;
+export const DEFAULT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS = 365 * 24 * 60 * 60_000;
+export const MIN_REVIEW_FINDING_ABSOLUTE_RETENTION_MS = 24 * 60 * 60_000;
+export const MAX_REVIEW_FINDING_ABSOLUTE_RETENTION_MS = 5 * 365 * 24 * 60 * 60_000;
+
+export interface ReviewFindingRetentionOptions {
+  /** Terminal findings not observed within this window become evictable. */
+  retentionMs: number;
+  /** Soft cap on retained findings per review record; active findings are never evicted to meet it. */
+  limit: number;
+  /**
+   * Absolute ceiling on how long any finding is retained, open ones included, measured from when
+   * it was first seen rather than last observed.
+   *
+   * `retentionMs` alone bounds only terminal findings, on the theory that an open finding is live
+   * advisory state whose retention is justified by still being reported. That justification has a
+   * floor: a pull request can stay open and unreviewed indefinitely, and the finding's engagement
+   * signal — a bounded ring of review-comment identifiers, which are personal data — would be
+   * retained with it for as long as the row exists. This bounds that.
+   *
+   * Left undefined the absolute pass is skipped entirely, so a caller that has not opted in keeps
+   * the previous liveness-only behaviour. `reviewFindingRetentionOptionsFromEnvironment` always
+   * supplies it, so every configured path is bounded.
+   */
+  absoluteRetentionMs?: number;
+}
+
+export function reviewFindingRetentionOptionsFromEnvironment(
+  environment: Record<string, string | undefined> = process.env
+): ReviewFindingRetentionOptions {
+  return {
+    retentionMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_REVIEW_FINDING_RETENTION_MS,
+      "GUARDIANBOT_REVIEW_FINDING_RETENTION_MS",
+      DEFAULT_REVIEW_FINDING_RETENTION_MS,
+      MIN_REVIEW_FINDING_RETENTION_MS,
+      MAX_REVIEW_FINDING_RETENTION_MS
+    ),
+    limit: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_REVIEW_FINDING_LIMIT,
+      "GUARDIANBOT_REVIEW_FINDING_LIMIT",
+      DEFAULT_REVIEW_FINDING_LIMIT,
+      MIN_REVIEW_FINDING_LIMIT,
+      MAX_REVIEW_FINDING_LIMIT
+    ),
+    absoluteRetentionMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS,
+      "GUARDIANBOT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS",
+      DEFAULT_REVIEW_FINDING_ABSOLUTE_RETENTION_MS,
+      MIN_REVIEW_FINDING_ABSOLUTE_RETENTION_MS,
+      MAX_REVIEW_FINDING_ABSOLUTE_RETENTION_MS
+    )
+  };
+}
+
+export interface EvictReviewFindingsResult {
+  findings: ReviewFindingRecord[];
+  evicted: number;
+}
+
+/**
+ * Bounds a review record's retained findings. Only terminal states are ever evictable: an
+ * `open` finding is live advisory state whose loss would silently re-report as a new finding
+ * and would break resolved-versus-superseded discrimination on the next head, so it is
+ * retained even when that holds the record above `limit`. Terminal findings are dropped
+ * oldest-observed first, by age past `retentionMs` and then to bring the record back to the cap.
+ *
+ * `absoluteRetentionMs`, when supplied, is the one rule that does reach an open finding: liveness
+ * justifies retaining live advisory state, but it is not an unbounded licence, so a finding first
+ * seen longer ago than the absolute ceiling is dropped whatever its state. That pass runs before
+ * anything else, because a record of nothing but open findings has no terminal work to do and must
+ * still be bounded.
+ */
+export function evictTerminalReviewFindings(
+  findings: readonly ReviewFindingRecord[],
+  options: ReviewFindingRetentionOptions,
+  now: Date
+): EvictReviewFindingsResult {
+  const observedAt = (finding: ReviewFindingRecord): number => {
+    const parsed = Date.parse(finding.lastSeenAt ?? finding.firstSeenAt ?? "");
+    // Provenance-free rows predate the migration; treating them as observed now keeps them
+    // until the cap genuinely needs the room rather than expiring them on first sight.
+    return Number.isFinite(parsed) ? parsed : now.getTime();
+  };
+  // Measured from first sighting, not last: the point of an absolute ceiling is that re-observing
+  // a finding cannot extend it, which is exactly what `retentionMs` allows.
+  const firstSeenAt = (finding: ReviewFindingRecord): number => {
+    const parsed = Date.parse(finding.firstSeenAt ?? "");
+    return Number.isFinite(parsed) ? parsed : now.getTime();
+  };
+  const dropped = new Set<ReviewFindingRecord>();
+  if (options.absoluteRetentionMs !== undefined) {
+    const absoluteExpiryBefore = now.getTime() - options.absoluteRetentionMs;
+    for (const finding of findings) {
+      if (firstSeenAt(finding) < absoluteExpiryBefore) dropped.add(finding);
+    }
+  }
+  // Every later pass reasons about what the absolute pass left behind, so its arithmetic reflects
+  // the record that will actually be retained.
+  const surviving = findings.filter((finding) => !dropped.has(finding));
+  const active = surviving.filter((finding) => finding.state === "open");
+  const terminal = surviving.filter((finding) => finding.state !== "open");
+  if (!terminal.length) {
+    return dropped.size
+      ? { findings: surviving, evicted: dropped.size }
+      : { findings: [...findings], evicted: 0 };
+  }
+
+  const expiryBefore = now.getTime() - options.retentionMs;
+  const oldestFirst = [...terminal].sort(
+    (left, right) =>
+      observedAt(left) - observedAt(right) || left.fingerprint.localeCompare(right.fingerprint)
+  );
+  for (const finding of oldestFirst) {
+    if (observedAt(finding) < expiryBefore) dropped.add(finding);
+  }
+  let terminalDropped = oldestFirst.filter((finding) => dropped.has(finding)).length;
+  // Active findings are never evictable to meet the cap, so once they alone exceed it the pass can
+  // never satisfy its own break condition: it would drop every terminal finding, discarding all
+  // their provenance, and still leave the record above the limit. Nothing is gained, so the pass is
+  // skipped and only what the retention window already expired stays dropped. At the cap exactly
+  // the limit is still reachable, so the pass runs.
+  if (active.length <= options.limit) {
+    for (const finding of oldestFirst) {
+      if (active.length + (terminal.length - terminalDropped) <= options.limit) break;
+      if (dropped.has(finding)) continue;
+      dropped.add(finding);
+      terminalDropped += 1;
+    }
+  }
+  if (!dropped.size) return { findings: [...findings], evicted: 0 };
+  return {
+    findings: findings.filter((finding) => !dropped.has(finding)),
+    evicted: dropped.size
+  };
+}
+
+export const DEFAULT_INDEX_GENERATION_RETENTION_MS = 14 * 24 * 60 * 60_000;
+export const DEFAULT_INDEX_GENERATION_SWEEP_BATCH_LIMIT = 200;
+export const MIN_INDEX_GENERATION_RETENTION_MS = 60 * 60_000;
+export const MAX_INDEX_GENERATION_RETENTION_MS = 365 * 24 * 60 * 60_000;
+export const MIN_INDEX_GENERATION_SWEEP_BATCH_LIMIT = 1;
+export const MAX_INDEX_GENERATION_SWEEP_BATCH_LIMIT = 5_000;
+
+/**
+ * Retention for superseded index generations.
+ *
+ * A storage key is commit-scoped, so every refresh publishes a whole new
+ * generation and nothing ever removed the old one: the table grew at roughly
+ * symbols per commit times commits indexed. Carrying a second durable vector copy
+ * per row plus an ANN index over it makes that growth materially more expensive,
+ * so superseded generations are swept on a bound.
+ */
+export interface IndexGenerationRetentionOptions {
+  /** Generations older than this and no longer current become sweepable. */
+  retentionMs: number;
+  /** Generations removed per sweep, so one run cannot lock the table open. */
+  batchLimit: number;
+}
+
+export function indexGenerationRetentionOptionsFromEnvironment(
+  environment: Record<string, string | undefined> = process.env
+): IndexGenerationRetentionOptions {
+  return {
+    retentionMs: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_INDEX_GENERATION_RETENTION_MS,
+      "GUARDIANBOT_INDEX_GENERATION_RETENTION_MS",
+      DEFAULT_INDEX_GENERATION_RETENTION_MS,
+      MIN_INDEX_GENERATION_RETENTION_MS,
+      MAX_INDEX_GENERATION_RETENTION_MS
+    ),
+    batchLimit: parsePositiveBoundedInteger(
+      environment.GUARDIANBOT_INDEX_GENERATION_SWEEP_BATCH_LIMIT,
+      "GUARDIANBOT_INDEX_GENERATION_SWEEP_BATCH_LIMIT",
+      DEFAULT_INDEX_GENERATION_SWEEP_BATCH_LIMIT,
+      MIN_INDEX_GENERATION_SWEEP_BATCH_LIMIT,
+      MAX_INDEX_GENERATION_SWEEP_BATCH_LIMIT
+    )
+  };
+}
+
+export interface PurgeSupersededIndexGenerationsOptions {
+  supersededBefore: Date;
+  limit: number;
+}
+
+export interface PurgeSupersededIndexGenerationsResult {
+  deleted: number;
+}
+
+/** Shared API guard so sweep limits cannot bypass env bounds when called directly. */
+export function assertIndexGenerationSweepLimit(limit: number): void {
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < MIN_INDEX_GENERATION_SWEEP_BATCH_LIMIT ||
+    limit > MAX_INDEX_GENERATION_SWEEP_BATCH_LIMIT
+  ) {
+    throw new Error(
+      `index generation sweep limit must be a safe integer between ${MIN_INDEX_GENERATION_SWEEP_BATCH_LIMIT} and ${MAX_INDEX_GENERATION_SWEEP_BATCH_LIMIT}`
+    );
+  }
+}
+
+/**
+ * Parameterized superseded-generation sweep (multi-instance safe via SKIP LOCKED).
+ *
+ * Deletes the parent `repository_indexes` row, not the vectors directly, because
+ * `repository_index_vectors.storage_key` cascades from it: pruning the parent
+ * removes the whole generation, vectors and index document together, in one
+ * statement.
+ *
+ * The generation a repository currently points at is never a candidate. The guard
+ * is `index_sha IS DISTINCT FROM commit_sha`, not `<>`: a repository with a NULL
+ * `index_sha` publishes no current generation, and `NULL <> commit_sha` is NULL
+ * rather than true, so a plain inequality would silently protect every generation
+ * of exactly those repositories.
+ */
+export const SUPERSEDED_INDEX_GENERATION_PURGE_SQL = `
+WITH candidates AS (
+  SELECT indexes.storage_key
+  FROM repository_indexes AS indexes
+  JOIN repositories AS owner ON owner.repository_id = indexes.repository_id
+  WHERE owner.index_sha IS DISTINCT FROM indexes.commit_sha
+    AND indexes.updated_at < $1
+  ORDER BY indexes.updated_at ASC
+  LIMIT $2
+  FOR UPDATE OF indexes SKIP LOCKED
+)
+DELETE FROM repository_indexes AS pruned
+USING candidates
+WHERE pruned.storage_key = candidates.storage_key
+RETURNING pruned.storage_key
+`.trim();
+
 /** Parameterized count query shared by PostgresStore (contract for tests). */
 export const WEBHOOK_QUEUE_COUNTS_SQL = `
 SELECT
@@ -353,6 +1029,86 @@ FROM webhook_jobs
 `.trim();
 
 /** Parameterized terminal-job purge (multi-instance safe via SKIP LOCKED). */
+/**
+ * Locks the review record owning an advisory before its feedback is recomputed. Both the
+ * repository and the pull-request predicates are load-bearing: a fingerprint marker is
+ * content-addressed, so two repositories reviewing identical code carry identical markers, and
+ * these predicates are the only thing that keeps one repository's reviewer activity off the
+ * other's row. `FOR UPDATE` serialises concurrent deliveries against the same row so a
+ * read-modify-write of the schemaless findings column cannot lose an engagement.
+ */
+export const REVIEW_FEEDBACK_LOCK_SQL = `
+SELECT findings
+FROM reviews
+WHERE repository_id = $1 AND pull_number = $2
+FOR UPDATE
+`.trim();
+
+/**
+ * Writes back the recomputed per-finding feedback and advances the aggregate. The counter is
+ * incremented server-side rather than assigned, matching `findings_evicted_total`, so the
+ * lifetime total survives eviction of the per-finding records that produced it.
+ */
+export const REVIEW_FEEDBACK_UPDATE_SQL = `
+UPDATE reviews
+SET findings = $3::jsonb,
+    feedback_total = reviews.feedback_total + 1,
+    updated_at = now()
+WHERE repository_id = $1 AND pull_number = $2
+`.trim();
+
+/**
+ * Drops every retained finding for repositories that just left the installation.
+ *
+ * `evictTerminalReviewFindings` is the only other thing that bounds this column, and it runs only
+ * while a review is being published. Once a repository is removed or the App uninstalled nothing
+ * is ever published for it again, so no TTL it applies — not even an absolute one — can be reached:
+ * the row simply stops being visited. The open findings and their reviewer-engagement rings would
+ * be retained for as long as the database exists. Removal is therefore the eviction trigger, and
+ * it is unconditional rather than aged: the justification for retaining an open finding is that it
+ * is still being reported, and after removal it never will be again.
+ *
+ * The lifetime evicted counter is advanced by what was actually dropped, so the operator signal
+ * stays truthful, and `updated_at` moves because the row genuinely changed. Rows already empty are
+ * excluded so a mass uninstall does not rewrite every review row to no effect.
+ */
+export const REVIEW_FINDINGS_DISCARD_SQL = `
+UPDATE reviews
+SET findings = '[]'::jsonb,
+    findings_evicted_total = reviews.findings_evicted_total + CASE
+      WHEN jsonb_typeof(reviews.findings) = 'array' THEN jsonb_array_length(reviews.findings)
+      ELSE 0
+    END,
+    findings_last_evicted_at = now(),
+    updated_at = now()
+WHERE repository_id = ANY($1::bigint[])
+  AND reviews.findings IS NOT NULL
+  AND reviews.findings <> '[]'::jsonb
+`.trim();
+
+/**
+ * The same discard keyed by installation, for an uninstall or a whole-installation suspension.
+ * Resolved through `repositories` in one statement rather than by listing repository ids first,
+ * so a repository cannot slip between the lookup and the discard.
+ */
+export const REVIEW_FINDINGS_DISCARD_BY_INSTALLATION_SQL = `
+UPDATE reviews
+SET findings = '[]'::jsonb,
+    findings_evicted_total = reviews.findings_evicted_total + CASE
+      WHEN jsonb_typeof(reviews.findings) = 'array' THEN jsonb_array_length(reviews.findings)
+      ELSE 0
+    END,
+    findings_last_evicted_at = now(),
+    updated_at = now()
+WHERE reviews.repository_id IN (
+    SELECT repositories.repository_id
+    FROM repositories
+    WHERE repositories.installation_id = $1
+  )
+  AND reviews.findings IS NOT NULL
+  AND reviews.findings <> '[]'::jsonb
+`.trim();
+
 export const WEBHOOK_TERMINAL_PURGE_SQL = `
 WITH candidates AS (
   SELECT delivery_id
@@ -378,6 +1134,10 @@ export interface Store {
   ping(): Promise<void>;
   close(): Promise<void>;
   getRepositoryIndexStorageMode(): Promise<RepositoryIndexStorageMode>;
+  getRepositoryIndexRetrievalStatus(): Promise<RepositoryIndexRetrievalStatus>;
+  purgeSupersededIndexGenerations(
+    options: PurgeSupersededIndexGenerationsOptions
+  ): Promise<PurgeSupersededIndexGenerationsResult>;
   upsertRepository(record: RepositoryRecord): Promise<void>;
   getRepository(repositoryId: number): Promise<RepositoryRecord | undefined>;
   replaceRepositoryIndex(
@@ -391,6 +1151,35 @@ export interface Store {
     repositoryScope: string,
     commitSha: string
   ): Promise<RepositoryIndex | undefined>;
+  /**
+   * Ranked nearest-neighbour read over one repository's persisted vectors. The
+   * canonical storage key derived from `request` is the isolation boundary: it
+   * pins both the repository scope and the commit, so no other repository's rows
+   * are reachable through this method.
+   */
+  queryRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryVectorQuery
+  ): Promise<RepositoryVectorMatch[]>;
+  /**
+   * Bounded content fetch for records named by a nearest-neighbour match. It is
+   * what lets retrieval build a candidate without loading the whole index
+   * document, and it carries the same isolation boundary as the vector read.
+   */
+  hydrateRepositoryIndexRecords(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]>;
+  /**
+   * Partial publication beside `replaceRepositoryIndex`. It upserts only changed
+   * records and deletes only named ones, so a large repository's unchanged rows
+   * are never rewritten.
+   */
+  applyRepositoryIndexDelta(
+    repositoryId: number,
+    delta: RepositoryIndexVectorDelta,
+    indexedAt?: Date
+  ): Promise<void>;
   setRepositoryState(repositoryId: number, state: RepositoryLifecycleState): Promise<void>;
   setInstallationState(installationId: number, state: RepositoryLifecycleState): Promise<void>;
   setAutomaticReviewPaused(repositoryId: number, paused: boolean): Promise<void>;
@@ -400,8 +1189,10 @@ export interface Store {
     headSha: string,
     placeholderCommentId?: number
   ): Promise<void>;
-  saveReview(state: ReviewState, expectedHeadSha?: string): Promise<boolean>;
+  /** Counters in `state` are per-write deltas, not lifetime totals; see `ReviewStateWrite`. */
+  saveReview(state: ReviewStateWrite, expectedHeadSha?: string): Promise<boolean>;
   getReview(repositoryId: number, pullNumber: number): Promise<ReviewState | undefined>;
+  recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean>;
   enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>): Promise<boolean>;
   claimWebhook(workerId: string, leaseMs: number, now?: Date): Promise<WebhookJob | undefined>;
   completeWebhook(deliveryId: string, workerId: string): Promise<void>;
@@ -527,7 +1318,12 @@ export class MemoryStore implements Store {
   private repositories = new Map<number, RepositoryRecord>();
   private reviews = new Map<string, ReviewState>();
   private webhooks = new Map<string, WebhookJob>();
-  private repositoryIndexes = new Map<string, { repositoryId: number; index: RepositoryIndex }>();
+  private repositoryIndexes = new Map<
+    string,
+    { repositoryId: number; index: RepositoryIndex; updatedAt: string }
+  >();
+  private repositoryIndexVectors = new Map<string, PersistedVectorRow[]>();
+  private repositoryIndexRecords = new Map<string, Map<string, PersistedRecordRow>>();
   private scannerRuns = new Map<string, ScannerWorkflowRunRecord>();
   private scannerArtifacts = new Map<string, ScannerArtifactRecord>();
   private scannerEvidence = new Map<string, ScannerEvidenceRecord>();
@@ -546,6 +1342,40 @@ export class MemoryStore implements Store {
     return "memory";
   }
 
+  async getRepositoryIndexRetrievalStatus(): Promise<RepositoryIndexRetrievalStatus> {
+    // In-memory retrieval always scores every candidate exactly, so there is no
+    // approximate index to be ready and no row that a durable column could miss.
+    return { mode: "memory", approximateIndexReady: false, uncoveredDurableVectorRows: 0 };
+  }
+
+  async purgeSupersededIndexGenerations(
+    options: PurgeSupersededIndexGenerationsOptions
+  ): Promise<PurgeSupersededIndexGenerationsResult> {
+    assertIndexGenerationSweepLimit(options.limit);
+    const supersededBeforeMs = options.supersededBefore.getTime();
+    const candidates = [...this.repositoryIndexes.entries()]
+      .filter(([, entry]) => {
+        // The generation a repository currently points at is never swept, however
+        // old it is: it is the one still being read.
+        const current = this.repositories.get(entry.repositoryId)?.indexSha;
+        if (current !== undefined && current === entry.index.commitSha) return false;
+        const updatedMs = Date.parse(entry.updatedAt);
+        return Number.isFinite(updatedMs) && updatedMs < supersededBeforeMs;
+      })
+      .sort(
+        ([, left], [, right]) => Date.parse(left.updatedAt) - Date.parse(right.updatedAt)
+      )
+      .slice(0, options.limit);
+    for (const [storageKey] of candidates) {
+      this.repositoryIndexes.delete(storageKey);
+      // Mirrors the ON DELETE CASCADE from repository_indexes to its vectors and
+      // its per-record content rows.
+      this.repositoryIndexVectors.delete(storageKey);
+      this.repositoryIndexRecords.delete(storageKey);
+    }
+    return { deleted: candidates.length };
+  }
+
   async upsertRepository(record: RepositoryRecord) {
     this.repositories.set(record.repositoryId, { ...record });
   }
@@ -558,7 +1388,7 @@ export class MemoryStore implements Store {
   async replaceRepositoryIndex(
     repositoryId: number,
     index: RepositoryIndex,
-    _vectors: readonly PersistedVectorRow[],
+    vectors: readonly PersistedVectorRow[],
     indexedAt = new Date()
   ) {
     const repository = this.repositories.get(repositoryId);
@@ -567,11 +1397,134 @@ export class MemoryStore implements Store {
     }
     this.repositoryIndexes.set(index.storageKey, {
       repositoryId,
-      index: structuredClone(index)
+      index: structuredClone(index),
+      updatedAt: indexedAt.toISOString()
     });
+    this.repositoryIndexVectors.set(
+      index.storageKey,
+      vectors.map((row) => structuredClone(row))
+    );
+    this.repositoryIndexRecords.set(
+      index.storageKey,
+      new Map(
+        toPersistedRecordRows(index).map((row) => [`${row.recordType}:${row.recordId}`, row])
+      )
+    );
     this.repositories.set(repositoryId, {
       ...repository,
       indexSha: index.commitSha,
+      indexUpdatedAt: indexedAt.toISOString()
+    });
+  }
+
+  /**
+   * Mirrors the durable hydration boundary: the canonical storage key pins scope
+   * and commit, so a record id from another repository resolves to nothing here
+   * even when both repositories hold byte-identical content.
+   */
+  async hydrateRepositoryIndexRecords(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return [];
+    const rows = this.repositoryIndexRecords.get(storageKey);
+    if (!rows) return [];
+    const hydrated = new Map<string, PersistedRecordRow>();
+    for (const reference of request.records) {
+      const recordKey = `${reference.recordType}:${reference.recordId}`;
+      const row = rows.get(recordKey);
+      if (row && row.storageKey === storageKey && !hydrated.has(recordKey)) {
+        hydrated.set(recordKey, structuredClone(row));
+      }
+    }
+    return [...hydrated.values()].sort(compareRecordRows);
+  }
+
+  async queryRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryVectorQuery
+  ): Promise<RepositoryVectorMatch[]> {
+    assertVectorQuery(request);
+    // The canonical storage key pins scope and commit together, so a query can
+    // only ever address the one repository snapshot it names.
+    const storageKey = repositoryIndexStorageKey(request);
+    const entry = this.repositoryIndexes.get(storageKey);
+    if (!entry || entry.repositoryId !== repositoryId) return [];
+    assertVectorQueryMatchesIndex(
+      request,
+      entry.index.embedding.providerId,
+      entry.index.embedding.dimensions
+    );
+    const acceptedTypes = request.recordTypes ? new Set(request.recordTypes) : undefined;
+    return (this.repositoryIndexVectors.get(storageKey) ?? [])
+      .filter(
+        (row) =>
+          row.storageKey === storageKey &&
+          row.dimensions === request.vector.length &&
+          (!acceptedTypes || acceptedTypes.has(row.recordType))
+      )
+      .map((row) => ({
+        row: structuredClone(row),
+        score: cosineSimilarity(request.vector as number[], row.vector)
+      }))
+      .sort(compareVectorMatches)
+      .slice(0, request.limit);
+  }
+
+  async applyRepositoryIndexDelta(
+    repositoryId: number,
+    delta: RepositoryIndexVectorDelta,
+    indexedAt = new Date()
+  ) {
+    const repository = this.repositories.get(repositoryId);
+    if (!repository) {
+      throw new Error(`repository ${repositoryId} must exist before indexing`);
+    }
+    assertDeltaRowsMatchIndex(delta);
+    const storageKey = delta.index.storageKey;
+    this.repositoryIndexes.set(storageKey, {
+      repositoryId,
+      index: structuredClone(delta.index),
+      updatedAt: indexedAt.toISOString()
+    });
+    const rows = new Map(
+      (this.repositoryIndexVectors.get(storageKey) ?? []).map((row) => [
+        `${row.recordType}:${row.recordId}`,
+        row
+      ])
+    );
+    for (const recordId of delta.deletedRecordIds) {
+      rows.delete(`symbol:${recordId}`);
+      rows.delete(`history:${recordId}`);
+    }
+    for (const row of delta.upserts) {
+      rows.set(`${row.recordType}:${row.recordId}`, structuredClone(row));
+    }
+    this.repositoryIndexVectors.set(storageKey, [...rows.values()]);
+    // The content rows are keyed like the vector rows, so the delta applies to
+    // both in step and hydration cannot lag a published vector.
+    const records = new Map(this.repositoryIndexRecords.get(storageKey) ?? []);
+    for (const recordId of delta.deletedRecordIds) {
+      records.delete(`symbol:${recordId}`);
+      records.delete(`history:${recordId}`);
+    }
+    const upsertedRecordKeys = new Set(
+      delta.upserts.map((row) => `${row.recordType}:${row.recordId}`)
+    );
+    for (const row of toPersistedRecordRows(delta.index)) {
+      const recordKey = `${row.recordType}:${row.recordId}`;
+      if (upsertedRecordKeys.has(recordKey) || !records.has(recordKey)) {
+        records.set(recordKey, row);
+      }
+    }
+    this.repositoryIndexRecords.set(storageKey, records);
+    this.repositories.set(repositoryId, {
+      ...repository,
+      indexSha: delta.index.commitSha,
       indexUpdatedAt: indexedAt.toISOString()
     });
   }
@@ -594,15 +1547,37 @@ export class MemoryStore implements Store {
   }
 
   async setRepositoryState(repositoryId: number, state: RepositoryLifecycleState) {
+    if (state === "removed") this.discardRetainedFindings([repositoryId]);
     const repository = this.repositories.get(repositoryId);
     if (!repository) return;
     this.repositories.set(repositoryId, { ...repository, repositoryState: state });
   }
 
   async setInstallationState(installationId: number, state: RepositoryLifecycleState) {
+    if (state === "removed") {
+      this.discardRetainedFindings(
+        [...this.repositories.values()]
+          .filter((repository) => repository.installationId === installationId)
+          .map((repository) => repository.repositoryId)
+      );
+    }
     for (const [repositoryId, repository] of this.repositories) {
       if (repository.installationId !== installationId) continue;
       this.repositories.set(repositoryId, { ...repository, repositoryState: state });
+    }
+  }
+
+  /** Mirrors `REVIEW_FINDINGS_DISCARD_SQL`; see `Store.setRepositoryState` for why removal clears. */
+  private discardRetainedFindings(repositoryIds: readonly number[]): void {
+    const removed = new Set(repositoryIds);
+    for (const [key, review] of this.reviews) {
+      if (!removed.has(review.repositoryId) || !review.findings.length) continue;
+      this.reviews.set(key, {
+        ...review,
+        findings: [],
+        findingsEvictedTotal: (review.findingsEvictedTotal ?? 0) + review.findings.length,
+        findingsLastEvictedAt: new Date().toISOString()
+      });
     }
   }
 
@@ -629,21 +1604,68 @@ export class MemoryStore implements Store {
       headSha,
       reviewedHeadSha: current?.reviewedHeadSha,
       placeholderCommentId: placeholderCommentId ?? current?.placeholderCommentId,
-      findings: current?.findings ?? []
+      findings: current?.findings ?? [],
+      // A row this method creates claims no provenance, matching the PostgreSQL column default the
+      // equivalent insert falls back to. Without the explicit default the two stores disagree —
+      // undefined here against 1 there — and a MemoryStore test stops being evidence about
+      // production. An existing row keeps whatever version already wrote its findings.
+      findingsSchemaVersion:
+        current?.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION_DEFAULT,
+      findingsEvictedTotal: current?.findingsEvictedTotal,
+      findingsLastEvictedAt: current?.findingsLastEvictedAt,
+      feedbackTotal: current?.feedbackTotal
     });
   }
 
-  async saveReview(state: ReviewState, expectedHeadSha?: string) {
+  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
     const key = `${state.repositoryId}:${state.pullNumber}`;
     const current = this.reviews.get(key);
     if (expectedHeadSha && current && current.headSha !== expectedHeadSha) return false;
-    this.reviews.set(key, { ...state });
+    this.reviews.set(key, {
+      ...state,
+      findings: normalizeReviewFindings(state.findings),
+      findingsSchemaVersion: state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
+      // `findingsEvictedTotal` is an increment on write, matching the server-authoritative
+      // PostgreSQL counter, so the two implementations cannot disagree on a lifetime total.
+      findingsEvictedTotal:
+        (current?.findingsEvictedTotal ?? 0) + (state.findingsEvictedTotal ?? 0),
+      findingsLastEvictedAt: state.findingsLastEvictedAt ?? current?.findingsLastEvictedAt,
+      // Same increment semantics as `findingsEvictedTotal`, so the aggregate outlives the
+      // per-finding records eviction is free to drop.
+      feedbackTotal: (current?.feedbackTotal ?? 0) + (state.feedbackTotal ?? 0)
+    });
     return true;
   }
 
   async getReview(id: number, pull: number) {
     const review = this.reviews.get(`${id}:${pull}`);
-    return review ? { ...review, findings: [...review.findings] } : undefined;
+    // Findings carry nested provenance, so callers get their own copies rather than aliases
+    // into the retained record.
+    return review
+      ? { ...review, findings: review.findings.map((finding) => ({ ...finding })) }
+      : undefined;
+  }
+
+  async recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean> {
+    // Scoped by repository and pull number exactly as the PostgreSQL predicates are: a marker
+    // digest is content-addressed, so identical findings in different repositories share one,
+    // and this lookup is what keeps another repository's reviewer activity off this row.
+    const key = `${input.repositoryId}:${input.pullNumber}`;
+    const review = this.reviews.get(key);
+    if (!review) return false;
+    const applied = applyFindingFeedback(
+      review.findings,
+      input.fingerprint,
+      input.commentId,
+      input.observedAt
+    );
+    if (!applied.recorded) return false;
+    this.reviews.set(key, {
+      ...review,
+      findings: applied.findings,
+      feedbackTotal: (review.feedbackTotal ?? 0) + 1
+    });
+    return true;
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
@@ -652,7 +1674,9 @@ export class MemoryStore implements Store {
     this.webhooks.set(deliveryId, {
       deliveryId,
       eventName,
-      payload,
+      // Scrubbed on the same boundary as PostgresStore so the two stores hand identical payloads
+      // to a handler and a memory-backed test cannot pass on fields production would have dropped.
+      payload: scrubWebhookPayloadForRetention(eventName, payload),
       status: "pending",
       attempts: 0,
       availableAt: new Date(0).toISOString(),
@@ -1237,9 +2261,63 @@ function scannerEvidenceKey(
   return `${scannerArtifactKey(repositoryId, runId, runAttempt, artifactId)}:${evidenceKey}`;
 }
 
+/**
+ * Raised when the migration advisory lock stays held by a peer instance past the bounded retry
+ * budget. `migrate()` runs before the HTTP server listens, so a boot that cannot make progress
+ * must fail loudly and let the deploy surface it rather than block on an unbounded lock wait.
+ */
+export class MigrationLockUnavailableError extends Error {
+  constructor(readonly attempts: number) {
+    super(
+      `PostgreSQL migration advisory lock was still held by another instance after ${attempts} attempts`
+    );
+    this.name = "MigrationLockUnavailableError";
+  }
+}
+
+function boundedErrorKind(error: unknown): string {
+  return error instanceof Error ? error.name.slice(0, 64) : "UnknownError";
+}
+
+/**
+ * Reports a migration step that degraded without failing boot.
+ *
+ * Every degradation reported here is a cost one: retrieval falls back to a path
+ * that returns the same ranking more slowly. That makes failing boot the wrong
+ * trade, but it also makes silence the wrong trade, because a fully reproducible
+ * failure would otherwise be indistinguishable from a healthy migration. The
+ * SQLSTATE is included when the driver supplies one: a type modifier rejected
+ * during parse analysis and a denied permission call for different responses, and
+ * an error name alone cannot separate them. The message itself is left out to
+ * keep the bounded-error idiom used elsewhere in this app.
+ */
+function reportDegradedMigrationStep(step: string, error: unknown): void {
+  const code = (error as { code?: unknown } | null)?.code;
+  console.warn(
+    JSON.stringify({
+      event: "guardianbot.migration_step_degraded",
+      step,
+      error: boundedErrorKind(error),
+      ...(typeof code === "string" ? { sqlstate: code.slice(0, 16) } : {})
+    })
+  );
+}
+
 export class PostgresStore implements Store {
   private readonly pool: Pool;
   private repositoryIndexStorageMode: RepositoryIndexStorageMode = "json-array-fallback";
+  // Set only when the dimensioned column and its ANN index both exist. Reads consult it before
+  // using the indexed path, so an instance whose migration could not build the index still
+  // answers correctly through the exact path.
+  private approximateVectorIndexReady = false;
+  // Rows carrying no durable vector after the backfill, or null when the count could not be
+  // taken. Null and zero must stay distinguishable so a scraper never reads "unmeasured" as
+  // "none outstanding".
+  private uncoveredDurableVectorRows: number | null = null;
+  // Retry budget for the migration lock, held on the instance so the bound can be narrowed in
+  // tests without adding a test-only parameter to the production migrate() signature.
+  private migrationLockAttempts = MIGRATION_LOCK_ATTEMPTS;
+  private migrationLockRetryDelayMs = MIGRATION_LOCK_RETRY_DELAY_MS;
 
   constructor(connectionString: string, caCertificate?: string) {
     this.pool = new Pool(postgresPoolConfig(connectionString, caCertificate));
@@ -1257,9 +2335,60 @@ export class PostgresStore implements Store {
     return this.repositoryIndexStorageMode;
   }
 
+  async getRepositoryIndexRetrievalStatus(): Promise<RepositoryIndexRetrievalStatus> {
+    return {
+      mode: this.repositoryIndexStorageMode,
+      approximateIndexReady: this.approximateVectorIndexReady,
+      uncoveredDurableVectorRows: this.uncoveredDurableVectorRows
+    };
+  }
+
+  /**
+   * Prunes superseded index generations outside the migration path.
+   *
+   * Deliberately not part of `migrate()`: boot must not be lengthened by a sweep,
+   * and a deletion that large has no business running while the port is closed.
+   * Bounded per run and safe to run on every instance concurrently, as the
+   * statement takes its candidates with SKIP LOCKED.
+   */
+  async purgeSupersededIndexGenerations(
+    options: PurgeSupersededIndexGenerationsOptions
+  ): Promise<PurgeSupersededIndexGenerationsResult> {
+    assertIndexGenerationSweepLimit(options.limit);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<{ storage_key: string }>(
+        SUPERSEDED_INDEX_GENERATION_PURGE_SQL,
+        [options.supersededBefore, options.limit]
+      );
+      await client.query("COMMIT");
+      return { deleted: result.rowCount ?? result.rows.length };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async migrate(): Promise<void> {
-    this.repositoryIndexStorageMode = await this.detectRepositoryIndexStorageMode();
-    await this.pool.query(`
+    // Concurrently booting instances must serialise rather than race: PostgreSQL still raises
+    // duplicate-object errors when overlapping CREATE TABLE / CREATE INDEX IF NOT EXISTS
+    // statements resolve existence at the same time. The lock is session-scoped, so it lives
+    // on a dedicated connection for the whole migration, and it is acquired through a bounded
+    // try-lock loop so a peer holding it with a wedged session cannot stall boot indefinitely.
+    const client = await this.pool.connect();
+    try {
+      await this.acquireMigrationLock(client);
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+
+    try {
+      this.repositoryIndexStorageMode = await this.detectRepositoryIndexStorageMode(client);
+      await client.query(`
       CREATE TABLE IF NOT EXISTS repositories (
         repository_id BIGINT PRIMARY KEY,
         installation_id BIGINT NOT NULL,
@@ -1287,6 +2416,14 @@ export class PostgresStore implements Store {
         PRIMARY KEY (repository_id, pull_number)
       );
       ALTER TABLE reviews ADD COLUMN IF NOT EXISTS reviewed_head_sha TEXT;
+      ALTER TABLE reviews ADD COLUMN IF NOT EXISTS findings_schema_version INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE reviews ADD COLUMN IF NOT EXISTS findings_evicted_total INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE reviews ADD COLUMN IF NOT EXISTS findings_last_evicted_at TIMESTAMPTZ;
+      -- Reviewer-feedback aggregate. Additive with a default so an older instance mid-rolling-deploy
+      -- reads and rewrites the row unchanged, and so existing rows need no backfill. The per-finding
+      -- feedback detail lives in the existing schemaless findings column, which needs no DDL and is
+      -- already bounded by finding retention.
+      ALTER TABLE reviews ADD COLUMN IF NOT EXISTS feedback_total INTEGER NOT NULL DEFAULT 0;
 
       CREATE TABLE IF NOT EXISTS webhook_jobs (
         delivery_id TEXT PRIMARY KEY,
@@ -1345,6 +2482,26 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS repository_index_vectors_scope_commit_idx
         ON repository_index_vectors (repository_scope, commit_sha);
+
+      CREATE TABLE IF NOT EXISTS repository_index_records (
+        storage_key TEXT NOT NULL REFERENCES repository_indexes(storage_key) ON DELETE CASCADE,
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        repository_scope TEXT NOT NULL,
+        commit_sha TEXT NOT NULL,
+        record_type TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        summary TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (storage_key, record_type, record_id)
+      );
+      CREATE INDEX IF NOT EXISTS repository_index_records_scope_commit_idx
+        ON repository_index_records (repository_scope, commit_sha);
 
       CREATE TABLE IF NOT EXISTS scanner_workflow_runs (
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -1497,11 +2654,34 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS deployment_promotions_repository_idx
         ON deployment_promotions (repository_id, environment);
-    `);
-    if (this.repositoryIndexStorageMode === "pgvector") {
-      await this.pool.query(
-        "ALTER TABLE repository_index_vectors ADD COLUMN IF NOT EXISTS vector_pgvector vector"
-      );
+      `);
+      if (this.repositoryIndexStorageMode === "pgvector") {
+        await client.query(
+          "ALTER TABLE repository_index_vectors ADD COLUMN IF NOT EXISTS vector_pgvector vector"
+        );
+        await this.migrateApproximateVectorIndex(client);
+      }
+    } finally {
+      let unlocked = false;
+      try {
+        // The client goes back to the shared pool, so the migration-only session bounds are
+        // dropped first: no review query should inherit a migration's timeouts.
+        await client.query("RESET lock_timeout");
+        await client.query("RESET statement_timeout");
+        await client.query("SELECT pg_advisory_unlock($1, $2)", [
+          MIGRATION_LOCK_NAMESPACE,
+          MIGRATION_LOCK_KEY
+        ]);
+        unlocked = true;
+      } catch {
+        // Destroying the connection ends the session and drops the lock, so an unlock failure
+        // needs no rethrow here: rethrowing would mask a migration error from the block above.
+      }
+      if (unlocked) {
+        client.release();
+      } else {
+        client.release(true);
+      }
     }
   }
 
@@ -1565,46 +2745,36 @@ export class PostgresStore implements Store {
       if (!repository.rows[0]) {
         throw new Error(`repository ${repositoryId} must exist before indexing`);
       }
+      await this.upsertRepositoryIndexDocument(client, repositoryId, index);
+      // Two predicates, matching the read path exactly. The storage key alone is
+      // already derived and canonical, so this is defence in depth rather than a
+      // fix for a known escape: repository isolation is a security property here,
+      // and it should not rest on a single predicate on the write path while the
+      // read path carries two.
       await client.query(
-        `INSERT INTO repository_indexes
-         (repository_id, repository_scope, commit_sha, visibility, storage_key, full_name, content_sha256,
-          embedding_provider_id, embedding_kind, embedding_dimensions, vector_storage, index_document)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         ON CONFLICT (repository_id, commit_sha) DO UPDATE SET
-           repository_scope=excluded.repository_scope,
-           visibility=excluded.visibility,
-           storage_key=excluded.storage_key,
-           full_name=excluded.full_name,
-           content_sha256=excluded.content_sha256,
-           embedding_provider_id=excluded.embedding_provider_id,
-           embedding_kind=excluded.embedding_kind,
-           embedding_dimensions=excluded.embedding_dimensions,
-           vector_storage=excluded.vector_storage,
-           index_document=excluded.index_document,
-           updated_at=now()`,
-        [
-          repositoryId,
-          index.repositoryScope,
-          index.commitSha,
-          index.visibility,
-          index.storageKey,
-          index.repository,
-          index.contentSha256,
-          index.embedding.providerId,
-          index.embedding.kind,
-          index.embedding.dimensions,
-          this.repositoryIndexStorageMode,
-          JSON.stringify(index)
-        ]
+        "DELETE FROM repository_index_vectors WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
       );
-      await client.query("DELETE FROM repository_index_vectors WHERE storage_key=$1", [
-        index.storageKey
-      ]);
       for (let start = 0; start < vectors.length; start += 100) {
         await this.insertRepositoryIndexVectorBatch(
           client,
           repositoryId,
           vectors.slice(start, start + 100)
+        );
+      }
+      // The per-record content rows a query hydrates from. Same two predicates,
+      // same batching, and written in the same transaction as the vectors, so a
+      // nearest-neighbour match can never name a row that is not yet hydratable.
+      await client.query(
+        "DELETE FROM repository_index_records WHERE repository_id=$1 AND storage_key=$2",
+        [repositoryId, index.storageKey]
+      );
+      const records = toPersistedRecordRows(index);
+      for (let start = 0; start < records.length; start += 100) {
+        await this.insertRepositoryIndexRecordBatch(
+          client,
+          repositoryId,
+          records.slice(start, start + 100)
         );
       }
       await client.query(
@@ -1637,11 +2807,188 @@ export class PostgresStore implements Store {
     return row ? (row.index_document as RepositoryIndex) : undefined;
   }
 
+  async queryRepositoryIndexVectors(
+    repositoryId: number,
+    request: RepositoryVectorQuery
+  ): Promise<RepositoryVectorMatch[]> {
+    assertVectorQuery(request);
+    // Derived, not caller-supplied: the canonical key binds scope and commit
+    // together, so this single predicate is the repository isolation boundary.
+    const storageKey = repositoryIndexStorageKey(request);
+    const useApproximateIndex = await this.hasCompleteAnnCoverage(
+      repositoryId,
+      storageKey,
+      request.vector.length
+    );
+    const statement = buildRepositoryIndexVectorQueryStatement(
+      repositoryId,
+      storageKey,
+      request,
+      this.repositoryIndexStorageMode,
+      useApproximateIndex
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    const matches = result.rows.map((row) => {
+      const persisted = toPersistedVectorRow(row);
+      // Defence in depth: a row that does not carry the requested key must never
+      // be scored, whatever the server returned.
+      if (persisted.storageKey !== storageKey) {
+        throw new Error("repository index vector query returned a foreign storage key");
+      }
+      assertVectorQueryMatchesIndex(request, persisted.providerId, persisted.dimensions);
+      const score =
+        row.score === undefined || row.score === null
+          ? cosineSimilarity(request.vector as number[], persisted.vector)
+          : Number(row.score);
+      return { row: persisted, score };
+    });
+    // pgvector already ordered by distance, but re-sorting costs nothing at this
+    // size and makes the fallback path's ordering identical to the indexed path.
+    return matches.sort(compareVectorMatches).slice(0, request.limit);
+  }
+
+  /**
+   * Bounded content fetch for the records a nearest-neighbour query named. One
+   * statement serves every record of one repository, so hydrating N matches costs
+   * one round trip rather than N.
+   *
+   * The canonical storage key is derived here, exactly as in the vector read, and
+   * re-checked on every returned row: a record id from another repository cannot
+   * resolve, even when both repositories hold byte-identical content.
+   */
+  async hydrateRepositoryIndexRecords(
+    repositoryId: number,
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]> {
+    assertRecordHydrationRequest(request);
+    if (!request.records.length) return [];
+    const storageKey = repositoryIndexStorageKey(request);
+    const statement = buildRepositoryIndexRecordQueryStatement(
+      repositoryId,
+      storageKey,
+      request.records
+    );
+    const result = await this.pool.query(statement.text, statement.values);
+    return result.rows
+      .map((row) => {
+        const persisted = toPersistedRecordRow(row);
+        if (
+          persisted.storageKey !== storageKey ||
+          persisted.repositoryScope !== request.repositoryScope
+        ) {
+          throw new Error("repository index record hydration returned a foreign storage key");
+        }
+        return persisted;
+      })
+      .sort(compareRecordRows);
+  }
+
+  async applyRepositoryIndexDelta(
+    repositoryId: number,
+    delta: RepositoryIndexVectorDelta,
+    indexedAt = new Date()
+  ) {
+    assertDeltaRowsMatchIndex(delta);
+    const index = delta.index;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const repository = await client.query(
+        "SELECT repository_id FROM repositories WHERE repository_id=$1 FOR UPDATE",
+        [repositoryId]
+      );
+      if (!repository.rows[0]) {
+        throw new Error(`repository ${repositoryId} must exist before indexing`);
+      }
+      await this.upsertRepositoryIndexDocument(client, repositoryId, index);
+      if (delta.deletedRecordIds.length) {
+        // Scoped by repository and snapshot key, so a delete can only ever remove
+        // rows belonging to the repository and commit being published.
+        const statement = buildRepositoryIndexVectorDeleteStatement(
+          repositoryId,
+          index.storageKey,
+          delta.deletedRecordIds
+        );
+        await client.query(statement.text, statement.values);
+        const recordStatement = buildRepositoryIndexRecordDeleteStatement(
+          repositoryId,
+          index.storageKey,
+          delta.deletedRecordIds
+        );
+        await client.query(recordStatement.text, recordStatement.values);
+      }
+      for (let start = 0; start < delta.upserts.length; start += 100) {
+        await this.insertRepositoryIndexVectorBatch(
+          client,
+          repositoryId,
+          delta.upserts.slice(start, start + 100)
+        );
+      }
+      // Every record of the new snapshot, upserted. The storage key and each
+      // record id are commit-scoped, so this publishes the new generation's rows
+      // without rewriting a previous generation's.
+      const records = toPersistedRecordRows(index);
+      for (let start = 0; start < records.length; start += 100) {
+        await this.insertRepositoryIndexRecordBatch(
+          client,
+          repositoryId,
+          records.slice(start, start + 100)
+        );
+      }
+      await client.query(
+        `UPDATE repositories
+         SET index_sha=$2, index_updated_at=$3, updated_at=now()
+         WHERE repository_id=$1`,
+        [repositoryId, index.commitSha, indexedAt]
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Confirms every row for one snapshot carries the dimensioned ANN column
+   * before the indexed path is used. During a rolling deploy an older instance
+   * can still write rows without it, and the ANN query filters on that column
+   * being present, so skipping this check would silently return fewer records
+   * rather than failing. One indexed aggregate is cheap next to that risk.
+   */
+  private async hasCompleteAnnCoverage(
+    repositoryId: number,
+    storageKey: string,
+    dimensions: number
+  ): Promise<boolean> {
+    if (
+      this.repositoryIndexStorageMode !== "pgvector" ||
+      !this.approximateVectorIndexReady ||
+      dimensions !== INDEXED_VECTOR_ANN_DIMENSIONS
+    ) {
+      return false;
+    }
+    const result = await this.pool.query<{ total: number; covered: number }>(
+      `SELECT COUNT(*)::int AS total, COUNT(vector_ann)::int AS covered
+       FROM repository_index_vectors
+       WHERE repository_id=$1 AND storage_key=$2 AND dimensions=$3`,
+      [repositoryId, storageKey, dimensions]
+    );
+    const row = result.rows[0];
+    return Boolean(row && row.total > 0 && row.total === row.covered);
+  }
+
   async setRepositoryState(repositoryId: number, state: RepositoryLifecycleState) {
     await this.pool.query(
       "UPDATE repositories SET repository_state=$2, updated_at=now() WHERE repository_id=$1",
       [repositoryId, state]
     );
+    // After the state change, so a failure leaves findings retained rather than dropping them for
+    // a repository whose removal did not actually commit.
+    if (state === "removed") {
+      await this.pool.query(REVIEW_FINDINGS_DISCARD_SQL, [[repositoryId]]);
+    }
   }
 
   async setInstallationState(installationId: number, state: RepositoryLifecycleState) {
@@ -1649,6 +2996,9 @@ export class PostgresStore implements Store {
       "UPDATE repositories SET repository_state=$2, updated_at=now() WHERE installation_id=$1",
       [installationId, state]
     );
+    if (state === "removed") {
+      await this.pool.query(REVIEW_FINDINGS_DISCARD_BY_INSTALLATION_SQL, [installationId]);
+    }
   }
 
   async setAutomaticReviewPaused(repositoryId: number, paused: boolean) {
@@ -1675,15 +3025,27 @@ export class PostgresStore implements Store {
     );
   }
 
-  async saveReview(state: ReviewState, expectedHeadSha?: string) {
+  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
     const result = await this.pool.query(
-      `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings)
-       VALUES ($1,$2,$3,$4,$5,$6)
+      `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings,
+        findings_schema_version,findings_evicted_total,findings_last_evicted_at,feedback_total)
+       VALUES ($1,$2,$3,$4,$5,$6,$8,$9,$10,$11)
        ON CONFLICT (repository_id,pull_number) DO UPDATE SET
        head_sha=excluded.head_sha,
        reviewed_head_sha=excluded.reviewed_head_sha,
        placeholder_comment_id=excluded.placeholder_comment_id,
        findings=excluded.findings,
+       findings_schema_version=excluded.findings_schema_version,
+       -- Server-authoritative lifetime counter: the caller supplies only this write's increment,
+       -- so a writer that did not read the existing row cannot reset the accumulated total. The
+       -- INSERT path starts from the same increment, which is the correct total for a new row.
+       findings_evicted_total=reviews.findings_evicted_total + excluded.findings_evicted_total,
+       findings_last_evicted_at=COALESCE(excluded.findings_last_evicted_at, reviews.findings_last_evicted_at),
+       -- Same increment semantics, for the same reason plus one more: a review publishing its
+       -- merged findings overwrites the schemaless column, so an engagement recorded between this
+       -- writer's read and this write loses its per-finding detail. The aggregate is incremented
+       -- server-side and therefore still counts it.
+       feedback_total=reviews.feedback_total + excluded.feedback_total,
        updated_at=now()
        WHERE $7::text IS NULL OR reviews.head_sha=$7`,
       [
@@ -1693,7 +3055,11 @@ export class PostgresStore implements Store {
         state.reviewedHeadSha,
         state.placeholderCommentId,
         JSON.stringify(state.findings),
-        expectedHeadSha ?? null
+        expectedHeadSha ?? null,
+        state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
+        state.findingsEvictedTotal ?? 0,
+        state.findingsLastEvictedAt ?? null,
+        state.feedbackTotal ?? 0
       ]
     );
     return (result.rowCount ?? 0) > 0;
@@ -1712,8 +3078,64 @@ export class PostgresStore implements Store {
       headSha: row.head_sha,
       reviewedHeadSha: row.reviewed_head_sha ?? undefined,
       placeholderCommentId: row.placeholder_comment_id ? Number(row.placeholder_comment_id) : undefined,
-      findings: row.findings
-    } as ReviewState;
+      // The JSONB column is schemaless and may predate the provenance migration, so every
+      // retained finding is revalidated rather than trusted as already-typed.
+      findings: normalizeReviewFindings(row.findings),
+      findingsSchemaVersion: Number(
+        row.findings_schema_version ?? REVIEW_FINDINGS_SCHEMA_VERSION_DEFAULT
+      ),
+      findingsEvictedTotal: Number(row.findings_evicted_total ?? 0),
+      findingsLastEvictedAt: fromUnknownDate(row.findings_last_evicted_at),
+      feedbackTotal: Number(row.feedback_total ?? 0)
+    } satisfies ReviewState;
+  }
+
+  /**
+   * Records one human engagement against a published advisory. The findings column is schemaless,
+   * so the update is a read-modify-write and must be serialised: the row is taken `FOR UPDATE`
+   * inside a transaction so two concurrent deliveries cannot each write back a copy computed from
+   * the same pre-state and lose one engagement.
+   *
+   * Returns false when the review row or the fingerprint is absent, or when this comment was
+   * already counted, so a redelivered webhook neither inflates the aggregate nor reports that it
+   * captured something.
+   */
+  async recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(REVIEW_FEEDBACK_LOCK_SQL, [
+        input.repositoryId,
+        input.pullNumber
+      ]);
+      const row = locked.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      const applied = applyFindingFeedback(
+        normalizeReviewFindings(row.findings),
+        input.fingerprint,
+        input.commentId,
+        input.observedAt
+      );
+      if (!applied.recorded) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      await client.query(REVIEW_FEEDBACK_UPDATE_SQL, [
+        input.repositoryId,
+        input.pullNumber,
+        JSON.stringify(applied.findings)
+      ]);
+      await client.query("COMMIT");
+      return true;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
@@ -1721,7 +3143,9 @@ export class PostgresStore implements Store {
       `INSERT INTO webhook_jobs (delivery_id, event_name, payload, status, attempts, available_at)
        VALUES ($1,$2,$3,'pending',0,now())
        ON CONFLICT (delivery_id) DO NOTHING`,
-      [deliveryId, eventName, JSON.stringify(payload)]
+      // Scrubbed here rather than in the caller because this is the only point the payload becomes
+      // durable: a future enqueue path cannot bypass the reduction by forgetting to call it.
+      [deliveryId, eventName, JSON.stringify(scrubWebhookPayloadForRetention(eventName, payload))]
     );
     return (result.rowCount ?? 0) > 0;
   }
@@ -2608,20 +4032,289 @@ export class PostgresStore implements Store {
     };
   }
 
-  private async detectRepositoryIndexStorageMode(): Promise<RepositoryIndexStorageMode> {
+  /**
+   * Bounds the migration session, then takes the migration lock without ever waiting on it
+   * indefinitely. The session bounds are set first so every statement that follows is covered:
+   * `lock_timeout` caps the ACCESS EXCLUSIVE wait each `ALTER TABLE reviews` takes behind a slow
+   * reader, so a queued migration cannot block all reviews traffic, and `statement_timeout` caps
+   * one wedged statement such as `CREATE EXTENSION`. `pg_try_advisory_lock` returns at once
+   * instead of waiting, so a bounded retry loop around it keeps contention finite where a
+   * blocking `pg_advisory_lock` would let a peer with a hung session stall boot forever, before
+   * the server ever opens a port.
+   */
+  private async acquireMigrationLock(client: PoolClient): Promise<void> {
+    // `SET` takes no bind parameters, so the session bounds go through parameterized set_config.
+    await client.query("SELECT set_config('lock_timeout', $1, false)", [
+      String(MIGRATION_LOCK_TIMEOUT_MS)
+    ]);
+    await client.query("SELECT set_config('statement_timeout', $1, false)", [
+      String(MIGRATION_STATEMENT_TIMEOUT_MS)
+    ]);
+    for (let attempt = 1; attempt <= this.migrationLockAttempts; attempt += 1) {
+      const result = await client.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_lock($1, $2) AS acquired",
+        [MIGRATION_LOCK_NAMESPACE, MIGRATION_LOCK_KEY]
+      );
+      if (result.rows[0]?.acquired) return;
+      if (attempt < this.migrationLockAttempts) {
+        await delay(this.migrationLockRetryDelayMs);
+      }
+    }
+    throw new MigrationLockUnavailableError(this.migrationLockAttempts);
+  }
+
+  /**
+   * Adds the dimensioned ANN column and its index. Every step is additive and
+   * runs on the caller's advisory-locked migration client.
+   *
+   * `ADD COLUMN ... vector(96)` is nullable with no default, so on PostgreSQL 11+
+   * it is a metadata-only change that rewrites nothing and stays readable by an
+   * instance running older code mid-deploy: that instance simply never writes the
+   * column, and rows it writes fall back to the exact query path.
+   *
+   * Building the index is the expensive step and is therefore the exception, not
+   * the rule. `CREATE INDEX` holds ACCESS EXCLUSIVE for its whole duration and
+   * this runs before the port opens, so it is attempted only while the table is
+   * small enough for the build to be trivial; at or above
+   * `ANN_INDEX_INLINE_BUILD_MAX_ROWS` the index is left to an operator to build
+   * with `CREATE INDEX CONCURRENTLY` out of band, which is the normal path and is
+   * documented in docs/operations.md. `CONCURRENTLY` is deliberately not used
+   * here: it would not remove the boot stall, since boot would still have to wait
+   * out a build that takes longer than the blocking one, and a failed
+   * `CONCURRENTLY` build leaves an INVALID index behind for an operator to drop.
+   *
+   * A failure here leaves `approximateVectorIndexReady` false rather than failing
+   * boot: retrieval degrades to an exact scan, which is the same behaviour as a
+   * server without pgvector. It is reported, though. This step previously
+   * swallowed every error silently, which hid a fully reproducible parse failure
+   * behind an apparently successful migration.
+   */
+  private async migrateApproximateVectorIndex(client: PoolClient): Promise<void> {
+    await this.backfillDurableVectorColumn(client);
     try {
-      await this.pool.query("CREATE EXTENSION IF NOT EXISTS vector");
+      await client.query(
+        `ALTER TABLE repository_index_vectors
+         ADD COLUMN IF NOT EXISTS vector_ann vector(${INDEXED_VECTOR_ANN_DIMENSIONS})`
+      );
+      await this.backfillApproximateVectorColumn(client);
+      // `CREATE INDEX` scans the whole heap and holds ACCESS EXCLUSIVE over the whole table, so
+      // the cost of the build tracks total rows and not how many carry a vector: a table of
+      // millions of rows with a handful of populated vectors is exactly the case that must not
+      // build inline. The probe is bounded by the ceiling itself — the subquery stops at the
+      // limit — so establishing "at least this many rows exist" never costs a full count.
+      const counted = await client.query<{ total: number }>(
+        `SELECT COUNT(*)::int AS total
+         FROM (SELECT 1 FROM repository_index_vectors LIMIT $1) AS bounded`,
+        [ANN_INDEX_INLINE_BUILD_MAX_ROWS]
+      );
+      const rows = Number(counted.rows[0]?.total ?? 0);
+      // `relname` is unique only within a namespace, so a same-named relation in any other schema
+      // would satisfy an unqualified probe and invert the guard below. `to_regclass` resolves
+      // through the same `search_path` `CREATE INDEX` uses, and matching `indexrelid` against
+      // `indrelid` additionally proves it is an index on the intended table rather than some
+      // unrelated relation that happens to share the name.
+      const existing = await client.query<{ exists: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_index
+           WHERE indexrelid = to_regclass('repository_index_vectors_ann_idx')
+             AND indrelid = to_regclass('repository_index_vectors')
+         ) AS exists`
+      );
+      if (!existing.rows[0]?.exists && rows >= ANN_INDEX_INLINE_BUILD_MAX_ROWS) {
+        // At or above the inline ceiling this must not be built under a table
+        // lock during boot. `>=` and a ceiling far below the backfill cap keep a
+        // saturating backfill from landing on the boundary and then triggering
+        // the very build the ceiling exists to avoid. The column is still
+        // written and queries stay correct through the exact path.
+        this.approximateVectorIndexReady = false;
+        return;
+      }
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS repository_index_vectors_ann_idx
+         ON repository_index_vectors
+         USING hnsw (vector_ann vector_cosine_ops)`
+      );
+      this.approximateVectorIndexReady = true;
+    } catch (error) {
+      this.approximateVectorIndexReady = false;
+      // pgvector was already confirmed present by detectRepositoryIndexStorageMode,
+      // so reaching here is unexpected and must be visible. Retrieval still
+      // answers correctly through the exact scan.
+      reportDegradedMigrationStep("approximate vector index setup", error);
+    }
+  }
+
+  /**
+   * Fills `vector_pgvector` for rows written before that column existed.
+   *
+   * Rows already on a live database carry only `vector_json`, and every
+   * pgvector-mode read filters on the vector column being non-null, so without
+   * this those snapshots return no durable matches at all while reporting
+   * success. The failure is masked rather than incorrect, because the caller
+   * falls back to scoring candidates in memory, which is exactly why it would go
+   * unnoticed. Backfilling is preferred over widening the read to include null
+   * vector rows: an ordered nearest-neighbour scan cannot rank rows it has no
+   * vector for, so that path would return an arbitrary `LIMIT` slice for
+   * application scoring and could rank worse than the in-memory fallback it
+   * displaces.
+   *
+   * `vector_json` is a JSONB array, whose text form is the same bracketed list
+   * pgvector's input function parses, so the value is converted in the database
+   * rather than round-tripped through the application. The spaces JSONB renders
+   * after each comma are stripped first: pgvector's parser is believed to tolerate
+   * them, but stripping costs one pass and removes the need to depend on that.
+   */
+  private async backfillDurableVectorColumn(client: PoolClient): Promise<void> {
+    // Reset first: a re-migrate must not leave a stale count standing if the
+    // measurement below cannot be taken this time.
+    this.uncoveredDurableVectorRows = null;
+    try {
+      await this.runBoundedVectorBackfill((limit) =>
+        client.query(
+          `UPDATE repository_index_vectors
+           SET vector_pgvector = replace(vector_json::text, ' ', '')::vector
+           WHERE (storage_key, record_type, record_id) IN (
+             SELECT storage_key, record_type, record_id
+             FROM repository_index_vectors
+             WHERE vector_pgvector IS NULL
+             LIMIT $1
+           )`,
+          [limit]
+        )
+      );
+      // Whatever the bound left behind is reported rather than assumed to be
+      // zero, so a table larger than one boot's budget is visible as a number
+      // instead of as unexplained fallback scoring.
+      const remaining = await client.query<{ total: number }>(
+        `SELECT COUNT(*)::int AS total
+         FROM repository_index_vectors
+         WHERE vector_pgvector IS NULL`
+      );
+      this.uncoveredDurableVectorRows = Number(remaining.rows[0]?.total ?? 0);
+    } catch (error) {
+      // Pre-existing rows stay on the in-memory fallback, which is the behaviour
+      // before this column existed, so this must not fail boot. It is reported
+      // because nothing else would reveal it.
+      reportDegradedMigrationStep("durable vector column backfill", error);
+    }
+  }
+
+  /**
+   * Fills `vector_ann` from `vector_pgvector` for rows of the indexed width.
+   *
+   * The dimension is inlined, not bound. A pgvector type modifier is resolved
+   * during parse analysis and must be a literal constant: a `$n` parameter there
+   * raises `type modifiers must be simple constants or identifiers`, so the bound
+   * form failed at parse time on every real server. This is not a
+   * parameterization gap. A type modifier is not a value, it is a numeric module
+   * constant with no user input anywhere on its path, and the value compared
+   * against each row's own `dimensions` stays bound. Do not "fix" this back to a
+   * placeholder.
+   *
+   * Convergence comes from republication, not from this step. Each boot spends at
+   * most `ANN_BACKFILL_MAX_ROWS`, so a table larger than that cap is left partly
+   * covered, and `hasCompleteAnnCoverage` requires a snapshot to be fully covered
+   * before the indexed path is used: a partly covered snapshot is served by the
+   * exact path until the next publication rewrites it in full. The loop below
+   * only bounds the work per statement so no single `UPDATE` has to finish inside
+   * the migration statement timeout.
+   */
+  private async backfillApproximateVectorColumn(client: PoolClient): Promise<void> {
+    await this.runBoundedVectorBackfill((limit) =>
+      client.query(
+        `UPDATE repository_index_vectors
+         SET vector_ann = vector_pgvector::vector(${INDEXED_VECTOR_ANN_DIMENSIONS})
+         WHERE (storage_key, record_type, record_id) IN (
+           SELECT storage_key, record_type, record_id
+           FROM repository_index_vectors
+           WHERE vector_ann IS NULL
+             AND vector_pgvector IS NOT NULL
+             AND dimensions = $1
+           LIMIT $2
+         )`,
+        [INDEXED_VECTOR_ANN_DIMENSIONS, limit]
+      )
+    );
+  }
+
+  /**
+   * Spends at most `ANN_BACKFILL_MAX_ROWS` in `ANN_BACKFILL_BATCH_ROWS` batches,
+   * stopping as soon as a batch reports fewer rows than it asked for, which is
+   * the only available signal that the predicate is drained. Bounding each
+   * statement keeps every one of them inside the migration statement timeout.
+   */
+  private async runBoundedVectorBackfill(
+    runBatch: (limit: number) => Promise<{ rowCount?: number | null }>
+  ): Promise<void> {
+    let remaining = ANN_BACKFILL_MAX_ROWS;
+    while (remaining > 0) {
+      const limit = Math.min(ANN_BACKFILL_BATCH_ROWS, remaining);
+      const result = await runBatch(limit);
+      const affected = Number(result.rowCount ?? 0);
+      if (affected < limit) return;
+      remaining -= affected;
+    }
+  }
+
+  private async detectRepositoryIndexStorageMode(
+    client: PoolClient
+  ): Promise<RepositoryIndexStorageMode> {
+    try {
+      await client.query("CREATE EXTENSION IF NOT EXISTS vector");
     } catch {
       // Managed PostgreSQL may deny extension creation. Fall back safely below.
     }
     try {
-      const result = await this.pool.query<{ installed: boolean }>(
+      const result = await client.query<{ installed: boolean }>(
         "SELECT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vector') AS installed"
       );
       return result.rows[0]?.installed ? "pgvector" : "json-array-fallback";
     } catch {
       return "json-array-fallback";
     }
+  }
+
+  /**
+   * Shared by full replacement and partial delta publication so both write the
+   * index document identically.
+   */
+  private async upsertRepositoryIndexDocument(
+    client: PoolClient,
+    repositoryId: number,
+    index: RepositoryIndex
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO repository_indexes
+       (repository_id, repository_scope, commit_sha, visibility, storage_key, full_name, content_sha256,
+        embedding_provider_id, embedding_kind, embedding_dimensions, vector_storage, index_document)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (repository_id, commit_sha) DO UPDATE SET
+         repository_scope=excluded.repository_scope,
+         visibility=excluded.visibility,
+         storage_key=excluded.storage_key,
+         full_name=excluded.full_name,
+         content_sha256=excluded.content_sha256,
+         embedding_provider_id=excluded.embedding_provider_id,
+         embedding_kind=excluded.embedding_kind,
+         embedding_dimensions=excluded.embedding_dimensions,
+         vector_storage=excluded.vector_storage,
+         index_document=excluded.index_document,
+         updated_at=now()`,
+      [
+        repositoryId,
+        index.repositoryScope,
+        index.commitSha,
+        index.visibility,
+        index.storageKey,
+        index.repository,
+        index.contentSha256,
+        index.embedding.providerId,
+        index.embedding.kind,
+        index.embedding.dimensions,
+        this.repositoryIndexStorageMode,
+        JSON.stringify(index)
+      ]
+    );
   }
 
   private async insertRepositoryIndexVectorBatch(
@@ -2637,6 +4330,347 @@ export class PostgresStore implements Store {
     if (!statement) return;
     await client.query(statement.text, statement.values);
   }
+
+  private async insertRepositoryIndexRecordBatch(
+    client: PoolClient,
+    repositoryId: number,
+    records: readonly PersistedRecordRow[]
+  ): Promise<void> {
+    const statement = buildRepositoryIndexRecordBatchStatement(repositoryId, records);
+    if (!statement) return;
+    await client.query(statement.text, statement.values);
+  }
+}
+
+/**
+ * Bounds one hydration fetch. It keeps a caller from turning a bounded per-match
+ * content read into an unbounded table scan by naming arbitrarily many records.
+ */
+function assertRecordHydrationRequest(request: RepositoryRecordHydrationRequest): void {
+  if (request.records.length > 1_000) {
+    throw new RangeError("record hydration is limited to 1000 records per request");
+  }
+  for (const record of request.records) {
+    if (record.recordType !== "symbol" && record.recordType !== "history") {
+      throw new Error("record hydration accepts only symbol and history records");
+    }
+    if (!record.recordId.trim()) {
+      throw new Error("record hydration requires a non-empty record id");
+    }
+  }
+}
+
+function assertVectorQuery(request: RepositoryVectorQuery): void {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 1_000) {
+    throw new RangeError("vector query limit must be between 1 and 1000");
+  }
+  if (!request.providerId.trim()) {
+    throw new Error("vector query must name the embedding provider that produced it");
+  }
+  if (
+    !request.vector.length ||
+    request.vector.some((value) => !Number.isFinite(value))
+  ) {
+    throw new Error("vector query must supply a finite, non-empty vector");
+  }
+}
+
+/**
+ * Refuses to score a query against vectors from a different embedding space.
+ * Comparing a 96-wide lexical hash to another provider's output would return
+ * confident nonsense rather than an error.
+ */
+function assertVectorQueryMatchesIndex(
+  request: RepositoryVectorQuery,
+  providerId: string,
+  dimensions: number
+): void {
+  if (request.providerId !== providerId || request.vector.length !== dimensions) {
+    throw new Error("vector query is incompatible with the stored index embedding");
+  }
+}
+
+function compareVectorMatches(
+  left: RepositoryVectorMatch,
+  right: RepositoryVectorMatch
+): number {
+  if (left.score !== right.score) return right.score - left.score;
+  const leftKey = `${left.row.recordType}:${left.row.recordId}`;
+  const rightKey = `${right.row.recordType}:${right.row.recordId}`;
+  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+}
+
+function assertDeltaRowsMatchIndex(delta: RepositoryIndexVectorDelta): void {
+  const index = delta.index;
+  // The delta's own index must be self-consistent before its rows are compared
+  // against it, otherwise every row could agree with a non-canonical storage key
+  // and pass. The replace path gets this from toPersistedVectorRows; the delta
+  // path had no equivalent, so a forged key would have reached SQL as the scope
+  // predicate.
+  assertIndexReference(index, index);
+  const deleted = new Set(delta.deletedRecordIds);
+  for (const row of delta.upserts) {
+    if (deleted.has(row.recordId)) {
+      throw new Error("a repository index delta cannot both upsert and delete a record");
+    }
+    if (
+      row.storageKey !== index.storageKey ||
+      row.repositoryScope !== index.repositoryScope ||
+      row.commitSha !== index.commitSha ||
+      row.visibility !== index.visibility ||
+      row.providerId !== index.embedding.providerId ||
+      row.dimensions !== index.embedding.dimensions ||
+      row.vector.length !== index.embedding.dimensions ||
+      row.vector.some((value) => !Number.isFinite(value))
+    ) {
+      throw new Error("repository index delta row does not match its repository index");
+    }
+  }
+}
+
+function toPersistedVectorRow(row: Record<string, any>): PersistedVectorRow {
+  const vector = Array.isArray(row.vector_json)
+    ? (row.vector_json as number[])
+    : (JSON.parse(String(row.vector_json)) as number[]);
+  return {
+    storageKey: row.storage_key,
+    repositoryScope: row.repository_scope,
+    commitSha: row.commit_sha,
+    visibility: row.visibility,
+    providerId: row.provider_id,
+    dimensions: Number(row.dimensions),
+    recordType: row.record_type,
+    recordId: row.record_id,
+    path: row.path ?? undefined,
+    vector
+  };
+}
+
+export interface RepositoryIndexVectorQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Nearest-neighbour read for one repository snapshot, fully parameterized.
+ *
+ * `storageKey` is the isolation predicate and is always bound, never
+ * interpolated. The query vector is bound too and cast in SQL with `$n::vector`,
+ * which is the one place a vector literal is easy to concatenate by mistake.
+ *
+ * `useApproximateIndex` selects the dimensioned, ANN-indexed column so pgvector
+ * can answer through the index. It is only safe once every row for the snapshot
+ * carries that column, so the caller gates it on confirmed backfill coverage;
+ * otherwise the exact ordering over the undimensioned column is used, which
+ * returns the same ranking at higher cost.
+ */
+export function buildRepositoryIndexVectorQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  request: RepositoryVectorQuery,
+  mode: RepositoryIndexStorageMode,
+  useApproximateIndex: boolean
+): RepositoryIndexVectorQueryStatement {
+  const values: unknown[] = [repositoryId, storageKey];
+  const recordTypes = request.recordTypes?.length ? [...request.recordTypes] : undefined;
+  let predicate = "repository_id=$1 AND storage_key=$2 AND dimensions=";
+  values.push(request.vector.length);
+  predicate += `$${values.length}`;
+  if (recordTypes) {
+    values.push(recordTypes);
+    predicate += ` AND record_type = ANY($${values.length}::text[])`;
+  }
+
+  if (mode !== "pgvector") {
+    // Without pgvector there is no distance operator, so ranking happens in the
+    // application. The scope predicate is unchanged, so isolation does not
+    // depend on which mode is active.
+    values.push(request.limit);
+    return {
+      text: `SELECT storage_key, repository_scope, commit_sha, visibility, provider_id, dimensions,
+              record_type, record_id, path, vector_json
+       FROM repository_index_vectors
+       WHERE ${predicate}
+       ORDER BY record_type ASC, record_id ASC
+       LIMIT $${values.length}`,
+      values
+    };
+  }
+
+  const column = useApproximateIndex ? "vector_ann" : "vector_pgvector";
+  values.push(vectorLiteral(request.vector));
+  const vectorPosition = values.length;
+  values.push(request.limit);
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, visibility, provider_id, dimensions,
+            record_type, record_id, path, vector_json,
+            1 - (${column} <=> $${vectorPosition}::vector) AS score
+     FROM repository_index_vectors
+     WHERE ${predicate} AND ${column} IS NOT NULL
+     ORDER BY ${column} <=> $${vectorPosition}::vector, record_type ASC, record_id ASC
+     LIMIT $${values.length}`,
+    values
+  };
+}
+
+function toPersistedRecordRow(row: Record<string, any>): PersistedRecordRow {
+  return {
+    storageKey: row.storage_key,
+    repositoryScope: row.repository_scope,
+    commitSha: row.commit_sha,
+    recordType: row.record_type,
+    recordId: row.record_id,
+    path: row.path,
+    line: Number(row.line),
+    endLine: Number(row.end_line),
+    name: row.name,
+    content: row.content,
+    contentSha256: row.content_sha256,
+    summary: row.summary ?? undefined
+  };
+}
+
+export interface RepositoryIndexRecordQueryStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Bounded content hydration for named records of one snapshot, fully parameterized.
+ *
+ * Carries the same two-predicate boundary as the vector read path, so a record id
+ * taken from a nearest-neighbour match can only ever resolve inside the
+ * repository and snapshot it came from: two repositories holding byte-identical
+ * content still hold separate rows under separate storage keys.
+ *
+ * The record identities are bound as two parallel text arrays matched through
+ * `unnest`, so the statement text does not vary with the number of records and a
+ * type/id pair cannot be satisfied by crossing between two different records.
+ */
+export function buildRepositoryIndexRecordQueryStatement(
+  repositoryId: number,
+  storageKey: string,
+  records: readonly RepositoryRecordReference[]
+): RepositoryIndexRecordQueryStatement {
+  return {
+    text: `SELECT storage_key, repository_scope, commit_sha, record_type, record_id,
+            path, line, end_line, name, content, content_sha256, summary
+       FROM repository_index_records
+       WHERE repository_id=$1 AND storage_key=$2
+         AND (record_type, record_id) IN (SELECT * FROM unnest($3::text[], $4::text[]))
+       ORDER BY record_type ASC, record_id ASC`,
+    values: [
+      repositoryId,
+      storageKey,
+      records.map((record) => record.recordType),
+      records.map((record) => record.recordId)
+    ]
+  };
+}
+
+export interface RepositoryIndexRecordDeleteStatement {
+  text: string;
+  values: unknown[];
+}
+
+export function buildRepositoryIndexRecordDeleteStatement(
+  repositoryId: number,
+  storageKey: string,
+  deletedRecordIds: readonly string[]
+): RepositoryIndexRecordDeleteStatement {
+  return {
+    text: `DELETE FROM repository_index_records
+       WHERE repository_id=$1 AND storage_key=$2 AND record_id = ANY($3::text[])`,
+    values: [repositoryId, storageKey, [...deletedRecordIds]]
+  };
+}
+
+export interface RepositoryIndexRecordBatchStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Upserts the per-record content rows that make a query answerable without the
+ * materialised document. Keyed identically to the vector rows, so one
+ * nearest-neighbour match names exactly one of these.
+ */
+export function buildRepositoryIndexRecordBatchStatement(
+  repositoryId: number,
+  records: readonly PersistedRecordRow[]
+): RepositoryIndexRecordBatchStatement | undefined {
+  if (!records.length) return undefined;
+  const values: unknown[] = [];
+  const rows: string[] = [];
+  for (const record of records) {
+    const firstPosition = values.length + 1;
+    values.push(
+      record.storageKey,
+      repositoryId,
+      record.repositoryScope,
+      record.commitSha,
+      record.recordType,
+      record.recordId,
+      record.path,
+      record.line,
+      record.endLine,
+      record.name,
+      record.content,
+      record.contentSha256,
+      record.summary ?? null
+    );
+    rows.push(
+      `(${Array.from({ length: 13 }, (_, offset) => `$${firstPosition + offset}`).join(",")})`
+    );
+  }
+  return {
+    text: `INSERT INTO repository_index_records
+       (storage_key, repository_id, repository_scope, commit_sha, record_type, record_id,
+        path, line, end_line, name, content, content_sha256, summary)
+       VALUES ${rows.join(",")}
+       ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
+         repository_id=excluded.repository_id,
+         repository_scope=excluded.repository_scope,
+         commit_sha=excluded.commit_sha,
+         path=excluded.path,
+         line=excluded.line,
+         end_line=excluded.end_line,
+         name=excluded.name,
+         content=excluded.content,
+         content_sha256=excluded.content_sha256,
+         summary=excluded.summary,
+         updated_at=now()`,
+    values
+  };
+}
+
+export interface RepositoryIndexVectorDeleteStatement {
+  text: string;
+  values: unknown[];
+}
+
+/**
+ * Scoped delete for the named records of one snapshot, fully parameterized.
+ *
+ * Carries the same two-predicate boundary as the read path: a delta delete is
+ * confined to one repository and one snapshot key, so caller-supplied record ids
+ * can never reach rows outside it. The ids are bound as a single text array
+ * rather than expanded into placeholders, so the statement text does not vary
+ * with the number of records being deleted.
+ *
+ * Extracted from the caller so the boundary itself is assertable without a
+ * server, as the query and batch paths already are.
+ */
+export function buildRepositoryIndexVectorDeleteStatement(
+  repositoryId: number,
+  storageKey: string,
+  deletedRecordIds: readonly string[]
+): RepositoryIndexVectorDeleteStatement {
+  return {
+    text: `DELETE FROM repository_index_vectors
+       WHERE repository_id=$1 AND storage_key=$2 AND record_id = ANY($3::text[])`,
+    values: [repositoryId, storageKey, [...deletedRecordIds]]
+  };
 }
 
 export interface RepositoryIndexVectorBatchStatement {
@@ -2672,15 +4706,25 @@ export function buildRepositoryIndexVectorBatchStatement(
       (_, offset) => `$${firstPosition + offset}`
     );
     if (usePgvector) {
+      // One bound literal feeds both vector columns. The dimensioned column is
+      // written only when this row's own width matches it, so a provider
+      // configured to another width still inserts cleanly with a NULL there and
+      // is served by the exact query path.
       values.push(vectorLiteral(vector.vector));
       placeholders.push(`$${firstPosition + 11}::vector`);
+      placeholders.push(
+        vector.dimensions === INDEXED_VECTOR_ANN_DIMENSIONS &&
+          vector.vector.length === INDEXED_VECTOR_ANN_DIMENSIONS
+          ? `$${firstPosition + 11}::vector(${INDEXED_VECTOR_ANN_DIMENSIONS})`
+          : "NULL"
+      );
     }
     rows.push(`(${placeholders.join(",")})`);
   }
   const text = usePgvector
     ? `INSERT INTO repository_index_vectors
        (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,
-        record_type, record_id, path, vector_json, vector_pgvector)
+        record_type, record_id, path, vector_json, vector_pgvector, vector_ann)
        VALUES ${rows.join(",")}
        ON CONFLICT (storage_key, record_type, record_id) DO UPDATE SET
          repository_id=excluded.repository_id,
@@ -2692,6 +4736,7 @@ export function buildRepositoryIndexVectorBatchStatement(
          path=excluded.path,
          vector_json=excluded.vector_json,
          vector_pgvector=excluded.vector_pgvector,
+         vector_ann=excluded.vector_ann,
          updated_at=now()`
     : `INSERT INTO repository_index_vectors
        (storage_key, repository_id, repository_scope, commit_sha, visibility, provider_id, dimensions,

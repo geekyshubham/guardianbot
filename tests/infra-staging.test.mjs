@@ -63,6 +63,49 @@ test("staging secrets are references generated into a root-only host file", () =
   assert.match(generator, /install -m 600/);
 });
 
+test("the production control-plane gates container health on readiness", () => {
+  const production = parse(fs.readFileSync(path.resolve("infra/docker-compose.yml"), "utf8"));
+  const probe = production.services["control-plane"].healthcheck.test.at(-1);
+  // /healthz answers 200 while the store is dead or the worker is wedged, so
+  // only /readyz turns a broken dependency into an unhealthy container.
+  assert.match(probe, /http:\/\/127\.0\.0\.1:3000\/readyz/);
+  assert.doesNotMatch(probe, /\/healthz/);
+  assert.equal(
+    production.services.caddy.depends_on["control-plane"].condition,
+    "service_healthy"
+  );
+});
+
+test("control-plane stop grace is strictly longer than the application drain budget", () => {
+  const production = parse(fs.readFileSync(path.resolve("infra/docker-compose.yml"), "utf8"));
+  const serverSource = fs.readFileSync(
+    path.resolve("apps/control-plane/src/server.ts"),
+    "utf8"
+  );
+  const drainMatch = /const DRAIN_BUDGET_MS = (\d[\d_]*);/.exec(serverSource);
+  assert.ok(drainMatch, "DRAIN_BUDGET_MS not declared");
+  const drainMs = Number(drainMatch[1].replaceAll("_", ""));
+
+  const grace = String(production.services["control-plane"].stop_grace_period ?? "");
+  const graceMatch = /^(\d+)(ms|s|m|h)$/.exec(grace);
+  assert.ok(graceMatch, `unrecognized stop_grace_period: ${grace}`);
+  const amount = Number(graceMatch[1]);
+  const unit = graceMatch[2];
+  const graceMs =
+    unit === "ms"
+      ? amount
+      : unit === "s"
+        ? amount * 1_000
+        : unit === "m"
+          ? amount * 60_000
+          : amount * 3_600_000;
+
+  assert.ok(
+    graceMs > drainMs,
+    `stop_grace_period ${grace} (${graceMs}ms) must exceed DRAIN_BUDGET_MS (${drainMs}ms)`
+  );
+});
+
 test("operator scripts pass Bash syntax validation", () => {
   for (const script of fs
     .readdirSync(path.join(root, "scripts"))

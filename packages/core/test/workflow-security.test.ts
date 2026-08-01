@@ -728,3 +728,155 @@ test("DAST profiles are bounded and preserve operational failure evidence", () =
     /headSha: process\.env\.GITHUB_SHA\.toLowerCase\(\),\s*scanProfile: contract\.scanProfile/
   );
 });
+
+test("pull request policy resolution binds onboarding state to the base commit", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import(
+    "node:fs"
+  );
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  // Onboarding state must never be derived from the head-supplied input, so the
+  // base lookup is pinned to the canonical location.
+  assert.doesNotMatch(workflow, /\$\{base_sha\}:\$\{config_path\}/);
+  assert.match(workflow, /\$\{base_sha\}:\$\{canonical_config_path\}/);
+
+  const resolutionStart = workflow.indexOf(
+    '          canonical_config_path=".guardianbot/config.yml"'
+  );
+  const resolutionEnd = workflow.indexOf("          docker run", resolutionStart);
+  assert.ok(resolutionStart >= 0);
+  assert.ok(resolutionEnd > resolutionStart);
+
+  const configResolution = [
+    "set -eo pipefail",
+    workflow
+      .slice(resolutionStart, resolutionEnd)
+      .split("\n")
+      .map((line) => {
+        if (line.length === 0) return line;
+        assert.match(line, /^ {10}/);
+        return line.slice(10);
+      })
+      .join("\n"),
+    'printf "%s\\n%s\\n" "$config_source" "$effective_config"'
+  ].join("\n");
+
+  const runGit = (directory: string, args: string[]): string => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+
+  const resolveConfig = (options: {
+    configPath: string;
+    onboarded: boolean;
+    baseSha?: string;
+  }) => {
+    const directory = mkdtempSync(join(tmpdir(), "guardianbot-config-source-"));
+    try {
+      runGit(directory, ["init", "--quiet", "--initial-branch=main", "."]);
+      runGit(directory, ["config", "user.email", "guardianbot@example.com"]);
+      runGit(directory, ["config", "user.name", "GuardianBot"]);
+      mkdirSync(join(directory, ".guardianbot"), { recursive: true });
+      if (options.onboarded) {
+        writeFileSync(
+          join(directory, ".guardianbot/config.yml"),
+          'schemaVersion: "1.0.0"\nscanners:\n  mode: enforce\n'
+        );
+      } else {
+        writeFileSync(
+          join(directory, ".guardianbot/placeholder.txt"),
+          "not onboarded\n"
+        );
+      }
+      runGit(directory, ["add", "--all"]);
+      runGit(directory, ["commit", "--quiet", "--message", "base"]);
+      const baseSha = options.baseSha ?? runGit(directory, ["rev-parse", "HEAD"]);
+      // The head commit always proposes advisory mode, so a successful
+      // downgrade is observable in the resolved configuration source.
+      writeFileSync(
+        join(directory, ".guardianbot/config.yml"),
+        'schemaVersion: "1.0.0"\nscanners:\n  mode: advisory\n'
+      );
+      writeFileSync(
+        join(directory, ".guardianbot/pr-config.yml"),
+        'schemaVersion: "1.0.0"\nscanners:\n  mode: advisory\n'
+      );
+      mkdirSync(join(directory, "guardianbot-evidence"), { recursive: true });
+      const result = spawnSync("bash", ["-c", configResolution], {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_EVENT_NAME: "pull_request",
+          PULL_REQUEST_BASE_SHA: baseSha,
+          config_path: options.configPath,
+          baseline_path: ".guardianbot/baseline.json"
+        }
+      });
+      const [configSource = "", effectiveConfig = ""] = result.stdout
+        .trim()
+        .split("\n");
+      return {
+        status: result.status,
+        stderr: result.stderr,
+        stdout: result.stdout,
+        configSource,
+        effectiveConfig
+      };
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  // An onboarded repository cannot be demoted to the first-onboarding path by
+  // repointing config-path at a file absent from the base commit.
+  const diverted = resolveConfig({
+    configPath: ".guardianbot/pr-config.yml",
+    onboarded: true
+  });
+  assert.notEqual(diverted.status, 0);
+  assert.notEqual(diverted.configSource, "head");
+  assert.match(
+    diverted.stdout,
+    /Onboarded repositories must pass config-path \.guardianbot\/config\.yml\./
+  );
+
+  // Legitimately onboarded callers keep resolving policy from the base blob.
+  const onboarded = resolveConfig({
+    configPath: ".guardianbot/config.yml",
+    onboarded: true
+  });
+  assert.equal(onboarded.status, 0, onboarded.stdout);
+  assert.equal(onboarded.configSource, "base");
+  assert.equal(
+    onboarded.effectiveConfig,
+    "guardianbot-evidence/effective-config.yml"
+  );
+
+  // The genuine first onboarding pull request still reaches its head config,
+  // where the separate mode check keeps it non-enforcing.
+  const firstOnboarding = resolveConfig({
+    configPath: ".guardianbot/config.yml",
+    onboarded: false
+  });
+  assert.equal(firstOnboarding.status, 0, firstOnboarding.stdout);
+  assert.equal(firstOnboarding.configSource, "head");
+  assert.equal(firstOnboarding.effectiveConfig, ".guardianbot/config.yml");
+
+  // An unreachable base commit fails closed instead of trusting head policy.
+  const unresolvable = resolveConfig({
+    configPath: ".guardianbot/config.yml",
+    onboarded: true,
+    baseSha: "0".repeat(40)
+  });
+  assert.notEqual(unresolvable.status, 0);
+  assert.notEqual(unresolvable.configSource, "head");
+  assert.match(
+    unresolvable.stdout,
+    /The pull request base commit is not available for policy resolution\./
+  );
+});

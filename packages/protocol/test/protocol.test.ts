@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import {
+  BackendError,
+  GuardianReviewClient,
   PROTOCOL_VERSION,
   ProtocolValidationError,
   validateReviewRequest,
@@ -8,6 +10,12 @@ import {
   type ReviewRequest,
   type ReviewResult
 } from "../src/index.js";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
 
 const request: ReviewRequest = {
   protocolVersion: PROTOCOL_VERSION,
@@ -131,5 +139,121 @@ test("rejects unknown scanner evidence references", () => {
   assert.throws(
     () => validateReviewResult(invalid, request),
     /references unknown scanner evidence/
+  );
+});
+
+/** Reject with AbortError when `init.signal` aborts; a forever-pending Promise alone never does. */
+function fetchPendingUntilAbort(
+  onSignal?: (signal: AbortSignal | undefined) => void
+): typeof fetch {
+  return async (_input, init) => {
+    const signal = init?.signal ?? undefined;
+    onSignal?.(signal);
+    return new Promise<Response>((_resolve, reject) => {
+      const abort = () =>
+        reject(new DOMException("The operation was aborted", "AbortError"));
+      if (!signal) return;
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+    });
+  };
+}
+
+test("external abort reaches fetch and is distinguishable from timeout", async () => {
+  const controller = new AbortController();
+  let observedSignal: AbortSignal | undefined;
+  globalThis.fetch = fetchPendingUntilAbort((signal) => {
+    observedSignal = signal;
+  });
+
+  const client = new GuardianReviewClient({
+    id: "bridge",
+    baseUrl: "https://bridge.example.test",
+    allowedClassifications: ["public"],
+    timeoutMs: 60_000
+  });
+
+  const pending = client.capabilities(controller.signal);
+  while (!observedSignal) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  controller.abort();
+  await assert.rejects(
+    () => pending,
+    (error: unknown) => error instanceof Error && error.name === "AbortError"
+  );
+  assert.equal(observedSignal.aborted, true);
+
+  // Timeout classification must remain distinct from external AbortError.
+  // Node's AbortSignal.timeout timer is unref'd; without a referenced handle the
+  // event loop can drain before the timeout fires (CI flake: "Promise resolution
+  // is still pending but the event loop has already resolved").
+  globalThis.fetch = fetchPendingUntilAbort();
+  const shortTimeout = new GuardianReviewClient({
+    id: "bridge",
+    baseUrl: "https://bridge.example.test",
+    allowedClassifications: ["public"],
+    timeoutMs: 20
+  });
+  const keepAlive = setTimeout(() => {}, 1_000);
+  try {
+    await assert.rejects(
+      () => shortTimeout.capabilities(),
+      (error: unknown) => error instanceof BackendError && error.code === "timeout"
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+test("external abort during stalled body read preserves AbortError", async () => {
+  const controller = new AbortController();
+  let bodyReading = false;
+  globalThis.fetch = async (_input, init) => {
+    const signal = init?.signal;
+    return new Response(
+      new ReadableStream({
+        start(streamController) {
+          const abort = () =>
+            streamController.error(
+              new DOMException("The operation was aborted", "AbortError")
+            );
+          if (signal?.aborted) {
+            abort();
+            return;
+          }
+          signal?.addEventListener("abort", abort, { once: true });
+          // Stall after headers so body read begins; never enqueue or close.
+          bodyReading = true;
+        }
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  const client = new GuardianReviewClient({
+    id: "bridge",
+    baseUrl: "https://bridge.example.test",
+    allowedClassifications: ["public"],
+    timeoutMs: 60_000
+  });
+
+  const pending = client.review(request, controller.signal);
+  while (!bodyReading) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  // Yield so readJsonResponseLimited is blocked in reader.read() before abort.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => pending,
+    (error: unknown) =>
+      error instanceof Error &&
+      error.name === "AbortError" &&
+      !(error instanceof BackendError)
   );
 });

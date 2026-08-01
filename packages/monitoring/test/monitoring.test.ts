@@ -366,3 +366,40 @@ test("buildWeeklyCoverageReport aggregates state and latency percentiles", () =>
 test("worstMonitoringStatus prefers failing over warning and passing", () => {
   assert.equal(worstMonitoringStatus(["passing", "warning", "failing"]), "failing");
 });
+
+test("evaluateIndexFreshness surfaces the truncation ratio so under-indexing is visible", () => {
+  const base = {
+    indexedAt: "2026-07-27T09:55:00.000Z",
+    warnAfterMs: 10 * 60_000,
+    failAfterMs: 20 * 60_000,
+    indexedCommitSha: "a".repeat(40),
+    expectedCommitSha: "a".repeat(40)
+  };
+
+  // A fresh index at the expected commit looks perfectly healthy to an age-based
+  // check even when a cap dropped most of the repository. The ratio is what makes
+  // that difference legible.
+  const truncated = evaluateIndexFreshness({ ...base, truncationRatio: 0.6 }, clock);
+  assert.equal(truncated.status, "warning");
+  assert.equal(truncated.metadata?.truncationRatio, 0.6);
+  assert.match(truncated.summary, /covers only 40%/);
+
+  // Full coverage is unchanged from the previous behaviour.
+  const complete = evaluateIndexFreshness({ ...base, truncationRatio: 0 }, clock);
+  assert.equal(complete.status, "passing");
+  assert.equal(complete.metadata?.truncationRatio, undefined);
+
+  // A small shortfall is reported without changing status, so one unreadable file
+  // does not read the same as a truncated repository.
+  const minor = evaluateIndexFreshness({ ...base, truncationRatio: 0.02 }, clock);
+  assert.equal(minor.status, "passing");
+  assert.equal(minor.metadata?.truncationRatio, 0.02);
+
+  // Staleness still outranks coverage: a stale index is not downgraded to warning.
+  const stale = evaluateIndexFreshness(
+    { ...base, indexedAt: "2026-07-27T08:00:00.000Z", truncationRatio: 0.9 },
+    clock
+  );
+  assert.equal(stale.status, "failing");
+  assert.equal(stale.metadata?.truncationRatio, 0.9);
+});

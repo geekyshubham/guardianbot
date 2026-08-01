@@ -25,7 +25,10 @@ export * from "./index/retrieval.js";
 export {
   buildRepositoryIndex,
   buildRepositoryIndexFallback,
-  type RepositoryIndexBuildOptions
+  buildRepositoryIndexIncremental,
+  type RepositoryIndexBuildOptions,
+  type RepositoryIndexIncrementalInput,
+  type RepositoryIndexIncrementalResult
 } from "./index/builder.js";
 
 export interface SyntaxAwareIndexOptions {

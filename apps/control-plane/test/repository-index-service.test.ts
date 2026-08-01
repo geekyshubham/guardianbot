@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  RepositoryIsolationError,
+  lexicalFeatureVector,
+  type RepositoryIndex
+} from "@guardianbot/core";
 import { RepositoryIndexService } from "../src/repository-index-service.js";
 import { MemoryStore, type RepositoryRecord } from "../src/store.js";
 
@@ -416,4 +421,541 @@ test("failed persistence leaves the prior repository index and repository pointe
   assert.equal(repository?.indexSha, firstSha);
   assert.ok(await store.getRepositoryIndex(42, "github:42", firstSha));
   assert.equal(await store.getRepositoryIndex(42, "github:42", secondSha), undefined);
+});
+
+/** One stubbed `base...head` comparison, including the status the API reports. */
+interface CompareStub {
+  files: { filename: string; previous_filename?: string }[];
+  /** Defaults to the forward-advance case that permits an incremental refresh. */
+  status?: string;
+}
+
+/** GitHub fake that serves a real recursive tree with blob SHAs, plus compare. */
+class FakeTreeGitHub {
+  blobReads: string[] = [];
+  contentReads: string[] = [];
+  comparePaths: string[] = [];
+  treeReads: string[] = [];
+
+  constructor(
+    private refSha: string,
+    private trees: Record<string, Record<string, string>>,
+    private compares: Record<string, CompareStub> = {}
+  ) {}
+
+  setRefSha(refSha: string): void {
+    this.refSha = refSha;
+  }
+
+  async getTree(): Promise<string[]> {
+    throw new Error("path-only tree listing must not be used when the tree API is available");
+  }
+
+  async request<T>(method: string, path: string): Promise<T> {
+    if (/\/git\/ref\/heads\//.test(path)) {
+      return { object: { sha: this.refSha } } as T;
+    }
+    const treeMatch = path.match(/\/git\/trees\/([^?]+)/);
+    if (treeMatch) {
+      const ref = decodeURIComponent(treeMatch[1]!);
+      this.treeReads.push(ref);
+      const files = this.trees[ref];
+      if (!files) throw new Error(`GitHub GET ${path} returned 404: no tree`);
+      return {
+        truncated: false,
+        tree: Object.entries(files).map(([filePath, content]) => ({
+          path: filePath,
+          type: "blob",
+          sha: blobSha(ref, filePath),
+          size: Buffer.byteLength(content, "utf8")
+        }))
+      } as T;
+    }
+    const blobMatch = path.match(/\/git\/blobs\/([^?]+)/);
+    if (blobMatch) {
+      const sha = decodeURIComponent(blobMatch[1]!);
+      this.blobReads.push(sha);
+      for (const [ref, files] of Object.entries(this.trees)) {
+        for (const [filePath, content] of Object.entries(files)) {
+          if (blobSha(ref, filePath) === sha) {
+            return {
+              encoding: "base64",
+              size: Buffer.byteLength(content, "utf8"),
+              content: Buffer.from(content, "utf8").toString("base64")
+            } as T;
+          }
+        }
+      }
+      throw new Error(`GitHub GET ${path} returned 404: no blob`);
+    }
+    const compareMatch = path.match(/\/compare\/([^.]+)\.\.\.(.+)$/);
+    if (compareMatch) {
+      const key = `${decodeURIComponent(compareMatch[1]!)}...${decodeURIComponent(compareMatch[2]!)}`;
+      this.comparePaths.push(key);
+      const stub = this.compares[key];
+      if (!stub) throw new Error(`GitHub GET ${path} returned 404: no comparison`);
+      return {
+        files: stub.files,
+        status: stub.status ?? "ahead",
+        total_commits: stub.files.length
+      } as T;
+    }
+    if (path.includes("/contents/")) {
+      this.contentReads.push(path);
+      throw new Error(`GitHub GET ${path} returned 404: contents read not expected`);
+    }
+    throw new Error(`Unhandled ${method} ${path}`);
+  }
+}
+
+function blobSha(ref: string, path: string): string {
+  return `blob-${ref.slice(0, 4)}-${path.replace(/[^a-z0-9]/gi, "-")}`;
+}
+
+test("incremental refresh re-reads only changed paths and carries the rest forward", async () => {
+  const baseSha = "1".repeat(40);
+  const headSha = "2".repeat(40);
+  const baseFiles = {
+    "src/keep.ts": "export function keep() { return 1; }\n",
+    "src/change.ts": "export function change() { return 2; }\n",
+    "src/drop.ts": "export function drop() { return 3; }\n"
+  };
+  const headFiles = {
+    "src/keep.ts": baseFiles["src/keep.ts"],
+    "src/change.ts": "export function change() { return 22; }\n"
+  };
+  const github = new FakeTreeGitHub(
+    baseSha,
+    { [baseSha]: baseFiles, [headSha]: headFiles },
+    {
+      [`${baseSha}...${headSha}`]: {
+        files: [{ filename: "src/change.ts" }, { filename: "src/drop.ts" }]
+      }
+    }
+  );
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const service = new RepositoryIndexService(store);
+  const input = {
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private" as const
+  };
+
+  const first = await service.refreshDefaultBranchIndex(input);
+  assert.equal(first.mode, "full");
+  assert.equal(github.blobReads.length, 3);
+  // Files are fetched by immutable blob id, never through GET /contents.
+  assert.deepEqual(github.contentReads, []);
+
+  github.setRefSha(headSha);
+  github.blobReads.length = 0;
+  const second = await service.refreshDefaultBranchIndex(input);
+
+  assert.equal(second.mode, "incremental");
+  assert.deepEqual(github.comparePaths, [`${baseSha}...${headSha}`]);
+  // Only the changed file is re-read; the unchanged one is carried forward.
+  assert.deepEqual(github.blobReads, [blobSha(headSha, "src/change.ts")]);
+  // The unchanged symbol's embedding is reused rather than recomputed.
+  assert.ok(second.reusedRecordCount > 0);
+
+  const index = await store.getRepositoryIndex(42, "github:42", headSha);
+  assert.deepEqual(
+    index?.files.map((file) => file.path),
+    ["src/change.ts", "src/keep.ts"]
+  );
+  // The removed path leaves no symbol behind.
+  assert.ok(!index?.symbols.some((symbol) => symbol.path === "src/drop.ts"));
+  assert.ok(index?.symbols.some((symbol) => symbol.content.includes("return 22")));
+  assert.ok(index?.symbols.every((symbol) => symbol.commitSha === headSha));
+  const repository = await store.getRepository(42);
+  assert.equal(repository?.indexSha, headSha);
+
+  // The incremental result must equal a full rebuild of the same head.
+  const rebuiltStore = new MemoryStore();
+  await rebuiltStore.upsertRepository(defaultRepository);
+  const rebuiltGithub = new FakeTreeGitHub(headSha, { [headSha]: headFiles });
+  await new RepositoryIndexService(rebuiltStore).refreshDefaultBranchIndex({
+    ...input,
+    github: rebuiltGithub
+  });
+  const rebuilt = await rebuiltStore.getRepositoryIndex(42, "github:42", headSha);
+  assert.equal(index?.contentSha256, rebuilt?.contentSha256);
+});
+
+test("refresh falls back to a full rebuild when the comparison is unavailable", async () => {
+  const baseSha = "3".repeat(40);
+  const headSha = "4".repeat(40);
+  const files = { "src/a.ts": "export function a() { return 1; }\n" };
+  // No compare entry is registered, so the comparison request fails.
+  const github = new FakeTreeGitHub(baseSha, {
+    [baseSha]: files,
+    [headSha]: { "src/a.ts": "export function a() { return 2; }\n" }
+  });
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const service = new RepositoryIndexService(store);
+  const input = {
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private" as const
+  };
+
+  await service.refreshDefaultBranchIndex(input);
+  github.setRefSha(headSha);
+  const second = await service.refreshDefaultBranchIndex(input);
+
+  // A missing delta degrades to existing behaviour rather than under-indexing.
+  assert.equal(second.mode, "full");
+  const index = await store.getRepositoryIndex(42, "github:42", headSha);
+  assert.ok(index?.symbols.some((symbol) => symbol.content.includes("return 2")));
+});
+
+test("a compare response at the file page cap rebuilds fully instead of carrying stale content forward", async () => {
+  const baseSha = "a1".repeat(20);
+  const headSha = "a2".repeat(20);
+  const github = new FakeTreeGitHub(
+    baseSha,
+    {
+      [baseSha]: {
+        "src/stale.ts": "export function stale() { return 1; }\n",
+        "src/keep.ts": "export function keep() { return 0; }\n"
+      },
+      [headSha]: {
+        "src/stale.ts": "export function stale() { return 999; }\n",
+        "src/keep.ts": "export function keep() { return 0; }\n"
+      }
+    },
+    {
+      // The comparison is truncated at GitHub's 300-entry page cap, so the one
+      // path that actually changed is absent from it. None of the 300 reported
+      // entries is an indexing candidate, so the incremental file cap does not
+      // reject this plan either: only the page-cap guard can.
+      [`${baseSha}...${headSha}`]: {
+        files: Array.from({ length: 300 }, (_, index) => ({
+          filename: `assets/blob-${String(index).padStart(3, "0")}.bin`
+        }))
+      }
+    }
+  );
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  const service = new RepositoryIndexService(store);
+  const input = {
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private" as const
+  };
+
+  await service.refreshDefaultBranchIndex(input);
+  github.setRefSha(headSha);
+  const second = await service.refreshDefaultBranchIndex(input);
+
+  // The comparison was consulted, then rejected for being possibly truncated.
+  assert.deepEqual(github.comparePaths, [`${baseSha}...${headSha}`]);
+  assert.equal(second.mode, "full");
+  const index = await store.getRepositoryIndex(42, "github:42", headSha);
+  // The changed path the comparison omitted must be published at its head
+  // content, never carried forward from the previous head.
+  assert.ok(index?.symbols.some((symbol) => symbol.content.includes("return 999")));
+  assert.equal(
+    index?.symbols.some((symbol) => symbol.content.includes("return 1;")),
+    false
+  );
+});
+
+test("a comparison that is not a forward advance rebuilds fully instead of publishing rewritten-away content", async () => {
+  for (const status of ["diverged", "behind", "identical"]) {
+    const baseSha = "b1".repeat(20);
+    const headSha = "b2".repeat(20);
+    const github = new FakeTreeGitHub(
+      baseSha,
+      {
+        [baseSha]: {
+          "src/rewritten.ts": "export function rewritten() { return 1; }\n",
+          "src/keep.ts": "export function keep() { return 0; }\n"
+        },
+        [headSha]: {
+          "src/rewritten.ts": "export function rewritten() { return 777; }\n",
+          "src/keep.ts": "export function keep() { return 0; }\n"
+        }
+      },
+      {
+        // The three-dot comparison reports the diff from the merge base, so a
+        // path whose base content came from a dropped commit is missing from it
+        // even though the tree at head disagrees with the previous index.
+        [`${baseSha}...${headSha}`]: { files: [], status }
+      }
+    );
+    const store = new MemoryStore();
+    await store.upsertRepository(defaultRepository);
+    const service = new RepositoryIndexService(store);
+    const input = {
+      github,
+      repositoryId: 42,
+      installationId: 1,
+      fullName: "Acme/Widget",
+      defaultBranch: "main",
+      visibility: "private" as const
+    };
+
+    await service.refreshDefaultBranchIndex(input);
+    github.setRefSha(headSha);
+    const second = await service.refreshDefaultBranchIndex(input);
+
+    assert.deepEqual(github.comparePaths, [`${baseSha}...${headSha}`], status);
+    assert.equal(second.mode, "full", status);
+    const index = await store.getRepositoryIndex(42, "github:42", headSha);
+    // A published index exists under the new head's storage key, and it agrees
+    // with the tree at head rather than with the rewritten-away base content.
+    assert.ok(
+      index?.symbols.some((symbol) => symbol.content.includes("return 777")),
+      status
+    );
+    assert.equal(
+      index?.symbols.some((symbol) => symbol.content.includes("return 1;")),
+      false,
+      status
+    );
+  }
+});
+
+test("indexing caps are constructor policy and surface a truncation ratio", async () => {
+  const commitSha = "5".repeat(40);
+  const files = Object.fromEntries(
+    Array.from({ length: 10 }, (_, index) => [
+      `src/file-${String(index).padStart(2, "0")}.ts`,
+      `export const value${index} = ${index};\n`
+    ])
+  );
+  const github = new FakeTreeGitHub(commitSha, { [commitSha]: files });
+  const store = new MemoryStore();
+  await store.upsertRepository(defaultRepository);
+  // The cap is policy, so it is set per service instance rather than being fixed.
+  const service = new RepositoryIndexService(store, { maxIndexedFiles: 4 });
+
+  const result = await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+
+  assert.equal(result.indexedFileCount, 4);
+  assert.equal(result.skipped.tooMany, 6);
+  assert.equal(result.partial, true);
+  // Under-indexing is visible as a ratio, not just as a boolean.
+  assert.equal(result.coverage.candidateFileCount, 10);
+  assert.equal(result.coverage.indexedFileCount, 4);
+  assert.equal(result.coverage.truncationRatio, 0.6);
+  assert.equal(result.coverage.fileCapReached, true);
+
+  const uncapped = new RepositoryIndexService(store);
+  const full = await uncapped.refreshDefaultBranchIndex({
+    github,
+    repositoryId: 42,
+    installationId: 1,
+    fullName: "Acme/Widget",
+    defaultBranch: "main",
+    visibility: "private"
+  });
+  assert.equal(full.coverage.truncationRatio, 0);
+  assert.equal(full.coverage.fileCapReached, false);
+});
+
+test("rejects a non-positive indexing cap rather than silently indexing nothing", () => {
+  assert.throws(
+    () => new RepositoryIndexService(new MemoryStore(), { maxIndexedFiles: 0 }),
+    /maxIndexedFiles must be a positive integer/
+  );
+});
+
+/** A store that answers a correctly-scoped read with another repository's rows. */
+class ForeignRowStore extends MemoryStore {
+  constructor(private readonly foreignScope: string) {
+    super();
+  }
+
+  override async queryRepositoryIndexVectors(
+    ...args: Parameters<MemoryStore["queryRepositoryIndexVectors"]>
+  ) {
+    const matches = await super.queryRepositoryIndexVectors(...args);
+    return matches.map((match) => ({
+      ...match,
+      row: { ...match.row, repositoryScope: this.foreignScope }
+    }));
+  }
+
+  override async hydrateRepositoryIndexRecords(
+    ...args: Parameters<MemoryStore["hydrateRepositoryIndexRecords"]>
+  ) {
+    const rows = await super.hydrateRepositoryIndexRecords(...args);
+    return rows.map((row) => ({ ...row, repositoryScope: this.foreignScope }));
+  }
+}
+
+async function publishIndex(
+  store: MemoryStore,
+  repositoryId = defaultRepository.repositoryId
+): Promise<RepositoryIndex> {
+  await store.upsertRepository({ ...defaultRepository, repositoryId });
+  const github = new FakeGitHub("d".repeat(40), ["src/auth.ts"], {
+    "src/auth.ts": {
+      content: Buffer.from("export function authorize(user) { return user.role === 'admin'; }\n")
+    }
+  });
+  const service = new RepositoryIndexService(store);
+  await service.refreshDefaultBranchIndex({
+    github,
+    repositoryId,
+    installationId: defaultRepository.installationId,
+    fullName: defaultRepository.fullName,
+    defaultBranch: defaultRepository.defaultBranch,
+    visibility: "private"
+  });
+  const index = await store.getRepositoryIndex(
+    repositoryId,
+    `github:${repositoryId}`,
+    "d".repeat(40)
+  );
+  assert.ok(index);
+  return index;
+}
+
+test("the durable ranker adapter binds one repository and re-checks what the store returned", async () => {
+  const store = new MemoryStore();
+  const index = await publishIndex(store);
+  const service = new RepositoryIndexService(store);
+  const ranker = service.repositoryVectorRanker(defaultRepository.repositoryId);
+  const vector = lexicalFeatureVector("authorize admin", index.embedding.dimensions);
+
+  // The adapter closes over the numeric repository id, which is the whole reason it
+  // exists: Store.queryRepositoryIndexVectors leads with that id and
+  // RepositoryVectorRanker.query has nowhere to put it.
+  const matches = await ranker.query({
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha,
+    providerId: index.embedding.providerId,
+    vector,
+    limit: 50
+  });
+  assert.ok(matches.length > 0);
+  assert.ok(matches.every((match) => match.row.repositoryScope === index.repositoryScope));
+  assert.ok(matches.every((match) => match.row.commitSha === index.commitSha));
+
+  const hydrated = await ranker.hydrateRecords!({
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha,
+    records: matches.map((match) => ({
+      recordType: match.row.recordType,
+      recordId: match.row.recordId
+    }))
+  });
+  assert.ok(hydrated.length > 0);
+  assert.ok(hydrated.every((row) => row.repositoryScope === index.repositoryScope));
+
+  // A request naming a repository this ranker was not bound to is refused rather
+  // than forwarded, so a bound id and a requested scope can never disagree.
+  const otherScope = `github:${defaultRepository.repositoryId + 1}`;
+  await assert.rejects(
+    ranker.query({
+      repositoryScope: otherScope,
+      commitSha: index.commitSha,
+      providerId: index.embedding.providerId,
+      vector,
+      limit: 50
+    }),
+    RepositoryIsolationError
+  );
+  await assert.rejects(
+    ranker.hydrateRecords!({
+      repositoryScope: otherScope,
+      commitSha: index.commitSha,
+      records: [{ recordType: "symbol", recordId: "any" }]
+    }),
+    RepositoryIsolationError
+  );
+});
+
+test("the durable ranker adapter rejects a foreign row instead of ranking it", async () => {
+  // The store is asked correctly and still answers with another repository's scope.
+  // Retrieval re-checks rows against the loaded document, but that check cannot see
+  // a document that is itself the wrong repository's; this one compares against the
+  // numeric id the caller actually asked about.
+  const foreignScope = `github:${defaultRepository.repositoryId + 1}`;
+  const store = new ForeignRowStore(foreignScope);
+  const index = await publishIndex(store);
+  const service = new RepositoryIndexService(store);
+  const ranker = service.repositoryVectorRanker(defaultRepository.repositoryId);
+  const vector = lexicalFeatureVector("authorize admin", index.embedding.dimensions);
+
+  await assert.rejects(
+    ranker.query({
+      repositoryScope: index.repositoryScope,
+      commitSha: index.commitSha,
+      providerId: index.embedding.providerId,
+      vector,
+      limit: 50
+    }),
+    RepositoryIsolationError
+  );
+  await assert.rejects(
+    ranker.hydrateRecords!({
+      repositoryScope: index.repositoryScope,
+      commitSha: index.commitSha,
+      records: index.symbols.map((symbol) => ({
+        recordType: "symbol" as const,
+        recordId: symbol.id
+      }))
+    }),
+    RepositoryIsolationError
+  );
+});
+
+test("the retrieval embedding provider reconstructs the stored space or declines", async () => {
+  const store = new MemoryStore();
+  const index = await publishIndex(store);
+  const service = new RepositoryIndexService(store);
+
+  // Without this, retrieval holds no query vector and ignores the ranker entirely,
+  // so the durable path would be wired and still dormant.
+  const provider = service.retrievalEmbeddingProvider(index);
+  assert.ok(provider);
+  assert.equal(provider.id, index.embedding.providerId);
+  assert.equal(provider.dimensions, index.embedding.dimensions);
+
+  // A different embedding space is declined rather than approximated: comparing a
+  // lexical hash to another provider's output returns confident nonsense.
+  assert.equal(
+    service.retrievalEmbeddingProvider({
+      ...index,
+      embedding: { ...index.embedding, kind: "local-model" }
+    }),
+    undefined
+  );
+  assert.equal(
+    service.retrievalEmbeddingProvider({
+      ...index,
+      embedding: { ...index.embedding, providerId: "some-other-provider-v1" }
+    }),
+    undefined
+  );
+  assert.equal(
+    service.retrievalEmbeddingProvider({
+      ...index,
+      embedding: { ...index.embedding, dimensions: 4 }
+    }),
+    undefined
+  );
 });

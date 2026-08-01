@@ -1,15 +1,21 @@
 import { posix } from "node:path";
-import { cosineSimilarity } from "./lexical.js";
+import { cosineSimilarity, sha256 } from "./lexical.js";
 import type {
+  IndexedHistory,
+  PersistedRecordRow,
   PersistedVectorRow,
   RepositoryIdentity,
   RepositoryIndex,
   RepositoryIndexInput,
   RepositoryIndexPersistence,
   RepositoryIndexReference,
+  RepositoryRecordHydrationRequest,
   RepositoryVectorMatch,
   RepositoryVectorQuery
 } from "./types.js";
+
+/** Fallback path for a history record that names no file. */
+export const HISTORY_RECORD_PATH = ".guardianbot/history";
 
 const INDEX_STORAGE_PREFIX = "guardianbot/repository-index/v2";
 
@@ -141,6 +147,77 @@ export function toPersistedVectorRows(index: RepositoryIndex): PersistedVectorRo
   ];
 }
 
+/**
+ * The single definition of a history record's retrievable content. Retrieval
+ * renders this from the materialised document and durable hydration stores it, so
+ * both paths must agree byte-for-byte or the two would score differently. It
+ * lives here, beside the row projection, so neither path can drift from it.
+ */
+export function renderHistoryRecordContent(entry: IndexedHistory): string {
+  return [
+    `Commit: ${entry.commitSha}`,
+    entry.path ? `Path: ${entry.path}` : undefined,
+    entry.author ? `Author: ${entry.author}` : undefined,
+    entry.authoredAt ? `Authored-At: ${entry.authoredAt}` : undefined,
+    "",
+    entry.summary
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+/**
+ * Projects the index into the per-record rows a query needs to build candidates
+ * without loading the whole document. It is the write-side counterpart of
+ * `hydrateRecords`, and is keyed identically to `toPersistedVectorRows` so a
+ * nearest-neighbour match names exactly one of these rows.
+ */
+export function toPersistedRecordRows(index: RepositoryIndex): PersistedRecordRow[] {
+  assertIndexReference(index, index);
+  const common = {
+    storageKey: index.storageKey,
+    repositoryScope: index.repositoryScope,
+    commitSha: index.commitSha
+  };
+  return [
+    ...index.symbols.map((symbol): PersistedRecordRow => ({
+      ...common,
+      recordType: "symbol",
+      recordId: symbol.id,
+      path: symbol.path,
+      line: symbol.line,
+      endLine: symbol.endLine,
+      name: symbol.name,
+      content: symbol.content,
+      contentSha256: symbol.contentSha256
+    })),
+    ...index.history.map((entry): PersistedRecordRow => {
+      const content = renderHistoryRecordContent(entry);
+      return {
+        ...common,
+        recordType: "history",
+        recordId: entry.id,
+        path: entry.path ?? HISTORY_RECORD_PATH,
+        line: 1,
+        endLine: 1,
+        // A history record has no symbol name. Its commit is the closest stable
+        // identifier, and name-based matching uses `summary` for these rows.
+        name: entry.commitSha,
+        content,
+        contentSha256: sha256(content),
+        summary: entry.summary
+      };
+    })
+  ];
+}
+
+export function compareRecordRows(left: PersistedRecordRow, right: PersistedRecordRow): number {
+  if (left.recordType !== right.recordType) {
+    return left.recordType < right.recordType ? -1 : 1;
+  }
+  return left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0;
+}
+
 function cloneIndex(index: RepositoryIndex): RepositoryIndex {
   return structuredClone(index);
 }
@@ -148,6 +225,7 @@ function cloneIndex(index: RepositoryIndex): RepositoryIndex {
 export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersistence {
   readonly #indexes = new Map<string, RepositoryIndex>();
   readonly #vectors = new Map<string, PersistedVectorRow[]>();
+  readonly #records = new Map<string, Map<string, PersistedRecordRow>>();
 
   async replace(index: RepositoryIndex, vectors: readonly PersistedVectorRow[]): Promise<void> {
     assertIndexReference(index, index);
@@ -187,6 +265,12 @@ export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersis
       index.storageKey,
       vectors.map((row) => structuredClone(row))
     );
+    this.#records.set(
+      index.storageKey,
+      new Map(
+        toPersistedRecordRows(index).map((row) => [`${row.recordType}:${row.recordId}`, row])
+      )
+    );
   }
 
   async load(reference: RepositoryIndexReference): Promise<RepositoryIndex | undefined> {
@@ -195,6 +279,36 @@ export class InMemoryRepositoryIndexPersistence implements RepositoryIndexPersis
     if (!index) return undefined;
     assertIndexReference(index, reference);
     return cloneIndex(index);
+  }
+
+  /**
+   * Bounded per-match content fetch. The canonical storage key is derived from
+   * the requested scope and commit, exactly as in `query`, so a caller-supplied
+   * record id can only ever resolve inside the requested repository snapshot: two
+   * repositories holding byte-identical content still hold separate row maps.
+   */
+  async hydrateRecords(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]> {
+    if (request.records.length > 1_000) {
+      throw new RangeError("record hydration is limited to 1000 records per request");
+    }
+    if (!request.records.length) return [];
+    const key = repositoryIndexStorageKey(request);
+    const index = this.#indexes.get(key);
+    if (!index) return [];
+    assertIndexReference(index, request);
+    const rows = this.#records.get(key);
+    if (!rows) return [];
+    const hydrated = new Map<string, PersistedRecordRow>();
+    for (const reference of request.records) {
+      const recordKey = `${reference.recordType}:${reference.recordId}`;
+      const row = rows.get(recordKey);
+      if (row && !hydrated.has(recordKey)) {
+        hydrated.set(recordKey, structuredClone(row));
+      }
+    }
+    return [...hydrated.values()].sort(compareRecordRows);
   }
 
   async query(request: RepositoryVectorQuery): Promise<RepositoryVectorMatch[]> {

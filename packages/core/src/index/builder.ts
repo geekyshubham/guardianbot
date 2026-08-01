@@ -29,6 +29,35 @@ export interface RepositoryIndexBuildOptions {
   embeddingProvider: LocalEmbeddingProvider;
 }
 
+export interface RepositoryIndexIncrementalInput {
+  /** Index published for the previous head of the same repository. */
+  previous: RepositoryIndex;
+  /** Content for paths that were added or modified between the two commits. */
+  changedFiles: Record<string, string>;
+  /** Paths that no longer exist at the new head. */
+  removedPaths?: readonly string[];
+  commitSha: string;
+  repository?: string;
+  repositoryId?: string | number;
+  repositoryScope?: string;
+  visibility?: RepositoryIndex["visibility"];
+  history?: readonly RepositoryHistoryInput[];
+  indexedAt?: string;
+}
+
+export interface RepositoryIndexIncrementalResult {
+  index: RepositoryIndex;
+  /** Paths parsed from freshly fetched content. */
+  reindexedPaths: string[];
+  /** Paths carried forward from the previous index without refetching. */
+  carriedPaths: string[];
+  removedPaths: string[];
+  /** Embedding texts that had to be embedded because no prior vector matched. */
+  embeddedRecordCount: number;
+  /** Embedding texts served from the previous index by content digest. */
+  reusedRecordCount: number;
+}
+
 interface NormalizedFile {
   path: string;
   content: string;
@@ -424,6 +453,184 @@ function finalizeIndex(
     history,
     embedding,
     createdAt: prepared.createdAt
+  };
+}
+
+/**
+ * Rebuilds the parser output for a path that did not change between two commits,
+ * from the previously published index alone. It exists so an incremental refresh
+ * never refetches or reparses unchanged content.
+ *
+ * Every identifier in the result is a *local* id. `prepareIndex` recomputes the
+ * durable ids from the new commit, which is required rather than optional: both
+ * symbol ids and the storage key are commit-scoped, so no row may be carried
+ * across commits under its old identity.
+ */
+function reconstructParsedFile(
+  previous: RepositoryIndex,
+  file: IndexedFile
+): ParsedSourceFile {
+  return {
+    path: file.path,
+    language: file.language,
+    parser: file.parser,
+    parserId: file.parserId,
+    contentSha256: file.contentSha256,
+    lineCount: file.lineCount,
+    diagnostic: file.diagnostic,
+    symbols: previous.symbols
+      .filter((symbol) => symbol.path === file.path)
+      .map((symbol) => ({
+        localId: symbol.id,
+        name: symbol.name,
+        qualifiedName: symbol.qualifiedName,
+        kind: symbol.kind,
+        line: symbol.line,
+        endLine: symbol.endLine,
+        content: symbol.content
+      })),
+    imports: previous.imports
+      .filter((entry) => entry.path === file.path)
+      .map((entry) => ({
+        line: entry.line,
+        source: entry.source,
+        names: [...entry.names],
+        kind: entry.kind,
+        containingSymbolLocalId: entry.containingSymbolId
+      })),
+    calls: previous.calls
+      .filter((call) => call.path === file.path)
+      .map((call) => ({
+        line: call.line,
+        target: call.target,
+        callerSymbolLocalId: call.callerSymbolId
+      }))
+  };
+}
+
+/**
+ * Reuses a previously computed vector for identical content. Embeddings are
+ * deterministic and content-addressed by contract, so an unchanged
+ * `contentSha256` under the same provider yields an identical vector. The
+ * provider identity and dimensions are both checked, so a provider or dimension
+ * change forces a full re-embed rather than mixing incomparable vector spaces.
+ */
+function reusableVectorsByDigest(
+  previous: RepositoryIndex,
+  provider: LocalEmbeddingProvider
+): Map<string, number[]> {
+  const reusable = new Map<string, number[]>();
+  if (
+    previous.embedding.providerId !== provider.id ||
+    previous.embedding.kind !== provider.kind ||
+    previous.embedding.dimensions !== provider.dimensions
+  ) {
+    return reusable;
+  }
+  for (const symbol of previous.symbols) {
+    if (symbol.vector.length === provider.dimensions) {
+      reusable.set(symbol.contentSha256, [...symbol.vector]);
+    }
+  }
+  for (const entry of previous.history) {
+    if (entry.vector.length === provider.dimensions) {
+      reusable.set(entry.contentSha256, [...entry.vector]);
+    }
+  }
+  return reusable;
+}
+
+/**
+ * Builds the index for a new head by reparsing only the supplied changed paths
+ * and carrying every other path forward from `previous`. The result is
+ * indistinguishable from a full rebuild over the same file set: all durable ids,
+ * the call graph, and `contentSha256` are recomputed from the new commit.
+ */
+export async function buildRepositoryIndexIncremental(
+  input: RepositoryIndexIncrementalInput,
+  options: RepositoryIndexBuildOptions
+): Promise<RepositoryIndexIncrementalResult> {
+  const provider = options.embeddingProvider;
+  validateProvider(provider);
+  const previous = input.previous;
+  const changedFiles = normalizeFiles(input.changedFiles);
+  const changedPaths = new Set(changedFiles.map((file) => file.path));
+  const removedPaths = new Set(
+    (input.removedPaths ?? []).map((path) => normalizeRepositoryPath(path))
+  );
+  for (const path of removedPaths) {
+    if (changedPaths.has(path)) {
+      throw new Error(`path cannot be both changed and removed: ${JSON.stringify(path)}`);
+    }
+  }
+
+  const carriedFiles = previous.files.filter(
+    (file) => !changedPaths.has(file.path) && !removedPaths.has(file.path)
+  );
+  const parser = options.parser ?? new TreeSitterSourceParser();
+  const parsedChanged = await parseFiles(changedFiles, parser);
+  const parsedFiles = [
+    ...parsedChanged,
+    ...carriedFiles.map((file) => reconstructParsedFile(previous, file))
+  ].sort((left, right) => compareText(left.path, right.path));
+
+  const prepared = prepareIndex(
+    {
+      repository: input.repository ?? previous.repository,
+      repositoryId: input.repositoryId,
+      repositoryScope: input.repositoryScope ?? previous.repositoryScope,
+      visibility: input.visibility ?? previous.visibility,
+      commitSha: input.commitSha,
+      files: {},
+      history: input.history ? [...input.history] : undefined,
+      indexedAt: input.indexedAt
+    },
+    parsedFiles
+  );
+  if (prepared.repositoryScope !== previous.repositoryScope) {
+    throw new Error("incremental index cannot change the repository isolation scope");
+  }
+
+  const reusable = reusableVectorsByDigest(previous, provider);
+  const digests = [
+    ...prepared.symbols.map((symbol) => symbol.contentSha256),
+    ...prepared.history.map((entry) => entry.contentSha256)
+  ];
+  const texts = [
+    ...prepared.symbols.map((symbol) => symbol.content),
+    ...prepared.history.map((entry) => entry.summary)
+  ];
+  const missingPositions = digests
+    .map((digest, position) => (reusable.has(digest) ? undefined : position))
+    .filter((position): position is number => position !== undefined);
+  const embedded = missingPositions.length
+    ? validateEmbeddingVectors(
+        await provider.embed(missingPositions.map((position) => texts[position]!)),
+        missingPositions.length,
+        provider.dimensions
+      )
+    : [];
+  const vectors = digests.map((digest) => reusable.get(digest));
+  missingPositions.forEach((position, offset) => {
+    vectors[position] = embedded[offset]!;
+  });
+
+  return {
+    index: finalizeIndex(
+      prepared,
+      provider,
+      vectors.map((vector, position) => {
+        if (!vector) {
+          throw new Error(`no embedding was produced for record ${position}`);
+        }
+        return vector;
+      })
+    ),
+    reindexedPaths: parsedChanged.map((file) => file.path).sort(compareText),
+    carriedPaths: carriedFiles.map((file) => file.path).sort(compareText),
+    removedPaths: [...removedPaths].sort(compareText),
+    embeddedRecordCount: missingPositions.length,
+    reusedRecordCount: digests.length - missingPositions.length
   };
 }
 

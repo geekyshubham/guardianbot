@@ -9,15 +9,69 @@ import {
 } from "./lexical.js";
 import {
   assertIndexReference,
-  normalizeRepositoryPath
+  HISTORY_RECORD_PATH,
+  normalizeRepositoryPath,
+  renderHistoryRecordContent
 } from "./storage.js";
 import type {
   IndexedHistory,
   IndexedSymbol,
   LocalEmbeddingProvider,
+  PersistedRecordRow,
   RepositoryIndex,
+  RepositoryRecordHydrationRequest,
+  RepositoryVectorMatch,
+  RepositoryVectorQuery,
   RepositoryVisibility
 } from "./types.js";
+
+/**
+ * The seam between retrieval and durable storage. Nearest-neighbour recall is the
+ * only part of retrieval that must consider every vector, so it is the part that
+ * cannot scale inside one materialised index document. A ranker moves that scan
+ * into storage, which can answer it with an ANN index scoped to one repository.
+ *
+ * `InMemoryRepositoryIndexPersistence` and a PostgreSQL/pgvector store both
+ * satisfy this structurally through their `query` method, so the in-memory
+ * reference implementation and a durable adapter are interchangeable here.
+ *
+ * A ranker that also implements `hydrateRecords` turns recalled records the
+ * document does not contain into candidates. That is what removes the requirement
+ * to hold a whole snapshot in memory to answer one query, and it is what makes a
+ * record that exists durably but not in the loaded document retrievable at all.
+ *
+ * What a ranker does NOT do is decide rank. See `candidateRelevance`: scores are
+ * always recomputed locally, because a store's score has store-specific polarity.
+ *
+ * Graph edges still come from the materialised document: `caller` and `callee`
+ * candidates are derived from `index.calls`, which no per-record durable row can
+ * reconstruct. See `sourceThroughDurableStorage` for what is and is not durable.
+ */
+export interface RepositoryVectorRanker {
+  /**
+   * Nearest-neighbour recall over one repository snapshot.
+   *
+   * `RepositoryVectorMatch.score` selects and orders what storage returns; it is
+   * deliberately NOT the number any candidate is ranked by. Stores disagree on
+   * what a vector score even means — pgvector's `<=>` is cosine DISTANCE, so a
+   * pgvector path must return `1 - (<=>)` to express similarity, while a
+   * non-pgvector fallback computes cosine similarity directly — and a seam whose
+   * ordering inverted depending on which path answered would be worthless. So the
+   * boundary normalises: retrieval recomputes every candidate's relevance locally
+   * from the record's own vector, whatever the store reported. A store that
+   * returned distance where another returned similarity can therefore change which
+   * records are recalled, and can never change how any candidate is ranked.
+   */
+  query(request: RepositoryVectorQuery): Promise<RepositoryVectorMatch[]>;
+  /**
+   * Optional. When present, nearest-neighbour matches whose records are absent
+   * from the materialised document are hydrated into candidates through a single
+   * batched fetch per repository.
+   */
+  hydrateRecords?(
+    request: RepositoryRecordHydrationRequest
+  ): Promise<PersistedRecordRow[]>;
+}
 
 export interface IndexChangedLineRange {
   start: number;
@@ -106,6 +160,20 @@ export interface RepositoryContextRequest {
   primaryPolicy?: RepositoryAccessPolicy;
   related?: readonly RelatedRepositoryContext[];
   embeddingProvider?: LocalEmbeddingProvider;
+  /**
+   * Optional durable ranker. When supplied together with an embedding provider
+   * and a query, nearest-neighbour RECALL comes from storage: records the loaded
+   * document does not contain become retrievable. It does not change how anything
+   * is scored — every candidate is ranked by the same local cosine either way — so
+   * omitting it can only narrow what is reachable, never reorder it.
+   */
+  vectorRanker?: RepositoryVectorRanker;
+  /**
+   * Records to request from the ranker per repository. It bounds the durable
+   * query independently of the context limit so recall can consider more records
+   * than are ultimately returned.
+   */
+  vectorRankerLimit?: number;
 }
 
 export interface RepositoryContextResult {
@@ -125,6 +193,13 @@ export class RepositoryIsolationError extends Error {
 
 interface Candidate {
   id: string;
+  /**
+   * Persisted vector row identity. It is what decides whether a record a durable
+   * query recalled is already present in a loaded document, and so whether it
+   * needs hydrating into a candidate at all.
+   */
+  recordId: string;
+  recordType: "symbol" | "history";
   repositoryScope: string;
   commitSha: string;
   source: RetrievedRepositoryContext["source"];
@@ -364,7 +439,7 @@ export function authorizeRelatedRepository(
 }
 
 function symbolIntersectsChangedLines(
-  symbol: IndexedSymbol,
+  symbol: Pick<IndexedSymbol, "line" | "endLine">,
   change: NormalizedChange
 ): boolean {
   if (!change.changedLines?.length) return true;
@@ -403,6 +478,20 @@ function isConfigPath(path: string): boolean {
   );
 }
 
+/**
+ * The stable candidate identity. Both the materialised and the durable sourcing
+ * path derive it from the same three fields, so one record cannot present two
+ * identities depending on where it came from. It also feeds the deterministic
+ * tie-break, so a drift here would reorder equal scores between the two paths.
+ */
+function candidateId(
+  repositoryScope: string,
+  recordId: string,
+  kind: RetrievedContextKind
+): string {
+  return sha256(`${repositoryScope}\u0000${recordId}\u0000${kind}`);
+}
+
 function candidateFromSymbol(
   index: RepositoryIndex,
   symbol: IndexedSymbol,
@@ -411,7 +500,9 @@ function candidateFromSymbol(
   baseScore: number
 ): Candidate {
   return {
-    id: sha256(`${index.repositoryScope}\u0000${symbol.id}\u0000${kind}`),
+    id: candidateId(index.repositoryScope, symbol.id, kind),
+    recordId: symbol.id,
+    recordType: "symbol",
     repositoryScope: index.repositoryScope,
     commitSha: index.commitSha,
     source,
@@ -432,18 +523,11 @@ function candidateFromHistory(
   source: Candidate["source"],
   baseScore: number
 ): Candidate {
-  const content = [
-    `Commit: ${entry.commitSha}`,
-    entry.path ? `Path: ${entry.path}` : undefined,
-    entry.author ? `Author: ${entry.author}` : undefined,
-    entry.authoredAt ? `Authored-At: ${entry.authoredAt}` : undefined,
-    "",
-    entry.summary
-  ]
-    .filter((line): line is string => line !== undefined)
-    .join("\n");
+  const content = renderHistoryRecordContent(entry);
   return {
-    id: sha256(`${index.repositoryScope}\u0000${entry.id}\u0000history`),
+    id: candidateId(index.repositoryScope, entry.id, "history"),
+    recordId: entry.id,
+    recordType: "history",
     repositoryScope: index.repositoryScope,
     commitSha: index.commitSha,
     source,
@@ -620,6 +704,294 @@ async function queryVectorForProvider(
   return vectors[0];
 }
 
+interface DurableClassification {
+  kind: RetrievedContextKind;
+  baseScore: number;
+}
+
+/**
+ * Classifies one durable record row into the same candidate kinds the
+ * materialised path would produce for it, using only durably-sourced fields.
+ *
+ * Every predicate here is deliberately a subset of its counterpart in
+ * `primaryCandidates`: a symbol's path, line span, name, and content are all
+ * durable, so path classification and changed-line intersection are exact, but a
+ * `caller`/`callee` edge needs `index.calls` and a test's call-based relation
+ * needs it too, so those are omitted rather than approximated. Because the set is
+ * a subset, sourcing durably can only ever add candidates for records the
+ * document does not contain; it can never invent one the document would reject.
+ * That is what keeps both paths' ordering identical.
+ */
+function classifyDurableRecord(
+  row: PersistedRecordRow,
+  source: Candidate["source"],
+  selectedPaths: ReadonlySet<string>,
+  changesByPath: ReadonlyMap<string, NormalizedChange>,
+  changedNames: ReadonlySet<string>,
+  query: string
+): DurableClassification[] {
+  const classifications: DurableClassification[] = [];
+  const lowerNames = [...changedNames];
+  if (row.recordType === "history") {
+    const summary = (row.summary ?? "").toLowerCase();
+    const matches =
+      source === "primary"
+        ? (row.path !== HISTORY_RECORD_PATH && selectedPaths.has(row.path)) ||
+          lowerNames.some((name) => summary.includes(name)) ||
+          Boolean(query && summary.includes(query.toLowerCase()))
+        : lowerNames.some((name) => summary.includes(name)) ||
+          Boolean(query && lexicalOverlapScore(query, row.summary ?? "") > 0);
+    if (matches) {
+      classifications.push({ kind: "history", baseScore: source === "primary" ? 68 : 45 });
+    }
+    return classifications;
+  }
+
+  const supportAdjustment = source === "primary" ? 0 : -18;
+  if (source === "primary") {
+    const change = changesByPath.get(row.path);
+    if (
+      selectedPaths.has(row.path) &&
+      change &&
+      symbolIntersectsChangedLines({ line: row.line, endLine: row.endLine }, change)
+    ) {
+      classifications.push({ kind: "changed-symbol", baseScore: 110 });
+    }
+  } else {
+    const lowerContent = row.content.toLowerCase();
+    const relevant =
+      changedNames.has(row.name.toLowerCase()) ||
+      lowerNames.some((name) => lowerContent.includes(name)) ||
+      (query ? lexicalOverlapScore(query, row.content) > 0 : false);
+    if (relevant) {
+      classifications.push(
+        isTestPath(row.path)
+          ? { kind: "test", baseScore: 63 }
+          : { kind: "callee", baseScore: 66 }
+      );
+    }
+  }
+
+  if (isOwnershipPath(row.path)) {
+    classifications.push({ kind: "ownership", baseScore: 76 + supportAdjustment });
+  } else if (isSchemaPath(row.path)) {
+    classifications.push({ kind: "schema", baseScore: 74 + supportAdjustment });
+  } else if (isConfigPath(row.path)) {
+    classifications.push({ kind: "config", baseScore: 72 + supportAdjustment });
+  }
+
+  if (source === "primary" && isTestPath(row.path)) {
+    const lowerContent = row.content.toLowerCase();
+    if (lowerNames.some((name) => lowerContent.includes(name))) {
+      classifications.push({ kind: "test", baseScore: 90 });
+    }
+  }
+  return classifications;
+}
+
+/**
+ * Repository-qualified record identity. A record id is unique only within one
+ * repository snapshot, so the scope is part of the key: without it, two
+ * repositories each holding a record of the same name would collide here.
+ */
+function recordIdentityKey(
+  repositoryScope: string,
+  recordType: Candidate["recordType"],
+  recordId: string
+): string {
+  return [repositoryScope, recordType, recordId].join("\u0000");
+}
+
+/**
+ * Every record the loaded documents actually contain, keyed by record identity.
+ *
+ * Durable sourcing consults this to decide what to hydrate, and it is derived
+ * from the documents' own records rather than from the candidates enumerated out
+ * of them. That distinction is what preserves the in-memory path byte-for-byte: a
+ * record a document holds but did not turn into a candidate (an unchanged symbol,
+ * say) stays a non-candidate instead of being re-admitted through hydration under
+ * the narrower durable classification rules.
+ */
+function materialisedRecordKeys(indexes: readonly RepositoryIndex[]): Set<string> {
+  const keys = new Set<string>();
+  for (const index of indexes) {
+    for (const symbol of index.symbols) {
+      keys.add(recordIdentityKey(index.repositoryScope, "symbol", symbol.id));
+    }
+    for (const entry of index.history) {
+      keys.add(recordIdentityKey(index.repositoryScope, "history", entry.id));
+    }
+  }
+  return keys;
+}
+
+function providerMatchesIndex(
+  provider: LocalEmbeddingProvider | undefined,
+  index: RepositoryIndex
+): boolean {
+  return Boolean(
+    provider &&
+      provider.id === index.embedding.providerId &&
+      provider.kind === index.embedding.kind &&
+      provider.dimensions === index.embedding.dimensions
+  );
+}
+
+/**
+ * Delegates semantic ranking to durable storage, one repository at a time. Each
+ * query carries that repository's own scope and commit, so a store that honours
+ * the reference cannot widen the read past one repository. The returned rows are
+ * re-checked against the requested identity regardless: an isolation boundary
+ * that depends on a remote implementation behaving correctly is not a boundary.
+ */
+interface DurableSourcingRequest {
+  ranker: RepositoryVectorRanker;
+  sources: readonly { index: RepositoryIndex; source: Candidate["source"] }[];
+  provider: LocalEmbeddingProvider | undefined;
+  providerQueryVector: readonly number[] | undefined;
+  limit: number;
+  selectedPaths: ReadonlySet<string>;
+  changesByPath: ReadonlyMap<string, NormalizedChange>;
+  changedNames: ReadonlySet<string>;
+  query: string;
+  /** Records the materialised document already enumerated, keyed as `type:id`. */
+  materialisedRecords: ReadonlySet<string>;
+}
+
+interface DurableSourcingResult {
+  candidates: Candidate[];
+}
+
+function assertRowWithinRepository(
+  row: { storageKey: string; repositoryScope: string; commitSha: string },
+  index: RepositoryIndex,
+  what: string
+): void {
+  if (
+    row.storageKey !== index.storageKey ||
+    row.repositoryScope !== index.repositoryScope ||
+    row.commitSha !== index.commitSha
+  ) {
+    throw new RepositoryIsolationError(
+      `${what} returned a row outside the requested repository and commit`
+    );
+  }
+}
+
+/**
+ * Delegates semantic ranking to durable storage, one repository at a time, and
+ * sources the candidate set from the same query. Each query carries that
+ * repository's own scope and commit, so a store that honours the reference cannot
+ * widen the read past one repository. Returned rows are re-checked against the
+ * requested identity on BOTH paths regardless: an isolation boundary that depends
+ * on a remote implementation behaving correctly is not a boundary.
+ *
+ * Records the materialised document already enumerated are left entirely alone,
+ * which leaves the in-memory path's candidate set and ordering untouched. Records
+ * the document does not contain are hydrated into candidates, which is what lets a
+ * query be answered without the whole snapshot resident. Hydration is one batched
+ * fetch per repository, so N matches cost one round trip and not N.
+ *
+ * The store's `score` is used only to decide WHICH records to recall and hydrate.
+ * It never leaves this function, because its meaning is store-specific (similarity
+ * on one path, distance on another) and ranking a candidate by a number of unknown
+ * polarity would silently invert the result order. Every returned candidate
+ * carries its record's own vector instead, and is scored by the same local cosine
+ * a materialised candidate of the same record would get.
+ */
+async function sourceThroughDurableStorage(
+  request: DurableSourcingRequest
+): Promise<DurableSourcingResult> {
+  const candidates: Candidate[] = [];
+  if (!request.providerQueryVector) return { candidates };
+  for (const { index, source } of request.sources) {
+    if (!providerMatchesIndex(request.provider, index)) continue;
+    const matches = await request.ranker.query({
+      repositoryScope: index.repositoryScope,
+      commitSha: index.commitSha,
+      providerId: index.embedding.providerId,
+      vector: request.providerQueryVector,
+      limit: request.limit
+    });
+    const absent = new Map<string, RepositoryVectorMatch>();
+    for (const match of matches) {
+      assertRowWithinRepository(match.row, index, "durable vector ranking");
+      // A store that answers with a non-finite score is malformed, so its row is
+      // not recalled at all rather than recalled at an unknown rank.
+      if (!Number.isFinite(match.score)) continue;
+      const key = recordIdentityKey(
+        match.row.repositoryScope,
+        match.row.recordType,
+        match.row.recordId
+      );
+      // Keyed by repository as well as record, so a record id cannot be treated
+      // as already materialised because another repository enumerated one by the
+      // same name.
+      if (!request.materialisedRecords.has(key)) {
+        const recordKey = `${match.row.recordType}:${match.row.recordId}`;
+        const seen = absent.get(recordKey);
+        if (!seen || match.score > seen.score) absent.set(recordKey, match);
+      }
+    }
+    if (!absent.size || !request.ranker.hydrateRecords) continue;
+
+    const hydrated = await request.ranker.hydrateRecords({
+      repositoryScope: index.repositoryScope,
+      commitSha: index.commitSha,
+      records: [...absent.values()].map((match) => ({
+        recordType: match.row.recordType,
+        recordId: match.row.recordId
+      }))
+    });
+    for (const row of hydrated) {
+      assertRowWithinRepository(row, index, "durable record hydration");
+      const recordKey = `${row.recordType}:${row.recordId}`;
+      const match = absent.get(recordKey);
+      // A store must not answer with a record that was not asked for. Dropping it
+      // rather than trusting it keeps an over-broad fetch from widening results.
+      if (!match) continue;
+      for (const classification of classifyDurableRecord(
+        row,
+        source,
+        request.selectedPaths,
+        request.changesByPath,
+        request.changedNames,
+        request.query
+      )) {
+        candidates.push({
+          id: candidateId(index.repositoryScope, row.recordId, classification.kind),
+          recordId: row.recordId,
+          recordType: row.recordType,
+          repositoryScope: index.repositoryScope,
+          commitSha: index.commitSha,
+          source,
+          path: row.path,
+          line: row.line,
+          kind: classification.kind,
+          content: row.content,
+          contentSha256: row.contentSha256,
+          vector: match.row.vector,
+          index,
+          baseScore: classification.baseScore
+        });
+      }
+    }
+  }
+  return { candidates };
+}
+
+/**
+ * Ranks one candidate, from its own vector, identically whether it was enumerated
+ * from a materialised document or hydrated out of durable storage.
+ *
+ * No store-reported score reaches this function. A durable score's polarity is
+ * store-specific — pgvector's `<=>` is cosine distance, a non-pgvector fallback
+ * computes similarity — so ranking by it would make the result order depend on
+ * which storage path answered, and a mismatch would invert it silently rather than
+ * fail. Scoring locally on both paths is what makes supplying a ranker a pure
+ * recall change: it can add candidates for records the document lacks, and cannot
+ * move any candidate the in-memory path already produced.
+ */
 function candidateRelevance(
   candidate: Candidate,
   query: string,
@@ -630,9 +1002,7 @@ function candidateRelevance(
   if (
     provider &&
     providerQueryVector &&
-    provider.id === candidate.index.embedding.providerId &&
-    provider.kind === candidate.index.embedding.kind &&
-    provider.dimensions === candidate.index.embedding.dimensions
+    providerMatchesIndex(provider, candidate.index)
   ) {
     return cosineSimilarity(providerQueryVector, candidate.vector);
   }
@@ -697,6 +1067,45 @@ export async function retrieveRepositoryContext(
     request.embeddingProvider,
     query
   );
+  const vectorRankerLimit = request.vectorRankerLimit ?? 200;
+  if (
+    !Number.isSafeInteger(vectorRankerLimit) ||
+    vectorRankerLimit < 1 ||
+    vectorRankerLimit > 1_000
+  ) {
+    throw new RangeError("vector ranker limit must be between 1 and 1000");
+  }
+  const durable =
+    request.vectorRanker && query
+      ? await sourceThroughDurableStorage({
+          ranker: request.vectorRanker,
+          sources: [
+            { index: request.index, source: "primary" as const },
+            ...related.map((source) => ({
+              index: source.index,
+              source: "related" as const
+            }))
+          ],
+          provider: request.embeddingProvider,
+          providerQueryVector,
+          limit: vectorRankerLimit,
+          selectedPaths: new Set(scope.selectedPaths),
+          changesByPath: new Map(
+            normalizedChanges.map((change) => [change.path, change])
+          ),
+          changedNames: primary.changedNames,
+          query,
+          materialisedRecords: materialisedRecordKeys([
+            request.index,
+            ...related.map((source) => source.index)
+          ])
+        })
+      : { candidates: [] };
+  // Durable-sourced candidates are, by construction, records no loaded document
+  // contains, so they extend the candidate set without perturbing any candidate
+  // the materialised path produced. Every candidate is then scored by the same
+  // local cosine, so supplying a ranker changes recall and never ordering.
+  candidates.push(...durable.candidates);
   const unique = new Map<string, Candidate & { score: number }>();
   for (const candidate of candidates) {
     const score =

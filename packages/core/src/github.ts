@@ -9,6 +9,83 @@ export interface GitHubRepository {
   fork: boolean;
 }
 
+/** Retry window bounds so a hostile or broken reset header cannot park a job forever. */
+const MIN_RATE_LIMIT_RETRY_MS = 1_000;
+const MAX_RATE_LIMIT_RETRY_MS = 60 * 60_000;
+const DEFAULT_RATE_LIMIT_RETRY_MS = 60_000;
+
+/**
+ * Raised when GitHub throttles a request. Callers requeue at `retryAt` instead of
+ * burning a delivery attempt, because throttling says nothing about the delivery.
+ */
+export class GitHubRateLimitError extends Error {
+  constructor(
+    message: string,
+    readonly retryAt: Date,
+    readonly remaining: number | undefined
+  ) {
+    super(message);
+    this.name = "GitHubRateLimitError";
+  }
+}
+
+function parseNonNegativeInteger(value: string | null): number | undefined {
+  const raw = value?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+/** retry-after is either delta-seconds or an HTTP date; both are accepted. */
+function parseRetryAfterMs(value: string | null, now: number): number | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const seconds = parseNonNegativeInteger(raw);
+  if (seconds !== undefined) return seconds * 1_000;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) ? at - now : undefined;
+}
+
+/**
+ * Detects a throttling response. A 403 without any budget signal stays a permanent
+ * failure, so authorization errors are never mistaken for rate limits.
+ */
+function rateLimitWindow(
+  response: Response,
+  now: number
+): { retryAt: Date; remaining: number | undefined } | undefined {
+  if (response.status !== 403 && response.status !== 429) return undefined;
+  const remaining = parseNonNegativeInteger(response.headers.get("x-ratelimit-remaining"));
+  const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), now);
+  if (retryAfterMs === undefined && remaining !== 0) return undefined;
+  const resetAt = parseNonNegativeInteger(response.headers.get("x-ratelimit-reset"));
+  const waitMs =
+    retryAfterMs ??
+    (resetAt === undefined ? DEFAULT_RATE_LIMIT_RETRY_MS : resetAt * 1_000 - now);
+  const bounded = Math.min(
+    MAX_RATE_LIMIT_RETRY_MS,
+    Math.max(MIN_RATE_LIMIT_RETRY_MS, waitMs)
+  );
+  return { retryAt: new Date(now + bounded), remaining };
+}
+
+/**
+ * Builds the message for a failed request.
+ *
+ * Request paths carry identifiers — a pull-request comment id, a collaborator login, a blob SHA —
+ * and a thrown message is not a local diagnostic: callers persist it into unbounded columns such
+ * as `webhook_jobs.last_error`, which would smuggle a retained identifier past the bounded stores
+ * that are supposed to hold it. So the message carries only the method and, for a response, the
+ * status: both are fixed-vocabulary and neither identifies a repository, a person, or a comment.
+ * The response body is left out for the same reason, since GitHub echoes request detail into it.
+ *
+ * `returned ${status}` is load-bearing text: callers discriminate an absent resource by matching
+ * `returned 404` on the stringified error, so the status must stay in the message.
+ */
+function requestFailureMessage(method: string, detail: string): string {
+  return `GitHub ${method} request ${detail}`;
+}
+
 export class GitHubClient {
   constructor(
     private readonly token: string,
@@ -68,15 +145,23 @@ export class GitHubClient {
         (error instanceof DOMException && error.name === "TimeoutError") ||
         (error instanceof Error && error.name === "AbortError")
       ) {
-        throw new Error(`GitHub ${method} ${url.pathname} timed out`);
+        throw new Error(requestFailureMessage(method, "timed out"));
       }
-      throw new Error(`GitHub ${method} ${url.pathname} failed`, { cause: error });
+      throw new Error(requestFailureMessage(method, "failed"), { cause: error });
     }
     if (!response.ok) {
-      const text = (await response.text()).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 2_000);
-      throw new Error(
-        `GitHub ${method} ${url.pathname} returned ${response.status}: ${text}`
-      );
+      const throttled = rateLimitWindow(response, Date.now());
+      if (throttled) {
+        throw new GitHubRateLimitError(
+          requestFailureMessage(
+            method,
+            `was rate limited until ${throttled.retryAt.toISOString()}`
+          ),
+          throttled.retryAt,
+          throttled.remaining
+        );
+      }
+      throw new Error(requestFailureMessage(method, `returned ${response.status}`));
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;

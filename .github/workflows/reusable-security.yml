@@ -64,15 +64,34 @@ jobs:
           # A pull request must not be able to weaken its own gate by changing
           # scanner mode, suppressions, or baseline fingerprints. Once a
           # repository is onboarded, those controls come from the immutable
-          # base commit. The first onboarding PR may use its head config, but
-          # only in non-enforcing mode.
+          # base commit. Onboarding state is therefore read from the canonical
+          # config location in the base commit and never from the head-supplied
+          # config-path, which would otherwise let a pull request repoint the
+          # input at a path absent from base and demote itself to the
+          # first-onboarding case. The first onboarding PR may use its head
+          # config, but only in non-enforcing mode.
+          canonical_config_path=".guardianbot/config.yml"
           effective_config="$config_path"
           effective_baseline="$baseline_path"
           config_source="head"
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             base_sha="$PULL_REQUEST_BASE_SHA"
-            if git cat-file -e "${base_sha}:${config_path}" 2>/dev/null; then
-              git show "${base_sha}:${config_path}" > guardianbot-evidence/effective-config.yml
+            [[ "$base_sha" =~ ^[a-f0-9]{40}$ ]] || {
+              echo "Pull request runs require a resolved base commit SHA."
+              exit 1
+            }
+            # An unreachable base commit must fail closed rather than silently
+            # fall back to the head-supplied configuration.
+            git cat-file -e "${base_sha}^{commit}" 2>/dev/null || {
+              echo "The pull request base commit is not available for policy resolution."
+              exit 1
+            }
+            if git cat-file -e "${base_sha}:${canonical_config_path}" 2>/dev/null; then
+              test "$config_path" = "$canonical_config_path" || {
+                echo "Onboarded repositories must pass config-path ${canonical_config_path}."
+                exit 1
+              }
+              git show "${base_sha}:${canonical_config_path}" > guardianbot-evidence/effective-config.yml
               effective_config="guardianbot-evidence/effective-config.yml"
               config_source="base"
             fi
