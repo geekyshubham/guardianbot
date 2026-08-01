@@ -46,11 +46,17 @@ reusable workflow commits remain immutable.
   relevance locally to avoid store score-polarity mismatch, and rechecks
   repository scope on request and returned rows. Automated tests cover
   durable-only retrieval, one-round-trip hydration, production wiring/isolation,
-  and pgvector/store behaviour, so the materialised-candidate barrier is closed
-  in source/test evidence. Graph edges still rely on the loaded index document;
-  history retrieval remains incomplete. All pgvector behaviour is automated/local
-  stub evidence only: no live PostgreSQL/pgvector verification, live ANN
-  performance, or production deployment of this path is claimed.
+  and pgvector/store behaviour, so a durably-stored record absent from the
+  loaded document is now reachable on the production review path. This widens
+  recall and closes the prior dormant-recall / missing-record gap; it does not
+  remove the whole-snapshot materialisation requirement.
+  `retrieveRepositoryContext` still takes the index document as a required
+  input and the review path still loads it in full before ranking, so the
+  production-scale materialised-document barrier remains open. Graph edges
+  still rely on the loaded index document; history retrieval remains
+  incomplete. All pgvector behaviour is automated/local stub evidence only: no
+  live PostgreSQL/pgvector verification, live ANN performance, or production
+  deployment of this path is claimed.
 - Repository index refresh is incremental. Vectors are reused by content digest
   across a `compare` range, so unchanged files are neither refetched nor
   re-embedded, and files are read by immutable git blob id. The plan falls back
