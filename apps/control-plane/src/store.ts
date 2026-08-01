@@ -1015,6 +1015,46 @@ export function assertIndexGenerationSweepLimit(limit: number): void {
   }
 }
 
+/** Upper bound for active monitoring alert ledger pages (operations endpoint). */
+export const MAX_ACTIVE_MONITORING_ALERTS_LIMIT = 512;
+export const MIN_ACTIVE_MONITORING_ALERTS_LIMIT = 1;
+/** Safe default when a caller asks for a bounded page without naming a limit. */
+export const DEFAULT_ACTIVE_MONITORING_ALERTS_LIMIT = MAX_ACTIVE_MONITORING_ALERTS_LIMIT;
+
+/** Shared API guard so alert ledger limits cannot bypass the hard page bound. */
+export function assertActiveMonitoringAlertLimit(limit: number): void {
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < MIN_ACTIVE_MONITORING_ALERTS_LIMIT ||
+    limit > MAX_ACTIVE_MONITORING_ALERTS_LIMIT
+  ) {
+    throw new Error(
+      `active monitoring alert limit must be a safe integer between ${MIN_ACTIVE_MONITORING_ALERTS_LIMIT} and ${MAX_ACTIVE_MONITORING_ALERTS_LIMIT}`
+    );
+  }
+}
+
+/**
+ * Bounded operations-page alert row. Carries the repository full name from a
+ * JOIN (Postgres) or repository map lookup (memory) so callers never need the
+ * full inventory. Omits resolvedAt and any raw/config/index fields.
+ */
+export interface ActiveMonitoringAlertPageItem {
+  repositoryId: number;
+  fullName: string;
+  alertKey: string;
+  severity: MonitoringAlertRecord["severity"];
+  summary: string;
+  firstObservedAt: string;
+  lastObservedAt: string;
+}
+
+export interface ActiveMonitoringAlertsPage {
+  alerts: ActiveMonitoringAlertPageItem[];
+  truncated: boolean;
+  limit: number;
+}
+
 /**
  * Parameterized superseded-generation sweep (multi-instance safe via SKIP LOCKED).
  *
@@ -1333,7 +1373,25 @@ export interface Store {
     deploymentKey: string,
     leaseId: string
   ): Promise<boolean>;
-  listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]>;
+  /**
+   * Active alert ledger. Optional `limit` bounds the page at the query layer
+   * (PostgreSQL `LIMIT`, memory slice) so operators never pull an unbounded table.
+   * Omit `limit` to preserve the historical full-list behaviour used by reconciler tests.
+   */
+  listActiveMonitoringAlerts(
+    repositoryId?: number,
+    limit?: number
+  ): Promise<MonitoringAlertRecord[]>;
+  /**
+   * Bounded active-alert page with limit+1 truncation detection and repository
+   * full names resolved in the page query itself (JOIN / map lookup). Prefer this
+   * for operator-facing ledgers; `listActiveMonitoringAlerts` remains the
+   * historical full-list API and must not be the operations path.
+   */
+  listActiveMonitoringAlertsPage(
+    limit?: number,
+    repositoryId?: number
+  ): Promise<ActiveMonitoringAlertsPage>;
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
   acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
@@ -2346,8 +2404,14 @@ export class MemoryStore implements Store {
     return this.deploymentPromotions.delete(deploymentKey);
   }
 
-  async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
-    return [...this.monitoringAlerts.values()]
+  async listActiveMonitoringAlerts(
+    repositoryId?: number,
+    limit?: number
+  ): Promise<MonitoringAlertRecord[]> {
+    if (limit !== undefined) {
+      assertActiveMonitoringAlertLimit(limit);
+    }
+    const alerts = [...this.monitoringAlerts.values()]
       .filter(
         (alert) =>
           !alert.resolvedAt &&
@@ -2359,6 +2423,43 @@ export class MemoryStore implements Store {
           left.alertKey.localeCompare(right.alertKey)
       )
       .map((alert) => ({ ...alert }));
+    return limit === undefined ? alerts : alerts.slice(0, limit);
+  }
+
+  async listActiveMonitoringAlertsPage(
+    limit: number = DEFAULT_ACTIVE_MONITORING_ALERTS_LIMIT,
+    repositoryId?: number
+  ): Promise<ActiveMonitoringAlertsPage> {
+    assertActiveMonitoringAlertLimit(limit);
+    // limit+1 fetch: sentinel row detects truncation without a second query.
+    // Stable order matches Postgres: repository_id, alert_key.
+    const fetched = [...this.monitoringAlerts.values()]
+      .filter(
+        (alert) =>
+          !alert.resolvedAt &&
+          (repositoryId === undefined || alert.repositoryId === repositoryId)
+      )
+      .sort(
+        (left, right) =>
+          left.repositoryId - right.repositoryId ||
+          left.alertKey.localeCompare(right.alertKey)
+      )
+      .slice(0, limit + 1);
+    const truncated = fetched.length > limit;
+    const page = truncated ? fetched.slice(0, limit) : fetched;
+    return {
+      alerts: page.map((alert) => ({
+        repositoryId: alert.repositoryId,
+        fullName: this.repositories.get(alert.repositoryId)?.fullName ?? "",
+        alertKey: alert.alertKey,
+        severity: alert.severity,
+        summary: alert.summary,
+        firstObservedAt: alert.firstObservedAt,
+        lastObservedAt: alert.lastObservedAt
+      })),
+      truncated,
+      limit
+    };
   }
 
   async resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void> {
@@ -4242,23 +4343,129 @@ export class PostgresStore implements Store {
     return result.rowCount === 1;
   }
 
-  async listActiveMonitoringAlerts(repositoryId?: number): Promise<MonitoringAlertRecord[]> {
-    const result =
-      repositoryId === undefined
-        ? await this.pool.query(
-            `SELECT *
-             FROM monitoring_alerts
-             WHERE active=true
-             ORDER BY repository_id ASC, alert_key ASC`
-          )
-        : await this.pool.query(
-            `SELECT *
-             FROM monitoring_alerts
-             WHERE active=true AND repository_id=$1
-             ORDER BY alert_key ASC`,
-            [repositoryId]
-          );
-    return result.rows.map((row) => this.toMonitoringAlert(row));
+  async listActiveMonitoringAlerts(
+    repositoryId?: number,
+    limit?: number
+  ): Promise<MonitoringAlertRecord[]> {
+    if (limit !== undefined) {
+      assertActiveMonitoringAlertLimit(limit);
+    }
+    const rows = await this.queryActiveMonitoringAlerts(repositoryId, limit);
+    return rows.map((row) => this.toMonitoringAlert(row));
+  }
+
+  async listActiveMonitoringAlertsPage(
+    limit: number = DEFAULT_ACTIVE_MONITORING_ALERTS_LIMIT,
+    repositoryId?: number
+  ): Promise<ActiveMonitoringAlertsPage> {
+    assertActiveMonitoringAlertLimit(limit);
+    // limit+1 fetch: sentinel row detects truncation without a COUNT(*).
+    // JOIN repositories so the page carries full names without a fleet inventory load.
+    const rows = await this.queryActiveMonitoringAlertsPage(repositoryId, limit + 1);
+    const alerts = rows.map((row) => this.toActiveMonitoringAlertPageItem(row));
+    const truncated = alerts.length > limit;
+    return {
+      alerts: truncated ? alerts.slice(0, limit) : alerts,
+      truncated,
+      limit
+    };
+  }
+
+  /**
+   * Historical full-list / optional-bound query for reconciler callers.
+   * Does not JOIN repositories; operations must use the page query instead.
+   */
+  private async queryActiveMonitoringAlerts(
+    repositoryId: number | undefined,
+    limit: number | undefined
+  ): Promise<Record<string, any>[]> {
+    if (repositoryId === undefined && limit === undefined) {
+      const result = await this.pool.query(
+        `SELECT *
+         FROM monitoring_alerts
+         WHERE active=true
+         ORDER BY repository_id ASC, alert_key ASC`
+      );
+      return result.rows;
+    }
+    if (repositoryId === undefined) {
+      const result = await this.pool.query(
+        `SELECT *
+         FROM monitoring_alerts
+         WHERE active=true
+         ORDER BY repository_id ASC, alert_key ASC
+         LIMIT $1`,
+        [limit]
+      );
+      return result.rows;
+    }
+    if (limit === undefined) {
+      const result = await this.pool.query(
+        `SELECT *
+         FROM monitoring_alerts
+         WHERE active=true AND repository_id=$1
+         ORDER BY alert_key ASC`,
+        [repositoryId]
+      );
+      return result.rows;
+    }
+    const result = await this.pool.query(
+      `SELECT *
+       FROM monitoring_alerts
+       WHERE active=true AND repository_id=$1
+       ORDER BY alert_key ASC
+       LIMIT $2`,
+      [repositoryId, limit]
+    );
+    return result.rows;
+  }
+
+  /**
+   * Bounded page query with repository full name JOIN and stable
+   * ORDER BY repository_id, alert_key. Always applies LIMIT (caller passes limit+1).
+   */
+  private async queryActiveMonitoringAlertsPage(
+    repositoryId: number | undefined,
+    limit: number
+  ): Promise<Record<string, any>[]> {
+    if (repositoryId === undefined) {
+      const result = await this.pool.query(
+        `SELECT
+           alerts.repository_id,
+           alerts.alert_key,
+           alerts.severity,
+           alerts.summary,
+           alerts.first_observed_at,
+           alerts.last_observed_at,
+           repositories.full_name
+         FROM monitoring_alerts AS alerts
+         JOIN repositories
+           ON repositories.repository_id = alerts.repository_id
+         WHERE alerts.active=true
+         ORDER BY alerts.repository_id ASC, alerts.alert_key ASC
+         LIMIT $1`,
+        [limit]
+      );
+      return result.rows;
+    }
+    const result = await this.pool.query(
+      `SELECT
+         alerts.repository_id,
+         alerts.alert_key,
+         alerts.severity,
+         alerts.summary,
+         alerts.first_observed_at,
+         alerts.last_observed_at,
+         repositories.full_name
+       FROM monitoring_alerts AS alerts
+       JOIN repositories
+         ON repositories.repository_id = alerts.repository_id
+       WHERE alerts.active=true AND alerts.repository_id=$1
+       ORDER BY alerts.repository_id ASC, alerts.alert_key ASC
+       LIMIT $2`,
+      [repositoryId, limit]
+    );
+    return result.rows;
   }
 
   async resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void> {
@@ -4459,6 +4666,22 @@ export class PostgresStore implements Store {
       lastObservedAt:
         fromUnknownDate(row.last_observed_at) ?? String(row.last_observed_at),
       resolvedAt: fromUnknownDate(row.resolved_at)
+    };
+  }
+
+  private toActiveMonitoringAlertPageItem(
+    row: Record<string, any>
+  ): ActiveMonitoringAlertPageItem {
+    return {
+      repositoryId: Number(row.repository_id),
+      fullName: String(row.full_name ?? ""),
+      alertKey: String(row.alert_key),
+      severity: row.severity,
+      summary: String(row.summary),
+      firstObservedAt:
+        fromUnknownDate(row.first_observed_at) ?? String(row.first_observed_at),
+      lastObservedAt:
+        fromUnknownDate(row.last_observed_at) ?? String(row.last_observed_at)
     };
   }
 

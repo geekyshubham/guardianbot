@@ -16,6 +16,13 @@ import {
   MonitoringService,
   monitoringOptionsFromEnvironment
 } from "./monitoring-service.js";
+import {
+  buildMonitoringOperationsStatus,
+  MONITORING_OPERATIONS_PATH,
+  writeMonitoringOperationsStatus,
+  writeMonitoringOperationsUnauthorized,
+  writeMonitoringOperationsUnavailable
+} from "./monitoring-operations.js";
 import { RepositoryIndexService } from "./repository-index-service.js";
 import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
 import { GuardianService, WebhookAuthenticationError } from "./service.js";
@@ -268,6 +275,34 @@ async function start() {
       response
         .writeHead(200, { "content-type": "text/plain; version=0.0.4" })
         .end(`${metrics.render()}${monitoring.renderMetrics()}`);
+      return;
+    }
+    if (request.url === MONITORING_OPERATIONS_PATH) {
+      // Same bearer/private-metrics policy as /metrics. Non-GET and unauthenticated
+      // callers receive an indistinguishable 404 so the route does not broaden access.
+      if (
+        request.method !== "GET" ||
+        !metricsRequestAuthorized(
+          request.headers.authorization,
+          process.env.GUARDIANBOT_METRICS_BEARER_TOKEN,
+          process.env.GUARDIANBOT_TRUST_PRIVATE_METRICS === "1"
+        )
+      ) {
+        writeMonitoringOperationsUnauthorized(response);
+        return;
+      }
+      try {
+        const status = await buildMonitoringOperationsStatus({ store, monitoring });
+        writeMonitoringOperationsStatus(response, status);
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            event: "guardianbot.monitoring_operations_failed",
+            error: boundedErrorKind(error)
+          })
+        );
+        writeMonitoringOperationsUnavailable(response);
+      }
       return;
     }
     if (request.method === "POST" && request.url === "/evidence/attest") {

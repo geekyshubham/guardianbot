@@ -5,6 +5,26 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Authenticated read-only operator ledger `GET /operations/monitoring`
+  (`guardianbot.monitoring.status.v1`): same
+  `GUARDIANBOT_METRICS_BEARER_TOKEN` / private-metrics trust policy as
+  `/metrics`; empty `404` for non-`GET`, query strings, trailing slash, and
+  unauthorized callers; `cache-control: no-store` on `200` and the fixed `503`
+  body; process-local scheduler state (not fleet-authoritative); at most 512
+  sanitized active alerts from a stable bounded PostgreSQL JOIN; page-scoped
+  repository names/count with `complete`; current UTC-week aggregate report or
+  `null`; no config, evidence payloads, index contents, credentials, digests,
+  webhook payloads, resolved rows, or raw provider text; explicit length caps
+  on alert full name/key/summary. Public Caddy returns `404` for `/metrics`
+  and `/operations/monitoring`; private Compose access stays internal. Source
+  and automated tests only—**not released or deployed**; do not claim live
+  ledger output or alert identities. Direct database/SSH firewall broadening
+  is not required. See
+  [operations](docs/operations.md#private-metrics-and-operator-monitoring-status)
+  and [metrics](docs/metrics.md#monitoring-model).
+
 ### Changed
 
 - Fleet consumer pins and GuardianBot self-consumer config/workflow references
@@ -14,6 +34,21 @@ reusable workflow commits remain immutable.
   upgrade PRs merged, including GuardianBot PR #37.
 
 ### Evidence
+
+- Live authenticated metrics transport on DigitalOcean app
+  `346b3b81-b8cf-4136-b706-0a7195bc9f00`, exact signed image
+  `sha256:49e8e47741337e20b0fe6cf05acb8eef8121e065d0c1293efb9745f1de3625a1`,
+  ACTIVE deployment `3f0b58cd-52b7-481b-b4d6-7f29d9dad283` (2026-08-01 UTC):
+  `/healthz` and `/readyz` HTTP 200; unauthenticated `/metrics` HTTP 404;
+  exact bearer succeeds. Scheduler gauges after deployment: enabled=1,
+  started=1, one successful cycle, zero failures/consecutive failures/lock
+  skips, 19 repositories evaluated, 7 failing repositories, 0 warning
+  repositories, 28 active alerts. The 7/28 aggregate is an unresolved
+  production signal from `/metrics` only. Bearer value remains a DigitalOcean
+  secret / local operator credential and is never documented. Does **not**
+  claim live `GET /operations/monitoring` output, weekly-report acceptance,
+  production AI review, seven-day enforcement, authenticated-full DAST,
+  DefectDojo current-run import, or GitHub App review-comment permission.
 
 - Current-binding AstraNull scheduled `authenticated-baseline` on head
   `3664cff061398c1bf3efc0c937a2470746d60e3d` / deployed digest

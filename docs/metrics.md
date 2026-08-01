@@ -43,9 +43,17 @@ registry digest and configured environment. Missing samples are never
 extrapolated; a zero has meaning only alongside its source-completeness label.
 
 Metrics transport stays private by default. Public Caddy exposure returns `404`
-for `/metrics`; successful access requires
-`GUARDIANBOT_METRICS_BEARER_TOKEN` or an explicitly trusted private-runtime
-override with `GUARDIANBOT_TRUST_PRIVATE_METRICS=1`.
+for both `/metrics` and `GET /operations/monitoring`. Successful access to
+either path requires `GUARDIANBOT_METRICS_BEARER_TOKEN` or an explicitly trusted
+private-runtime override with `GUARDIANBOT_TRUST_PRIVATE_METRICS=1` on a
+genuinely private Compose network. App Platform always requires the exact
+bearer; unauthorized, non-`GET`, query-string, and trailing-slash variants of
+the operations path return an empty `404`. The bearer lives only as a
+DigitalOcean secret and local operator credential—never in repository docs or
+committed config. Operators do not need broader database or SSH firewall
+access; scrape or curl the control plane instead. Operator ledger shape and
+field semantics are documented in
+[operations](operations.md#private-metrics-and-operator-monitoring-status).
 
 ## Control-plane webhook queue gauges
 

@@ -81,7 +81,16 @@ destructive, and explicitly excluded routes are prohibited.
 PostgreSQL, DefectDojo, and optional staging dependencies remain on
 DigitalOcean. Managed PostgreSQL uses its CA through
 `GUARDIANBOT_DATABASE_CA_CERT`; private Compose PostgreSQL is not exposed
-publicly. Public `/metrics` access is closed by default.
+publicly. Public `/metrics` and `/operations/monitoring` access is closed by
+default: the public Caddy edge returns `404` for both paths, and App Platform
+requires the exact metrics bearer. Private Compose may trust the private
+network only when `GUARDIANBOT_TRUST_PRIVATE_METRICS=1` is set deliberately.
+Neither private path requires opening direct database or SSH firewall access
+to operators. The operations endpoint is read-only and returns only a
+sanitized, bounded alert page plus process-local scheduler state and the
+current UTC-week report or `null`—never config, evidence payloads, index
+contents, credentials, digests, webhook payloads, resolved rows, or raw
+provider text.
 
 Consumer repositories contain no model, DefectDojo, database, DigitalOcean,
 DAST, evidence-signing, or GitHub App secret. Repository configuration contains
