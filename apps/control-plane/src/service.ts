@@ -55,6 +55,7 @@ import {
   type ReviewState,
   type Store,
   type WebhookJob,
+  type WebhookLeaseFence,
   type WebhookQueueCounts
 } from "./store.js";
 
@@ -363,7 +364,10 @@ export class GuardianService {
     try {
       // Await the owned handler fully — never race it against abort. Racing left handle()
       // detached after lease release, so a late backend/GitHub write could still mutate state.
-      await this.handle(job.eventName, job.payload, signal);
+      await this.handle(job.eventName, job.payload, signal, {
+        deliveryId: job.deliveryId,
+        leaseOwner: workerId
+      });
       await this.store.completeWebhook(job.deliveryId, workerId);
       this.uncountedAttempts.delete(job.deliveryId);
       this.metrics.increment("webhook_succeeded_total");
@@ -458,7 +462,15 @@ export class GuardianService {
     return resolved ? { alias: resolved.alias, backend: resolved.client } : undefined;
   }
 
-  private async handle(name: string, event: GitHubEvent, signal?: AbortSignal): Promise<void> {
+  private async handle(
+    name: string,
+    event: GitHubEvent,
+    signal?: AbortSignal,
+    fence?: WebhookLeaseFence
+  ): Promise<void> {
+    // Checked before dispatch so a job claimed just as shutdown began does no work at all,
+    // rather than relying on each arm to notice.
+    throwIfAborted(signal);
     if (name === "installation") {
       if (event.action === "deleted") {
         await this.store.setInstallationState(event.installation.id, "removed");
@@ -472,16 +484,24 @@ export class GuardianService {
         await this.store.setInstallationState(event.installation.id, "active");
       }
       const repositories = event.repositories ?? (event.repository ? [event.repository] : []);
-      for (const repository of repositories) await this.discover(event, repository);
+      // One installation can carry hundreds of repositories, each a full discovery round trip,
+      // so cancellation is checked per repository rather than only once for the batch. Stopping
+      // between repositories is safe: discovery is idempotent and the job is retried whole.
+      for (const repository of repositories) {
+        throwIfAborted(signal);
+        await this.discover(event, repository, signal);
+      }
       return;
     }
 
     if (name === "installation_repositories") {
       for (const repository of event.repositories_removed ?? []) {
+        throwIfAborted(signal);
         await this.store.setRepositoryState(repository.id, "removed");
       }
       for (const repository of event.repositories_added ?? []) {
-        await this.discover(event, repository);
+        throwIfAborted(signal);
+        await this.discover(event, repository, signal);
       }
       return;
     }
@@ -494,12 +514,12 @@ export class GuardianService {
       if (event.action === "unarchived") {
         await this.store.setRepositoryState(event.repository.id, "active");
       }
-      if (event.repository) await this.discover(event, event.repository);
+      if (event.repository) await this.discover(event, event.repository, signal);
       return;
     }
 
     if (name === "push" && event.repository && !event.deleted) {
-      await this.refreshDefaultBranchIndex(event, event.repository);
+      await this.refreshDefaultBranchIndex(event, event.repository, signal);
       return;
     }
 
@@ -507,26 +527,31 @@ export class GuardianService {
       name === "pull_request" &&
       ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)
     ) {
-      await this.reviewPullRequest(event, {}, signal);
+      await this.reviewPullRequest(event, {}, signal, fence);
       return;
     }
 
     if (name === "workflow_run" && event.action === "completed") {
-      await this.handleScannerWorkflowRun(event);
+      await this.handleScannerWorkflowRun(event, signal);
       return;
     }
 
     if (name === "pull_request_review_comment" && event.action === "created") {
-      await this.captureReviewCommentFeedback(event);
+      await this.captureReviewCommentFeedback(event, signal);
       return;
     }
 
     if (name === "issue_comment" && event.action === "created") {
-      await this.command(event, signal);
+      await this.command(event, signal, fence);
     }
   }
 
-  private async discover(event: GitHubEvent, repository: any): Promise<void> {
+  private async discover(
+    event: GitHubEvent,
+    repository: any,
+    signal?: AbortSignal
+  ): Promise<void> {
+    throwIfAborted(signal);
     const github = await this.client(event, [repository.id]);
     const repositoryDetails =
       typeof repository.default_branch === "string" &&
@@ -581,14 +606,32 @@ export class GuardianService {
         detection.notes
       )
     );
-    const refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
-      github,
-      repositoryId: repositoryDetails.id,
-      installationId: event.installation.id,
-      fullName: repositoryDetails.full_name,
-      defaultBranch: repositoryDetails.default_branch,
-      visibility
-    });
+    // Discovery rebuilds the whole default-branch index, which is the same unbounded work
+    // the push arm cancels. The entry checkpoint above only covers the moment before the
+    // GitHub round trips begin, so without the signal here the installation,
+    // installation_repositories, and repository arms all remain uncancellable.
+    let refresh: Awaited<
+      ReturnType<RepositoryIndexService["refreshDefaultBranchIndex"]>
+    > | undefined;
+    try {
+      refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+        github,
+        repositoryId: repositoryDetails.id,
+        installationId: event.installation.id,
+        fullName: repositoryDetails.full_name,
+        defaultBranch: repositoryDetails.default_branch,
+        visibility,
+        signal
+      });
+    } catch (error) {
+      // Normalised exactly as the push arm does: the index service raises the platform
+      // AbortError, which failClaimedWebhook does not recognise as shutdown, so a rebuild
+      // interrupted by SIGTERM would consume an attempt and could eventually dead-letter a
+      // delivery that carried no fault of its own.
+      if (isShutdownAbort(error, signal)) throw asWebhookAborted(error);
+      throw error;
+    }
+    throwIfAborted(signal);
     if (refresh) {
       await this.refreshScannerStateFromConfig(
         github,
@@ -720,7 +763,11 @@ export class GuardianService {
     await this.store.upsertRepository({ ...repository, scannerState });
   }
 
-  private async handleScannerWorkflowRun(event: GitHubEvent): Promise<void> {
+  private async handleScannerWorkflowRun(
+    event: GitHubEvent,
+    signal?: AbortSignal
+  ): Promise<void> {
+    throwIfAborted(signal);
     const repository = await this.store.getRepository(event.repository.id);
     if (!repository || repository.repositoryState !== "active") return;
     const run = event.workflow_run;
@@ -750,10 +797,20 @@ export class GuardianService {
     });
   }
 
+  /**
+   * Stamps a lease fence with the current time from the service clock at the moment of the write.
+   * The instant cannot be captured when the job is claimed: the whole point of the fence is that a
+   * long handler may outlive its lease, so expiry has to be judged against write time.
+   */
+  private fenceAsOf(fence?: WebhookLeaseFence): WebhookLeaseFence | undefined {
+    return fence ? { ...fence, asOf: this.now().toISOString() } : undefined;
+  }
+
   private async reviewPullRequest(
     event: GitHubEvent,
     execution: ReviewExecutionOptions = {},
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    fence?: WebhookLeaseFence
   ): Promise<void> {
     throwIfAborted(signal);
     const pull = event.pull_request as GitHubPull;
@@ -841,7 +898,8 @@ export class GuardianService {
         placeholder.id,
         existing,
         repositoryContext.scannerConfigured,
-        "no-route"
+        "no-route",
+        fence
       );
       return;
     }
@@ -865,7 +923,8 @@ export class GuardianService {
         placeholder.id,
         existing,
         repositoryContext.scannerConfigured,
-        unavailableReason(backendError)
+        unavailableReason(backendError),
+        fence
       );
       throw backendError;
     }
@@ -960,7 +1019,8 @@ export class GuardianService {
         placeholder.id,
         existing,
         repositoryContext.scannerConfigured,
-        "capability"
+        "capability",
+        fence
       );
       throw error;
     }
@@ -1034,7 +1094,8 @@ export class GuardianService {
         placeholder.id,
         existing,
         repositoryContext.scannerConfigured,
-        "capability"
+        "capability",
+        fence
       );
       throw error;
     }
@@ -1062,7 +1123,8 @@ export class GuardianService {
         placeholder.id,
         existing,
         repositoryContext.scannerConfigured,
-        unavailableReason(backendError)
+        unavailableReason(backendError),
+        fence
       );
       throw backendError;
     }
@@ -1080,7 +1142,8 @@ export class GuardianService {
         latestPull?.head.sha ?? "unknown",
         placeholder.id,
         existing,
-        repositoryContext.scannerConfigured
+        repositoryContext.scannerConfigured,
+        fence
       );
       return;
     }
@@ -1121,7 +1184,10 @@ export class GuardianService {
           ? now.toISOString()
           : existing?.findingsLastEvictedAt
       },
-      pull.head.sha
+      pull.head.sha,
+      // Head-SHA CAS cannot separate two workers replaying one delivery — both compute this same
+      // head SHA — so the lease is named too. A handler whose lease lapsed mid-run commits nothing.
+      this.fenceAsOf(fence)
     );
     if (!saved) {
       this.metrics.increment("review_stale_total");
@@ -1162,7 +1228,8 @@ export class GuardianService {
         stillCurrent?.head.sha ?? "unknown",
         placeholder.id,
         existing,
-        repositoryContext.scannerConfigured
+        repositoryContext.scannerConfigured,
+        fence
       );
       return;
     }
@@ -1196,7 +1263,8 @@ export class GuardianService {
       repo,
       publishedComments,
       findingStates,
-      pull.head.sha
+      pull.head.sha,
+      signal
     );
 
     const reviewedChangedLines = includedDiffFiles.reduce(
@@ -1261,7 +1329,11 @@ export class GuardianService {
     );
   }
 
-  private async command(event: GitHubEvent, signal?: AbortSignal): Promise<void> {
+  private async command(
+    event: GitHubEvent,
+    signal?: AbortSignal,
+    fence?: WebhookLeaseFence
+  ): Promise<void> {
     if (!event.issue.pull_request) return;
     const text = String(event.comment.body).trim();
     const parsed = /^@guardianbot(?:\s+([a-z-]+))?(?:\s+([\s\S]*))?$/i.exec(text);
@@ -1370,7 +1442,8 @@ export class GuardianService {
           pull_request: pull
         },
         { manual: true, full: command === "full-review" },
-        signal
+        signal,
+        fence
       );
       return;
     }
@@ -1458,9 +1531,14 @@ export class GuardianService {
     return record;
   }
 
-  private async refreshDefaultBranchIndex(event: GitHubEvent, repository: any): Promise<void> {
+  private async refreshDefaultBranchIndex(
+    event: GitHubEvent,
+    repository: any,
+    signal?: AbortSignal
+  ): Promise<void> {
     const branchRef = `refs/heads/${repository.default_branch}`;
     if (event.ref !== branchRef) return;
+    throwIfAborted(signal);
     const existing = await this.store.getRepository(repository.id);
     const visibility = repositoryVisibility(repository);
     await this.store.upsertRepository({
@@ -1476,14 +1554,31 @@ export class GuardianService {
       automaticReviewPaused: existing?.automaticReviewPaused ?? false
     });
     const github = await this.client(event, [repository.id]);
-    const refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
-      github,
-      repositoryId: repository.id,
-      installationId: event.installation.id,
-      fullName: repository.full_name,
-      defaultBranch: repository.default_branch,
-      visibility
-    });
+    // A full rebuild is the longest unit of work in the service: a tree read plus one blob fetch
+    // per indexed file. Without the signal it ran to completion after SIGTERM and published an
+    // index the drain budget had already given up on.
+    let refresh: Awaited<
+      ReturnType<RepositoryIndexService["refreshDefaultBranchIndex"]>
+    > | undefined;
+    try {
+      refresh = await this.options.repositoryIndexService?.refreshDefaultBranchIndex({
+        github,
+        repositoryId: repository.id,
+        installationId: event.installation.id,
+        fullName: repository.full_name,
+        defaultBranch: repository.default_branch,
+        visibility,
+        signal
+      });
+    } catch (error) {
+      // The index service signals cancellation with the platform's AbortError, which is not a
+      // WebhookAbortedError. failClaimedWebhook keys retry-credit off that class, so a raw
+      // AbortError would consume an attempt and could eventually dead-letter a job that was only
+      // ever interrupted by shutdown. Normalised here, as the backend call sites already do.
+      if (isShutdownAbort(error, signal)) throw asWebhookAborted(error);
+      throw error;
+    }
+    throwIfAborted(signal);
     if (refresh) {
       const [owner, repo] = repository.full_name.split("/");
       await this.refreshScannerStateFromConfig(
@@ -1648,7 +1743,8 @@ export class GuardianService {
     placeholderCommentId: number,
     existing: ReviewState | undefined,
     scannerConfigured: boolean,
-    reason: "no-route" | "capability" | "transport" | "invalid-output"
+    reason: "no-route" | "capability" | "transport" | "invalid-output",
+    fence?: WebhookLeaseFence
   ): Promise<void> {
     const now = this.now();
     const lifecycle = preserveFindingStates(
@@ -1672,7 +1768,10 @@ export class GuardianService {
           ? now.toISOString()
           : existing?.findingsLastEvictedAt
       },
-      pull.head.sha
+      pull.head.sha,
+      // Fenced for the same reason as the success path: a worker whose lease was reclaimed must
+      // not overwrite the review the new owner already published with an "unavailable" row.
+      this.fenceAsOf(fence)
     );
     if (!saved) {
       this.metrics.increment("review_stale_total");
@@ -1700,7 +1799,8 @@ export class GuardianService {
     currentHeadSha: string,
     placeholderCommentId: number,
     existing: ReviewState | undefined,
-    scannerConfigured: boolean
+    scannerConfigured: boolean,
+    fence?: WebhookLeaseFence
   ): Promise<void> {
     this.metrics.increment("review_stale_total");
     const now = this.now();
@@ -1730,7 +1830,10 @@ export class GuardianService {
           ? now.toISOString()
           : existing?.findingsLastEvictedAt
       },
-      pull.head.sha
+      pull.head.sha,
+      // Fenced for the same reason as the success path: a worker whose lease was reclaimed must
+      // not overwrite the review the new owner already published with an "unavailable" row.
+      this.fenceAsOf(fence)
     );
     if (!saved) return;
     await github.updateComment(
@@ -1907,7 +2010,8 @@ export class GuardianService {
     repo: string,
     comments: readonly GitHubReviewComment[],
     findings: readonly ReviewFindingRecord[],
-    headSha: string
+    headSha: string,
+    signal?: AbortSignal
   ): Promise<number> {
     const terminal = new Map(
       findings
@@ -1917,6 +2021,12 @@ export class GuardianService {
     if (!terminal.size) return 0;
     let closed = 0;
     for (const comment of comments) {
+      // Deliberately outside the try below: that catch absorbs per-comment GitHub failures, and
+      // swallowing the abort here would let shutdown keep PATCHing for the rest of the loop.
+      // Stopping at a comment boundary is safe because each rewrite is independent and
+      // idempotent — a retry re-lists the comments and `isClosedFindingComment` skips the ones
+      // already rewritten, so the remainder is completed rather than redone.
+      throwIfAborted(signal);
       if (closed >= MAX_CLOSED_INLINE_UPDATES) break;
       if (!this.isOwnInlineAdvisory(comment)) continue;
       if (isClosedFindingComment(comment.body)) continue;
@@ -1983,7 +2093,11 @@ export class GuardianService {
    * installation, so the first real payloads will arrive only after an operator applies the
    * manifest change, and an unfamiliar field must not turn into a failed delivery.
    */
-  private async captureReviewCommentFeedback(event: GitHubEvent): Promise<void> {
+  private async captureReviewCommentFeedback(
+    event: GitHubEvent,
+    signal?: AbortSignal
+  ): Promise<void> {
+    throwIfAborted(signal);
     const comment = event.comment;
     if (!comment || typeof comment !== "object") return;
     const commentId = positiveIdentifier(comment.id);

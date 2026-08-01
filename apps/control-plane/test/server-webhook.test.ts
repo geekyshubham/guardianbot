@@ -56,8 +56,16 @@ test("shutdown cancels in-flight webhook work before closing the store", () => {
   const shutdown = serverSource.slice(serverSource.indexOf("async function shutdown("));
   assert.match(shutdown, /webhookAbort\.abort\(\);/);
   assert.match(shutdown, /server\.closeIdleConnections\(\);/);
-  // The worker records its lease release through the store, so the close must wait.
-  assert.match(shutdown, /if \(drained\) await store\.close\(\);/);
+  // The worker records its lease release through the store, so the close must wait, and a
+  // blown budget must leave the connection alone for a still-live handler.
+  assert.match(shutdown, /if \(!drained\) \{/);
+  // Comments are stripped so this "must not appear" check cannot be satisfied by prose that
+  // merely describes the call being skipped.
+  const blownBudget = shutdown
+    .slice(shutdown.indexOf("if (!drained) {"), shutdown.indexOf("server.closeAllConnections()"))
+    .replaceAll(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(blownBudget, /store\.close\(\)/);
+  assert.match(shutdown, /server\.closeAllConnections\(\);\n[\s\S]*await store\.close\(\);/);
   assert.match(
     shutdown,
     /webhookAbort\.abort\(\);[\s\S]*Promise\.race\([\s\S]*store\.close\(\)/

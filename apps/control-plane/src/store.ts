@@ -222,6 +222,29 @@ export interface ReviewState {
  * Pass the increment this write is responsible for — typically `lifecycle.evicted` — or omit the
  * field entirely. Never pass a value that was read from the store.
  */
+/**
+ * Binds a review write to the webhook lease that authorised it.
+ *
+ * The head-SHA compare-and-set alone cannot separate two workers running the *same* delivery:
+ * both derive `expectedHeadSha` from the same payload, so the predicate holds for both and both
+ * commit. Because the row's counters are accumulated server-side (`findings_evicted_total`,
+ * `feedback_total` are incremented, not assigned), a duplicated commit inflates lifetime totals
+ * rather than merely repeating itself. Naming the lease in the predicate closes that gap: a
+ * worker whose lease lapsed and was reclaimed by another instance fails the fence and writes
+ * nothing, so only the current lease holder can publish.
+ */
+export interface WebhookLeaseFence {
+  deliveryId: string;
+  /** Must still match `webhook_jobs.lease_owner`, and the lease must not have expired. */
+  leaseOwner: string;
+  /**
+   * Instant the expiry is judged against, as ISO-8601. Supplied by the caller so it comes from the
+   * same clock that minted the lease in `claimWebhook`; reading wall time here instead would make
+   * every lease look expired under an injected test clock.
+   */
+  asOf?: string;
+}
+
 export interface ReviewStateWrite extends Omit<ReviewState, "findingsEvictedTotal" | "feedbackTotal"> {
   /** DELTA: terminal findings this write evicted. Added to the stored lifetime total. */
   findingsEvictedTotal?: number;
@@ -1189,8 +1212,18 @@ export interface Store {
     headSha: string,
     placeholderCommentId?: number
   ): Promise<void>;
-  /** Counters in `state` are per-write deltas, not lifetime totals; see `ReviewStateWrite`. */
-  saveReview(state: ReviewStateWrite, expectedHeadSha?: string): Promise<boolean>;
+  /**
+   * Counters in `state` are per-write deltas, not lifetime totals; see `ReviewStateWrite`.
+   *
+   * `fence`, when supplied, additionally requires the named webhook lease to still be held and
+   * unexpired. `expectedHeadSha` cannot do that job for two workers replaying one delivery, since
+   * both compute the same head SHA. See `WebhookLeaseFence`.
+   */
+  saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ): Promise<boolean>;
   getReview(repositoryId: number, pullNumber: number): Promise<ReviewState | undefined>;
   recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean>;
   enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>): Promise<boolean>;
@@ -1617,10 +1650,26 @@ export class MemoryStore implements Store {
     });
   }
 
-  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
+  /** True while `fence` still names the live, unexpired holder of its delivery's lease. */
+  private holdsWebhookLease(fence: WebhookLeaseFence): boolean {
+    const job = this.webhooks.get(fence.deliveryId);
+    if (!job || job.status !== "leased" || job.leaseOwner !== fence.leaseOwner) return false;
+    // A lease with no expiry is treated as already lapsed, matching claimWebhook's reclaim rule.
+    if (!job.leaseExpiresAt) return false;
+    const asOf = fence.asOf ? Date.parse(fence.asOf) : Date.now();
+    if (!Number.isFinite(asOf)) return false;
+    return new Date(job.leaseExpiresAt).getTime() > asOf;
+  }
+
+  async saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ) {
     const key = `${state.repositoryId}:${state.pullNumber}`;
     const current = this.reviews.get(key);
     if (expectedHeadSha && current && current.headSha !== expectedHeadSha) return false;
+    if (fence && !this.holdsWebhookLease(fence)) return false;
     this.reviews.set(key, {
       ...state,
       findings: normalizeReviewFindings(state.findings),
@@ -3025,11 +3074,29 @@ export class PostgresStore implements Store {
     );
   }
 
-  async saveReview(state: ReviewStateWrite, expectedHeadSha?: string) {
+  async saveReview(
+    state: ReviewStateWrite,
+    expectedHeadSha?: string,
+    fence?: WebhookLeaseFence
+  ) {
     const result = await this.pool.query(
+      // The lease fence gates the *source row* rather than riding on the ON CONFLICT predicate:
+      // `DO UPDATE ... WHERE` filters only the update branch, so a fence expressed there would
+      // still let a worker whose lease lapsed INSERT a brand-new row. Selecting the row through
+      // the fence suppresses both branches, and the EXISTS probe shares this statement's snapshot
+      // so the check cannot drift from the write it authorises.
       `INSERT INTO reviews (repository_id,pull_number,head_sha,reviewed_head_sha,placeholder_comment_id,findings,
         findings_schema_version,findings_evicted_total,findings_last_evicted_at,feedback_total)
-       VALUES ($1,$2,$3,$4,$5,$6,$8,$9,$10,$11)
+       SELECT $1::bigint,$2::int,$3::text,$4::text,$5::bigint,$6::jsonb,$8::int,$9::int,
+              $10::timestamptz,$11::int
+       WHERE $12::text IS NULL OR EXISTS (
+         SELECT 1 FROM webhook_jobs
+         WHERE delivery_id=$12
+           AND lease_owner=$13
+           AND status='leased'
+           AND lease_expires_at IS NOT NULL
+           AND lease_expires_at > COALESCE($14::timestamptz, now())
+       )
        ON CONFLICT (repository_id,pull_number) DO UPDATE SET
        head_sha=excluded.head_sha,
        reviewed_head_sha=excluded.reviewed_head_sha,
@@ -3059,7 +3126,10 @@ export class PostgresStore implements Store {
         state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
         state.findingsEvictedTotal ?? 0,
         state.findingsLastEvictedAt ?? null,
-        state.feedbackTotal ?? 0
+        state.feedbackTotal ?? 0,
+        fence?.deliveryId ?? null,
+        fence?.leaseOwner ?? null,
+        fence?.asOf ?? null
       ]
     );
     return (result.rowCount ?? 0) > 0;

@@ -24,6 +24,61 @@ reusable workflow commits remain immutable.
   Does not claim production AI review, seven-day enforcement, scheduled
   authenticated-full DAST on the v0.2.37 digests, or a new DefectDojo reimport.
 
+### Fixed
+
+- Shutdown no longer deregisters its own signal handlers. `SIGINT`/`SIGTERM`
+  register with `process.on` rather than `process.once`, so a second signal
+  arriving mid-drain is absorbed by the existing `shuttingDown` guard instead of
+  reaching Node's default terminate action while a webhook lease is held.
+- A shutdown that exhausts the 120 second drain budget now ends the process
+  through an unref'd 5 second force-exit timer instead of continuing unbounded.
+  The 125 second total stays inside the orchestrator's 130 second
+  `stop_grace_period`, asserted against `infra/docker-compose.yml`, so the
+  process chooses its own exit rather than being `SIGKILL`ed. `store.close()`
+  remains deliberately skipped on that branch so a still-live handler keeps its
+  connection; in exchange, a request still in flight at the 120 second mark is
+  terminated unanswered and redelivered.
+- In-flight HTTP requests are part of the drain. `closeAllConnections()` runs
+  after the drain rather than before, so an accepted webhook `POST` writes its
+  `202` before its socket is destroyed; previously the socket could be destroyed
+  first, producing an empty reply and a GitHub redelivery. Shutdown bounds that
+  wait itself at 15 seconds, because `server.close()` clears Node's
+  connections-checking interval and `requestTimeout`/`headersTimeout` stop being
+  enforced for the remainder of the drain. The server-level timeouts are
+  retained as pre-shutdown defence only.
+- The shutdown `AbortSignal` reaches the long-running webhook work: the
+  default-branch index rebuild on the `push` arm and, through discovery, on the
+  `installation`, `installation_repositories`, and `repository` arms; and the
+  inline-comment closing loop, which stops at a comment boundary and resumes on
+  retry rather than continuing to `PATCH` GitHub past the budget. A cancelled
+  rebuild publishes no index. Cancellation is normalised to the queue's own
+  aborted class at each site, so an interrupted delivery credits its attempt back
+  and requeues instead of spending an attempt and eventually dead-lettering. The
+  per-file read loop inside a rebuild has a checkpoint that no test covers.
+- Monitoring reconciliation can be cancelled between repositories, and
+  cancellation is a distinct outcome rather than being folded into success or
+  failure: a cancelled sweep publishes no weekly report, does not set
+  `lastSuccessAt` or increment the success counter, and leaves the aggregate
+  gauges on the last complete sweep, so a partial sweep cannot be read as
+  authoritative. The checkpoint is evaluated only before an item and never
+  mid-write, so the repository being persisted when the signal arrives is always
+  finished. `consecutiveFailures` is left untouched so shutdown does not read as
+  an outage; the attempt still counts in `runsTotal`, which widens the
+  runs-versus-successes gap by one for each interrupted shutdown.
+- Review writes are bound to the webhook lease that authorised them, in addition
+  to the existing head-SHA compare-and-set. The head-SHA predicate cannot
+  separate two workers replaying the same delivery, because both derive the same
+  expected SHA, and since `findings_evicted_total` and `feedback_total`
+  accumulate server-side, a duplicated commit inflated lifetime counters rather
+  than merely repeating itself. A handler whose lease lapsed and was reclaimed
+  now writes nothing, while a legitimate retry re-claims the delivery with a
+  fresh lease and is unaffected. The `MemoryStore` fence is verified
+  behaviourally; the `PostgresStore` form is verified only by asserting on the
+  statement's source text, because this environment has no live PostgreSQL.
+  `review_stale_total` now covers both a moved head SHA and a lost lease, which
+  mean different things operationally and are no longer distinguishable from
+  metrics alone.
+
 ### Evidence
 
 - On 2026-08-01, the production-hardening shutdown/cancellation implementation

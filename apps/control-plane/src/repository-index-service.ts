@@ -131,6 +131,12 @@ export interface RepositoryIndexRefreshInput {
   fullName: string;
   defaultBranch: string;
   visibility: "public" | "private" | "internal";
+  /**
+   * Cancels a rebuild that shutdown no longer has budget for. Checked between GitHub round trips
+   * and immediately before each store write, so a cancelled refresh never publishes a partial
+   * index. Raises the platform `AbortError`; the caller normalises it.
+   */
+  signal?: AbortSignal;
 }
 
 /** Whether the published index was rebuilt wholesale or advanced from a prior head. */
@@ -224,6 +230,7 @@ export class RepositoryIndexService {
   async refreshDefaultBranchIndex(
     input: RepositoryIndexRefreshInput
   ): Promise<RepositoryIndexRefreshResult> {
+    input.signal?.throwIfAborted();
     const [owner, repo] = splitFullName(input.fullName);
     const commitSha = await this.resolveBranchHead(
       input.github,
@@ -231,6 +238,7 @@ export class RepositoryIndexService {
       repo,
       input.defaultBranch
     );
+    input.signal?.throwIfAborted();
     const repositoryScope = `github:${input.repositoryId}`;
     const existing = await this.store.getRepositoryIndex(
       input.repositoryId,
@@ -245,6 +253,7 @@ export class RepositoryIndexService {
       existing.visibility === input.visibility &&
       existing.commitSha === commitSha
     ) {
+      input.signal?.throwIfAborted();
       await this.store.replaceRepositoryIndex(
         input.repositoryId,
         existing,
@@ -268,6 +277,7 @@ export class RepositoryIndexService {
     }
 
     const tree = await this.readTree(input.github, owner, repo, commitSha);
+    input.signal?.throwIfAborted();
     const supported = tree.blobs
       .flatMap((entry): IndexCandidate[] => {
         const priority = classifyIndexCandidate(entry.path);
@@ -306,7 +316,8 @@ export class RepositoryIndexService {
       owner,
       repo,
       commitSha,
-      readTargets
+      readTargets,
+      input.signal
     );
     const files = new Map<string, string>();
     for (const read of reads) {
@@ -365,6 +376,10 @@ export class RepositoryIndexService {
     const removedRecordIds = existing
       ? recordIdsRemovedFrom(existing, vectors)
       : [];
+    // Last checkpoint before the index becomes visible. Everything above is pure computation over
+    // already-fetched content, so aborting here costs only work-in-progress; aborting after would
+    // leave a published index the drain budget never accounted for.
+    input.signal?.throwIfAborted();
     if (existing && removedRecordIds.length) {
       await this.store.applyRepositoryIndexDelta(input.repositoryId, {
         index,
@@ -643,7 +658,8 @@ export class RepositoryIndexService {
     owner: string,
     repo: string,
     ref: string,
-    candidates: readonly IndexCandidate[]
+    candidates: readonly IndexCandidate[],
+    signal?: AbortSignal
   ): Promise<RepositoryFileRead[]> {
     const results = new Array<RepositoryFileRead>(candidates.length);
     let nextIndex = 0;
@@ -654,6 +670,10 @@ export class RepositoryIndexService {
     await Promise.all(
       Array.from({ length: workerCount }, async () => {
         while (true) {
+          // This is the bulk of a rebuild's wall time: one fetch per indexed file. Checking per
+          // iteration lets every worker stop at a file boundary, so shutdown ends the read phase
+          // in one round trip rather than after the whole candidate list.
+          signal?.throwIfAborted();
           const current = nextIndex;
           nextIndex += 1;
           if (current >= candidates.length) return;

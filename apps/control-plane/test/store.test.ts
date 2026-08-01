@@ -2814,7 +2814,8 @@ test("the counter read/write asymmetry is documented at both ends", () => {
   assert.match(storeSource, /LIFETIME TOTAL of human engagements/);
   assert.match(storeSource, /Never pass a value that was read from the store/);
   // The write side is typed apart from the read side so the difference is visible at the signature.
-  assert.match(storeSource, /saveReview\(state: ReviewStateWrite/);
+  // Tolerates the signature spanning lines, which it does now that a lease fence follows.
+  assert.match(storeSource, /saveReview\(\s*state: ReviewStateWrite/);
 });
 
 test("the absolute finding ceiling is documented with its default and bounds", () => {
@@ -2855,3 +2856,151 @@ function maxPlaceholder(query: string): number {
     ...[...query.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
   );
 }
+
+test("head-SHA CAS alone cannot stop a lapsed lease holder from committing a review", async () => {
+  const store = new MemoryStore();
+  await store.enqueueWebhook("delivery-slow", "pull_request", {});
+  const claimedAt = new Date("2026-08-01T00:00:00.000Z");
+  const first = await store.claimWebhook("worker-1", 900_000, claimedAt);
+  assert.equal(first?.leaseOwner, "worker-1");
+
+  // worker-1 is still inside its handler when the 15-minute lease lapses, so a second instance
+  // legitimately claims the very same delivery.
+  const afterLapse = new Date(claimedAt.getTime() + 900_001);
+  const second = await store.claimWebhook("worker-2", 900_000, afterLapse);
+  assert.equal(second?.deliveryId, "delivery-slow");
+  assert.equal(second?.leaseOwner, "worker-2");
+
+  // The new owner publishes the review for this head.
+  assert.equal(
+    await store.saveReview(
+      {
+        repositoryId: 11,
+        pullNumber: 5,
+        headSha: "head-1",
+        findings: [{ fingerprint: "fp-owner", state: "open" }]
+      },
+      undefined,
+      { deliveryId: "delivery-slow", leaseOwner: "worker-2", asOf: afterLapse.toISOString() }
+    ),
+    true
+  );
+
+  // THE POINT: both workers are replaying one delivery, so both derive the same expected head
+  // SHA. The compare-and-set predicate therefore holds for the evicted worker too — it narrows
+  // the race to same-head writes but does not exclude them. Proven by letting it through here.
+  assert.equal(
+    await store.saveReview(
+      {
+        repositoryId: 11,
+        pullNumber: 5,
+        headSha: "head-1",
+        findings: [{ fingerprint: "fp-stale", state: "open" }]
+      },
+      "head-1"
+    ),
+    true
+  );
+  assert.deepEqual(
+    (await store.getReview(11, 5))?.findings.map((finding) => finding.fingerprint),
+    ["fp-stale"]
+  );
+
+  // Naming the lease closes it: worker-1 no longer holds the lease, so the identical write is
+  // refused even though its head SHA still matches.
+  assert.equal(
+    await store.saveReview(
+      {
+        repositoryId: 11,
+        pullNumber: 5,
+        headSha: "head-1",
+        findings: [{ fingerprint: "fp-evicted", state: "open" }]
+      },
+      "head-1",
+      { deliveryId: "delivery-slow", leaseOwner: "worker-1", asOf: afterLapse.toISOString() }
+    ),
+    false
+  );
+  // The refused write left nothing behind, including the server-side counters.
+  const review = await store.getReview(11, 5);
+  assert.deepEqual(
+    review?.findings.map((finding) => finding.fingerprint),
+    ["fp-stale"]
+  );
+
+  // The current holder still writes normally.
+  assert.equal(
+    await store.saveReview(
+      {
+        repositoryId: 11,
+        pullNumber: 5,
+        headSha: "head-1",
+        findings: [{ fingerprint: "fp-final", state: "open" }]
+      },
+      "head-1",
+      { deliveryId: "delivery-slow", leaseOwner: "worker-2", asOf: afterLapse.toISOString() }
+    ),
+    true
+  );
+});
+
+test("a lease that expired without being reclaimed still fences the write", async () => {
+  const store = new MemoryStore();
+  await store.enqueueWebhook("delivery-expired", "pull_request", {});
+  const claimedAt = new Date("2026-08-01T00:00:00.000Z");
+  await store.claimWebhook("worker-1", 900_000, claimedAt);
+
+  // No peer has claimed it yet, so lease_owner still reads worker-1. Ownership alone is not the
+  // test — the lease must also still be live, or a handler that overran its budget could commit.
+  const afterExpiry = new Date(claimedAt.getTime() + 900_001).toISOString();
+  assert.equal(
+    await store.saveReview(
+      { repositoryId: 12, pullNumber: 6, headSha: "head-2", findings: [] },
+      undefined,
+      { deliveryId: "delivery-expired", leaseOwner: "worker-1", asOf: afterExpiry }
+    ),
+    false
+  );
+  assert.equal(await store.getReview(12, 6), undefined);
+
+  // Before expiry the same fence admits the write.
+  assert.equal(
+    await store.saveReview(
+      { repositoryId: 12, pullNumber: 6, headSha: "head-2", findings: [] },
+      undefined,
+      {
+        deliveryId: "delivery-expired",
+        leaseOwner: "worker-1",
+        asOf: new Date(claimedAt.getTime() + 1_000).toISOString()
+      }
+    ),
+    true
+  );
+});
+
+test("PostgresStore fences the review write on the lease inside one statement", async () => {
+  const { store, poolQueries } = stubbedPostgresStore(undefined, (text) =>
+    text.includes("INSERT INTO reviews") ? { rows: [], rowCount: 0 } : undefined
+  );
+  const saved = await store.saveReview(
+    { repositoryId: 11, pullNumber: 5, headSha: "head-1", findings: [] },
+    "head-1",
+    { deliveryId: "delivery-1", leaseOwner: "worker-1", asOf: "2026-08-01T00:00:00.000Z" }
+  );
+  // rowCount 0 means the fence (or the CAS) suppressed the write, and that must surface as false
+  // rather than a silent success.
+  assert.equal(saved, false);
+
+  const insert = poolQueries.find((query) => query.includes("INSERT INTO reviews"));
+  assert.ok(insert);
+  // The fence is evaluated in the same statement as the write, so it cannot drift from it.
+  assert.match(insert, /EXISTS \(\s*SELECT 1 FROM webhook_jobs/);
+  assert.match(insert, /lease_owner=\$13/);
+  assert.match(insert, /status='leased'/);
+  assert.match(insert, /lease_expires_at > COALESCE\(\$14::timestamptz, now\(\)\)/);
+  // Gating the SELECT that feeds the INSERT, not the ON CONFLICT predicate: a DO UPDATE ... WHERE
+  // filters only the update branch and would still let an evicted worker insert a fresh row.
+  assert.match(insert, /SELECT \$1::bigint[\s\S]*WHERE \$12::text IS NULL OR EXISTS/);
+  assert.ok(insert.indexOf("WHERE $12::text IS NULL") < insert.indexOf("ON CONFLICT"));
+  assert.equal(maxPlaceholder(insert), 14);
+});

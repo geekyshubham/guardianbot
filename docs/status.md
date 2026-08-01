@@ -63,10 +63,14 @@ against those digests). No new DefectDojo import/reimport was independently
 verified. Scheduled authenticated-full acceptance on the v0.2.37 bindings and a
 current DefectDojo reimport remain open.
 
-Independent source review of production-hardening shutdown/cancellation and a
-passing control-plane suite (240/240 on 2026-08-01) are recorded under
-outstanding item 1; that closes only the cancellation sub-item as source/test
-evidence, not live cancel-under-load or other production-readiness work.
+Independent source review of production-hardening shutdown/cancellation is
+recorded under outstanding item 1. The review found nine defects rather than
+confirming clean behaviour; seven were fixed with mutation-proven tests and one
+was triaged as not a defect, and the suite passes 484 checks across all gate
+stages on 2026-08-01 (control-plane 257). That closes the cancellation sub-item
+as source/test evidence only, not live cancel-under-load or other
+production-readiness work, and those fixes are **not** part of the signed
+`v0.2.37` release; they are uncommitted work after that tag.
 
 This does not claim production model-backed review, seven-day enforcement
 completion, reviewed baselines, ruleset readiness, authenticated-full DAST
@@ -99,13 +103,35 @@ the stated live evidence must also be captured where required.
   verification are complete. GuardianBot's own consumer caller/config pin is
   updated to that immutable release commit.
 - **Done (source/test only, 2026-08-01):** Independently reviewed the
-  production-hardening shutdown/cancellation implementation in source; the
-  control-plane test suite passed **240/240**. Backend model calls receive
-  `AbortSignal`; the owned webhook/review handler is **awaited** rather than
-  detached; cancellation checkpoints prevent post-review lifecycle and GitHub
-  writes after abort; the delivery lease is requeued without consuming attempt
-  budget. This does **not** claim live production cancel-under-load evidence
-  and does not close other production-hardening or recovery items.
+  production-hardening shutdown/cancellation implementation in source through
+  three separate lenses (detached model requests, webhook lease validity, and
+  background-loop sequencing). The review was **not** clean: it produced nine
+  findings, seven of which were confirmed and fixed, each with a
+  mutation-proven test. Pre-existing behaviour that held up: backend model
+  calls receive `AbortSignal`, the owned webhook/review handler is **awaited**
+  rather than detached, cancellation checkpoints prevent post-review lifecycle
+  and GitHub writes after abort, and the delivery lease is requeued without
+  consuming attempt budget. Fixed as a result: signal handlers survive a
+  repeated `SIGTERM` (`process.on`, not `process.once`); an exhausted drain
+  budget now terminates the process inside the container grace period rather
+  than running unbounded; in-flight requests are drained before connections are
+  destroyed, so an accepted webhook writes its `202` instead of being answered
+  with an empty reply and redelivered; the abort signal reaches index rebuilds
+  on every dispatch arm and the inline-comment closing loop; monitoring
+  cancellation is a distinct outcome so a partial sweep is never published as
+  authoritative; and a review write is fenced on the webhook lease that
+  authorised it, because the head-SHA compare-and-set cannot separate two
+  workers replaying the same delivery. Suite after the fixes: **438 tests, 0
+  failures** (control-plane 257). One finding was triaged as **not a defect**
+  and deliberately left unchanged. **Not closed:** the `PostgresStore` lease
+  fence is asserted only against the statement's source text, since this
+  environment has no live PostgreSQL, so its parameter numbering and
+  `ON CONFLICT` interaction are unverified at runtime; a request in flight when
+  the drain budget expires is still terminated unanswered and redelivered;
+  `review_stale_total` no longer distinguishes a moved head SHA from a lost
+  lease; and the per-file cancellation checkpoint inside a rebuild has no test.
+  This does **not** claim live production cancel-under-load evidence and does
+  not close other production-hardening or recovery items.
 - Confirm the final repository-index implementation and update the capability
   matrix: automated/local evidence now makes durable recall reachable on the
   production review path (durable ANN ranking, matching embeddings, batch

@@ -3049,3 +3049,295 @@ test("the review path supplies a durable ranker, so a record absent from the loa
       .content.includes("checkTenant")
   );
 });
+
+test("a push-triggered index rebuild stops at a round trip boundary and publishes nothing", async () => {
+  const store = new MemoryStore();
+  const refSha = "f".repeat(40);
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", ".guardianbot/config.yml"],
+    refSha,
+    contents: {
+      "src/auth.ts": Buffer.from("export function authorize(u) { return u.role === 'admin'; }\n")
+    },
+    config: "review:\n  incremental: true\n"
+  });
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 7, 1, 0, 0, 0);
+  // Shutdown lands while the rebuild is between GitHub round trips: the branch head and the tree
+  // listing are already resolved, the per-file content reads have not started.
+  const getTree = github.getTree.bind(github);
+  let treeReads = 0;
+  github.getTree = async function (owner?: string, repo?: string, ref?: string) {
+    const paths = await getTree(owner, repo, ref);
+    treeReads += 1;
+    controller.abort();
+    return paths;
+  };
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      repositoryIndexService: new RepositoryIndexService(store),
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue(
+    "push",
+    {
+      installation: { id: 1 },
+      ref: "refs/heads/main",
+      deleted: false,
+      repository: {
+        id: 99,
+        full_name: "Geekyshubham/guardianbot",
+        default_branch: "main",
+        private: false
+      }
+    },
+    "delivery-push-abort"
+  );
+
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+  assert.equal(treeReads, 1);
+
+  // The whole point: a rebuild cancelled by SIGTERM must not publish an index.
+  assert.equal(await store.getRepositoryIndex(99, "github:99", refSha), undefined);
+  assert.equal((await store.getRepository(99))?.indexSha, undefined);
+
+  // Cancellation is not a delivery failure, so the job is requeued rather than spending its only
+  // attempt and dead-lettering.
+  const job = await store.getWebhook("delivery-push-abort");
+  assert.equal(job?.status, "pending");
+  assert.equal(job?.leaseOwner, undefined);
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // Re-running without an aborted signal completes the rebuild, so the work was only deferred.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.ok(await store.getRepositoryIndex(99, "github:99", refSha));
+  assert.equal((await store.getRepository(99))?.indexSha, refSha);
+});
+
+test("the inline closing loop stops at a comment boundary on shutdown and resumes later", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  const files = [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" },
+    { filename: "src/b.ts", status: "modified", patch: "@@ -1 +20 @@\n+line" }
+  ];
+  github.pullFiles = [files, files, files];
+  let reportFindings = true;
+  const backend = new FakeBackend((request) => {
+    const base = createResult(request, { path: "src/a.ts", startLine: 10 });
+    if (!reportFindings) return { ...base, findings: [] };
+    const [first] = base.findings;
+    return {
+      ...base,
+      findings: [
+        first,
+        {
+          ...first,
+          id: "F2",
+          fingerprint: "fp-2",
+          path: "src/b.ts",
+          startLine: 20,
+          endLine: 20,
+          evidence:
+            request.contexts.find((context) => context.path === "src/b.ts")?.content.slice(0, 500) ??
+            "Changed file src/b.ts contains an unsafe operation."
+        }
+      ]
+    };
+  });
+
+  const controller = new AbortController();
+  const nowMs = Date.UTC(2026, 7, 1, 0, 0, 0);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      now: () => new Date(nowMs)
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-open-two");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 2);
+
+  // Both findings are gone next time, so both advisories become closeable and the loop has two
+  // PATCHes to make. Shutdown lands after the first one.
+  reportFindings = false;
+  const request = github.request.bind(github);
+  github.request = async function <T>(method: string, path: string, body?: any): Promise<T> {
+    const response = await request<T>(method, path, body);
+    if (method === "PATCH" && /\/pulls\/comments\/\d+$/.test(path)) controller.abort();
+    return response;
+  };
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-close-two");
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+
+  // Stopped at the boundary: the second PATCH never went out. Without the in-loop checkpoint the
+  // per-comment catch swallows nothing here, so the loop would run to completion past the budget.
+  assert.equal(github.reviewCommentUpdates.length, 1);
+  const [closed, stillOpen] = github.reviewComments;
+  assert.match(closed!.body, /guardianbot-finding-closed/);
+  assert.doesNotMatch(stillOpen!.body, /guardianbot-finding-closed/);
+
+  const job = await store.getWebhook("delivery-close-two");
+  assert.equal(job?.status, "pending");
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // Resumable and convergent: the retry re-lists the comments, skips the one already rewritten,
+  // and finishes the remainder rather than redoing it.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.equal(github.reviewCommentUpdates.length, 2);
+  for (const comment of github.reviewComments) {
+    assert.match(comment.body, /guardianbot-finding-closed/);
+  }
+});
+
+test("a review whose webhook lease was reclaimed mid-handler commits and publishes nothing", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub();
+  github.pullFiles = [[{ filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }]];
+  const leaseMs = 900_000;
+  let clock = Date.UTC(2026, 7, 1, 0, 0, 0);
+  let reclaimedBy: string | undefined;
+  const backend = new FakeBackend((request) => createResult(request));
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      webhookLeaseMs: leaseMs,
+      now: () => new Date(clock)
+    },
+    store
+  );
+
+  const claimWebhook = store.claimWebhook.bind(store);
+  const request = github.request.bind(github);
+  github.request = async function <T>(method: string, path: string, body?: any): Promise<T> {
+    const response = await request<T>(method, path, body);
+    // This is the head re-check that runs after the backend review and immediately before the
+    // review is committed. The handler has now overrun its 15-minute lease, so a second instance
+    // legitimately claims the same delivery — the exact interleaving the fence has to stop.
+    if (
+      method === "GET" &&
+      /\/pulls\/\d+$/.test(path) &&
+      backend.requests.length > 0 &&
+      !reclaimedBy
+    ) {
+      clock += leaseMs + 1;
+      reclaimedBy = (await claimWebhook("worker-2", leaseMs, new Date(clock)))?.leaseOwner;
+    }
+    return response;
+  };
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-reclaimed");
+  assert.equal(await service.processNextWebhook("worker-1"), true);
+  assert.equal(reclaimedBy, "worker-2");
+
+  // saveReviewHead ran while the lease was still held, so the row exists — but the evicted
+  // handler's findings must not have been committed to it.
+  const review = await store.getReview(99, 12);
+  assert.deepEqual(review?.findings ?? [], []);
+  // And nothing was published to GitHub: no inline advisory, no final summary.
+  assert.equal(github.reviews.length, 0);
+  for (const update of github.updates) {
+    assert.doesNotMatch(update.body, /\*\*Finding lifecycle:\*\*/);
+    assert.doesNotMatch(update.body, /\*\*Problem\*\*/);
+  }
+});
+
+test("a discovery-triggered index rebuild is cancellable, not just the push arm", async () => {
+  const store = new MemoryStore();
+  const refSha = "e".repeat(40);
+  const github = new FakeGitHub({
+    tree: ["src/auth.ts", ".guardianbot/config.yml"],
+    refSha,
+    contents: {
+      "src/auth.ts": Buffer.from("export function authorize(u) { return u.role === 'admin'; }\n")
+    },
+    config: "review:\n  incremental: true\n"
+  });
+  const controller = new AbortController();
+
+  // Abort on the SECOND tree read, not the first. discover() reads the tree itself for language
+  // detection before it rebuilds, so the entry checkpoint has already passed by then; only the
+  // signal threaded into the rebuild can observe this abort. Aborting on the first read would
+  // pass even with the rebuild left uncancellable.
+  const getTree = github.getTree.bind(github);
+  let treeReads = 0;
+  github.getTree = async function (owner?: string, repo?: string, ref?: string) {
+    const paths = await getTree(owner, repo, ref);
+    treeReads += 1;
+    if (treeReads === 2) controller.abort();
+    return paths;
+  };
+
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      maxWebhookAttempts: 1,
+      githubClientFactory: async () => github,
+      repositoryIndexService: new RepositoryIndexService(store)
+    },
+    store
+  );
+
+  await service.enqueue(
+    "installation",
+    {
+      action: "created",
+      installation: { id: 1 },
+      repositories: [
+        {
+          id: 99,
+          full_name: "Geekyshubham/guardianbot",
+          default_branch: "main",
+          private: false
+        }
+      ]
+    },
+    "delivery-discover-abort"
+  );
+
+  assert.equal(await service.processNextWebhook("worker-1", controller.signal), true);
+  // Two reads: discovery's own language detection, then the rebuild's.
+  assert.equal(treeReads, 2);
+
+  // Discovery got far enough to register the repository, which is what makes the absent index
+  // the discriminating signal rather than a no-op.
+  assert.equal((await store.getRepository(99))?.fullName, "Geekyshubham/guardianbot");
+  assert.equal(await store.getRepositoryIndex(99, "github:99", refSha), undefined);
+  assert.equal((await store.getRepository(99))?.indexSha, undefined);
+
+  // Shutdown is not a delivery fault: with maxWebhookAttempts at 1, consuming the attempt would
+  // dead-letter this job instead of requeueing it.
+  const job = await store.getWebhook("delivery-discover-abort");
+  assert.equal(job?.status, "pending");
+  assert.equal(job?.leaseOwner, undefined);
+  assert.match(job?.lastError ?? "", /aborted for shutdown/);
+
+  // The work was deferred, not lost.
+  assert.equal(await service.processNextWebhook("worker-2"), true);
+  assert.ok(await store.getRepositoryIndex(99, "github:99", refSha));
+  assert.equal((await store.getRepository(99))?.indexSha, refSha);
+});

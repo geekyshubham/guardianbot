@@ -1032,6 +1032,94 @@ test("failed reconciliation releases the singleton lock and retains only a bound
   await lock.release();
 });
 
+test("shutdown cancels the sweep between repositories without publishing a partial aggregate", async () => {
+  // Aborts as soon as the first repository's snapshot is durably written, so the sweep is
+  // interrupted strictly between whole repositories.
+  class AbortAfterFirstSnapshotStore extends MemoryStore {
+    controller = new AbortController();
+    savedRepositoryIds: number[] = [];
+    weeklyReportsWritten = 0;
+
+    override async saveMonitoringSnapshot(
+      snapshot: Parameters<MemoryStore["saveMonitoringSnapshot"]>[0],
+      activeAlerts: Parameters<MemoryStore["saveMonitoringSnapshot"]>[1]
+    ): Promise<void> {
+      await super.saveMonitoringSnapshot(snapshot, activeAlerts);
+      this.savedRepositoryIds.push(snapshot.repositoryId);
+      this.controller.abort();
+    }
+
+    override async saveMonitoringWeeklyReport(
+      report: Parameters<MemoryStore["saveMonitoringWeeklyReport"]>[0]
+    ): Promise<void> {
+      this.weeklyReportsWritten += 1;
+      await super.saveMonitoringWeeklyReport(report);
+    }
+  }
+
+  const store = new AbortAfterFirstSnapshotStore();
+  await seedConfiguredRepository(store);
+  await store.upsertRepository(repository({ repositoryId: 21, fullName: "acme/second" }));
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  const result = await monitoring.reconcileOnce(store.controller.signal);
+
+  // The interrupted repository is finished, the next one is never started.
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(store.savedRepositoryIds, [20]);
+  assert.equal(result.repositoriesEvaluated, 1);
+  assert.ok(await store.getLatestMonitoringSnapshot(20));
+  assert.equal(await store.getLatestMonitoringSnapshot(21), undefined);
+
+  // The aggregate is the part that could lie, so a partial sweep must publish none of it.
+  assert.equal(store.weeklyReportsWritten, 0);
+  assert.equal(await store.getMonitoringWeeklyReport("v1:2026-07-27"), undefined);
+
+  // A cancelled sweep is neither a success nor a failure.
+  const state = monitoring.getState();
+  assert.equal(state.successesTotal, 0);
+  assert.equal(state.lastSuccessAt, undefined);
+  assert.equal(state.failuresTotal, 0);
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(state.lastErrorKind, undefined);
+  assert.equal(state.running, false);
+  // Gauges still describe the last COMPLETE sweep, not this partial one.
+  assert.equal(state.repositoriesEvaluated, 0);
+  assert.equal(state.activeAlerts, 0);
+
+  // Cancellation still releases the singleton lock.
+  const lock = await store.acquireMonitoringLock();
+  assert.ok(lock);
+  await lock.release();
+});
+
+test("an uncancelled sweep of the same inventory does publish the complete aggregate", async () => {
+  // Control for the cancellation test: proves the assertions above are caused by the
+  // abort, not by this two-repository fixture being unable to produce a report at all.
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  await store.upsertRepository(repository({ repositoryId: 21, fullName: "acme/second" }));
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+
+  const result = await monitoring.reconcileOnce();
+  assert.equal(result.cancelled, false);
+  assert.equal(result.repositoriesEvaluated, 2);
+  assert.ok(await store.getLatestMonitoringSnapshot(20));
+  assert.ok(await store.getLatestMonitoringSnapshot(21));
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(weekly?.report.totalRepositories, 2);
+  assert.equal(monitoring.getState().successesTotal, 1);
+  assert.equal(monitoring.getState().repositoriesEvaluated, 2);
+});
+
 test("scheduler start and stop abort the interval wait without leaving work running", async () => {
   const store = new MemoryStore();
   let sleepEntered!: () => void;
