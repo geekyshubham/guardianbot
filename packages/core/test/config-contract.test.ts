@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   type GuardianConfig,
+  type ConfiguredReviewProfile,
   parseGuardianConfig,
   serializeGuardianConfig,
   validateAgainstJsonSchema,
@@ -78,6 +79,7 @@ function richConfig(): GuardianConfig {
       highRiskPaths: ["**/auth/**", ".github/workflows/**"],
       contextDocuments: ["README.md", "SECURITY.md", ".github/CODEOWNERS"],
       excludedPaths: ["node_modules/**", "dist/**", "vendor/**"],
+      profile: "benchmark-review",
       pathRules: [
         {
           name: "authentication",
@@ -168,6 +170,41 @@ test("accepts the complete reusable repository contract", () => {
   const config = richConfig();
   assert.deepEqual(validateGuardianConfig(config), []);
   assert.deepEqual(validateAgainstJsonSchema(schema, config), []);
+});
+
+test("accepts approved review profiles and rejects fallback or unknown values", () => {
+  const profiles: ConfiguredReviewProfile[] = [
+    "automatic",
+    "routine-review",
+    "high-risk-review",
+    "benchmark-review"
+  ];
+  for (const profile of profiles) {
+    const accepted = richConfig();
+    accepted.review.profile = profile;
+    assert.deepEqual(validateGuardianConfig(accepted), []);
+    assert.deepEqual(validateAgainstJsonSchema(schema, accepted), []);
+  }
+
+  const omitted = legacyConfig();
+  assert.equal(omitted.review.profile, undefined);
+  assert.deepEqual(validateGuardianConfig(omitted), []);
+  assert.deepEqual(validateAgainstJsonSchema(schema, omitted), []);
+  assert.deepEqual(parseGuardianConfig(serializeGuardianConfig(omitted)), omitted);
+
+  for (const profile of ["fallback-review", "unknown-profile"] as const) {
+    const rejected = richConfig() as GuardianConfig & {
+      review: GuardianConfig["review"] & { profile: string };
+    };
+    rejected.review.profile = profile;
+    const implementationErrors = validateGuardianConfig(rejected);
+    assert.ok(
+      implementationErrors.some((error) => error.includes("review.profile is invalid")),
+      `expected custom validation to reject ${profile}`
+    );
+    const schemaErrors = validateAgainstJsonSchema(schema, rejected);
+    assert.ok(schemaErrors.length > 0, `expected JSON Schema to reject ${profile}`);
+  }
 });
 
 test("accepts optional verified-default-branch promotion and rejects invalid values", () => {

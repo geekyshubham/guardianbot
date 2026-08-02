@@ -1,0 +1,37 @@
+{
+  "capabilities": {
+    "structuredOutput": true,
+    "retention": "bounded",
+    "usageReporting": false
+  },
+  "defaultResult": {
+    "protocolVersion": "guardian.review.v1",
+    "schemaVersion": "1.0.0",
+    "requestId": "fixture-template",
+    "reviewedHeadSha": "0000000",
+    "contextIndexSha": "0000000000000000000000000000000000000000000000000000000000000000",
+    "summary": {
+      "intent": "Deterministic fixture-provider conformance review",
+      "changeGroups": [
+        {
+          "title": "Documentation",
+          "paths": ["README.md"],
+          "summary": "Safe no-finding conformance result for live bridge checks."
+        }
+      ],
+      "riskScore": 0,
+      "reviewEffort": 1,
+      "impactedComponents": [],
+      "partialReview": false
+    },
+    "findings": [],
+    "requirements": [],
+    "testGaps": [],
+    "suggestedReviewers": [],
+    "backend": {
+      "backendId": "fixture-provider",
+      "modelId": "fixture-conformance",
+      "latencyMs": 1
+    }
+  }
+}

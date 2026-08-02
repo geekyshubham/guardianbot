@@ -37,6 +37,88 @@ put provider product names, model ids, or upstream provider URLs into control-pl
 config; those belong only in bridge admin config
 (`GUARDIAN_MODEL_BRIDGE_CONFIG_JSON` or `GUARDIAN_MODEL_BRIDGE_CONFIG_FILE`).
 
+Repository `.guardianbot/config.yml` may set optional `review.profile` to one of
+`automatic`, `routine-review`, `high-risk-review`, or `benchmark-review`. That
+field selects only an approved profile name. It cannot choose a backend URL,
+binding alias, model id, credential, or fallback. When the selected profile has
+no administrative route, the control plane publishes advisory
+`AI review unavailable` and deterministic checks continue.
+
+## Packaged fixture-provider conformance
+
+The model-bridge package includes a deterministic zero-finding fixture at
+`apps/model-bridge/fixtures/live-conformance.json`. In a signed runtime image
+the same file is available at
+`/app/apps/model-bridge/fixtures/live-conformance.json` once that image is
+released. The fixture returns a strict zero-finding `guardian.review.v1`
+result for bridge and plumbing verification only. It is never production AI
+and must not be treated as a live model review.
+
+Fixture deployments must:
+
+- set `adapter: "fixture-provider"` and point `fixtureFile` at the packaged
+  conformance path
+- explicitly map every routed profile's `profileModels` entry to
+  `fixture-conformance` (omitted keys keep the default real model ids such as
+  `gpt-5.6-terra` / `gpt-5.6-sol`)
+- use an explicit partial control-plane registry that routes only the intended
+  verification profile (typically `benchmark-review`) to the fixture bridge
+- never use the legacy single-backend
+  `GUARDIAN_MODEL_BACKEND_URL` / `GUARDIAN_MODEL_BACKEND_TOKEN` pair for fixture
+  verification, because that pair collapses every profile onto one backend
+- never route routine or high-risk production reviews to the fixture
+
+Safe administrative example for local or private-network plumbing checks
+(placeholders only; no secrets or public provider URLs):
+
+```json
+{
+  "protocolVersion": "guardian.review.v1",
+  "bindings": {
+    "fixture-conformance": {
+      "adapter": "fixture-provider",
+      "fixtureFile": "/app/apps/model-bridge/fixtures/live-conformance.json",
+      "allowedClassifications": ["public", "private"],
+      "retention": "bounded",
+      "usageReporting": false,
+      "profileModels": {
+        "benchmark-review": "fixture-conformance"
+      }
+    }
+  },
+  "routes": {
+    "benchmark-review": {
+      "binding": "fixture-conformance"
+    }
+  }
+}
+```
+
+Matching control-plane registry shape (partial routes only; private placeholder
+endpoint):
+
+```json
+{
+  "protocolVersion": "guardian.review.v1",
+  "backends": {
+    "fixture-bridge": {
+      "endpoint": "http://model-bridge.internal:3001",
+      "tokenEnv": "GUARDIAN_MODEL_BRIDGE_TOKEN",
+      "allowedClassifications": ["public", "private"]
+    }
+  },
+  "routes": {
+    "benchmark-review": "fixture-bridge"
+  }
+}
+```
+
+Leave `routine-review` and `high-risk-review` unmapped in that partial registry
+so ordinary repository reviews stay unavailable rather than silently hitting the
+fixture. Current fixture and repository-selected profile coverage is
+automated/local only; production OpenAI Responses credentials and live AI PR
+review remain open.
+
 ## Running the included bridge
 
 Run the bridge as its own process, separate from the control plane:

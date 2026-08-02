@@ -1635,6 +1635,199 @@ test("internal repository visibility routes reviews as restricted", async () => 
   assert.equal(backend.requests[0]?.repository.visibility, "restricted");
 });
 
+function validRepositoryConfig(profile?: string): string {
+  const profileLine = profile ? `  profile: ${profile}\n` : "";
+  return `schemaVersion: 1.0.0
+workflowVersion: 0123456789abcdef0123456789abcdef01234567
+repository:
+  defaultBranch: main
+  releaseBranches: [main]
+  languages: [typescript]
+review:
+  automatic: true
+  drafts: automatic
+  incremental: false
+  maxInlineComments: 8
+  categories: [security, logic, reliability, testing]
+  highRiskPaths: []
+${profileLine}scanners:
+  mode: report-only
+  semgrep: true
+  trivy: true
+  suppressions: []
+image: null
+dast: null
+`;
+}
+
+function profileCapableBackend(supportedProfiles: string[]) {
+  return {
+    requests: [] as ReviewRequest[],
+    async capabilities() {
+      return {
+        protocolVersion: "guardian.review.v1" as const,
+        backendId: "profile-capable",
+        structuredOutput: true,
+        maxInputCharacters: 200_000,
+        supportedProfiles: supportedProfiles as Array<
+          "routine-review" | "high-risk-review" | "benchmark-review"
+        >,
+        supportedDataClassifications: ["public", "private"] as Array<
+          "public" | "private" | "restricted"
+        >,
+        retention: "none" as const,
+        usageReporting: true
+      };
+    },
+    async review(request: ReviewRequest) {
+      this.requests.push(request);
+      const line = request.validChangedLines[0];
+      return createResult(request, {
+        path: line?.path,
+        startLine: line?.start
+      });
+    }
+  };
+}
+
+test("repository benchmark-review config routes low-risk PRs to benchmark backend", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ config: validRepositoryConfig("benchmark-review") });
+  github.currentPulls = [{ head: { sha: "head-sha" } }, { head: { sha: "head-sha" } }];
+  github.pullFiles = [[{
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n+line"
+  }]];
+  const routed: Array<{ profile: string; classification: string }> = [];
+  const backend = profileCapableBackend([
+    "routine-review",
+    "high-risk-review",
+    "benchmark-review"
+  ]);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: (profile, classification) => {
+        routed.push({ profile, classification });
+        return backend;
+      }
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-profile-benchmark");
+  await service.processNextWebhook("worker-1");
+
+  assert.deepEqual(routed, [{ profile: "benchmark-review", classification: "public" }]);
+  assert.equal(backend.requests.length, 1);
+  assert.equal(backend.requests[0]?.profile, "benchmark-review");
+});
+
+test("repository high-risk-review config escalates low-risk PRs to high-risk", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ config: validRepositoryConfig("high-risk-review") });
+  github.currentPulls = [{ head: { sha: "head-sha" } }, { head: { sha: "head-sha" } }];
+  github.pullFiles = [[{
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n+line"
+  }]];
+  const routed: Array<{ profile: string; classification: string }> = [];
+  const backend = profileCapableBackend(["routine-review", "high-risk-review"]);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: (profile, classification) => {
+        routed.push({ profile, classification });
+        return backend;
+      }
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-profile-high-risk");
+  await service.processNextWebhook("worker-1");
+
+  assert.deepEqual(routed, [{ profile: "high-risk-review", classification: "public" }]);
+  assert.equal(backend.requests.length, 1);
+  assert.equal(backend.requests[0]?.profile, "high-risk-review");
+});
+
+test("repository routine-review config never downgrades deterministic high-risk", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ config: validRepositoryConfig("routine-review") });
+  github.currentPulls = [{ head: { sha: "head-sha" } }, { head: { sha: "head-sha" } }];
+  github.pullFiles = [[{
+    filename: "src/auth/login.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n+line"
+  }]];
+  const routed: Array<{ profile: string; classification: string }> = [];
+  const backend = profileCapableBackend(["routine-review", "high-risk-review"]);
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: (profile, classification) => {
+        routed.push({ profile, classification });
+        return backend;
+      }
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-profile-no-downgrade");
+  await service.processNextWebhook("worker-1");
+
+  assert.deepEqual(routed, [{ profile: "high-risk-review", classification: "public" }]);
+  assert.equal(backend.requests.length, 1);
+  assert.equal(backend.requests[0]?.profile, "high-risk-review");
+});
+
+test("repository benchmark-review with no administrative route publishes unavailable", async () => {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ config: validRepositoryConfig("benchmark-review") });
+  github.currentPulls = [{ head: { sha: "head-sha" } }, { head: { sha: "head-sha" } }];
+  github.pullFiles = [[{
+    filename: "src/a.ts",
+    status: "modified",
+    patch: "@@ -1 +1 @@\n+line"
+  }]];
+  let factoryCalls = 0;
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: (profile) => {
+        factoryCalls += 1;
+        assert.equal(profile, "benchmark-review");
+        return undefined;
+      }
+    },
+    store
+  );
+
+  await service.enqueue("pull_request", createPullEvent(), "delivery-profile-benchmark-no-route");
+  await service.processNextWebhook("worker-1");
+
+  assert.equal(factoryCalls, 1);
+  assert.equal(
+    github.updates.some((update) => /AI review unavailable/.test(update.body)),
+    true
+  );
+});
+
 test("administrative backend registry routes profiles without implicit fallback", () => {
   const registry = new ReviewBackendRegistry(
     {
