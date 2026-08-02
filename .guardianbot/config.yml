@@ -14,6 +14,7 @@ review:
   drafts: manual
   incremental: true
   maxInlineComments: 8
+  profile: benchmark-review
   categories:
     - security
     - logic
