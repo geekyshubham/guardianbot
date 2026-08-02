@@ -31,6 +31,7 @@ COPY --from=build /app/apps/control-plane/package.json ./apps/control-plane/pack
 COPY --from=build /app/apps/control-plane/dist ./apps/control-plane/dist
 COPY --from=build /app/apps/model-bridge/package.json ./apps/model-bridge/package.json
 COPY --from=build /app/apps/model-bridge/dist ./apps/model-bridge/dist
+COPY --from=build /app/apps/model-bridge/fixtures ./apps/model-bridge/fixtures
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 USER node
 EXPOSE 3000 3001

@@ -19,6 +19,11 @@ export type DastScanProfile =
   | "authenticated-baseline"
   | "full"
   | "authenticated-full";
+export type ConfiguredReviewProfile =
+  | "automatic"
+  | "routine-review"
+  | "high-risk-review"
+  | "benchmark-review";
 
 export interface GuardianConfig {
   schemaVersion: "1.0.0";
@@ -50,6 +55,7 @@ export interface GuardianConfig {
     highRiskPaths: string[];
     contextDocuments?: string[];
     excludedPaths?: string[];
+    profile?: ConfiguredReviewProfile;
     pathRules?: Array<{
       name: string;
       paths: string[];
@@ -145,6 +151,12 @@ const DAST_PROFILES = new Set<DastScanProfile>([
   "authenticated-baseline",
   "full",
   "authenticated-full"
+]);
+const REVIEW_PROFILES = new Set<ConfiguredReviewProfile>([
+  "automatic",
+  "routine-review",
+  "high-risk-review",
+  "benchmark-review"
 ]);
 const IMAGE_PROMOTION_MODES = new Set<ImagePromotionMode>([
   "enforce-only",
@@ -366,6 +378,7 @@ export function validateGuardianConfig(config: unknown): string[] {
         "highRiskPaths",
         "contextDocuments",
         "excludedPaths",
+        "profile",
         "pathRules"
       ],
       "review",
@@ -380,6 +393,12 @@ export function validateGuardianConfig(config: unknown): string[] {
     }
     if (config.review.manual !== undefined && typeof config.review.manual !== "boolean") {
       errors.push("review.manual must be boolean");
+    }
+    if (
+      config.review.profile !== undefined &&
+      !REVIEW_PROFILES.has(config.review.profile as ConfiguredReviewProfile)
+    ) {
+      errors.push("review.profile is invalid");
     }
     stringArray(config.review.targetBranches, "review.targetBranches", errors, {
       validate: (entry) => BRANCH_PATTERN.test(entry)

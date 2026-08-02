@@ -881,10 +881,19 @@ export class GuardianService {
         pathMatchesPattern(pattern, file.filename)
       )
     );
-    const profile: ReviewProfile =
+    const deterministicProfile: ReviewProfile =
       deterministicRisk.highRisk || configuredHighRisk
         ? "high-risk-review"
         : "routine-review";
+    // automatic | missing | routine-review → floor (never downgrade high-risk).
+    // high-risk-review always escalates; benchmark-review is the only explicit override.
+    const requestedProfile = repositoryContext.config?.review.profile;
+    const profile: ReviewProfile =
+      requestedProfile === "high-risk-review"
+        ? "high-risk-review"
+        : requestedProfile === "benchmark-review"
+          ? "benchmark-review"
+          : deterministicProfile;
     const indexVisibility = repositoryVisibility(event.repository);
     const classification: DataClassification =
       indexVisibility === "internal" ? "restricted" : indexVisibility;

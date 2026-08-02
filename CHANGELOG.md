@@ -5,6 +5,34 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Optional repository `review.profile` (`automatic` default when omitted,
+  `routine-review`, `high-risk-review`, `benchmark-review`). Deterministic risk
+  is a floor: explicit routine cannot downgrade a high-risk change; explicit
+  high-risk escalates; benchmark selects benchmark. Repository config chooses
+  only an approved profile name—never backend URL, alias, model, credential, or
+  fallback. Missing administrative route yields advisory `AI review unavailable`
+  while deterministic checks continue. Automated/local evidence only; no
+  production OpenAI Responses credential or live AI PR review is claimed.
+- Packaged fixture-provider conformance path
+  `apps/model-bridge/fixtures/live-conformance.json` (runtime image path
+  `/app/apps/model-bridge/fixtures/live-conformance.json` once released): strict
+  zero-finding deterministic result for bridge/plumbing verification only, never
+  production AI. Fixture deployments must explicitly map `profileModels` to
+  `fixture-conformance`, use an explicit partial control-plane registry (never
+  legacy single-backend env), and must not route routine/high-risk production
+  reviews to the fixture.
+
+### Changed
+
+- Documentation for repository configuration, model-bridge adapters, model-bridge
+  README, and capability status now describe repository-selected review profiles
+  and the packaged fixture-provider conformance path, and keep production AI,
+  RouteLens current-binding full schedule, seven-day enforcement, GitHub App
+  `pull_request_review_comment`, weekly monitoring cadence, DefectDojo old-token
+  retirement, and recovery/HA blockers explicit.
+
 ### Evidence
 
 - Live DefectDojo least-privilege automation cutover (2026-08-02 UTC): pre-cutover

@@ -46,6 +46,7 @@ review:
   highRiskPaths: ["**/auth/**", ".github/workflows/**", "**/migrations/**"]
   contextDocuments: [README.md, SECURITY.md, .github/CODEOWNERS]
   excludedPaths: ["node_modules/**", "dist/**", "vendor/**"]
+  profile: automatic
   pathRules:
     - name: authentication
       paths: ["**/auth/**"]
@@ -74,6 +75,24 @@ dast: null
 `review.excludedPaths` is also present, it must contain the same ordered values.
 This prevents advisory review and deterministic scanners from silently
 disagreeing about coverage.
+
+## Review profile selection
+
+Optional `review.profile` chooses only which approved administrative review
+profile the control plane requests. Allowed values:
+
+| Value | Behavior |
+| --- | --- |
+| `automatic` (default when omitted) | Use the deterministic risk floor: routine for ordinary changes, high-risk when the change scores high-risk or matches `review.highRiskPaths`. |
+| `routine-review` | Prefer the routine administrative route, but never below the deterministic floor: a deterministic high-risk change still routes as `high-risk-review`. |
+| `high-risk-review` | Always escalate to the high-risk administrative route. |
+| `benchmark-review` | Explicitly select the benchmark administrative route. |
+
+Repository configuration cannot choose a backend URL, binding alias, model id,
+credential, or fallback. Those remain administrative bridge and control-plane
+registry concerns only. When the selected profile has no approved administrative
+route, the control plane publishes advisory `AI review unavailable` and
+deterministic checks continue unchanged.
 
 ## Auto-detection profiles
 
@@ -224,6 +243,7 @@ Schema and the inline `GuardianConfig` TypeScript interface.
 | `review.highRiskPaths` | yes | Globs that raise deterministic change risk. |
 | `review.contextDocuments` | no | Repository documents allowed as bounded review context. |
 | `review.excludedPaths` | no | Advisory exclusion mirror of `paths.excluded`. |
+| `review.profile` | no | Optional approved review profile: `automatic` (default when omitted), `routine-review`, `high-risk-review`, or `benchmark-review`. Selects only a profile name; never a backend URL, alias, model, credential, or fallback. Deterministic risk is a floor: explicit routine cannot downgrade a high-risk change; explicit high-risk escalates; benchmark selects benchmark. Missing admin route yields advisory `AI review unavailable` while deterministic checks continue. |
 | `review.pathRules` | no | Ordered, path-scoped review rules. |
 | `review.pathRules.name` | yes | Stable human-readable rule name. |
 | `review.pathRules.paths` | yes | Repository globs to which the rule applies. |

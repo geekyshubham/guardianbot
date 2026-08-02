@@ -97,7 +97,9 @@ Common binding fields:
 - `profileReasoningEfforts`: optional mapping from review profile to `none`, `low`,
   `medium`, `high`, `xhigh`, or `max`
 
-Default profile models for OpenAI-family bindings when `profileModels` is omitted:
+Default profile models when `profileModels` is omitted (OpenAI-family and
+fixture bindings share these defaults; fixture deployments must override them
+to `fixture-conformance`):
 
 - `routine-review`: `gpt-5.6-terra`
 - `high-risk-review`: `gpt-5.6-sol`
@@ -128,6 +130,46 @@ the configured timeout.
 Fixture-provider fields:
 
 - `fixtureFile`: required path to JSON fixtures
+
+Packaged live conformance fixture:
+
+- Source path: `apps/model-bridge/fixtures/live-conformance.json`
+- Signed runtime image path (once released):
+  `/app/apps/model-bridge/fixtures/live-conformance.json`
+- Returns a strict zero-finding deterministic `guardian.review.v1` result
+- For bridge/plumbing verification only; never production AI
+- Fixture bindings must explicitly set `profileModels` to `fixture-conformance`
+  for every routed profile. Omitted keys keep the default real model ids
+  (`gpt-5.6-terra` / `gpt-5.6-sol`)
+- Route only the intended verification profile (typically `benchmark-review`)
+  to the fixture; do not route routine or high-risk production reviews there
+- Pair with an explicit partial control-plane registry, never the legacy
+  single-backend env pair
+
+Safe benchmark-only fixture binding example (private path placeholder):
+
+```json
+{
+  "protocolVersion": "guardian.review.v1",
+  "bindings": {
+    "fixture-conformance": {
+      "adapter": "fixture-provider",
+      "fixtureFile": "/app/apps/model-bridge/fixtures/live-conformance.json",
+      "allowedClassifications": ["public", "private"],
+      "retention": "bounded",
+      "usageReporting": false,
+      "profileModels": {
+        "benchmark-review": "fixture-conformance"
+      }
+    }
+  },
+  "routes": {
+    "benchmark-review": {
+      "binding": "fixture-conformance"
+    }
+  }
+}
+```
 
 Fixture file shape:
 

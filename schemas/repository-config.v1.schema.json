@@ -147,6 +147,14 @@
         "excludedPaths": {
           "$ref": "#/$defs/repositoryPathArray"
         },
+        "profile": {
+          "enum": [
+            "automatic",
+            "routine-review",
+            "high-risk-review",
+            "benchmark-review"
+          ]
+        },
         "pathRules": {
           "type": "array",
           "items": {
