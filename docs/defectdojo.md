@@ -87,6 +87,14 @@ The base URL must use HTTPS outside loopback development. The API token must
 belong to a dedicated automation user with only the product hierarchy, test
 lookup, import, and reimport permissions needed by GuardianBot.
 
+This deployment is DefectDojo **OSS**. Scope the automation identity with the
+OSS Product Type **Authorized Users** model (non-staff, non-superuser, no
+configuration permissions, authorized only on the Product Type GuardianBot
+uses). Do **not** claim a DefectDojo Pro **API Importer** role exists here; that
+role is Pro-only and is not available on this stack. Consumer repositories never
+receive the token. Rotation procedure:
+[Operator runbook](../infra/defectdojo/RUNBOOK.md#oss-automation-token-rotation).
+
 ## Live conformance command
 
 The checked-in `semgrep-empty.json` fixture contains no credentials or
@@ -126,11 +134,27 @@ import/reimport conformance run. RouteLens workflow evidence has also created
 and reimported stable Semgrep and Trivy Test IDs. That workflow run exposed a
 format mismatch in the DAST path: DefectDojo 3.1.200 requires XML for `ZAP Scan`,
 while GuardianBot originally submitted ZAP JSON. v0.2.28 fixes the artifact and
-ingestion contracts with regression coverage. Live XML reimport, a destructive
-restore drill, least-privilege automation permissions, and HA remain unverified.
+ingestion contracts with regression coverage. Live XML reimport for AstraNull
+current-binding full is independently verified (TestImport 862); RouteLens
+current-binding full import remains open.
 
-See [v0.2.27 live evidence](evidence/v0.2.27-defectdojo.md) for the exact
-DigitalOcean resources and bounded verification claims.
+**Live automation identity (2026-08-02 UTC):** control-plane token cut over to
+OSS least-privilege user ID 5 `guardianbot-importer-prod` (active true, staff
+false, superuser false, no configuration permissions), authorized only on
+Product Type ID 2 via OSS Authorized Users. Live mutation conformance under that
+identity: Product 20, Engagement 28, import/reimport TestImports 878/879 on
+stable Test ID 46. DigitalOcean env-only cutover ACTIVE deployment
+`b4f8fda3-c103-4771-91af-2bc0efd24b73`. The old overprivileged token is no longer
+deployed but has **not** been revoked, and the old superuser account has **not**
+been deactivated—credential rotation is not fully closed. A destructive restore
+drill and HA remain unverified. Overall DefectDojo acceptance remains partial
+while RouteLens full import, failed-import alerting, restore/HA, and old-token
+retirement stay open.
+
+See [v0.2.27 live evidence](evidence/v0.2.27-defectdojo.md) for platform
+resources and
+[v0.2.40 least-privilege cutover](evidence/v0.2.40-defectdojo-least-privilege.md)
+for the automation identity evidence.
 
 Deployment and operations details:
 
