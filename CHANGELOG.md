@@ -5,6 +5,8 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+## [0.2.41] - 2026-08-02
+
 ### Added
 
 - Optional repository `review.profile` (`automatic` default when omitted,
