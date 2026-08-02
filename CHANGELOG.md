@@ -5,6 +5,125 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Evidence
+
+- Live GuardianBot `v0.2.40` signed control-plane deployment (2026-08-01 UTC):
+  release source `d6b5a41a468e515b398db4c530a5936cb8ac7c95`, release run
+  [`30719671783`](https://github.com/geekyshubham/guardianbot/actions/runs/30719671783)
+  passed, exact signed image
+  `sha256:a86d9adc209037c99bc489d0c7efed92a2f09ab2e2b657dd007d762437040f13`,
+  DigitalOcean app `346b3b81-b8cf-4136-b706-0a7195bc9f00` ACTIVE deployment
+  `dee798d7-42d9-4c2b-8b44-acfbce7b5944`. `/healthz` and `/readyz` HTTP 200;
+  unauthenticated `GET /operations/monitoring` HTTP 404; exact private bearer
+  returns schema `guardianbot.monitoring.status.v1` (bearer never documented).
+  First live ledger snapshot at `2026-08-01T21:47:39.197Z` remains the
+  post-deploy baseline (1 successful run, 7 failing, 20 active alerts). Current
+  multi-cycle snapshot at `2026-08-02T08:10:30.142Z` (last cycle
+  `2026-08-02T08:02:09.438Z`): scheduler enabled/started, running false, 42
+  runs / 42 successes, 0 failures, 0 consecutive failures, 0 lock skips, 19
+  repositories evaluated, 6 failing, 13 warnings, 35 active alerts. Weekly
+  report: scanner expected 18 / successful 18 / evidence complete 11 /
+  missing-evidence alerts 7; fresh indexes 18 / stale 1; protected digests 2 /
+  complete-evidence digests 2 / missing-evidence digests 4; review source
+  unavailable and zero AI review metrics; inventory report-only 16 /
+  advisory-only 2 / misconfigured 1. AstraNull active alerts contain only
+  `index-freshness` warning after successful full DAST reconciliation; prior
+  active `scanner-zap-nightly` and `scanner-zap-nightly-import` alerts for
+  AstraNull are absent. RouteLens still has failing `scanner-zap-nightly` and
+  `scanner-zap-nightly-import` alerts plus freshness warnings. Proves
+  multi-cycle process-local scheduler success and observed AstraNull
+  active-alert recovery—not DefectDojo independent import proof or weekly
+  cadence across multiple UTC weeks. Evidence:
+  [v0.2.40 live monitoring and current DAST](docs/evidence/v0.2.40-live-monitoring-and-current-dast.md).
+- AstraNull current binding advanced to head
+  `3cb15183e3bf7ccb7326efd461878ce655b66bcb`; push run
+  [`30722621728`](https://github.com/geekyshubham/AstraNull/actions/runs/30722621728)
+  (event `push`, success); exact DigitalOcean digest
+  `sha256:061ed079c9d95ef792d92c3ab55af40d2ece8a3f234e741ec1e6afa66f587473`
+  ACTIVE on app `2a76914e-d04e-4a6c-8b9c-929a1e8976e2` deployment
+  `baab86b3-747d-4765-b4eb-39ab31d857cc` (service and migrate job use that
+  digest; `/health` and `/ready` healthy per ACTIVE promotion/runtime
+  contract). Intermediate head `6ee73a48e14d3181738c430cd9662acc20ecac3b` /
+  digest
+  `sha256:ad09cc35894a3299a02fa3198c7f0cbb282d1a982bbacec71f36279cf7b78fc0` /
+  deployment `df13260c-4f0f-42f7-822d-80b7c1c5e6ee` / manual diagnostic
+  [`30720398948`](https://github.com/geekyshubham/AstraNull/actions/runs/30720398948)
+  remain historical repair evidence only (OIDC role-map repair and baseline
+  dispatch on the intermediate binding).
+- AstraNull genuine scheduled `authenticated-full` DAST acceptance on the
+  current binding: run
+  [`30734622751`](https://github.com/geekyshubham/AstraNull/actions/runs/30734622751)
+  (event exactly `schedule`, head exactly
+  `3cb15183e3bf7ccb7326efd461878ce655b66bcb`, success). Only executed DAST job
+  was `guardianbot/dast-nightly / authenticated staging DAST`; security-gate,
+  image, and dast-smoke skipped by schedule conditions. Full job passed exact
+  staging contract, one-time session, bounded repository OpenAPI, authenticated
+  assertion and active ZAP API scan, session destruction, provenance
+  attestation, and artifact upload. DAST artifact `8829127168` digest
+  `sha256:9116d4c7ccd97e6c0fcd148f48529d30e7b14dbc777de7ad52992b9015f93fbe`.
+  scan-status: schema 1.0.0, profile `authenticated-full`,
+  `deploymentEnvironment` staging, exact digest
+  `sha256:061ed079c9d95ef792d92c3ab55af40d2ece8a3f234e741ec1e6afa66f587473`,
+  minutes 45, ZAP exit 2 (report-only findings, no operational failure).
+  Provenance: repository `geekyshubham/astranull`, repositoryId `1287322655`,
+  run/attempt `30734622751/1`, current head, workflow
+  `.github/workflows/reusable-dast.yml`, workflow SHA
+  `7524547700e4c3994353f5c61d1625b2bd5e5428`. Manifest file hashes/sizes
+  independently recomputed and all 3 matched (scan-status, zap.json, zap.xml).
+  Closes AstraNull current-binding scheduled authenticated-full only; does
+  **not** independently prove DefectDojo import/reimport.
+- RouteLens genuine scheduled `authenticated-full` failure with
+  `wall_clock_timeout`: run
+  [`30734627567`](https://github.com/geekyshubham/RouteLens/actions/runs/30734627567)
+  (event exactly `schedule`, then-current head
+  `55eeead5b7306972abfff1b30a32b5cae95e96eb`, then-current exact DigitalOcean
+  digest
+  `sha256:7ac78ef0d9ab23c14f7e3665a834f21fd73a9be3ceed040b4c76b7a06532dceb`).
+  `guardianbot/dast-nightly / authenticated staging DAST` executed; other
+  top-level jobs skipped. Exact staging contract, one-time session, bounded
+  safe-method OpenAPI preparation, authenticated assertion, cleanup, provenance
+  attestation, and artifact upload passed. Active ZAP scanned the live schema's
+  175 retained GET/HEAD/OPTIONS operations and exceeded the 45-minute wall
+  bound. scan-status: profile `authenticated-full`, staging, exact digest
+  above, minutes 45, `zapExitCode` 3, `failureKind` `wall_clock_timeout`. DAST
+  artifact `8829613107` digest
+  `sha256:e40de909d7a8e1963a875d4def733e8b1ccb83d6fc39e48c18d78cf8835d942f`.
+  Provenance binds `geekyshubham/routelens`, repositoryId `1146692767`,
+  run/attempt `30734627567/1`, head `55eeead5…`, reusable workflow SHA
+  `7524547700e4c3994353f5c61d1625b2bd5e5428`; all 3 manifest file hashes/sizes
+  independently matched. Valid provenance-bound failure evidence, not a
+  successful full scan. Prior baseline schedule
+  [`30718271723`](https://github.com/geekyshubham/RouteLens/actions/runs/30718271723)
+  on the same then-current binding remains baseline-only history.
+- RouteLens remediation merged/promoted but next genuine schedule still
+  required: PR [#77](https://github.com/geekyshubham/RouteLens/pull/77) merged
+  at current default head `5f8990484101feb56733308b3f0b3b01706bdaf8` on
+  `2026-08-02T08:11:19Z` after Backend, Frontend, Production artifact,
+  GuardianBot deterministic security, and exact-image checks passed. Replaced
+  the 175-operation live schema input with
+  `docs/api/guardianbot-dast-openapi.json` (exactly 3 non-destructive GET
+  operations: public health, public schema, authenticated target list/session
+  assertion) through the existing generic repository-file mechanism; keeps
+  immutable workflow SHA, one-time auth profile, active-full profile, genuine
+  `47 2 * * *` schedule, and 45-minute bound. Current push run
+  [`30739285447`](https://github.com/geekyshubham/RouteLens/actions/runs/30739285447)
+  passed deterministic security, exact linux/amd64 build, disposable
+  dependencies, tests, migrations, runtime smoke, Trivy, CycloneDX SBOM,
+  Critical policy, immutable push, keyless Cosign signing, attestation, and
+  provenance. Current signed digest
+  `sha256:f99d875c5ad4a3439186b4783db7cbc221f66ee30b84914843731b528d839119`.
+  DigitalOcean App `8cbf8b10-0d55-408f-87fc-2b501a06fada` ACTIVE deployment
+  `56c22a8c-0258-41ab-b839-8a50613810d6`; routelens service and migrate job use
+  exact current digest; `/api/v1/health/` 200, `/api/schema/` 200, anonymous
+  `/api/targets/` 401. Because head/digest changed after the failed schedule,
+  RouteLens scheduled authenticated-full remains **open** until the next
+  genuine schedule passes with provenance on this new exact binding. PR checks
+  and push promotion do **not** prove full DAST. Still open overall: RouteLens
+  current-binding full DAST, DefectDojo independent verification, production
+  model credential/live AI review, seven-day enforcement/ruleset readiness,
+  GitHub App review-comment permission, and full PoC acceptance. Evidence:
+  [v0.2.40 live monitoring and current DAST](docs/evidence/v0.2.40-live-monitoring-and-current-dast.md).
+
 ## [0.2.40] - 2026-08-02
 
 ### Added
