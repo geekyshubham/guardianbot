@@ -7,6 +7,25 @@ reusable workflow commits remain immutable.
 
 ### Evidence
 
+- Live DefectDojo least-privilege automation cutover (2026-08-02 UTC): pre-cutover
+  deployed token resolved to user ID 2 `guardianbot-automation` (active true,
+  staff true, superuser true; Product Type 2 `authorized_users: []`), proving
+  staff/superuser bypass of OSS Authorized Users. Replacement user ID 5
+  `guardianbot-importer-prod` (active true, staff false, superuser false,
+  `configuration_permissions: []`) authorized only on Product Type ID 2 via OSS
+  `authorized_users` (not a DefectDojo Pro API Importer role). Live mutation
+  conformance before cutover: Product 20, Engagement 28, Semgrep empty fixture
+  import TestImport 878 and reimport 879 both on stable Test ID 46. Control plane
+  rotated only `GUARDIANBOT_DEFECTDOJO_API_TOKEN` on app
+  `346b3b81-b8cf-4136-b706-0a7195bc9f00`; ACTIVE deployment
+  `b4f8fda3-c103-4771-91af-2bc0efd24b73` (created `2026-08-02T09:10:33Z`, updated
+  `2026-08-02T09:11:25Z`, 7/7 steps; same signed v0.2.40 image). Injected token
+  resolves to user ID 5; first process-local cycle last
+  `2026-08-02T09:11:05.298Z` (1/1 success, 19 repos, 6 failing, 13 warning, 33
+  active alerts). Old token no longer deployed but **not** revoked; old superuser
+  account **not** deactivated. RouteLens current-binding full DAST/import and
+  unrelated acceptance blockers remain open. Evidence:
+  [v0.2.40 DefectDojo least-privilege cutover](docs/evidence/v0.2.40-defectdojo-least-privilege.md).
 - Live GuardianBot `v0.2.40` signed control-plane deployment (2026-08-01 UTC):
   release source `d6b5a41a468e515b398db4c530a5936cb8ac7c95`, release run
   [`30719671783`](https://github.com/geekyshubham/guardianbot/actions/runs/30719671783)

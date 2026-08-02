@@ -144,9 +144,61 @@ For a database password rotation:
 5. restart the service and run `doctor.sh`;
 6. securely remove the recovery file after verification.
 
-Rotate the bootstrap administrator password in the DefectDojo UI. Rotate the
-GuardianBot API token by creating a new token, updating only the GuardianBot
-control-plane secret, verifying an import, and then revoking the old token.
+Rotate the bootstrap administrator password in the DefectDojo UI.
+
+## OSS automation token rotation
+
+This stack is DefectDojo **OSS**. Scope automation with Product Type
+**Authorized Users** (non-staff, non-superuser). Do **not** claim or configure a
+DefectDojo Pro **API Importer** role; it does not exist here. Never print tokens,
+write them into this repository, or place them in consumer repository secrets.
+Consumer repositories never receive DefectDojo credentials.
+
+Staged procedure (fail closed before cutover):
+
+1. **Create candidate user** — inactive or immediately constrained: active only
+   when ready to validate; `is_staff=false`; `is_superuser=false`; empty
+   configuration permissions. Prefer a dedicated importer username (for example
+   `guardianbot-importer-prod`).
+2. **Authorize Product Type only** — add the candidate solely to Product Type
+   `GitHub Repositories` (ID 2 in the current PoC) through OSS
+   `authorized_users`. Do not grant staff, superuser, global configuration, or
+   other Product Types.
+3. **Acquire token without logging it** — create or regenerate the API token in
+   the admin UI or approved operator path; store it only in a root-only or
+   approved secret-manager path. Never `echo`, log, commit, or paste the value
+   into chat/evidence.
+4. **Validate identity and read access** — with the candidate token only, confirm
+   `/api/v2/user_profile/` shows the expected user ID, active true, staff false,
+   superuser false, empty configuration permissions; confirm Product Type 2
+   authorization and HTTP 200 for products, engagements, and tests. If any check
+   fails, **rollback before cutover**: remove Product Type authorization,
+   deactivate the candidate, and stop.
+5. **Unique import/reimport conformance** — create a uniquely named product and
+   engagement under Product Type 2; import the non-secret empty Semgrep fixture;
+   reimport the same fixture; require both operations to return the **same**
+   Test ID (stable Test ID). Prefer the package live conformance command when
+   available. On failure, **rollback before cutover** as in step 4; do not
+   rotate the control plane.
+6. **Rotate only the control-plane secret** — update solely
+   `GUARDIANBOT_DEFECTDOJO_API_TOKEN` on the GuardianBot DigitalOcean App
+   (preserve all other App spec fields). Do not change consumer repos.
+7. **Wait for ACTIVE and health** — deployment must reach ACTIVE with successful
+   steps; public `/healthz` and `/readyz` HTTP 200; unauthenticated private
+   operations endpoints remain denied.
+8. **Verify injected identity** — on the ACTIVE deployment, confirm the injected
+   token resolves to the candidate user ID with staff/superuser false, Product
+   Type authorization true, and the conformance TestImports present on the
+   stable Test ID.
+9. **Retire the old identity** — only after step 8: reset/revoke the old API
+   token and deactivate the old automation account through an approved
+   DefectDojo admin path. Until both complete, credential rotation is **not**
+   fully closed even if the control plane no longer deploys the old token.
+
+If validation fails at any step before cutover, restore Product Type
+authorization for the previous production identity only if it is still the
+intended interim path, deactivate failed candidates, and do not cut over.
+Failed temporary candidates must not retain production significance.
 
 ## Emergency disablement
 
