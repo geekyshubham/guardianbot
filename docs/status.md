@@ -1,9 +1,12 @@
 # Capability status
 
-Release: `0.2.40`
+Release: `0.2.41`
 Last verified: 2026-08-02
 
-**Release control:** signed `v0.2.40` is live on the control plane. Release
+**Release control:** `v0.2.41` is a release candidate at this release-prep stage
+(not yet signed, published, or deployed). It packages repository-selected
+approved review profiles and the packaged fixture-provider conformance path.
+Live control plane remains signed `v0.2.40`. Proven live `v0.2.40`: release
 source commit `d6b5a41a468e515b398db4c530a5936cb8ac7c95`; release workflow run
 [`30719671783`](https://github.com/geekyshubham/guardianbot/actions/runs/30719671783)
 passed; exact signed image
@@ -30,12 +33,12 @@ reimport is independently verified (TestImport 862); RouteLens current-binding
 full import remains open. Live DefectDojo automation identity is least-privilege
 user ID 5 `guardianbot-importer-prod` (conformance-proven; env-only cutover
 deployment `b4f8fda3-c103-4771-91af-2bc0efd24b73`); old token retirement remains
-open. **Still not claimed:** RouteLens current-binding scheduled
-authenticated-full DAST, RouteLens current-binding full DefectDojo import, old
+open. **Still not claimed:** production OpenAI Responses credential or live AI
+review, RouteLens current-binding scheduled authenticated-full DAST, RouteLens
+current-binding full DefectDojo import, seven-day enforcement, GitHub App
+`pull_request_review_comment` permission, cross-week monitoring cadence, old
 DefectDojo automation token revocation and old superuser deactivation,
-production model-backed AI review, seven-day enforcement, cross-week monitoring
-cadence, GitHub App `pull_request_review_comment` permission, or full PoC
-acceptance. Evidence:
+restore/HA, or full PoC acceptance. Evidence:
 [v0.2.40 live monitoring and current DAST](evidence/v0.2.40-live-monitoring-and-current-dast.md)
 and
 [v0.2.40 DefectDojo least-privilege cutover](evidence/v0.2.40-defectdojo-least-privilege.md).
