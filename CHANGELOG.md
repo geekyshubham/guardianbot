@@ -32,8 +32,9 @@ reusable workflow commits remain immutable.
   AstraNull are absent. RouteLens still has failing `scanner-zap-nightly` and
   `scanner-zap-nightly-import` alerts plus freshness warnings. Proves
   multi-cycle process-local scheduler success and observed AstraNull
-  active-alert recovery—not DefectDojo independent import proof or weekly
-  cadence across multiple UTC weeks. Evidence:
+  active-alert recovery—not weekly cadence across multiple UTC weeks.
+  Operator-ledger recovery is not the DefectDojo API proof (AstraNull full
+  reimport is separately verified as TestImport 862). Evidence:
   [v0.2.40 live monitoring and current DAST](docs/evidence/v0.2.40-live-monitoring-and-current-dast.md).
 - AstraNull current binding advanced to head
   `3cb15183e3bf7ccb7326efd461878ce655b66bcb`; push run
@@ -70,8 +71,27 @@ reusable workflow commits remain immutable.
   `.github/workflows/reusable-dast.yml`, workflow SHA
   `7524547700e4c3994353f5c61d1625b2bd5e5428`. Manifest file hashes/sizes
   independently recomputed and all 3 matched (scan-status, zap.json, zap.xml).
-  Closes AstraNull current-binding scheduled authenticated-full only; does
-  **not** independently prove DefectDojo import/reimport.
+  Closes AstraNull current-binding scheduled authenticated-full only.
+- Independently verified DefectDojo reimport for AstraNull genuine scheduled
+  authenticated-full run `30734622751/1` (read-only DefectDojo API via control
+  plane; token never printed or persisted): TestImport ID 862, type `reimport`,
+  Test ID 6, created `2026-08-02T05:44:58.992083Z`, build `30734622751/1`,
+  commit `3cb15183e3bf7ccb7326efd461878ce655b66bcb`, branch `main`, findings
+  affected 10 (2 reactivated `R`, 8 updated `U`); tags bind attempt 1, branch
+  main, exact commit, env staging, image
+  `sha256:061ed079c9d95ef792d92c3ab55af40d2ece8a3f234e741ec1e6afa66f587473`,
+  profile dast, repo ID 1287322655, repo `geekyshubham/astranull`, run
+  30734622751, scan zap-scan, visibility public. Stable hierarchy: Product Type
+  2 `GitHub Repositories`, Product 3 `geekyshubham/AstraNull`, Engagement 5
+  `main/dast` (active), ZAP Test 6 `main/dast` / `ZAP Scan`. Later genuine
+  scheduled authenticated-baseline `30737896566/1` reimported as TestImport 867
+  at `2026-08-02T07:30:23.448587Z` onto the same Test ID 6 (mutable Test now
+  shows that later baseline; immutable TestImport 862 remains full-run
+  evidence). RouteLens failed full `30734627567/1` has zero TestImports
+  (expected after `wall_clock_timeout`). RouteLens current-binding full DAST
+  and DefectDojo import remain open; least-privilege automation identity
+  hardening remains open. Evidence:
+  [v0.2.40 live monitoring and current DAST](docs/evidence/v0.2.40-live-monitoring-and-current-dast.md).
 - RouteLens genuine scheduled `authenticated-full` failure with
   `wall_clock_timeout`: run
   [`30734627567`](https://github.com/geekyshubham/RouteLens/actions/runs/30734627567)
@@ -119,9 +139,10 @@ reusable workflow commits remain immutable.
   RouteLens scheduled authenticated-full remains **open** until the next
   genuine schedule passes with provenance on this new exact binding. PR checks
   and push promotion do **not** prove full DAST. Still open overall: RouteLens
-  current-binding full DAST, DefectDojo independent verification, production
-  model credential/live AI review, seven-day enforcement/ruleset readiness,
-  GitHub App review-comment permission, and full PoC acceptance. Evidence:
+  current-binding full DAST and its DefectDojo import, least-privilege
+  DefectDojo automation identity hardening, production model credential/live AI
+  review, seven-day enforcement/ruleset readiness, GitHub App review-comment
+  permission, and full PoC acceptance. Evidence:
   [v0.2.40 live monitoring and current DAST](docs/evidence/v0.2.40-live-monitoring-and-current-dast.md).
 
 ## [0.2.40] - 2026-08-02
