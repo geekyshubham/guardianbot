@@ -173,6 +173,8 @@ export interface DoctorFacts {
   requiredCheckName: string;
   rulesetId?: number;
   rulesetReady: boolean;
+  /** Present only when scanners.releaseBranches is configured; report only. */
+  releaseBranchCoverage?: ReleaseBranchRuleCoverage[];
 }
 
 export interface DoctorResult {
@@ -560,7 +562,8 @@ export async function generateOnboarding(
       defaultBranch: snapshot.defaultBranch,
       scannerMode: configObject.scanners.mode,
       image: configObject.image,
-      dast: configObject.dast
+      dast: configObject.dast,
+      releaseBranches: configObject.scanners.releaseBranches
     }),
     report
   };
@@ -2301,18 +2304,31 @@ async function inspectObservationPeriod(
 }
 
 function rulesetAppliesToDefaultBranch(ruleset: Ruleset, defaultBranch: string): boolean {
+  return rulesetAppliesToBranch(ruleset, defaultBranch, defaultBranch);
+}
+
+/**
+ * Whether a ruleset's ref_name conditions cover refs/heads/<branch>.
+ * ~DEFAULT_BRANCH only matches when <branch> is the repository default branch.
+ */
+function rulesetAppliesToBranch(
+  ruleset: Ruleset,
+  branch: string,
+  defaultBranch: string
+): boolean {
   const include = ruleset.conditions?.ref_name?.include;
   const exclude = ruleset.conditions?.ref_name?.exclude ?? [];
-  const branchRef = `refs/heads/${defaultBranch}`;
+  const branchRef = `refs/heads/${branch}`;
   const matchesDefault = (value: string) => {
     if (
       value === "~ALL" ||
-      value === "~DEFAULT_BRANCH" ||
-      value === defaultBranch ||
+      (value === "~DEFAULT_BRANCH" && branch === defaultBranch) ||
+      value === branch ||
       value === branchRef
     ) {
       return true;
     }
+    if (value.startsWith("~")) return false;
     const pattern = value
       .replace(/[.+^${}()|[\]\\]/g, "\\$&")
       .replace(/\*\*/g, "\u0000")
@@ -2472,6 +2488,126 @@ async function inspectRulesets(
         : `no strict required ${expectedCheck} rule is configured`
       : "rulesets and branch protection are not observable with this operator token"
   };
+}
+
+export interface ReleaseBranchRuleCoverage {
+  branch: string;
+  observable: boolean;
+  ready: boolean;
+  detail: string;
+}
+
+/**
+ * Report-only inspection: for each configured scanners.releaseBranches entry,
+ * determine whether an active strict ruleset (or classic branch protection)
+ * requires the security gate check. Never creates or updates rulesets.
+ */
+async function inspectReleaseBranchRules(
+  github: GitHubClient,
+  owner: string,
+  repo: string,
+  defaultBranch: string,
+  releaseBranches: readonly string[],
+  expectedCheck: string
+): Promise<ReleaseBranchRuleCoverage[]> {
+  const rulesets: Ruleset[] = [];
+  let rulesetsObservable = false;
+  try {
+    for (let page = 1; ; page += 1) {
+      const batch = await github.request<Ruleset[]>(
+        "GET",
+        `/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100&page=${page}`
+      );
+      rulesetsObservable = true;
+      rulesets.push(...batch);
+      if (batch.length < 100) break;
+    }
+  } catch (error) {
+    const status = githubErrorStatus(error);
+    if (!status || ![403, 404].includes(status)) throw error;
+  }
+  const active = rulesets.filter(
+    (ruleset) =>
+      (!ruleset.target || ruleset.target === "branch") &&
+      (!ruleset.enforcement || ruleset.enforcement === "active")
+  );
+  const details = new Map<number, Ruleset | undefined>();
+  const detailFor = async (summary: Ruleset): Promise<Ruleset | undefined> => {
+    if (summary.rules) return summary;
+    if (details.has(summary.id)) return details.get(summary.id);
+    let detail: Ruleset | undefined;
+    try {
+      detail = await github.request<Ruleset>("GET", `/repos/${owner}/${repo}/rulesets/${summary.id}`);
+    } catch (error) {
+      const status = githubErrorStatus(error);
+      if (!status || ![403, 404].includes(status)) throw error;
+    }
+    details.set(summary.id, detail);
+    return detail;
+  };
+
+  const results: ReleaseBranchRuleCoverage[] = [];
+  for (const branch of releaseBranches) {
+    if (branch === defaultBranch) continue;
+    let ready: Ruleset | undefined;
+    for (const summary of active) {
+      if (!rulesetAppliesToBranch(summary, branch, defaultBranch)) continue;
+      const detailed = await detailFor(summary);
+      if (!detailed) continue;
+      const required = rulesetContexts(detailed);
+      if (required.strict && required.contexts.includes(expectedCheck)) {
+        ready = detailed;
+        break;
+      }
+    }
+    if (ready) {
+      results.push({
+        branch,
+        observable: true,
+        ready: true,
+        detail: `${branch}: ${expectedCheck} is strict and required by ruleset ${ready.name}`
+      });
+      continue;
+    }
+    let protectionObservable = false;
+    let protectionReady = false;
+    try {
+      const protection = await github.request<{
+        strict?: boolean;
+        contexts?: string[];
+        checks?: Array<{ context?: string }>;
+      }>(
+        "GET",
+        `/repos/${owner}/${repo}/branches/${encodeURIComponent(
+          branch
+        )}/protection/required_status_checks`
+      );
+      protectionObservable = true;
+      const classic = [
+        ...(protection.contexts ?? []),
+        ...(protection.checks ?? [])
+          .map((check) => check.context)
+          .filter((value): value is string => Boolean(value))
+      ];
+      protectionReady = protection.strict === true && classic.includes(expectedCheck);
+    } catch (error) {
+      const status = githubErrorStatus(error);
+      if (!status || ![403, 404].includes(status)) throw error;
+      if (status === 404) protectionObservable = true;
+    }
+    const observable = rulesetsObservable || protectionObservable;
+    results.push({
+      branch,
+      observable,
+      ready: protectionReady,
+      detail: protectionReady
+        ? `${branch}: ${expectedCheck} is strict and required by branch protection`
+        : observable
+          ? `${branch}: no strict required ${expectedCheck} rule covers refs/heads/${branch}`
+          : `${branch}: rulesets and branch protection are not observable with this operator token`
+    });
+  }
+  return results;
 }
 
 async function doctorInternal(
@@ -2644,7 +2780,8 @@ async function doctorInternal(
       defaultBranch: metadata.default_branch,
       scannerMode: parsedConfig.scanners.mode,
       image: parsedConfig.image,
-      dast: parsedConfig.dast
+      dast: parsedConfig.dast,
+      releaseBranches: parsedConfig.scanners.releaseBranches
     });
     const matches = callerWorkflowMatches(workflow.content, expectedWorkflow);
     checks.push(
@@ -2874,6 +3011,48 @@ async function doctorInternal(
     )
   );
 
+  const releaseBranches = (parsedConfig?.scanners.releaseBranches ?? []).filter(
+    (branch) => branch !== metadata.default_branch
+  );
+  let releaseBranchCoverage: ReleaseBranchRuleCoverage[] | undefined;
+  if (parsedConfig && releaseBranches.length) {
+    // Report only: release-branch rule coverage never blocks doctor status or
+    // enforcement readiness, and guardianctl never mutates these rulesets.
+    let detail: string;
+    let ok = false;
+    let state: DoctorCheckState = "unobservable";
+    if (!workflow) {
+      detail = "caller workflow is not configured";
+      state = "not-applicable";
+    } else {
+      try {
+        releaseBranchCoverage = await inspectReleaseBranchRules(
+          context.github,
+          owner,
+          repo,
+          metadata.default_branch,
+          releaseBranches,
+          expectedCheck
+        );
+        ok = releaseBranchCoverage.every((entry) => entry.ready);
+        state = ok
+          ? "ok"
+          : releaseBranchCoverage.every((entry) => entry.ready || entry.observable)
+            ? "missing"
+            : "unobservable";
+        detail = releaseBranchCoverage.map((entry) => entry.detail).join("; ");
+      } catch (error) {
+        detail = errorMessage(error);
+      }
+    }
+    checks.push(
+      makeCheck("release-branch-rules", "release branch required check (report only)", ok, detail, {
+        blocking: false,
+        state
+      })
+    );
+  }
+
   const blockingFailures = checks.filter((check) => check.blocking && !check.ok);
   const status: DoctorResult["status"] =
     !configuredAny
@@ -2930,7 +3109,8 @@ async function doctorInternal(
       reportOnlyRunHeadSha: observation.headSha,
       requiredCheckName: expectedCheck,
       rulesetId: ruleset.ownedRulesetId,
-      rulesetReady: ruleset.ready
+      rulesetReady: ruleset.ready,
+      ...(releaseBranchCoverage ? { releaseBranchCoverage } : {})
     }
   };
 }
@@ -3088,7 +3268,8 @@ export async function upgrade(
     defaultBranch: metadata.default_branch,
     scannerMode: config.scanners.mode,
     image: config.image,
-    dast: config.dast
+    dast: config.dast,
+    releaseBranches: config.scanners.releaseBranches
   });
   const workflowChanged = !callerWorkflowMatches(workflowFile.content, workflow);
   if (!configChanged && !workflowChanged) return { changed: false };

@@ -880,3 +880,115 @@ test("pull request policy resolution binds onboarding state to the base commit",
     /The pull request base commit is not available for policy resolution\./
   );
 });
+
+test("Semgrep policy severity comes only from verified rule metadata, never workflow interpolation", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptEnd = workflow.indexOf("\n          NODE\n", stepStart);
+  assert.ok(stepStart >= 0 && scriptEnd > stepStart);
+  const step = workflow.slice(stepStart, scriptEnd);
+  // The step env is unchanged: no new expression-fed inputs reach the gate.
+  const env = step.slice(step.indexOf("        env:"), step.indexOf("        shell: bash"));
+  assert.deepEqual(
+    env.split("\n").filter((line) => /^ {10}[A-Z_]+:/.test(line)).map((line) => line.trim().split(":")[0]),
+    ["SCANNER_MODE", "BASELINE_PATH"]
+  );
+  const script = step.slice(step.indexOf("node <<'NODE'"));
+  assert.doesNotMatch(script, /\$\{\{/);
+  assert.match(script, /metadata\[SEMGREP_POLICY_SEVERITY_KEY\]/);
+  // Only critical/high Semgrep findings can block, regardless of severity source.
+  assert.match(script, /severitySource: policyMapped \? "policy" : "native"/);
+
+  // Execute the extracted normalizer so mapped and unmapped behaviour is proven.
+  const normalizerStart = script.indexOf("          const SEMGREP_POLICY_SEVERITY_KEY");
+  const semgrepTableEnd = script.indexOf("          const trivySeverity", normalizerStart);
+  const normalizeStart = script.indexOf("          const normalizeSemgrep = (report) =>");
+  const normalizeEnd = script.indexOf("          const normalizeTrivy", normalizeStart);
+  assert.ok(normalizerStart >= 0 && semgrepTableEnd > normalizerStart);
+  assert.ok(normalizeStart >= 0 && normalizeEnd > normalizeStart);
+  const source = [
+    script.slice(normalizerStart, semgrepTableEnd),
+    script.slice(normalizeStart, normalizeEnd),
+    "return normalizeSemgrep;"
+  ].join("\n");
+  const normalizeSemgrep = new Function(
+    "asRecord",
+    "fingerprintFields",
+    source
+  )(
+    (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? value : undefined,
+    (parts: unknown[]) => ({ fingerprint: parts.join("|") })
+  ) as (report: unknown) => Array<Record<string, unknown>>;
+  const [mapped, unmapped, invalid] = normalizeSemgrep({
+    results: [
+      {
+        check_id: "mapped",
+        path: "a.ts",
+        start: { line: 1 },
+        extra: { severity: "WARNING", message: "m", metadata: { "guardianbot-severity": "high" } }
+      },
+      { check_id: "unmapped", path: "b.ts", start: { line: 2 }, extra: { severity: "ERROR", message: "u" } },
+      {
+        check_id: "invalid",
+        path: "c.ts",
+        start: { line: 3 },
+        extra: { severity: "INFO", message: "i", metadata: { "guardianbot-severity": "blocker" } }
+      }
+    ]
+  });
+  assert.equal(mapped?.severity, "high");
+  assert.equal(mapped?.severitySource, "policy");
+  assert.equal(unmapped?.severity, "high");
+  assert.equal(unmapped?.severitySource, "native");
+  assert.equal(invalid?.severity, "info");
+  assert.equal(invalid?.severitySource, "native");
+  // Severity is not a fingerprint input.
+  assert.equal(mapped?.fingerprint, "semgrep|mapped|a.ts|1|m");
+});
+
+test("release-branch callers keep image promotion and DAST on the default branch", async () => {
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const caller = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    releaseBranches: ["release/1.x"],
+    image: {
+      dockerfile: "Dockerfile",
+      context: ".",
+      platform: "linux/amd64",
+      registry: "ghcr.io/example/service",
+      healthPath: "/health",
+      sbomFormat: "cyclonedx-json",
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true,
+        promotionMode: "verified-default-branch"
+      }
+    },
+    dast: {
+      allowedOrigin: "https://staging.example.com",
+      openapi: "openapi.json",
+      openapiSource: "repository-file",
+      authenticationProfile: "control-plane://profiles/service-staging",
+      sessionAssertionPath: "/session"
+    } as never
+  });
+  assert.match(caller, /pull_request:\n {4}types: \[[^\]]+\]\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(caller, /push:\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(
+    caller,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+  assert.doesNotMatch(caller, /refs\/heads\/release/);
+  // DAST jobs run only on schedule or manual dispatch, never on push.
+  const dastJobs = caller.slice(caller.indexOf("  guardianbot-dast-smoke:"));
+  assert.doesNotMatch(dastJobs.split("\n    uses:")[0] ?? "", /'push'/);
+  assert.match(caller, /guardianbot-dast-nightly:\n {4}name: guardianbot\/dast-nightly\n {4}if: github\.event_name == 'schedule'/);
+  // No untrusted ref or PR data is interpolated into the generated caller.
+  assert.doesNotMatch(caller, /github\.head_ref|github\.event\.pull_request/);
+});

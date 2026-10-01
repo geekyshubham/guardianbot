@@ -435,6 +435,11 @@ jobs:
             return Number.isInteger(line) && line > 0 ? line : undefined;
           };
 
+          // Organization severity comes from the immutable rule pack's
+          // guardianbot-severity rule metadata; Semgrep's native severity is
+          // only a fallback for unmapped rules, which the summary flags.
+          const SEMGREP_POLICY_SEVERITY_KEY = "guardianbot-severity";
+          const SEMGREP_POLICY_SEVERITIES = ["critical", "high", "medium", "low", "info"];
           const semgrepSeverity = {
             ERROR: "high",
             WARNING: "medium",
@@ -478,15 +483,21 @@ jobs:
           const normalizeSemgrep = (report) =>
             (report.results || []).map((entry) => {
               const extra = entry.extra || {};
+              const metadata = asRecord(extra.metadata) || {};
               const start = entry.start || {};
               const ruleId = String(entry.check_id || "unknown");
               const findingPath = String(entry.path || "");
               const line = Number(start.line || 1);
               const title = String(extra.message || ruleId);
+              const mapped = String(metadata[SEMGREP_POLICY_SEVERITY_KEY] ?? "").toLowerCase();
+              const policyMapped = SEMGREP_POLICY_SEVERITIES.includes(mapped);
               return {
                 source: "semgrep",
                 ...fingerprintFields(["semgrep", ruleId, findingPath, line, title]),
-                severity: semgrepSeverity[String(extra.severity || "WARNING").toUpperCase()] || "medium",
+                severity: policyMapped
+                  ? mapped
+                  : semgrepSeverity[String(extra.severity || "WARNING").toUpperCase()] || "medium",
+                severitySource: policyMapped ? "policy" : "native",
                 ruleId,
                 path: findingPath,
                 line,
@@ -680,7 +691,8 @@ jobs:
 
           const summarizeFinding = (finding) => {
             if (finding.source === "semgrep") {
-              return `Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}`;
+              const unmapped = finding.severitySource === "native" ? " (no policy severity mapping)" : "";
+              return `Semgrep ${finding.ruleId} at ${finding.path}:${finding.line}${unmapped}`;
             }
             const suffix = finding.line ? `:${finding.line}` : "";
             if (finding.scannerClass === "misconfiguration") {
@@ -851,6 +863,21 @@ jobs:
             "",
             `Active suppressions: **${suppressions.size}**`
           ];
+          const unmappedSemgrepRules = [
+            ...new Set(
+              semgrepFindings
+                .filter((finding) => finding.severitySource === "native")
+                .map((finding) => finding.ruleId)
+            )
+          ].sort();
+          if (unmappedSemgrepRules.length) {
+            summaryLines.push(
+              "",
+              ...unmappedSemgrepRules.map((ruleId) =>
+                `- ⚠️ Semgrep rule \`${ruleId}\` has no policy severity mapping; native severity used`
+              )
+            );
+          }
           if (expiredSuppressions.length) {
             summaryLines.push(
               "",

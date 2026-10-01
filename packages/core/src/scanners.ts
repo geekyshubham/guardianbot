@@ -20,9 +20,30 @@ export interface NormalizedFinding {
   packageName?: string;
   installedVersion?: string;
   fixedVersion?: string;
+  /**
+   * Semgrep only. "policy" when the rule pack's guardianbot-severity metadata
+   * set the severity; "native" when it fell back to Semgrep's own severity.
+   */
+  severitySource?: "policy" | "native";
 }
 
-const semgrepSeverity: Record<string, NormalizedSeverity> = {
+/**
+ * Rule metadata key carrying the organization severity for a Semgrep rule.
+ * Every rule in rules/semgrep.yml must set it; the reusable security workflow
+ * reads the same key from the immutable rule pack at job.workflow_sha.
+ */
+export const SEMGREP_POLICY_SEVERITY_KEY = "guardianbot-severity";
+
+export const SEMGREP_POLICY_SEVERITIES: readonly NormalizedSeverity[] = [
+  "critical",
+  "high",
+  "medium",
+  "low",
+  "info"
+];
+
+/** Fallback for rules without a policy mapping; unchanged pre-policy behaviour. */
+export const SEMGREP_NATIVE_SEVERITY: Readonly<Record<string, NormalizedSeverity>> = {
   ERROR: "high",
   WARNING: "medium",
   INFO: "info",
@@ -31,6 +52,20 @@ const semgrepSeverity: Record<string, NormalizedSeverity> = {
   MEDIUM: "medium",
   LOW: "low"
 };
+
+export function semgrepPolicySeverity(
+  metadata: Record<string, unknown>,
+  nativeSeverity: unknown
+): { severity: NormalizedSeverity; severitySource: "policy" | "native" } {
+  const mapped = String(metadata[SEMGREP_POLICY_SEVERITY_KEY] ?? "").toLowerCase();
+  if ((SEMGREP_POLICY_SEVERITIES as readonly string[]).includes(mapped)) {
+    return { severity: mapped as NormalizedSeverity, severitySource: "policy" };
+  }
+  return {
+    severity: SEMGREP_NATIVE_SEVERITY[String(nativeSeverity ?? "WARNING").toUpperCase()] ?? "medium",
+    severitySource: "native"
+  };
+}
 
 export function normalizeSemgrep(report: unknown): NormalizedFinding[] {
   const results = (report as { results?: Array<Record<string, unknown>> })?.results ?? [];
@@ -41,7 +76,7 @@ export function normalizeSemgrep(report: unknown): NormalizedFinding[] {
     const ruleId = String(entry.check_id ?? "unknown");
     const path = String(entry.path ?? "");
     const line = Number(start.line ?? 1);
-    const severity = semgrepSeverity[String(extra.severity ?? "WARNING").toUpperCase()] ?? "medium";
+    const { severity, severitySource } = semgrepPolicySeverity(metadata, extra.severity);
     const title = String(extra.message ?? ruleId);
     return {
       source: "semgrep",
@@ -51,7 +86,8 @@ export function normalizeSemgrep(report: unknown): NormalizedFinding[] {
       title,
       description: String(metadata.impact ?? title),
       path,
-      line
+      line,
+      severitySource
     };
   });
 }

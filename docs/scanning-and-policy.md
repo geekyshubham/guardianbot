@@ -9,6 +9,29 @@ that the caller's full immutable revision, the resolved checkout, and
 `job.workflow_sha` are identical before scanning, then records that revision with
 the evidence. It never selects a moving remote rule pack.
 
+Organization Semgrep severity is versioned in the same rule pack: each rule in
+`rules/semgrep.yml` carries `metadata.guardianbot-severity` (`critical`, `high`,
+`medium`, `low`, or `info`), so the mapping is read from the verified checkout at
+`job.workflow_sha` and cannot be changed by the scanned repository. A mapped
+severity replaces Semgrep's native severity. A finding from a rule with no valid
+mapping falls back to its native severity (`ERROR` maps to high, `WARNING` to
+medium, `INFO` to info). Such findings record `severitySource: "native"` in
+`gate.json` policy findings, and the job summary flags the rule as having no
+policy severity mapping. A native `ERROR` therefore still counts as high and
+can block in enforce mode, so a test requires every rule in the shipped pack to
+carry a mapping and keeps the workflow and `@guardianbot/core` severity tables
+in agreement. Severity and its source are not fingerprint inputs, so mapping
+changes never invalidate baselines or suppressions.
+
+By default the generated caller runs on pull requests (any base branch) and on
+pushes to the default branch. Setting `scanners.releaseBranches` limits
+`pull_request` to the default branch plus those release branches and adds them to
+`push`. Release-branch runs use the same report-only/enforce policy, but image
+promotion stays bound to `refs/heads/<default>` and DAST stays on schedule and
+manual dispatch. Release-branch push runs are not default-branch evidence:
+`guardianctl doctor`, report-only observation, and control-plane monitoring
+ignore them, and DefectDojo imports for them never close old findings.
+
 Initial onboarding is report-only. Qualifying findings are emitted as warnings in
 this mode; they fail the check only after the configuration changes to `enforce`
 and the repository contains a reviewed `.guardianbot/baseline.json` fingerprint
@@ -39,7 +62,8 @@ blocking when the repository is promoted to `enforce`.
 
 Enforcement may block:
 
-- new mapped High/Critical Semgrep findings;
+- new High/Critical Semgrep findings, using the rule pack's organization
+  severity mapping (unmapped rules fall back to native severity, as above);
 - High/Critical dependency vulnerabilities with a known fixed version;
 - new High/Critical Trivy misconfiguration findings;
 - new High/Critical Trivy secret findings, without publishing the matched
@@ -83,7 +107,8 @@ metadata, the exact successful deterministic scanner job, report-only config at
 each head SHA, and exact `referenced_workflows` reusable-security identity
 pinned to the immutable `workflowVersion`. The observation run must be at least
 seven days old. An active default-branch GuardianBot ruleset must strictly
-require `guardianbot/security-gate / deterministic scanners`. Missing, invalid,
+require `guardianbot/security-gate / deterministic scanners`; release-branch
+rulesets are reported by `guardianctl doctor` but not verified here. Missing, invalid,
 or unauthorized API evidence fails closed. Pull requests still read their
 configuration and baseline from the base commit so they cannot weaken their own
 gate; PR checks remain report-only because they bind base-branch configuration.

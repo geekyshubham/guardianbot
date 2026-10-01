@@ -3394,3 +3394,17 @@ test("PostgresStore fences the review write on the lease inside one statement", 
   assert.ok(insert.indexOf("WHERE $12::text IS NULL") < insert.indexOf("ON CONFLICT"));
   assert.equal(maxPlaceholder(insert), 14);
 });
+
+test("PostgresStore monitoring inventory reads runs and evidence from the default branch only", async () => {
+  const harness = stubbedPostgresStore();
+  await harness.store.listMonitoringRepositoryInventory();
+  const runsQuery = harness.poolQueries.find((text) => text.includes("ranked_runs"));
+  const evidenceQuery = harness.poolQueries.find((text) =>
+    text.includes("FROM scanner_evidence AS evidence")
+  );
+  assert.ok(runsQuery);
+  assert.ok(evidenceQuery);
+  // Release-branch push runs must never count as, or shadow, default-branch monitoring evidence.
+  assert.match(runsQuery, /runs\.head_branch=repositories\.default_branch/);
+  assert.match(evidenceQuery, /runs\.head_branch=repositories\.default_branch/);
+});

@@ -2175,6 +2175,11 @@ export class MemoryStore implements Store {
           const run = this.scannerRuns.get(
             scannerRunKey(evidence.repositoryId, evidence.runId, evidence.runAttempt)
           );
+          // Monitoring evidence is default-branch evidence only: a newer
+          // release-branch push must never shadow default-branch evidence.
+          if (run?.headBranch !== repository.defaultBranch) {
+            continue;
+          }
           const artifact = this.scannerArtifacts.get(
             scannerArtifactKey(
               evidence.repositoryId,
@@ -3998,6 +4003,7 @@ export class PostgresStore implements Store {
          JOIN repositories AS repositories
           ON repositories.repository_id=evidence.repository_id
           AND repositories.repository_state='active'
+          AND runs.head_branch=repositories.default_branch
          WHERE evidence.fingerprint IS NULL
          ORDER BY evidence.repository_id,
                   evidence.evidence_key,

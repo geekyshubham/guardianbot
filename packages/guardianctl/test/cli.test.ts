@@ -2791,3 +2791,152 @@ function listen(server: Server): Promise<void> {
     server.listen(0, "127.0.0.1", () => resolve());
   });
 }
+
+function withReleaseBranches(state: MockRepositoryState, releaseBranches: string[]): GuardianConfig {
+  const config = parseGuardianConfig(state.files.get(CONFIG_PATH)!.content);
+  config.scanners.releaseBranches = releaseBranches;
+  state.files.set(CONFIG_PATH, { content: serializeGuardianConfig(config), sha: "config-sha" });
+  state.files.set(CALLER_WORKFLOW_PATH, {
+    content: generateCallerWorkflow({
+      guardianRepository: "Acme/guardianbot",
+      workflowSha: WORKFLOW_SHA,
+      defaultBranch: "main",
+      scannerMode: config.scanners.mode,
+      image: config.image,
+      dast: config.dast,
+      releaseBranches
+    }),
+    sha: "workflow-sha"
+  });
+  return config;
+}
+
+test("doctor reports uncovered release branches without blocking or mutating rulesets", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("service", { mode: "enforce" }));
+  withReleaseBranches(state, ["release/1.x"]);
+
+  const result = await doctor(commandContext(github), "acme/service");
+
+  assert.equal(checkByCode(result, "generated-caller").ok, true);
+  const check = checkByCode(result, "release-branch-rules");
+  assert.equal(check.ok, false);
+  assert.equal(check.blocking, false);
+  assert.match(check.detail, /no strict required .* covers refs\/heads\/release\/1\.x/);
+  assert.equal(result.status, "ready");
+  assert.equal(result.enforcementReady, true);
+  assert.deepEqual(result.facts.releaseBranchCoverage?.map((entry) => entry.ready), [false]);
+  assert.equal(
+    github.requests.some((request) => request.method !== "GET" && request.path.includes("rulesets")),
+    false
+  );
+});
+
+test("doctor accepts release branch coverage from a matching ruleset or classic protection", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("service", { mode: "enforce" }));
+  withReleaseBranches(state, ["main", "release/1.x"]);
+  const releaseRuleset = buildSecurityGateRuleset(DEFAULT_SECURITY_GATE_CHECK);
+  state.rulesets.push({
+    id: 43,
+    ...releaseRuleset,
+    name: "Release gate",
+    conditions: { ref_name: { include: ["refs/heads/release/*"], exclude: [] } }
+  });
+
+  const viaRuleset = await doctor(commandContext(github), "acme/service");
+  const check = checkByCode(viaRuleset, "release-branch-rules");
+  assert.equal(check.ok, true, check.detail);
+  assert.match(check.detail, /ruleset Release gate/);
+  // The default branch is never re-reported as a release branch.
+  assert.deepEqual(viaRuleset.facts.releaseBranchCoverage?.map((entry) => entry.branch), ["release/1.x"]);
+
+  state.rulesets = state.rulesets.filter((ruleset) => ruleset.id !== 43);
+  state.branchProtection = { strict: true, contexts: [DEFAULT_SECURITY_GATE_CHECK] };
+  const viaProtection = await doctor(commandContext(github), "acme/service");
+  assert.match(checkByCode(viaProtection, "release-branch-rules").detail, /branch protection/);
+  assert.equal(checkByCode(viaProtection, "release-branch-rules").ok, true);
+});
+
+test("~DEFAULT_BRANCH rulesets do not count as release branch coverage", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("service", { mode: "enforce" }));
+  withReleaseBranches(state, ["release/1.x"]);
+  // healthyState's enforce ruleset targets ~DEFAULT_BRANCH only.
+  const result = await doctor(commandContext(github), "acme/service");
+  assert.equal(checkByCode(result, "release-branch-rules").ok, false);
+  assert.equal(checkByCode(result, "required-check-rule").ok, true);
+});
+
+test("doctor omits the release-branch check when scanners.releaseBranches is unset", async () => {
+  const github = new MockGitHub();
+  github.add(healthyState("service", { mode: "enforce" }));
+  const result = await doctor(commandContext(github), "acme/service");
+  assert.equal(result.checks.some((check) => check.code === "release-branch-rules"), false);
+  assert.equal(result.facts.releaseBranchCoverage, undefined);
+});
+
+test("release-branch push runs never count as default-branch expected runs", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("service"));
+  withReleaseBranches(state, ["release/1.x"]);
+  // The mock ignores ?branch=, so the CLI-side branch filter is what is exercised here.
+  state.workflowRuns = [
+    {
+      id: 450,
+      status: "completed",
+      conclusion: "failure",
+      event: "push",
+      head_branch: "release/1.x",
+      head_sha: HEAD_SHA,
+      created_at: hoursAgo(0.25),
+      html_url: "https://github.example/actions/runs/450"
+    },
+    ...state.workflowRuns
+  ];
+  state.runJobs.set(450, [
+    { name: DEFAULT_SECURITY_GATE_CHECK, status: "completed", conclusion: "failure" }
+  ]);
+
+  const result = await doctor(commandContext(github), "acme/service");
+  assert.notEqual(result.facts.latestRunId, 450);
+  assert.equal(result.facts.latestRunId, 200);
+  assert.equal(checkByCode(result, "expected-run").ok, true);
+  assert.equal(checkByCode(result, "security-gate-check").ok, true);
+});
+
+test("upgrade regenerates a caller that lacks configured release-branch triggers", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState());
+  const config = withReleaseBranches(state, ["release/1.x"]);
+  // A caller generated before scanners.releaseBranches was set is drift.
+  state.files.set(CALLER_WORKFLOW_PATH, {
+    content: workflowFor(config),
+    sha: "workflow-sha"
+  });
+  const drifted = await doctor(commandContext(github), "acme/service");
+  assert.equal(checkByCode(drifted, "generated-caller").ok, false);
+
+  const result = await upgrade(commandContext(github), "acme/service");
+  assert.equal(result.changed, true);
+  const written = github.writes.find((write) => write.path === CALLER_WORKFLOW_PATH);
+  assert.ok(written);
+  assert.match(written.content, /branches: \["main", "release\/1\.x"\]|branches: \[main, release\/1\.x\]/);
+});
+
+test("parseGateForBaseline accepts policy findings carrying severitySource unchanged", () => {
+  const source = gateJson({
+    policyFindings: [
+      { fingerprint: FINGERPRINT, source: "semgrep", severity: "high", severitySource: "policy" },
+      {
+        fingerprint: SECOND_FINGERPRINT,
+        source: "semgrep",
+        severity: "high",
+        severitySource: "native"
+      }
+    ]
+  });
+  const parsed = parseGateForBaseline(source);
+  assert.deepEqual(parsed.fingerprints, [FINGERPRINT, SECOND_FINGERPRINT]);
+  assert.equal(parsed.gateSha256, sha256Hex(source));
+});
