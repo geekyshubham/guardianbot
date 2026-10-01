@@ -13,6 +13,7 @@ test("reusable workflows resolve attestation only from the exact workflow releas
   const workflows = [
     ".github/workflows/reusable-security.yml",
     ".github/workflows/reusable-image.yml",
+    ".github/workflows/reusable-image-rescan.yml",
     ".github/workflows/reusable-dast.yml"
   ].map(repositoryFile);
 
@@ -47,6 +48,7 @@ test("reusable workflows retry only transient GitHub OIDC failures", () => {
   const workflows = new Map([
     [".github/workflows/reusable-security.yml", 1],
     [".github/workflows/reusable-image.yml", 2],
+    [".github/workflows/reusable-image-rescan.yml", 2],
     [".github/workflows/reusable-dast.yml", 2]
   ]);
 
@@ -878,5 +880,155 @@ test("pull request policy resolution binds onboarding state to the base commit",
   assert.match(
     unresolvable.stdout,
     /The pull request base commit is not available for policy resolution\./
+  );
+});
+
+test("deployed image rescan workflow is schedule-only, read-only, and digest-bound", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-image-rescan.yml");
+  const header = workflow.slice(0, workflow.indexOf("steps:"));
+  assert.match(header, /name: deployed digest rescan/);
+  assert.match(header, /if: github\.event_name == 'schedule'\n/);
+  assert.match(header, /environment: guardianbot-image-rescan/);
+  assert.match(
+    header,
+    /permissions:\n\s+contents: read\n\s+packages: read\n\s+id-token: write/
+  );
+  assert.doesNotMatch(workflow, /packages: write/);
+  assert.doesNotMatch(workflow, /cosign (?:sign|attest) /);
+  assert.doesNotMatch(workflow, /docker push/);
+  assert.doesNotMatch(workflow, /docker build/);
+  // Every action is pinned to a full commit SHA already used by the other reusable workflows.
+  const uses = [...workflow.matchAll(/^\s*(?:- )?uses:\s*(\S+)\s*$/gm)].map((match) => match[1]);
+  assert.deepEqual([...new Set(uses)].sort(), [
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac"
+  ]);
+  // Untrusted caller inputs enter shell steps only through environment assignments.
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{ inputs."))) {
+    assert.match(line, /^\s+INPUT_[A-Z0-9_]+:\s+\$\{\{ inputs\.[A-Za-z0-9-]+ \}\}$/);
+  }
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{"))) {
+    assert.doesNotMatch(line, /^\s+run:/, `expression interpolated into a run script: ${line}`);
+  }
+  assert.doesNotMatch(workflow, /docker login[^\n]*\$\{\{/);
+  // The digest comes only from the control plane and is validated before use.
+  assert.match(workflow, /new URL\("\/image\/rescan-target", evidenceEndpoint\)/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-image-rescan"\)/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-evidence"\)/);
+  assert.match(workflow, /target\.imageReference\.toLowerCase\(\) !== `\$\{imageName\}@\$\{target\.imageDigest\}`/);
+  assert.match(workflow, /reusable-image\\\.yml@\(\[a-f0-9\]\{40\}\)\$/);
+  assert.doesNotMatch(workflow, /:\$\{GITHUB_SHA\}/);
+  assert.doesNotMatch(workflow, /:latest/);
+  // Signature and SBOM attestation are verified against the deployed identity before pulling.
+  const verifyAt = workflow.indexOf("cosign verify --output json \"$image_reference\"");
+  const attestationAt = workflow.indexOf(
+    "cosign verify-attestation --output json --type cyclonedx \"$image_reference\""
+  );
+  const pullAt = workflow.indexOf("docker pull --platform linux/amd64 \"$image_reference\"");
+  const trivyAt = workflow.indexOf("- name: Trivy rescan of deployed digest");
+  assert.ok(verifyAt > 0 && attestationAt > verifyAt && pullAt > attestationAt && trivyAt > pullAt);
+  assert.match(workflow, /--certificate-identity "\$certificate_identity"/);
+  assert.match(
+    workflow,
+    /aquasec\/trivy:0\.70\.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e/
+  );
+  assert.match(workflow, /EVIDENCE_ARTIFACT_TYPE: image-rescan/);
+  assert.match(
+    workflow,
+    /EVIDENCE_FILES: cosign-verification\.json,rescan\.json,sbom-attestation-verification\.json,sbom\.cdx\.json,trivy-image\.json/
+  );
+  assert.match(
+    workflow,
+    /name: guardianbot-image-rescan-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/
+  );
+  // The provenance attestation script is shared verbatim with the image workflow.
+  const image = repositoryFile(".github/workflows/reusable-image.yml");
+  const attestScript = (source: string) => {
+    const start = source.indexOf("const workflowMatch = process.env.JOB_WORKFLOW_REF.match(", source.indexOf("EVIDENCE_ARTIFACT_TYPE"));
+    return source.slice(start, source.indexOf("NODE\n", start));
+  };
+  assert.equal(attestScript(workflow), attestScript(image.slice(image.indexOf("Attest promotion evidence provenance"))));
+});
+
+test("generated callers stay byte-identical unless image.deployment opts into the rescan", async () => {
+  const { createHash } = await import("node:crypto");
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const image = {
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64" as const,
+    registry: "ghcr.io/example/service",
+    healthPath: "/health",
+    sbomFormat: "cyclonedx-json" as const
+  };
+  const dast = {
+    allowedOrigin: "https://staging.example.com",
+    openapi: "openapi.yaml",
+    authenticationProfile: "control-plane://profiles/example",
+    sessionAssertionPath: "/api/me",
+    excludedRoutes: ["/logout"]
+  };
+  const base = {
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main"
+  };
+  const hash = (options: Parameters<typeof generateCallerWorkflow>[0]) =>
+    createHash("sha256").update(generateCallerWorkflow(options)).digest("hex");
+  // Hashes captured from the generator before the deployed-digest rescan existed.
+  assert.equal(
+    hash({ ...base, scannerMode: "advisory" }),
+    "d10ab3f1cf0e88de7439db3b8ba5804ae9b28307a6a8b5ab47816cc8fd8c847e"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "report-only", image }),
+    "5a16bc39ab9e0da8ebe5bef6830d0d7b33959028004f4f20972197cf5af47c69"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "enforce", image }),
+    "ddee9456ab431464aab48ba9e180f93c8b00a4f46978b6ea4b5096a5e87ed344"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "report-only", dast }),
+    "8607e40cfc8a9424558f9fb34ba930db18e4948018779276dd854525fcf1da8e"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "enforce", image, dast }),
+    "8c5a22bdd25107e4e9810edfac026d556d57a75f71e4e4eff585ad6352032ee1"
+  );
+  for (const output of [
+    generateCallerWorkflow({ ...base, scannerMode: "enforce", image, dast }),
+    generateCallerWorkflow({ ...base, scannerMode: "advisory" })
+  ]) {
+    assert.doesNotMatch(output, /image-rescan|13 3 \* \* \*/);
+  }
+
+  const deployed = generateCallerWorkflow({
+    ...base,
+    scannerMode: "report-only",
+    image: {
+      ...image,
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true
+      }
+    }
+  });
+  assert.match(deployed, /    - cron: "23 2 \* \* \*"\n    - cron: "13 3 \* \* \*"\n/);
+  assert.match(
+    deployed,
+    /  guardianbot-image-rescan:\n    name: guardianbot\/image-rescan\n/
+  );
+  assert.match(
+    deployed,
+    /if: github\.event_name == 'schedule' && github\.event\.schedule == '13 3 \* \* \*'\n    permissions:\n      contents: read\n      packages: read\n      id-token: write\n    uses: Geekyshubham\/guardianbot\/\.github\/workflows\/reusable-image-rescan\.yml@b{40}\n    with:\n      image-name: "ghcr\.io\/example\/service"\n      deployment-environment: "staging"\n/
+  );
+  // The existing image and security jobs still skip the rescan schedule.
+  assert.equal(
+    deployed.match(/github\.event_name != 'schedule' \|\| github\.event\.schedule == '23 2 \* \* \*'/g)?.length,
+    2
   );
 });

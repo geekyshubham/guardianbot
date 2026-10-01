@@ -52,6 +52,8 @@ const IMAGE_TRIVY_EVIDENCE_KEY = "image-trivy-summary";
 const SBOM_EVIDENCE_KEY = "sbom";
 const SIGNATURE_EVIDENCE_KEY = "signature";
 const DEPLOYMENT_EVIDENCE_PREFIX = "deployment:";
+const IMAGE_RESCAN_EVIDENCE_PREFIX = "image-rescan:";
+const PROMOTION_FREEZE_EVIDENCE_PREFIX = "promotion-freeze:";
 const ZAP_SMOKE_EVIDENCE_KEY = "zap-smoke-summary";
 const ZAP_NIGHTLY_EVIDENCE_KEY = "zap-nightly-summary";
 const ZAP_SMOKE_IMPORT_EVIDENCE_KEY =
@@ -546,6 +548,16 @@ function evaluateInventoryItem(
     baselineReady = baseline.ready;
     supplementaryChecks.push(baseline.check);
   }
+  if (config?.image?.deployment) {
+    supplementaryChecks.push(
+      ...deployedDigestRescanChecks(
+        item,
+        config.image.deployment.environment,
+        thresholds.evidenceMaxAgeMs,
+        clock
+      )
+    );
+  }
   if (config?.image) {
     supplementaryChecks.push({
       key: "image-digest-observability",
@@ -634,6 +646,126 @@ function evaluateInventoryItem(
     checks,
     overallStatus: worstMonitoringStatus(checks.map((check) => check.status))
   };
+}
+
+/**
+ * Coverage of the nightly deployed-digest rescan. The deployed digest is the newest accepted
+ * default-branch push deployment for the configured environment, independent of the indexed head,
+ * because the running digest is what the rescan protects. A fresh deployment gets one evidence
+ * window before missing coverage alerts. Freeze signals are reported only; monitoring never
+ * changes the deployment.
+ */
+function deployedDigestRescanChecks(
+  item: MonitoringRepositoryInventory,
+  environment: string,
+  maxAgeMs: number,
+  clock: MonitoringClock
+): MonitoringCheckResult[] {
+  const acceptedRuns = new Map(
+    item.latestScannerRuns
+      .filter(
+        (run) =>
+          run.validationStatus === "accepted" &&
+          run.headBranch === item.repository.defaultBranch
+      )
+      .map((run) => [workflowRunKey(run.runId, run.runAttempt), run] as const)
+  );
+  const fromAcceptedRun = (
+    evidence: MonitoringRepositoryInventory["latestScannerEvidence"][number],
+    event: string
+  ) =>
+    acceptedRuns.get(workflowRunKey(evidence.runId, evidence.runAttempt))?.event === event;
+  const newest = <T extends { observedAt: string }>(records: T[]): T | undefined =>
+    records.sort(
+      (left, right) => Date.parse(right.observedAt) - Date.parse(left.observedAt)
+    )[0];
+  const observedRunKeys = new Set(
+    item.latestScannerRuns.map((run) => workflowRunKey(run.runId, run.runAttempt))
+  );
+  const deployment = newest(
+    item.latestScannerEvidence.filter(
+      (evidence) =>
+        evidence.evidenceKey === `${DEPLOYMENT_EVIDENCE_PREFIX}${environment}` &&
+        evidence.kind === "deployment" &&
+        evidence.artifactType === "image-promotion" &&
+        evidence.environment === environment &&
+        // Deployment rows come only from accepted default-branch push promotions. A deployment
+        // older than the bounded run window stays the deployed digest; a run that is still
+        // visible must be the accepted push it claims to be.
+        (!observedRunKeys.has(workflowRunKey(evidence.runId, evidence.runAttempt)) ||
+          fromAcceptedRun(evidence, "push"))
+    )
+  );
+  if (!deployment || deployment.status !== "success" || !deployment.digest) {
+    // Without an accepted deployment there is no deployed digest to rescan; the existing
+    // image-deployment requirement already reports that gap.
+    return [];
+  }
+  const now = clock.now().getTime();
+  const rescan = newest(
+    item.latestScannerEvidence.filter(
+      (evidence) =>
+        evidence.evidenceKey === `${IMAGE_RESCAN_EVIDENCE_PREFIX}${environment}` &&
+        evidence.kind === "image-rescan" &&
+        evidence.artifactType === "image-rescan" &&
+        evidence.status === "success" &&
+        evidence.environment === environment &&
+        evidence.digest === deployment.digest &&
+        fromAcceptedRun(evidence, "schedule")
+    )
+  );
+  if (!rescan) {
+    const deploymentAgeMs = Math.max(0, now - Date.parse(deployment.observedAt));
+    const withinGrace = Number.isFinite(deploymentAgeMs) && deploymentAgeMs <= maxAgeMs;
+    return [
+      {
+        key: "image-rescan-coverage",
+        status: withinGrace ? "passing" : "failing",
+        summary: withinGrace
+          ? "Deployed digest is awaiting its first nightly rescan"
+          : "Nightly rescan evidence is missing for the deployed digest",
+        observedAt: deployment.observedAt,
+        ageMs: deploymentAgeMs
+      }
+    ];
+  }
+  const rescanAgeMs = Math.max(0, now - Date.parse(rescan.observedAt));
+  const checks: MonitoringCheckResult[] = [
+    {
+      key: "image-rescan-coverage",
+      status:
+        !Number.isFinite(rescanAgeMs) || rescanAgeMs > 2 * maxAgeMs
+          ? "failing"
+          : rescanAgeMs > maxAgeMs
+            ? "warning"
+            : "passing",
+      summary:
+        rescanAgeMs > maxAgeMs
+          ? "Nightly rescan evidence for the deployed digest is stale"
+          : "Deployed digest was rescanned within the evidence window",
+      observedAt: rescan.observedAt,
+      ageMs: rescanAgeMs
+    }
+  ];
+  const freeze = item.latestScannerEvidence.find(
+    (evidence) =>
+      evidence.evidenceKey === `${PROMOTION_FREEZE_EVIDENCE_PREFIX}${environment}` &&
+      evidence.kind === "promotion-freeze" &&
+      evidence.runId === rescan.runId &&
+      evidence.runAttempt === rescan.runAttempt &&
+      evidence.digest === rescan.digest
+  );
+  checks.push({
+    key: "image-promotion-freeze",
+    status: !freeze ? "failing" : freeze.status === "failure" ? "failing" : "passing",
+    summary: !freeze
+      ? "Promotion freeze signal is missing for the latest deployed digest rescan"
+      : freeze.status === "failure"
+        ? "Promotion freeze: new Critical findings on the deployed digest"
+        : "No new Critical findings on the deployed digest",
+    observedAt: freeze?.observedAt ?? rescan.observedAt
+  });
+  return checks;
 }
 
 function isCanonicalUtcInstant(value: string): boolean {

@@ -97,6 +97,59 @@ deployment, and—when configured—DAST/DefectDojo evidence to agree on that
 digest and environment. A mismatch, incomplete App Platform response, failed
 deployment, timeout, or failed probe cannot be reported as protected.
 
+## Deployed digest rescan
+
+When `image.deployment` is configured, the generated caller adds a
+schedule-only `guardianbot/image-rescan` job (cron `13 3 * * *`) that calls the
+read-only `reusable-image-rescan.yml` workflow. Callers without
+`image.deployment` are byte-identical to earlier releases. There is no new
+configuration field.
+
+The rescan never builds, pushes, signs, or deploys. Each night it:
+
+1. requests a GitHub OIDC token with audience `guardianbot-image-rescan` from
+   the `guardianbot-image-rescan` GitHub environment and calls
+   `POST /image/rescan-target`;
+2. receives the exact digest, image reference, keyless signing identity, and
+   deployment run from the latest accepted `deployment:<environment>` evidence.
+   The target is never resolved from a tag;
+3. verifies the Cosign signature and the CycloneDX SBOM attestation for that
+   identity, then pulls the image by digest and checks the pulled RepoDigest;
+4. runs the pinned Trivy image scan and generates a fresh CycloneDX SBOM; and
+5. uploads provenance-bound `image-rescan` evidence.
+
+The endpoint applies the same checks as the DAST session broker: repository,
+run, commit, trusted workflow SHA, hosted runner, and environment claims. It
+fails closed when the repository has no accepted deployment for the requested
+environment, when the image name does not match, or when the stored evidence is
+incomplete.
+
+The control plane independently verifies the uploaded evidence. It requires a
+default-branch schedule run, re-verifies the signature and SBOM attestation,
+requires the Trivy report to name the exact deployed reference, rejects scanner
+errors, and requires the reported Critical count to match the report. It records:
+
+- `image-rescan:<environment>`: finding counts plus a bounded SBOM diff
+  (added, removed, and version-changed components keyed by purl or
+  name+ecosystem) against the previously attested SBOM; and
+- `promotion-freeze:<environment>`: `failure` when the rescan finds one or more
+  Critical vulnerabilities in the running digest, otherwise `success`.
+
+SBOM diff heuristics flag possible typosquats, dependency-confusion names, and
+version downgrades. They are advisory only and never block, waive, or approve.
+The promotion freeze is a signal in evidence and monitoring. Rescan ingestion
+never changes the running deployment, and promotion does not yet enforce the
+freeze.
+
+Monitoring adds two checks for repositories with `image.deployment`:
+
+- `image-rescan-coverage`: passing when a successful rescan of the deployed
+  digest is within the evidence max age, warning when it is older, and failing
+  when it is older than twice the max age or missing after the first window
+  following a deployment; and
+- `image-promotion-freeze`: failing when the latest rescan of the deployed
+  digest reports new Critical findings or has no freeze record.
+
 ## RouteLens and AstraNull
 
 RouteLens and AstraNull were onboarded through the same generated configuration

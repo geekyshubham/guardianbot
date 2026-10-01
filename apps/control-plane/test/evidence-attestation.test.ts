@@ -9,6 +9,7 @@ import {
   computeEvidenceManifestDigest,
   createEvidenceAttestationService,
   createEvidenceProvenanceToken,
+  parseEvidenceTrustPolicy,
   verifyEvidenceProvenanceToken,
   type EvidenceAttestationRequest,
   type EvidenceArtifactType,
@@ -240,6 +241,83 @@ test("binds image promotion to its protected job environment", async () => {
     verifyEvidenceProvenanceToken(response.token, SIGNING_SECRET, NOW)
       .artifactType,
     "image-promotion"
+  );
+});
+
+test("binds deployed-digest rescan evidence to its own workflow and job environment", async () => {
+  const rescanClaims = {
+    job_workflow_ref:
+      `Geekyshubham/guardianbot/.github/workflows/reusable-image-rescan.yml@${IMAGE_SHA}`,
+    job_workflow_sha: IMAGE_SHA,
+    environment: "guardianbot-image-rescan",
+    sub:
+      "repo:Geekyshubham/guardianbot-consumer:" +
+      "environment:guardianbot-image-rescan"
+  };
+  await assert.rejects(
+    () =>
+      service().service.attest(
+        `Bearer ${oidcToken({
+          ...rescanClaims,
+          environment: undefined,
+          sub: "repo:Geekyshubham/guardianbot-consumer:ref:refs/heads/main"
+        })}`,
+        request("image-rescan")
+      ),
+    /environment is not authorized/i
+  );
+  await assert.rejects(
+    () =>
+      service().service.attest(
+        `Bearer ${oidcToken({
+          ...rescanClaims,
+          job_workflow_ref:
+            `Geekyshubham/guardianbot/.github/workflows/reusable-image.yml@${IMAGE_SHA}`
+        })}`,
+        request("image-rescan")
+      ),
+    /not an approved GuardianBot release/i
+  );
+  await assert.rejects(
+    () =>
+      service().service.attest(
+        `Bearer ${oidcToken({
+          ...rescanClaims,
+          environment: "guardianbot-image-promotion",
+          sub:
+            "repo:Geekyshubham/guardianbot-consumer:" +
+            "environment:guardianbot-image-promotion"
+        })}`,
+        request("image-rescan")
+      ),
+    /environment is not authorized/i
+  );
+  const response = await service().service.attest(
+    `Bearer ${oidcToken(rescanClaims)}`,
+    request("image-rescan")
+  );
+  const claims = verifyEvidenceProvenanceToken(response.token, SIGNING_SECRET, NOW);
+  assert.equal(claims.artifactType, "image-rescan");
+  assert.equal(claims.workflowPath, ".github/workflows/reusable-image-rescan.yml");
+});
+
+test("the rescan workflow SHA defaults to the image workflow SHA and can be pinned separately", () => {
+  assert.equal(parseEvidenceTrustPolicy(ENVIRONMENT).workflows["image-rescan"].sha, IMAGE_SHA);
+  const pinned = "f".repeat(40);
+  assert.equal(
+    parseEvidenceTrustPolicy({
+      ...ENVIRONMENT,
+      GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA: pinned
+    }).workflows["image-rescan"].sha,
+    pinned
+  );
+  assert.throws(
+    () =>
+      parseEvidenceTrustPolicy({
+        ...ENVIRONMENT,
+        GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA: "main"
+      }),
+    /exact 40-character commit SHA/
   );
 });
 

@@ -6,10 +6,13 @@ import { tmpdir } from "node:os";
 import { basename, join, posix } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import {
+  diffCycloneDxSboms,
   normalizeSemgrep,
   normalizeTrivy,
+  SbomDiffError,
   stableFingerprint,
-  type NormalizedFinding
+  type NormalizedFinding,
+  type SbomDiff
 } from "@guardianbot/core";
 import { createAppJwt } from "./app-auth.js";
 import {
@@ -65,6 +68,18 @@ const IMAGE_FILES = new Set([
   ...IMAGE_PROMOTION_REPORT_FILES,
   ...PROVENANCE_FILES
 ]);
+const IMAGE_RESCAN_REPORT_FILES = [
+  "cosign-verification.json",
+  "rescan.json",
+  "sbom-attestation-verification.json",
+  "sbom.cdx.json",
+  "trivy-image.json"
+] as const;
+const IMAGE_RESCAN_FILES = new Set([
+  ...IMAGE_RESCAN_REPORT_FILES,
+  ...PROVENANCE_FILES
+]);
+const IMAGE_RESCAN_PAYLOAD_LIST_LIMIT = 50;
 const LEGACY_DAST_REPORT_FILES = ["scan-status.json", "zap.json"] as const;
 const DAST_REPORT_FILES = ["scan-status.json", "zap.json", "zap.xml"] as const;
 const DAST_FILES = new Set([...DAST_REPORT_FILES, ...PROVENANCE_FILES]);
@@ -934,6 +949,7 @@ function reportFilesForArtifact(
   if (artifactType === "security") return SECURITY_REPORT_FILES;
   if (artifactType === "dast") return DAST_REPORT_FILES;
   if (artifactType === "image-promotion") return IMAGE_PROMOTION_REPORT_FILES;
+  if (artifactType === "image-rescan") return IMAGE_RESCAN_REPORT_FILES;
   return IMAGE_VALIDATION_REPORT_FILES;
 }
 
@@ -1731,6 +1747,233 @@ async function processImageArtifact(
   }
 }
 
+function selectAttestedPreviousSbom(
+  report: unknown,
+  imageDigest: string
+): { document: Record<string, unknown>; attestations: number; distinct: number } {
+  const envelopes = Array.isArray(report) ? report : [report];
+  const digestHex = imageDigest.slice("sha256:".length);
+  const candidates = new Map<string, Record<string, unknown>>();
+  let attestations = 0;
+  for (const envelopeValue of envelopes) {
+    const envelope = asRecord(envelopeValue);
+    if (!envelope || typeof envelope.payload !== "string" || !envelope.payload) continue;
+    let statement: Record<string, unknown> | undefined;
+    try {
+      statement = asRecord(
+        JSON.parse(Buffer.from(envelope.payload, "base64").toString("utf8"))
+      );
+    } catch {
+      statement = undefined;
+    }
+    const subjects = Array.isArray(statement?.subject) ? statement.subject : [];
+    const bound = subjects.some(
+      (subject) => asRecord(asRecord(subject)?.digest)?.sha256 === digestHex
+    );
+    const predicate = asRecord(statement?.predicate);
+    if (
+      !bound ||
+      typeof statement?.predicateType !== "string" ||
+      !statement.predicateType.toLowerCase().includes("cyclonedx") ||
+      predicate?.bomFormat !== "CycloneDX"
+    ) {
+      continue;
+    }
+    attestations += 1;
+    candidates.set(
+      createHash("sha256").update(JSON.stringify(predicate)).digest("hex"),
+      predicate
+    );
+  }
+  if (!candidates.size) {
+    throw new Error("SBOM attestation verification is missing or bound to another digest");
+  }
+  // cosign output order is not defined; pick deterministically when a digest was attested twice.
+  const [selected] = [...candidates.entries()].sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0
+  );
+  return { document: selected![1], attestations, distinct: candidates.size };
+}
+
+function boundedSbomDiffPayload(diff: SbomDiff): Record<string, unknown> {
+  const limit = IMAGE_RESCAN_PAYLOAD_LIST_LIMIT;
+  return {
+    schemaVersion: diff.schemaVersion,
+    previousComponentCount: diff.previousComponentCount,
+    currentComponentCount: diff.currentComponentCount,
+    addedCount: diff.addedCount,
+    removedCount: diff.removedCount,
+    changedCount: diff.changedCount,
+    added: diff.added.slice(0, limit),
+    removed: diff.removed.slice(0, limit),
+    changed: diff.changed.slice(0, limit),
+    signals: diff.signals.slice(0, limit),
+    signalCount: diff.signals.length,
+    truncated:
+      diff.truncated ||
+      diff.added.length > limit ||
+      diff.removed.length > limit ||
+      diff.changed.length > limit ||
+      diff.signals.length > limit
+  };
+}
+
+/**
+ * Nightly rescan of the exact digest already deployed to an environment. The rescan is accepted
+ * only when it targets the digest the control plane itself recorded as deployed, with the same
+ * signing identity, and only from the default-branch schedule. It records coverage and a
+ * promotion-freeze signal; it never calls the deployment service or changes the running app.
+ */
+async function processImageRescanArtifact(
+  store: Store,
+  archive: ParsedArtifactArchive,
+  artifact: ScannerArtifactRecord,
+  defaultBranch: string,
+  run: Pick<ScannerWorkflowRunRecord, "headBranch" | "workflowRef" | "event">,
+  trustPolicy: EvidenceTrustPolicy
+): Promise<void> {
+  if (
+    run.event !== "schedule" ||
+    run.headBranch !== defaultBranch ||
+    (run.workflowRef !== undefined && run.workflowRef !== `refs/heads/${defaultBranch}`)
+  ) {
+    throw new Error("image rescan evidence is not bound to the default-branch schedule");
+  }
+  const rescanBytes = archive.selectedFiles.get("rescan.json");
+  const cosignBytes = archive.selectedFiles.get("cosign-verification.json");
+  const attestationBytes = archive.selectedFiles.get("sbom-attestation-verification.json");
+  const sbomBytes = archive.selectedFiles.get("sbom.cdx.json");
+  const trivyBytes = archive.selectedFiles.get("trivy-image.json");
+  if (!rescanBytes || !cosignBytes || !attestationBytes || !sbomBytes || !trivyBytes) {
+    throw new Error("image rescan evidence is incomplete");
+  }
+  const rescan = asRecord(parseJsonFile(rescanBytes, "rescan.json"));
+  const environment = String(rescan?.environment ?? "");
+  const imageDigest = String(rescan?.imageDigest ?? "");
+  const imageReference = String(rescan?.imageReference ?? "");
+  const certificateIdentity = String(rescan?.certificateIdentity ?? "");
+  if (
+    !rescan ||
+    rescan.schemaVersion !== "1.0.0" ||
+    !/^[a-z][a-z0-9-]{0,62}$/.test(environment) ||
+    !/^sha256:[a-f0-9]{64}$/.test(imageDigest) ||
+    !imageReference.endsWith(`@${imageDigest}`) ||
+    rescan.sbomSha256 !== createHash("sha256").update(sbomBytes).digest("hex")
+  ) {
+    throw new Error("rescan.json is invalid or not bound to the fresh SBOM");
+  }
+  const deployed = await store.getLatestDeployedImageEvidence(
+    artifact.repositoryId,
+    environment,
+    defaultBranch
+  );
+  const trustedIdentityPrefix =
+    `https://github.com/${trustPolicy.repository}/.github/workflows/reusable-image.yml@`;
+  if (
+    !deployed ||
+    deployed.imageDigest !== imageDigest ||
+    deployed.imageReference !== imageReference ||
+    deployed.certificateIdentity !== certificateIdentity ||
+    !certificateIdentity.toLowerCase().startsWith(trustedIdentityPrefix) ||
+    rescan.deploymentRunId !== deployed.runId ||
+    rescan.deploymentRunAttempt !== deployed.runAttempt ||
+    rescan.deploymentHeadSha !== deployed.headSha
+  ) {
+    // The deployment moved, or the artifact names a digest the control plane never deployed.
+    throw new Error("image rescan does not target the accepted deployed digest");
+  }
+  const signatures = verifyCosignSignatureEvidence(
+    parseJsonFile(cosignBytes, "cosign-verification.json"),
+    imageDigest,
+    certificateIdentity
+  );
+  const attestationReport = parseJsonFile(
+    attestationBytes,
+    "sbom-attestation-verification.json"
+  );
+  verifySbomAttestationEvidence(attestationReport, imageDigest);
+  const previous = selectAttestedPreviousSbom(attestationReport, imageDigest);
+  const trivyJson = parseJsonFile(trivyBytes, "trivy-image.json");
+  if (asRecord(trivyJson)?.scanner_error) {
+    throw new Error("Trivy image rescan reported scanner_error");
+  }
+  validateTrivyScannerReport(trivyJson, "trivy-image.json");
+  if (
+    String(asRecord(trivyJson)?.ArtifactName ?? "").toLowerCase() !==
+    imageReference.toLowerCase()
+  ) {
+    throw new Error("Trivy image rescan did not scan the deployed digest");
+  }
+  const criticalCount = countCriticalImageFindings(trivyJson);
+  if (rescan.criticalFindings !== criticalCount) {
+    throw new Error("image rescan critical count does not match the Trivy report");
+  }
+  const sbomJson = parseJsonFile(sbomBytes, "sbom.cdx.json");
+  const sbomSummary = parseCycloneDxSummary(sbomJson);
+  let diff: SbomDiff;
+  try {
+    diff = diffCycloneDxSboms(previous.document, sbomJson);
+  } catch (error) {
+    if (error instanceof SbomDiffError) {
+      throw new Error(`image rescan SBOM diff failed: ${error.message}`);
+    }
+    throw error;
+  }
+  const base = {
+    repositoryId: artifact.repositoryId,
+    runId: artifact.runId,
+    runAttempt: artifact.runAttempt,
+    artifactId: artifact.artifactId
+  };
+  const observedAt = new Date().toISOString();
+  await recordEvidence(store, base, {
+    evidenceKey: `image-rescan:${environment}`,
+    kind: "image-rescan",
+    source: "trivy",
+    status: "success",
+    observedAt,
+    digest: imageDigest,
+    environment,
+    details:
+      `deployed digest rescanned: ${criticalCount} Critical, SBOM +${diff.addedCount} ` +
+      `-${diff.removedCount} ~${diff.changedCount}, ${diff.signals.length} advisory signals`,
+    payload: {
+      imageReference,
+      certificateIdentity,
+      deploymentRunId: deployed.runId,
+      deploymentRunAttempt: deployed.runAttempt,
+      deploymentHeadSha: deployed.headSha,
+      deployedAt: deployed.observedAt,
+      criticalFindings: criticalCount,
+      signatures,
+      previousSbomAttestations: previous.attestations,
+      previousSbomDistinct: previous.distinct,
+      sbom: sbomSummary,
+      sbomDiff: boundedSbomDiffPayload(diff)
+    }
+  });
+  // Promotion required zero Critical findings, so every Critical finding on the deployed digest
+  // is new since promotion. The freeze is a recorded signal only; it never changes the deployment.
+  await recordEvidence(store, base, {
+    evidenceKey: `promotion-freeze:${environment}`,
+    kind: "promotion-freeze",
+    source: "guardianbot",
+    status: criticalCount > 0 ? "failure" : "success",
+    observedAt,
+    digest: imageDigest,
+    environment,
+    details:
+      criticalCount > 0
+        ? `promotion freeze: ${criticalCount} new Critical findings on the deployed digest`
+        : "no new Critical findings on the deployed digest",
+    payload: {
+      active: criticalCount > 0,
+      criticalFindings: criticalCount,
+      deploymentRunId: deployed.runId
+    }
+  });
+}
+
 async function processDastArtifact(
   store: Store,
   archive: ParsedArtifactArchive,
@@ -1842,6 +2085,7 @@ async function processDastArtifact(
 function artifactType(name: string): EvidenceArtifactType | undefined {
   if (name.startsWith("guardianbot-evidence-")) return "security";
   if (name.startsWith("guardianbot-image-promotion-")) return "image-promotion";
+  if (name.startsWith("guardianbot-image-rescan-")) return "image-rescan";
   if (name.startsWith("guardianbot-image-evidence-")) return "image-validation";
   if (name.startsWith("guardianbot-dast-evidence-")) return "dast";
   return undefined;
@@ -1859,7 +2103,9 @@ function expectedArtifactName(
         ? "guardianbot-dast-evidence-"
         : type === "image-promotion"
           ? "guardianbot-image-promotion-"
-          : "guardianbot-image-evidence-";
+          : type === "image-rescan"
+            ? "guardianbot-image-rescan-"
+            : "guardianbot-image-evidence-";
   return `${prefix}${runId}-${runAttempt}`;
 }
 
@@ -1916,6 +2162,18 @@ function expectedArtifactTypes(
     } else {
       if (validationJob.conclusion !== "skipped") types.push("image-validation");
       if (promotionJob.conclusion !== "skipped") types.push("image-promotion");
+    }
+  }
+  if (paths.has(".github/workflows/reusable-image-rescan.yml")) {
+    const rescanJob = workflowJob(jobs, "deployed digest rescan");
+    if (!rescanJob) {
+      if (!workflowCallWasSkipped(jobs, ["guardianbot/image-rescan"])) {
+        throw new RetryableScannerEvidenceError(
+          "trusted image rescan reusable workflow job metadata is unavailable"
+        );
+      }
+    } else if (rescanJob.conclusion !== "skipped") {
+      types.push("image-rescan");
     }
   }
   if (paths.has(".github/workflows/reusable-dast.yml")) {
@@ -2207,7 +2465,13 @@ export function createScannerWorkflowRunHandler(
           throw new Error("artifact size or digest mismatch");
         }
         const allowedFiles =
-          type === "security" ? SECURITY_FILES : type === "dast" ? DAST_FILES : IMAGE_FILES;
+          type === "security"
+            ? SECURITY_FILES
+            : type === "dast"
+              ? DAST_FILES
+              : type === "image-rescan"
+                ? IMAGE_RESCAN_FILES
+                : IMAGE_FILES;
         const archive = await parseArtifactArchive(zipPath, allowedFiles);
         validateArtifactProvenance(
           archive,
@@ -2245,6 +2509,15 @@ export function createScannerWorkflowRunHandler(
             workflowRecord,
             env,
             defectDojoSettings
+          );
+        } else if (type === "image-rescan") {
+          await processImageRescanArtifact(
+            options.store,
+            archive,
+            artifactRecord,
+            repository.defaultBranch,
+            workflowRecord,
+            trustPolicy
           );
         } else {
           await processImageArtifact(

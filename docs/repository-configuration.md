@@ -170,6 +170,11 @@ contract (invalid values fail validation), authorizes promotion only for
 `enforce` or `report-only`+`verified-default-branch`, and still refuses Critical,
 missing-scan, and scanner-error promotion.
 
+Setting `image.deployment` also adds a schedule-only nightly
+`guardianbot/image-rescan` job that rescans the exact deployed digest; see
+[Image security](image-security.md#deployed-digest-rescan). Callers without
+`image.deployment` are unchanged.
+
 ## DAST policy
 
 DAST configuration is staging-only. The primary origin and every additional

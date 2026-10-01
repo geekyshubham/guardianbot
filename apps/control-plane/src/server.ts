@@ -9,6 +9,10 @@ import {
   createDastSessionService,
   DastSessionError
 } from "./dast-session.js";
+import {
+  createImageRescanTargetService,
+  ImageRescanTargetError
+} from "./image-rescan.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
 import { startImageSmokeServer } from "./image-smoke.js";
@@ -107,6 +111,23 @@ async function start() {
     }
   });
   const dastSession = createDastSessionService({
+    store,
+    environment: process.env,
+    authorizeRepository: async (repositoryName, repositoryId) => {
+      const repository = await store.getRepository(repositoryId);
+      if (
+        repository?.repositoryState !== "active" ||
+        repository.fullName.toLowerCase() !== repositoryName.toLowerCase()
+      ) {
+        return undefined;
+      }
+      return {
+        fullName: repository.fullName,
+        defaultBranch: repository.defaultBranch
+      };
+    }
+  });
+  const imageRescanTarget = createImageRescanTargetService({
     store,
     environment: process.env,
     authorizeRepository: async (repositoryName, repositoryId) => {
@@ -416,6 +437,64 @@ async function start() {
               error: failure
             })
           );
+      }
+      return;
+    }
+    if (request.method === "POST" && request.url === "/image/rescan-target") {
+      const mediaType = String(request.headers["content-type"] ?? "")
+        .split(";", 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (mediaType !== "application/json") {
+        response.writeHead(415).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      try {
+        for await (const chunk of request) {
+          const buffer = Buffer.from(chunk);
+          received += buffer.length;
+          if (received > 16 * 1024) {
+            response.writeHead(413).end();
+            request.destroy();
+            return;
+          }
+          chunks.push(buffer);
+        }
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const target = await imageRescanTarget.resolve(
+          request.headers.authorization,
+          payload
+        );
+        response
+          .writeHead(200, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(JSON.stringify(target));
+      } catch (error) {
+        const status =
+          error instanceof ImageRescanTargetError ? error.statusCode : 400;
+        const failure =
+          error instanceof ImageRescanTargetError
+            ? error.message
+            : "invalid image rescan request";
+        console.warn(
+          JSON.stringify({
+            event: "guardianbot.image_rescan_target_rejected",
+            status,
+            failure
+          })
+        );
+        response
+          .writeHead(status, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(JSON.stringify({ error: failure }));
       }
       return;
     }
