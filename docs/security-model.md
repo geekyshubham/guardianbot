@@ -21,6 +21,29 @@ caller workflow, exact reusable-workflow SHA, artifact digest, and signed
 attestation. Consumer repositories cannot substitute their own evidence
 directory or symlink.
 
+### Mode C remediation drafts
+
+Mode C is the only path where the control plane writes repository contents,
+and it is off unless `GUARDIANBOT_REMEDIATION_DRAFTS=1` is set and the
+installation token reports `contents: write`. The default manifest does not
+grant it. The trust boundary is:
+
+- Trigger: a human with write, maintain, or admin permission (read from the
+  GitHub API at command time) comments `@guardianbot draft-fix`. Bot comments
+  and fork pull requests never reach a write.
+- Content: only the exact suggestion GuardianBot already validated and
+  published, proven by a retained SHA-256 digest, spliced into the finding's
+  exact changed-line range. A deterministic validator rejects protected paths
+  (workflows, CI, GuardianBot config, CODEOWNERS, lockfiles), binaries, stale
+  heads, oversize changes, and any change outside the range. No model output
+  is used beyond that suggestion, and no second model is consulted.
+- Target: a new `guardianbot/fix/*` branch cut from the pull request head and
+  a DRAFT pull request into the head branch. GuardianBot never merges,
+  approves, or pushes to the contributor's branch, and its draft does not
+  change deterministic gates.
+
+Details are in [remediation drafts](remediation-drafts.md).
+
 ### Repository content and isolation
 
 Repository files, diffs, issues, commit messages, generated files, scanner
@@ -205,3 +228,8 @@ does not discard.
 
 The integer aggregate is not per-person data and survives eviction of the
 per-finding records that produced it, including a removal discard.
+
+Review-value outcomes follow the same rule. Each retained finding may carry one
+closed-union outcome (`fixed`, `dismissed`, or `ignored`) and its timestamp,
+plus a SHA-256 digest of its exact suggestion. Who dismissed a finding, any
+reviewer text, and the suggestion text itself are not retained.

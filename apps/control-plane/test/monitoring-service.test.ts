@@ -10,7 +10,8 @@ import {
   MAX_MONITORING_INTERVAL_MS,
   MIN_MONITORING_INTERVAL_MS,
   MonitoringService,
-  monitoringOptionsFromEnvironment
+  monitoringOptionsFromEnvironment,
+  reviewCompleteness
 } from "../src/monitoring-service.js";
 import {
   MemoryStore,
@@ -1223,3 +1224,55 @@ function maxPlaceholder(query: string): number {
     ...[...query.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
   );
 }
+
+test("weekly review completeness is labelled honestly from retained findings", async () => {
+  assert.equal(reviewCompleteness(false, false), "unavailable");
+  assert.equal(reviewCompleteness(true, false), "retained-findings");
+  assert.equal(reviewCompleteness(true, true), "retained-findings-partial");
+  assert.equal(reviewCompleteness(false, true), "retained-findings-partial");
+
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  const observed = new Date(INITIAL_NOW - 60_000).toISOString();
+  await store.saveReview({
+    repositoryId: 20,
+    pullNumber: 4,
+    headSha: "h".repeat(40),
+    reviewedHeadSha: "h".repeat(40),
+    findings: [
+      {
+        fingerprint: "1".repeat(64),
+        state: "resolved",
+        category: "security",
+        firstSeenAt: observed,
+        lastSeenAt: observed,
+        outcome: "fixed",
+        outcomeAt: observed
+      },
+      {
+        fingerprint: "2".repeat(64),
+        state: "open",
+        category: "security",
+        firstSeenAt: observed,
+        lastSeenAt: observed,
+        outcome: "dismissed",
+        outcomeAt: observed
+      }
+    ]
+  });
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(weekly?.sourceCompleteness.review, "retained-findings");
+  assert.equal(weekly?.report.review.advisoryFindingsAccepted, 1);
+  assert.equal(weekly?.report.review.advisoryFindingsDismissed, 1);
+  assert.equal(weekly?.report.reviewValue?.totals.precision, 0.5);
+  assert.equal(weekly?.report.reviewValue?.totals.sampleSize, 2);
+  assert.equal(weekly?.report.reviewValue?.byCategory.security?.fixed, 1);
+  // Unmeasured review fields stay at zero rather than being inferred.
+  assert.equal(weekly?.report.review.prsReviewed, 0);
+});

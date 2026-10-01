@@ -41,6 +41,10 @@ class FakeGitHub {
   treeRefs: string[] = [];
   fileReads: Array<{ path: string; ref: string }> = [];
   permission = "write";
+  // Permissions the installation token reports; absent unless a test grants them explicitly.
+  grantedPermissions?: Record<string, string>;
+  repositoryWrites: Array<{ method: string; path: string; body: any }> = [];
+  failRefCreation = false;
   failIssueCreations = 0;
   failConfigFileReads = 0;
   issueCreationDelayMs = 0;
@@ -197,6 +201,23 @@ class FakeGitHub {
       existing.body = String(body.body);
       this.reviewCommentUpdates.push({ id: commentId, body: existing.body });
       return { id: commentId } as T;
+    }
+    if (method === "POST" && /\/git\/refs$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      if (this.failRefCreation) throw new Error(`GitHub POST ${path} returned 422: exists`);
+      return { ref: body.ref } as T;
+    }
+    if (method === "PUT" && path.includes("/contents/")) {
+      this.repositoryWrites.push({ method, path, body });
+      return { commit: { sha: "c".repeat(40) } } as T;
+    }
+    if (method === "POST" && /\/pulls$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      return { number: 501, html_url: "https://example.test/pull/501" } as T;
+    }
+    if (method === "POST" && /\/issues\/\d+\/labels$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      return [] as T;
     }
     if (method === "POST" && /\/pulls\/\d+\/reviews$/.test(path)) {
       this.reviews.push(body);
@@ -3772,4 +3793,275 @@ test("a stored storage key that is not canonical for its scope and commit is rej
   assert.deepEqual(indexed, []);
   assert.match(body, /repository index context was rejected by repository isolation checks/);
   assert.match(body, /Partial review/);
+});
+
+const DRAFT_FILE = `${Array.from({ length: 12 }, (_, index) =>
+  index === 9 ? "  return unsafeValue;" : `line ${index + 1}`
+).join("\n")}\n`;
+
+async function reviewWithSuggestion(options: { remediationDrafts?: boolean } = {}) {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ contents: { "src/a.ts": Buffer.from(DRAFT_FILE, "utf8") } });
+  const file = { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" };
+  github.pullFiles = Array.from({ length: 6 }, () => [file]);
+  const backend = new FakeBackend((request) =>
+    createResult(request, { suggestion: "return safeValue;" })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      ...(options.remediationDrafts === undefined
+        ? {}
+        : { remediationDrafts: options.remediationDrafts })
+    },
+    store
+  );
+  await service.enqueue("pull_request", createPullEvent(), "delivery-suggestion");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 1);
+  return { store, github, service };
+}
+
+function draftCommandEvent(body: string, user: Record<string, any> = { login: "reviewer" }) {
+  return {
+    action: "created",
+    installation: { id: 1 },
+    repository: {
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    },
+    issue: { number: 12, pull_request: { url: "https://example.test/pull" } },
+    comment: { body, user }
+  };
+}
+
+function sameRepositoryPull(overrides: Record<string, any> = {}) {
+  return {
+    ...createPullEvent().pull_request,
+    head: {
+      sha: "head-sha",
+      ref: "feature/harden",
+      repo: { id: 99, full_name: "Geekyshubham/guardianbot" },
+      ...overrides
+    }
+  };
+}
+
+let draftDelivery = 0;
+async function runCommand(service: GuardianService, body: string, user?: Record<string, any>) {
+  draftDelivery += 1;
+  await service.enqueue("issue_comment", draftCommandEvent(body, user), `draft-${draftDelivery}`);
+  await service.processNextWebhook("worker-1");
+}
+
+test("the review row retains only a digest of the validated suggestion", async () => {
+  const { store } = await reviewWithSuggestion();
+  const finding = (await store.getReview(99, 12))?.findings[0];
+  assert.match(finding?.suggestionSha256 ?? "", /^[a-f0-9]{64}$/);
+  assert.ok(!JSON.stringify(finding).includes("safeValue"));
+});
+
+test("draft-fix is unavailable by default and writes nothing to the repository", async () => {
+  const { service, github } = await reviewWithSuggestion();
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /unavailable: they are disabled/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_unavailable_total 1$/m);
+});
+
+test("draft-fix is unavailable when the installation lacks contents:write", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not granted `contents: write`/);
+  github.grantedPermissions = { contents: "read" };
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not granted `contents: write`/);
+  assert.deepEqual(github.repositoryWrites, []);
+});
+
+test("draft-fix ignores bots and refuses readers, forks, and draft branches", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  const before = github.comments.length;
+  await runCommand(service, "@guardianbot draft-fix F1", { login: "helper[bot]", type: "Bot" });
+  await runCommand(service, "@guardianbot draft-fix F1", { login: "helper", type: "Bot" });
+  assert.equal(github.comments.length, before);
+
+  github.permission = "read";
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not authorized/);
+  github.permission = "write";
+
+  github.currentPulls = [
+    sameRepositoryPull({ repo: { id: 7, full_name: "someone/guardianbot" } }),
+    sameRepositoryPull({ repo: null }),
+    sameRepositoryPull({ ref: "guardianbot/fix/abc-1234567" })
+  ];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /forks or from GuardianBot draft branches/);
+  }
+  assert.deepEqual(github.repositoryWrites, []);
+});
+
+test("draft-fix opens a labelled draft PR on a new branch targeting the PR head branch", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+
+  const [ref, put, pull, label] = github.repositoryWrites;
+  assert.equal(github.repositoryWrites.length, 4);
+  assert.equal(ref?.body.sha, "head-sha");
+  assert.match(ref?.body.ref ?? "", /^refs\/heads\/guardianbot\/fix\/[a-f0-9]{12}-[a-f0-9]*$/);
+  const branch = String(ref?.body.ref).slice("refs/heads/".length);
+  assert.equal(put?.method, "PUT");
+  assert.equal(put?.body.branch, branch);
+  assert.notEqual(put?.body.branch, "feature/harden");
+  assert.equal(put?.body.sha, "src/a.ts-sha");
+  const written = Buffer.from(put?.body.content, "base64").toString("utf8");
+  const original = DRAFT_FILE.split("\n");
+  const updated = written.split("\n");
+  assert.equal(updated[9], "return safeValue;");
+  assert.deepEqual(
+    updated.filter((_, index) => index !== 9),
+    original.filter((_, index) => index !== 9)
+  );
+  assert.equal(pull?.body.draft, true);
+  assert.equal(pull?.body.base, "feature/harden");
+  assert.equal(pull?.body.head, branch);
+  assert.match(pull?.body.body ?? "", /AI-drafted remediation\. Requires human review and approval\./);
+  assert.deepEqual(label?.body, { labels: ["guardianbot-ai-draft"] });
+  assert.ok(!github.repositoryWrites.some((write) => /\/merge|\/reviews/.test(write.path)));
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #501/);
+  assert.match(github.comments.at(-1)?.body ?? "", /Checks: \*\*pending\*\*/);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 1$/m);
+});
+
+test("draft-fix refuses a stale head before any repository write", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull({ sha: "moved-head" })];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not validated at the current pull request head/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+});
+
+test("dismiss records an outcome without retaining who dismissed it, and merge marks the rest ignored", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  await runCommand(service, "@guardianbot dismiss F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /recorded finding `F1` as dismissed/i);
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings[0]?.outcome, "dismissed");
+  assert.ok(!JSON.stringify(review).includes("reviewer"));
+  await runCommand(service, "@guardianbot dismiss F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /already recorded as dismissed/);
+  await runCommand(service, "@guardianbot dismiss nope");
+  assert.match(github.comments.at(-1)?.body ?? "", /No open GuardianBot finding matches/);
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_dismissed_total 1$/m);
+
+  // Merging leaves the dismissal intact; it never re-labels a human decision as ignored.
+  await service.enqueue(
+    "pull_request",
+    { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: true } },
+    "delivery-merged-dismissed"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, "dismissed");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_ignored_total 0$/m);
+});
+
+test("a merged pull request marks still-open findings ignored; a closed one records nothing", async () => {
+  const { service, store } = await reviewWithSuggestion();
+  await service.enqueue(
+    "pull_request",
+    { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: false } },
+    "delivery-closed"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, undefined);
+  for (const delivery of ["delivery-merged", "delivery-merged-replay"]) {
+    await service.enqueue(
+      "pull_request",
+      { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: true } },
+      delivery
+    );
+    await service.processNextWebhook("worker-1");
+  }
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, "ignored");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_ignored_total 1$/m);
+});
+
+test("a verified incremental review marks a finding fixed when its lines were rewritten", async () => {
+  const previousHead = "1".repeat(40);
+  const currentHead = "2".repeat(40);
+  const event = createPullEvent(currentHead);
+  event.pull_request.base.sha = "3".repeat(40);
+  const github = new FakeGitHub({ config: VALID_INCREMENTAL_CONFIG });
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.comparisons = [{
+    status: "ahead",
+    base_commit: { sha: previousHead },
+    merge_base_commit: { sha: previousHead },
+    head_commit: { sha: currentHead },
+    files: [{
+      filename: "src/incremental.ts",
+      status: "modified",
+      patch: "@@ -20 +20 @@\n-unsafe\n+safe"
+    }]
+  }];
+  const backend = new FakeBackend((request) => ({ ...createResult(request), findings: [] }));
+  const store = new MemoryStore();
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  await store.saveReview({
+    repositoryId: 99,
+    pullNumber: 12,
+    headSha: previousHead,
+    reviewedHeadSha: previousHead,
+    placeholderCommentId: 79,
+    findings: [{
+      fingerprint: "e".repeat(64),
+      state: "open",
+      path: "src/incremental.ts",
+      startLine: 20,
+      endLine: 20,
+      category: "security",
+      lastSeenHeadSha: previousHead
+    }]
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, "delivery-incremental-fixed");
+  await service.processNextWebhook("worker-1");
+  const retained = (await store.getReview(99, 12))?.findings[0];
+  assert.notEqual(retained?.state, "open");
+  assert.equal(retained?.outcome, "fixed");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 1$/m);
 });

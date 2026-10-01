@@ -182,7 +182,31 @@ export interface ReviewFindingProvenance {
    * and the ring is capped at `MAX_FEEDBACK_COMMENT_IDS` so the row cannot grow without bound.
    */
   feedbackCommentIds?: number[];
+  /**
+   * SHA-256 of the exact replacement the validated review result proposed for this finding, as
+   * rendered into the inline advisory. Retained as a digest only, so a remediation draft can prove
+   * the suggestion it is about to apply is byte-identical to the one GuardianBot validated without
+   * the store holding model output text. Absent when the finding carried no exact suggestion.
+   */
+  suggestionSha256?: string;
+  /**
+   * Derived review-value outcome, orthogonal to lifecycle `state` so the three-value state union
+   * stays readable by an older instance mid-deploy. `fixed` means the finding stopped being
+   * reported after a verified incremental head change that rewrote its line range; `dismissed`
+   * means an authorized human ran the bounded dismiss command; `ignored` means the finding was
+   * still open when the pull request merged. No reviewer identity or prose is ever recorded.
+   */
+  outcome?: ReviewFindingOutcome;
+  outcomeAt?: string;
 }
+
+export type ReviewFindingOutcome = "fixed" | "dismissed" | "ignored";
+
+export const REVIEW_FINDING_OUTCOMES: readonly ReviewFindingOutcome[] = [
+  "fixed",
+  "dismissed",
+  "ignored"
+];
 
 export interface ReviewFindingRecord extends ReviewFindingProvenance {
   fingerprint: string;
@@ -336,8 +360,29 @@ export function normalizeReviewFinding(value: unknown): ReviewFindingRecord | un
     category: optionalText(raw.category, 64),
     severity: optionalText(raw.severity, 8),
     title: optionalText(raw.title, 300),
-    ...feedbackProvenance(raw)
+    ...feedbackProvenance(raw),
+    ...suggestionProvenance(raw),
+    ...outcomeProvenance(raw)
   };
+}
+
+/** Omitted unless a well-formed digest was retained, so suggestion-free findings do not grow. */
+function suggestionProvenance(raw: Record<string, unknown>): Partial<ReviewFindingProvenance> {
+  return typeof raw.suggestionSha256 === "string" && /^[a-f0-9]{64}$/.test(raw.suggestionSha256)
+    ? { suggestionSha256: raw.suggestionSha256 }
+    : {};
+}
+
+/**
+ * Reads the derived outcome, omitting it entirely when absent or unrecognised. A value outside the
+ * closed union is dropped rather than surfaced, so a future outcome name cannot reach aggregation
+ * as an uncounted string, and a finding without an outcome normalizes to exactly its old record.
+ */
+function outcomeProvenance(raw: Record<string, unknown>): Partial<ReviewFindingProvenance> {
+  const outcome = REVIEW_FINDING_OUTCOMES.find((candidate) => candidate === raw.outcome);
+  if (!outcome) return {};
+  const outcomeAt = optionalTimestamp(raw.outcomeAt);
+  return outcomeAt ? { outcome, outcomeAt } : { outcome };
 }
 
 /**
@@ -436,6 +481,75 @@ export function applyFindingFeedback(
     recorded: true
   };
 }
+
+/**
+ * One explicit outcome observation. `dismissed` names a single fingerprint; `ignored` applies to
+ * every finding still open with no outcome when the pull request merged, so it names none.
+ */
+export type FindingOutcomeInput =
+  | {
+      repositoryId: number;
+      pullNumber: number;
+      outcome: "dismissed";
+      fingerprint: string;
+      observedAt: Date;
+    }
+  | {
+      repositoryId: number;
+      pullNumber: number;
+      outcome: "ignored";
+      observedAt: Date;
+    };
+
+export interface ApplyFindingOutcomeResult {
+  findings: ReviewFindingRecord[];
+  /** Findings whose outcome this call changed; zero for a redelivered or inapplicable event. */
+  changed: number;
+}
+
+/**
+ * Applies one outcome observation. Kept pure and exported so the precedence rules are testable
+ * without a server:
+ *
+ * - `dismissed` is an explicit human signal and replaces any derived outcome on its finding, but
+ *   re-dismissing is a no-op so a redelivered command does not count twice.
+ * - `ignored` reaches only findings still `open` that carry no outcome: a finding already fixed
+ *   or dismissed is not ignored merely because the pull request merged afterwards.
+ *
+ * Nothing is invented for a fingerprint the record does not retain.
+ */
+export function applyFindingOutcome(
+  findings: readonly ReviewFindingRecord[],
+  input: Pick<FindingOutcomeInput, "outcome" | "observedAt"> & { fingerprint?: string }
+): ApplyFindingOutcomeResult {
+  const observedIso = input.observedAt.toISOString();
+  let changed = 0;
+  const updated = findings.map((finding) => {
+    const eligible =
+      input.outcome === "dismissed"
+        ? finding.fingerprint === input.fingerprint && finding.outcome !== "dismissed"
+        : finding.state === "open" && finding.outcome === undefined;
+    if (!eligible) return { ...finding };
+    changed += 1;
+    return { ...finding, outcome: input.outcome, outcomeAt: observedIso };
+  });
+  return { findings: updated, changed };
+}
+
+/** One retained review row, as read for weekly review-value aggregation. */
+export interface ReviewActivityRecord {
+  pullNumber: number;
+  reviewedHeadSha?: string;
+  findings: ReviewFindingRecord[];
+}
+
+export interface ReviewActivityPage {
+  reviews: ReviewActivityRecord[];
+  /** True when more rows matched than `limit`, so an aggregate built from the page is partial. */
+  truncated: boolean;
+}
+
+export const MAX_REVIEW_ACTIVITY_ROWS = 1_000;
 
 export function normalizeReviewFindings(value: unknown): ReviewFindingRecord[] {
   return Array.isArray(value)
@@ -556,6 +670,11 @@ export interface MonitoringAlertRecord extends MonitoringAlertInput {
   resolvedAt?: string;
 }
 
+export type MonitoringReviewCompleteness =
+  | "unavailable"
+  | "retained-findings"
+  | "retained-findings-partial";
+
 export interface MonitoringWeeklyReportRecord {
   weekKey: string;
   periodStart: string;
@@ -563,7 +682,13 @@ export interface MonitoringWeeklyReportRecord {
   generatedAt: string;
   report: WeeklyCoverageReport;
   sourceCompleteness: {
-    review: "unavailable";
+    /**
+     * `unavailable` when no retained review row was read for any repository; `retained-findings`
+     * when the advisory finding and review-value fields were aggregated from retained finding
+     * records; `retained-findings-partial` when at least one repository's read failed or was
+     * truncated. The other review fields are not measured under any label.
+     */
+    review: MonitoringReviewCompleteness;
     scanner: "latest-reconciliation";
     monitoring: "latest-reconciliation";
     imageProtection: "latest-reconciliation";
@@ -1134,6 +1259,32 @@ WHERE repository_id = $1 AND pull_number = $2
 `.trim();
 
 /**
+ * Writes back findings whose derived outcome changed. Unlike the feedback update it leaves
+ * `feedback_total` alone: an outcome is not an engagement, and the row lock taken by
+ * `REVIEW_FEEDBACK_LOCK_SQL` in the same transaction serialises it against concurrent writers.
+ */
+export const REVIEW_OUTCOME_UPDATE_SQL = `
+UPDATE reviews
+SET findings = $3::jsonb,
+    updated_at = now()
+WHERE repository_id = $1 AND pull_number = $2
+`.trim();
+
+/**
+ * Reads the review rows of one repository touched since `$2`, newest first, bounded by `$3`. The
+ * `updated_at` predicate is only a superset prefilter: every finding timestamp the aggregation
+ * reads is written in the same statement that advances `updated_at`, and the aggregation then
+ * filters each finding by its own timestamps.
+ */
+export const REVIEW_ACTIVITY_SQL = `
+SELECT pull_number, reviewed_head_sha, findings
+FROM reviews
+WHERE repository_id = $1 AND updated_at >= $2
+ORDER BY updated_at DESC, pull_number DESC
+LIMIT $3
+`.trim();
+
+/**
  * Drops every retained finding for repositories that just left the installation.
  *
  * `evictTerminalReviewFindings` is the only other thing that bounds this column, and it runs only
@@ -1314,6 +1465,17 @@ export interface Store {
   ): Promise<boolean>;
   getReview(repositoryId: number, pullNumber: number): Promise<ReviewState | undefined>;
   recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean>;
+  /** Returns how many findings changed outcome; see `applyFindingOutcome`. */
+  recordFindingOutcome(input: FindingOutcomeInput): Promise<number>;
+  /**
+   * Bounded read of one repository's retained review rows for review-value aggregation. Rows are
+   * returned whole; per-finding period filtering is the caller's job.
+   */
+  listReviewActivity(
+    repositoryId: number,
+    since: Date,
+    limit?: number
+  ): Promise<ReviewActivityPage>;
   enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>): Promise<boolean>;
   claimWebhook(workerId: string, leaseMs: number, now?: Date): Promise<WebhookJob | undefined>;
   completeWebhook(deliveryId: string, workerId: string): Promise<void>;
@@ -1967,6 +2129,38 @@ export class MemoryStore implements Store {
       feedbackTotal: (review.feedbackTotal ?? 0) + 1
     });
     return true;
+  }
+
+  async recordFindingOutcome(input: FindingOutcomeInput): Promise<number> {
+    const key = `${input.repositoryId}:${input.pullNumber}`;
+    const review = this.reviews.get(key);
+    if (!review) return 0;
+    const applied = applyFindingOutcome(review.findings, input);
+    if (!applied.changed) return 0;
+    this.reviews.set(key, { ...review, findings: applied.findings });
+    return applied.changed;
+  }
+
+  async listReviewActivity(
+    repositoryId: number,
+    _since: Date,
+    limit = MAX_REVIEW_ACTIVITY_ROWS
+  ): Promise<ReviewActivityPage> {
+    // No `updated_at` is tracked here, so every row of the repository is a candidate; the
+    // PostgreSQL prefilter is a strict superset optimisation and the caller filters by the
+    // finding timestamps either way, so both stores produce the same aggregate.
+    const bounded = Math.max(1, Math.min(MAX_REVIEW_ACTIVITY_ROWS, Math.trunc(limit)));
+    const rows = [...this.reviews.values()]
+      .filter((review) => review.repositoryId === repositoryId)
+      .sort((left, right) => right.pullNumber - left.pullNumber);
+    return {
+      reviews: rows.slice(0, bounded).map((review) => ({
+        pullNumber: review.pullNumber,
+        reviewedHeadSha: review.reviewedHeadSha,
+        findings: review.findings.map((finding) => ({ ...finding }))
+      })),
+      truncated: rows.length > bounded
+    };
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
@@ -3683,6 +3877,65 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Records one outcome observation under the same row lock feedback capture takes, so a review
+   * publishing merged findings and an outcome write cannot lose each other's per-finding detail.
+   */
+  async recordFindingOutcome(input: FindingOutcomeInput): Promise<number> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(REVIEW_FEEDBACK_LOCK_SQL, [
+        input.repositoryId,
+        input.pullNumber
+      ]);
+      const row = locked.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return 0;
+      }
+      const applied = applyFindingOutcome(normalizeReviewFindings(row.findings), input);
+      if (!applied.changed) {
+        await client.query("ROLLBACK");
+        return 0;
+      }
+      await client.query(REVIEW_OUTCOME_UPDATE_SQL, [
+        input.repositoryId,
+        input.pullNumber,
+        JSON.stringify(applied.findings)
+      ]);
+      await client.query("COMMIT");
+      return applied.changed;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listReviewActivity(
+    repositoryId: number,
+    since: Date,
+    limit = MAX_REVIEW_ACTIVITY_ROWS
+  ): Promise<ReviewActivityPage> {
+    const bounded = Math.max(1, Math.min(MAX_REVIEW_ACTIVITY_ROWS, Math.trunc(limit)));
+    // One extra row is read so truncation is observed rather than guessed.
+    const result = await this.pool.query(REVIEW_ACTIVITY_SQL, [
+      repositoryId,
+      since.toISOString(),
+      bounded + 1
+    ]);
+    return {
+      reviews: result.rows.slice(0, bounded).map((row) => ({
+        pullNumber: Number(row.pull_number),
+        reviewedHeadSha: row.reviewed_head_sha ?? undefined,
+        findings: normalizeReviewFindings(row.findings)
+      })),
+      truncated: result.rows.length > bounded
+    };
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {

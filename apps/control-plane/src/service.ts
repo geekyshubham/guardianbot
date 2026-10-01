@@ -33,6 +33,18 @@ import {
 import { GuardianMetrics } from "./metrics.js";
 import type { RepositoryIndexService } from "./repository-index-service.js";
 import {
+  REMEDIATION_BRANCH_PREFIX,
+  REMEDIATION_DRAFT_LABEL,
+  REMEDIATION_REJECTION_TEXT,
+  remediationBranchName,
+  remediationDraftBody,
+  sha256Hex,
+  validateRemediationDraft,
+  type RemediationRejection
+} from "./remediation-draft.js";
+import { markFixedOutcomes } from "./review-value.js";
+import {
+  exactSuggestion,
   extractFindingMarker,
   findingMarker,
   isClosedFindingComment,
@@ -82,6 +94,11 @@ export interface ServiceOptions {
   metrics?: GuardianMetrics;
   repositoryIndexService?: RepositoryIndexService;
   reviewFindingRetention?: ReviewFindingRetentionOptions;
+  /**
+   * Mode C remediation drafts. Off unless the operator sets it explicitly; even when on, a draft
+   * is attempted only when the installation token was actually granted `contents: write`.
+   */
+  remediationDrafts?: boolean;
 }
 
 export interface GuardianScannerWorkflowRun {
@@ -113,7 +130,12 @@ interface GitHubPullFile {
 
 interface GitHubPull {
   number: number;
-  head: { sha: string };
+  head: {
+    sha: string;
+    ref?: string;
+    /** Null when the head repository was deleted; any absence is treated as a fork. */
+    repo?: { id?: number; full_name?: string } | null;
+  };
   base: { sha: string; ref: string };
   title: string;
   body?: string | null;
@@ -166,6 +188,11 @@ interface GitHubClientLike {
     body?: unknown,
     extraHeaders?: Record<string, string>
   ): Promise<T>;
+  /**
+   * Permissions GitHub reported when the installation token was minted. Absent on clients that
+   * did not record them, which every permission-gated feature treats as not granted.
+   */
+  grantedPermissions?: Readonly<Record<string, string>>;
 }
 
 export interface ReviewBackend {
@@ -221,6 +248,8 @@ interface ReviewFileScope {
   baseSha: string;
   summary: string;
   partialReason?: string;
+  /** True only when GitHub verified `baseSha` as the previously reviewed head. */
+  incremental?: boolean;
 }
 
 const HIGH_RISK_PATH =
@@ -451,7 +480,7 @@ export class GuardianService {
       this.options.privateKey,
       event.installation.id,
       repositoryIds
-    ) as Promise<GitHubClient>;
+    );
   }
 
   private reviewClient(
@@ -530,6 +559,11 @@ export class GuardianService {
       ["opened", "synchronize", "reopened", "ready_for_review"].includes(event.action)
     ) {
       await this.reviewPullRequest(event, {}, signal, fence);
+      return;
+    }
+
+    if (name === "pull_request" && event.action === "closed") {
+      await this.recordMergedOutcomes(event, signal);
       return;
     }
 
@@ -1176,7 +1210,13 @@ export class GuardianService {
       now,
       this.reviewFindingRetention
     );
-    const findingStates = lifecycle.findings;
+    // `fixed` is derived only from a verified incremental review, and only against the diff files
+    // the model actually received, so a finding that vanished because its file was omitted from
+    // the bounded bundle, or because the base could not be verified, records no outcome at all.
+    const outcomes = fileScope.incremental
+      ? markFixedOutcomes(existing?.findings, lifecycle.findings, includedDiffFiles, now)
+      : { findings: lifecycle.findings, fixed: 0 };
+    const findingStates = outcomes.findings;
     const reappeared = countReappearances(existing?.findings, findingStates);
     if (reappeared) {
       this.metrics.increment("finding_reappeared_total", reappeared);
@@ -1204,6 +1244,7 @@ export class GuardianService {
       this.metrics.increment("review_stale_total");
       return;
     }
+    if (outcomes.fixed) this.metrics.increment("finding_outcome_fixed_total", outcomes.fixed);
 
     const publishedComments = await this.listReviewComments(
       github,
@@ -1350,11 +1391,20 @@ export class GuardianService {
     const parsed = /^@guardianbot(?:\s+([a-z-]+))?(?:\s+([\s\S]*))?$/i.exec(text);
     if (!parsed) return;
 
+    const command = (parsed[1] ?? "help").toLowerCase();
+    const actor = String(event.comment.user?.login ?? "");
+    // A bot can never trigger a write to the repository, whatever permission its identity holds:
+    // that would let one automation chain another into opening pull requests unattended.
+    if (
+      command === "draft-fix" &&
+      (actor.endsWith(BOT_LOGIN_SUFFIX) || event.comment.user?.type === "Bot")
+    ) {
+      return;
+    }
+
     const github = await this.client(event, [event.repository.id]);
     const [owner, repo] = event.repository.full_name.split("/");
-    const actor = String(event.comment.user?.login ?? "");
     const permission = await this.getActorPermission(github, owner, repo, actor);
-    const command = (parsed[1] ?? "help").toLowerCase();
     const argument = String(parsed[2] ?? "").trim().slice(0, 200);
     if (!["write", "maintain", "admin"].includes(permission)) {
       this.metrics.increment("commands_rejected_total");
@@ -1386,7 +1436,7 @@ export class GuardianService {
         owner,
         repo,
         event.issue.number,
-        "Commands: `review`, `full-review`, `status`, `explain <id>`, `suggest-fix <id>`, `pause`, `resume`, `help`. All AI output is advisory; no command merges code or waives deterministic scanners."
+        "Commands: `review`, `full-review`, `status`, `explain <id>`, `suggest-fix <id>`, `dismiss <id>`, `draft-fix <id>`, `pause`, `resume`, `help`. All AI output is advisory; no command merges code or waives deterministic scanners."
       );
       return;
     }
@@ -1512,12 +1562,411 @@ export class GuardianService {
       return;
     }
 
+    if (command === "dismiss") {
+      await this.dismissCommand(github, event, owner, repo, argument);
+      return;
+    }
+    if (command === "draft-fix") {
+      await this.draftFixCommand(github, event, owner, repo, argument, signal);
+      return;
+    }
+
     await github.createComment(
       owner,
       repo,
       event.issue.number,
       `Unknown GuardianBot command \`${safeInline(command)}\`. Use \`@guardianbot help\`.`
     );
+  }
+
+  /**
+   * Resolves an identifier to exactly one of GuardianBot's own open advisories on this pull
+   * request and the retained fingerprint behind it. Ambiguity is refused rather than resolved, so
+   * a short prefix can never act on a finding the commenter did not mean.
+   */
+  private async resolveAdvisory(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    pullNumber: number,
+    findings: readonly ReviewFindingRecord[],
+    identifier: string
+  ): Promise<
+    | { ok: true; fingerprint: string; comment: GitHubReviewComment }
+    | { ok: false; message: string }
+  > {
+    const comments = await this.listReviewComments(github, owner, repo, pullNumber);
+    const matches = comments.filter(
+      (comment) =>
+        this.isOwnInlineAdvisory(comment) &&
+        !isClosedFindingComment(comment.body) &&
+        commentMatchesIdentifier(comment.body, identifier)
+    );
+    if (matches.length !== 1) {
+      return {
+        ok: false,
+        message: matches.length
+          ? `\`${safeInline(identifier)}\` matches more than one GuardianBot finding; use a longer fingerprint prefix.`
+          : `No open GuardianBot finding matches \`${safeInline(identifier)}\`.`
+      };
+    }
+    const comment = matches[0] as GitHubReviewComment;
+    const marker = extractFindingMarker(comment.body);
+    const fingerprint = marker
+      ? findings.find((finding) => markerDigest(finding.fingerprint) === marker)?.fingerprint
+      : undefined;
+    if (!fingerprint) {
+      return {
+        ok: false,
+        message: `GuardianBot no longer retains finding \`${safeInline(identifier)}\`.`
+      };
+    }
+    return { ok: true, fingerprint, comment };
+  }
+
+  private async dismissCommand(
+    github: GitHubClientLike,
+    event: GitHubEvent,
+    owner: string,
+    repo: string,
+    argument: string
+  ): Promise<void> {
+    if (!argument) {
+      await github.createComment(owner, repo, event.issue.number, "Usage: `@guardianbot dismiss <id>`.");
+      return;
+    }
+    const review = await this.store.getReview(event.repository.id, event.issue.number);
+    const resolved = await this.resolveAdvisory(
+      github,
+      owner,
+      repo,
+      event.issue.number,
+      review?.findings ?? [],
+      argument
+    );
+    if (!resolved.ok) {
+      await github.createComment(owner, repo, event.issue.number, resolved.message);
+      return;
+    }
+    const changed = await this.store.recordFindingOutcome({
+      repositoryId: event.repository.id,
+      pullNumber: event.issue.number,
+      outcome: "dismissed",
+      fingerprint: resolved.fingerprint,
+      observedAt: this.now()
+    });
+    if (changed) this.metrics.increment("finding_outcome_dismissed_total", changed);
+    await github.createComment(
+      owner,
+      repo,
+      event.issue.number,
+      changed
+        ? `Recorded finding \`${safeInline(argument)}\` as dismissed for review-value analytics. The advisory comment is unchanged and deterministic scanners are unaffected.`
+        : `Finding \`${safeInline(argument)}\` is already recorded as dismissed.`
+    );
+  }
+
+  /**
+   * A merged pull request turns every still-open finding without an outcome into `ignored`. A
+   * pull request closed without merging records nothing: abandoning a change says nothing about
+   * whether its advisories were right.
+   */
+  private async recordMergedOutcomes(event: GitHubEvent, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    if (event.pull_request?.merged !== true) return;
+    const repositoryId = positiveIdentifier(event.repository?.id);
+    const pullNumber = positiveIdentifier(event.pull_request?.number);
+    if (!repositoryId || !pullNumber) return;
+    const repository = await this.store.getRepository(repositoryId);
+    if (repository && repository.repositoryState !== "active") return;
+    const changed = await this.store.recordFindingOutcome({
+      repositoryId,
+      pullNumber,
+      outcome: "ignored",
+      observedAt: this.now()
+    });
+    if (changed) this.metrics.increment("finding_outcome_ignored_total", changed);
+  }
+
+  private async rejectDraft(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    message: string,
+    counter: "remediation_draft_rejected_total" | "remediation_draft_unavailable_total"
+  ): Promise<void> {
+    this.metrics.increment(counter);
+    await github.createComment(owner, repo, issueNumber, message);
+  }
+
+  /**
+   * Mode C: opens a DRAFT pull request carrying GuardianBot's exact validated suggestion, on a
+   * new `guardianbot/fix/*` branch cut from the pull request head and targeting that head branch.
+   * Gated, in order, on the operator flag, a write-capable human actor (already checked by the
+   * caller), the installation token actually holding `contents: write`, a same-repository head,
+   * and the deterministic validator. Nothing is merged, approved, or pushed to the contributor's
+   * branch, and the draft is linked immediately in an explicit checks-pending state because the
+   * App subscribes to no check-suite event that could confirm the draft's checks later.
+   */
+  private async draftFixCommand(
+    github: GitHubClientLike,
+    event: GitHubEvent,
+    owner: string,
+    repo: string,
+    argument: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const issueNumber = event.issue.number as number;
+    if (!argument) {
+      await github.createComment(owner, repo, issueNumber, "Usage: `@guardianbot draft-fix <fingerprint>`.");
+      return;
+    }
+    if (!this.options.remediationDrafts) {
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        "Remediation drafts are unavailable: they are disabled on this GuardianBot deployment. Use `@guardianbot suggest-fix` to see the advisory replacement.",
+        "remediation_draft_unavailable_total"
+      );
+      return;
+    }
+    if (github.grantedPermissions?.contents !== "write") {
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        "Remediation drafts are unavailable: the GuardianBot App installation was not granted `contents: write`. Use `@guardianbot suggest-fix` to see the advisory replacement.",
+        "remediation_draft_unavailable_total"
+      );
+      return;
+    }
+    const pull = await this.getCurrentPull(github, owner, repo, issueNumber);
+    if (!pull) {
+      await github.createComment(owner, repo, issueNumber, "GuardianBot could not load this pull request; no draft was created.");
+      return;
+    }
+    const headRepository = pull.head.repo;
+    const sameRepository =
+      Boolean(headRepository) &&
+      headRepository?.id === event.repository.id &&
+      String(headRepository?.full_name ?? "").toLowerCase() ===
+        String(event.repository.full_name).toLowerCase();
+    const headRef = typeof pull.head.ref === "string" ? pull.head.ref : "";
+    if (!sameRepository || !headRef || headRef.startsWith(REMEDIATION_BRANCH_PREFIX)) {
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        "Remediation drafts are unavailable for pull requests from forks or from GuardianBot draft branches.",
+        "remediation_draft_rejected_total"
+      );
+      return;
+    }
+    const review = await this.store.getReview(event.repository.id, issueNumber);
+    const resolved = await this.resolveAdvisory(
+      github,
+      owner,
+      repo,
+      issueNumber,
+      review?.findings ?? [],
+      argument
+    );
+    if (!resolved.ok) {
+      await this.rejectDraft(github, owner, repo, issueNumber, resolved.message, "remediation_draft_rejected_total");
+      return;
+    }
+    const finding = review?.findings.find((entry) => entry.fingerprint === resolved.fingerprint);
+    const reject = (reason: RemediationRejection) =>
+      this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        `No remediation draft was created for \`${safeInline(argument)}\`: ${REMEDIATION_REJECTION_TEXT[reason]}.`,
+        "remediation_draft_rejected_total"
+      );
+    if (!finding?.path) {
+      await reject("invalid-path");
+      return;
+    }
+    throwIfAborted(signal);
+    const files = await this.listPullFiles(github, owner, repo, issueNumber);
+    const changedFile = files.find((file) => file.filename === finding.path);
+    const changedRanges = changedFile?.patch ? addedLineRanges(changedFile.patch) : [];
+    const file = await this.getRemediationFile(github, owner, repo, finding.path, pull.head.sha);
+    if (!file) {
+      await reject(changedFile ? "binary-file" : "range-not-changed");
+      return;
+    }
+    const validation = validateRemediationDraft({
+      finding,
+      currentHeadSha: pull.head.sha,
+      reviewedHeadSha: review?.reviewedHeadSha,
+      publishedSuggestion: /```suggestion\n([\s\S]*?)\n```/.exec(resolved.comment.body)?.[1],
+      changedRanges,
+      fileContent: file.content,
+      fileBytes: file.bytes
+    });
+    if (!validation.ok) {
+      await reject(validation.reason);
+      return;
+    }
+
+    throwIfAborted(signal);
+    const branch = remediationBranchName(finding.fingerprint, pull.head.sha);
+    // Defence in depth against a future change to the name builder: every write below is
+    // addressed to this branch, which must never be the contributor's.
+    if (!branch.startsWith(REMEDIATION_BRANCH_PREFIX) || branch === headRef) {
+      throw new Error("remediation branch name failed its invariant");
+    }
+    const commitNeeded = await this.prepareRemediationBranch(github, owner, repo, branch, pull.head.sha);
+    if (commitNeeded === "conflict") {
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        `No remediation draft was created for \`${safeInline(argument)}\`: branch \`${branch}\` already exists with unrelated commits.`,
+        "remediation_draft_rejected_total"
+      );
+      return;
+    }
+    if (commitNeeded) {
+      await github.request(
+        "PUT",
+        `/repos/${owner}/${repo}/contents/${validation.path.split("/").map(encodeURIComponent).join("/")}`,
+        {
+          message: `GuardianBot AI-drafted remediation for ${finding.fingerprint.slice(0, 12)}\n\nRequires human review. Generated from a validated advisory suggestion.`,
+          content: Buffer.from(validation.content, "utf8").toString("base64"),
+          sha: file.sha,
+          branch
+        }
+      );
+    }
+    const draft = await this.openRemediationPull(github, owner, repo, branch, headRef, {
+      title: `GuardianBot AI draft: ${safeInline(finding.title ?? "advisory remediation").slice(0, 120)}`,
+      body: remediationDraftBody({
+        sourcePullNumber: issueNumber,
+        path: validation.path,
+        startLine: validation.startLine,
+        endLine: validation.endLine,
+        fingerprint: finding.fingerprint,
+        headSha: pull.head.sha
+      })
+    });
+    try {
+      await github.request("POST", `/repos/${owner}/${repo}/issues/${draft.number}/labels`, {
+        labels: [REMEDIATION_DRAFT_LABEL]
+      });
+    } catch (error) {
+      // The body already states the draft is AI-generated; a missing label must not hide the link.
+      if (error instanceof Error && error.name === "GitHubRateLimitError") throw error;
+    }
+    this.metrics.increment("remediation_draft_created_total");
+    await github.createComment(
+      owner,
+      repo,
+      issueNumber,
+      `AI-drafted remediation for \`${safeInline(argument)}\` opened as draft #${draft.number} targeting \`${safeInline(headRef)}\`. Checks: **pending**; GuardianBot does not wait for or report the draft's checks, so confirm them on the draft before merging it. It requires human review and approval; GuardianBot did not merge, approve, or push to this branch.`
+    );
+  }
+
+  /** Reads the target file at the head, refusing anything that is not a plain UTF-8 file. */
+  private async getRemediationFile(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    path: string,
+    ref: string
+  ): Promise<{ content: string; sha: string; bytes: number } | undefined> {
+    let result: { type?: string; encoding?: string; content?: string; sha?: string };
+    try {
+      result = await github.request(
+        "GET",
+        `/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`
+      );
+    } catch (error) {
+      if (String(error).includes("returned 404")) return undefined;
+      throw error;
+    }
+    if (
+      result.type !== "file" ||
+      result.encoding !== "base64" ||
+      typeof result.content !== "string" ||
+      typeof result.sha !== "string"
+    ) {
+      return undefined;
+    }
+    const raw = Buffer.from(result.content.replace(/\n/g, ""), "base64");
+    const content = raw.toString("utf8");
+    // A lossy decode means the bytes were not UTF-8, so the file is treated as binary.
+    if (!Buffer.from(content, "utf8").equals(raw)) return undefined;
+    return { content, sha: result.sha, bytes: raw.length };
+  }
+
+  /**
+   * Creates the draft branch at the head, or recognises one a previous attempt of this same
+   * command already created. Returns whether the remediation commit still needs to be written.
+   */
+  private async prepareRemediationBranch(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    branch: string,
+    headSha: string
+  ): Promise<boolean | "conflict"> {
+    try {
+      await github.request("POST", `/repos/${owner}/${repo}/git/refs`, {
+        ref: `refs/heads/${branch}`,
+        sha: headSha
+      });
+      return true;
+    } catch (error) {
+      if (!String(error).includes("returned 422")) throw error;
+    }
+    const existing = await github.request<{ object?: { sha?: string } }>(
+      "GET",
+      `/repos/${owner}/${repo}/git/ref/heads/${branch.split("/").map(encodeURIComponent).join("/")}`
+    );
+    const tip = existing.object?.sha;
+    if (tip === headSha) return true;
+    if (!tip) return "conflict";
+    const commit = await github.request<{ parents?: Array<{ sha?: string }> }>(
+      "GET",
+      `/repos/${owner}/${repo}/git/commits/${encodeURIComponent(tip)}`
+    );
+    return commit.parents?.length === 1 && commit.parents[0]?.sha === headSha ? false : "conflict";
+  }
+
+  private async openRemediationPull(
+    github: GitHubClientLike,
+    owner: string,
+    repo: string,
+    branch: string,
+    base: string,
+    content: { title: string; body: string }
+  ): Promise<{ number: number; html_url?: string }> {
+    try {
+      return await github.request<{ number: number; html_url?: string }>(
+        "POST",
+        `/repos/${owner}/${repo}/pulls`,
+        { title: content.title, body: content.body, head: branch, base, draft: true }
+      );
+    } catch (error) {
+      if (!String(error).includes("returned 422")) throw error;
+    }
+    const open = await github.request<Array<{ number: number; html_url?: string }>>(
+      "GET",
+      `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`
+    );
+    const existing = open[0];
+    if (!existing) throw new Error("GitHub POST pull request returned 422 without an existing draft");
+    return existing;
   }
 
   private hasReviewRoute(profile: ReviewProfile): boolean {
@@ -1972,6 +2421,7 @@ export class GuardianService {
       return {
         files: comparison.files,
         baseSha: lastReviewedHeadSha,
+        incremental: true,
         summary: `incremental diff from ${lastReviewedHeadSha.slice(0, 12)} to ${pull.head.sha.slice(0, 12)}`,
         ...(comparison.files.length >= 300
           ? {
@@ -2507,6 +2957,8 @@ function observeFindingState(
     severity: finding.severity,
     title: finding.title
   };
+  const suggestion = exactSuggestion(finding);
+  const suggestionDigest = suggestion ? { suggestionSha256: sha256Hex(suggestion) } : {};
   if (!retained) {
     return {
       fingerprint: finding.fingerprint,
@@ -2517,13 +2969,29 @@ function observeFindingState(
       lastSeenAt: nowIso,
       transitions: 0,
       reappearances: 0,
-      ...identity
+      ...identity,
+      ...suggestionDigest
     };
   }
   const reappeared = retained.state !== "open";
+  // The digest always describes the current report, so a suggestion the model withdrew cannot be
+  // drafted from a stale digest. A `fixed` outcome is withdrawn when the finding returns, because
+  // the fix evidently did not hold; an explicit dismissal is a human decision and is kept.
+  const {
+    suggestionSha256: _previousSuggestion,
+    outcome: previousOutcome,
+    outcomeAt: previousOutcomeAt,
+    ...carried
+  } = retained;
+  const keptOutcome =
+    previousOutcome && !(reappeared && previousOutcome === "fixed")
+      ? { outcome: previousOutcome, ...(previousOutcomeAt ? { outcomeAt: previousOutcomeAt } : {}) }
+      : {};
   return {
-    ...retained,
+    ...carried,
+    ...keptOutcome,
     ...identity,
+    ...suggestionDigest,
     fingerprint: finding.fingerprint,
     state: "open",
     // Pre-migration rows carry no first-seen provenance; this head is the earliest known sighting.

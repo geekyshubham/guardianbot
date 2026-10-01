@@ -16,9 +16,11 @@ import {
   systemClock,
   worstMonitoringStatus
 } from "@guardianbot/monitoring";
+import { aggregateReviewActivity, type ReviewActivityAggregate } from "./review-value.js";
 import type {
   MonitoringAlertInput,
   MonitoringRepositoryInventory,
+  MonitoringReviewCompleteness,
   MonitoringSnapshotRecord,
   MonitoringWeeklyReportRecord,
   PersistedMonitoringCheck,
@@ -385,6 +387,9 @@ export class MonitoringService {
       const inventory = await this.store.listMonitoringRepositoryInventory();
       await this.store.resolveMonitoringAlertsForInactiveRepositories(observedAt);
       const weeklyRepositories: RepositoryWeeklyMetrics[] = [];
+      const reviewPeriodStart = startOfUtcWeek(observedAt);
+      let reviewMeasured = false;
+      let reviewPartial = false;
       for (const item of inventory) {
         // Checked before the item, never mid-write, so shutdown stops after the
         // repository currently being persisted rather than tearing it.
@@ -411,11 +416,30 @@ export class MonitoringService {
         activeAlerts += alerts.length;
         await this.store.saveMonitoringSnapshot(persisted, alerts);
         repositoriesEvaluated += 1;
-        weeklyRepositories.push(toWeeklyRepositoryMetrics(item, snapshot));
+        // Review value is read per repository and degrades per repository: a failed or truncated
+        // read marks the review source partial rather than failing the whole sweep, because the
+        // scanner and monitoring sections are complete and independently authoritative.
+        let reviewActivity: ReviewActivityAggregate | undefined;
+        try {
+          const page = await this.store.listReviewActivity(
+            item.repository.repositoryId,
+            reviewPeriodStart
+          );
+          if (page.truncated) reviewPartial = true;
+          reviewActivity = aggregateReviewActivity(page.reviews, reviewPeriodStart, observedAt);
+          if (reviewActivity.measured) reviewMeasured = true;
+        } catch {
+          reviewPartial = true;
+        }
+        weeklyRepositories.push(toWeeklyRepositoryMetrics(item, snapshot, reviewActivity));
       }
       // Reached only when every repository was persisted, so the aggregate report is
       // built from a complete inventory and its "latest-reconciliation" provenance holds.
-      const weeklyReport = toMonitoringWeeklyReport(weeklyRepositories, observedAt);
+      const weeklyReport = toMonitoringWeeklyReport(
+        weeklyRepositories,
+        observedAt,
+        reviewCompleteness(reviewMeasured, reviewPartial)
+      );
       if (weeklyReport) {
         await this.store.saveMonitoringWeeklyReport(weeklyReport);
       }
@@ -1028,9 +1052,22 @@ function workflowRunTimestamp(run: ScannerWorkflowRunRecord): number {
   return Number.isNaN(parsed) ? -1 : parsed;
 }
 
+/**
+ * Honest provenance for the review section. Nothing read means `unavailable`, exactly as before
+ * review aggregation existed; any failed or truncated repository read downgrades to partial.
+ */
+export function reviewCompleteness(
+  measured: boolean,
+  partial: boolean
+): MonitoringReviewCompleteness {
+  if (!measured) return partial ? "retained-findings-partial" : "unavailable";
+  return partial ? "retained-findings-partial" : "retained-findings";
+}
+
 function toWeeklyRepositoryMetrics(
   item: MonitoringRepositoryInventory,
-  snapshot: RepositoryMonitoringSnapshot
+  snapshot: RepositoryMonitoringSnapshot,
+  reviewActivity?: ReviewActivityAggregate
 ): RepositoryWeeklyMetrics {
   const checks = new Map(snapshot.checks.map((check) => [check.key, check]));
   const expectedRun = checks.get("scanner-run");
@@ -1051,15 +1088,20 @@ function toWeeklyRepositoryMetrics(
     visibility: item.repository.visibility === "public" ? "public" : "private",
     inventoryState: snapshot.inventoryState,
     review: {
+      // Not derivable from retained finding records, so these stay unmeasured zeros under every
+      // completeness label; docs/metrics.md names them as such.
       prsReviewed: 0,
-      advisoryFindingsOpened: 0,
-      advisoryFindingsAccepted: 0,
-      advisoryFindingsDismissed: 0,
-      advisoryFindingsResolved: 0,
+      advisoryFindingsOpened: reviewActivity?.advisoryFindingsOpened ?? 0,
+      advisoryFindingsAccepted: reviewActivity?.advisoryFindingsAccepted ?? 0,
+      advisoryFindingsDismissed: reviewActivity?.advisoryFindingsDismissed ?? 0,
+      advisoryFindingsResolved: reviewActivity?.advisoryFindingsResolved ?? 0,
       deterministicBlockersOpened: 0,
       bridgeFailures: 0,
       partialReviews: 0
     },
+    ...(reviewActivity?.measured
+      ? { reviewValue: { byCategory: reviewActivity.byCategory } }
+      : {}),
     scanner: {
       expectedRuns: expectedRun ? 1 : 0,
       successfulRuns: expectedRun?.status === "passing" ? 1 : 0,
@@ -1088,7 +1130,8 @@ function toWeeklyRepositoryMetrics(
 
 function toMonitoringWeeklyReport(
   repositories: RepositoryWeeklyMetrics[],
-  observedAt: Date
+  observedAt: Date,
+  review: MonitoringReviewCompleteness = "unavailable"
 ): MonitoringWeeklyReportRecord | undefined {
   const periodStart = startOfUtcWeek(observedAt);
   if (observedAt.getTime() <= periodStart.getTime()) return undefined;
@@ -1107,7 +1150,7 @@ function toMonitoringWeeklyReport(
     generatedAt: observedAt.toISOString(),
     report,
     sourceCompleteness: {
-      review: "unavailable",
+      review,
       scanner: "latest-reconciliation",
       monitoring: "latest-reconciliation",
       imageProtection: "latest-reconciliation"

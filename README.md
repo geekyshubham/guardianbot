@@ -59,6 +59,8 @@ See [what is verified](docs/status.md), [how it works](docs/how-it-works.md),
 [configuration](docs/repository-configuration.md), and the
 [security model](docs/security-model.md). GitHub App creation and least-
 privilege settings are documented in [docs/github-app.md](docs/github-app.md).
+Opt-in AI-drafted remediation pull requests are described in
+[remediation drafts](docs/remediation-drafts.md).
 
 ## Repository layout
 

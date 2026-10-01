@@ -35,6 +35,23 @@ Do not grant Administration, Secrets, Variables, Deployments, or Packages
 permission to the App. `guardianctl enforce` uses the operator's ordinary
 GitHub authorization for rulesets.
 
+## Optional Mode C permission
+
+[Remediation drafts](remediation-drafts.md) need `Contents: Read and write` to
+create a `guardianbot/fix/*` branch and commit to it. The default manifest
+deliberately keeps `Contents: Read`, and this repository does not change it.
+Granting write is an explicit operator decision:
+
+1. Edit the App's repository permissions to `Contents: Read and write`.
+2. Have each installation owner accept the updated permissions.
+3. Set `GUARDIANBOT_REMEDIATION_DRAFTS=1` on the control plane.
+
+GuardianBot checks the permissions GitHub reports on each minted installation
+token, so an installation that has not accepted the change keeps answering
+that drafting is unavailable. Contents write also lets the App write any
+branch, so treat the private key accordingly; the control plane writes only
+`guardianbot/fix/*` branches and never the contributor's branch.
+
 ## DigitalOcean secret placement
 
 Store the generated App ID, private key, and webhook secret only as encrypted
