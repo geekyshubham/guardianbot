@@ -1,4 +1,8 @@
+import type { RepositoryFindingsMetrics } from "./findings.js";
 import type { RepositoryInventoryState } from "./status.js";
+
+/** Owners listed individually in the weekly findings section; the rest are folded together. */
+export const MAX_WEEKLY_FINDING_OWNERS = 50;
 
 export interface RepositoryWeeklyMetrics {
   repository: string;
@@ -34,6 +38,26 @@ export interface RepositoryWeeklyMetrics {
     completeEvidenceDigests: number;
     missingEvidenceDigests: number;
   };
+  /**
+   * Deterministic finding-lifecycle metrics. Present only when the control plane
+   * enables the findings lifecycle, so reports from deployments that do not opt
+   * in keep their historical shape.
+   */
+  findings?: RepositoryFindingsMetrics;
+}
+
+export interface WeeklyFindingsSection {
+  source: "deterministic-scanners";
+  open: number;
+  breached: number;
+  fixed: number;
+  suppressed: number;
+  riskAccepted: number;
+  ticketFailures: number;
+  bySeverity: RepositoryFindingsMetrics["bySeverity"];
+  byOwner: Record<string, number>;
+  otherOwners: number;
+  ageBuckets: RepositoryFindingsMetrics["ageBuckets"];
 }
 
 export interface WeeklyCoverageReport {
@@ -74,6 +98,7 @@ export interface WeeklyCoverageReport {
     completeEvidenceDigests: number;
     missingEvidenceDigests: number;
   };
+  findings?: WeeklyFindingsSection;
 }
 
 function sum(values: Iterable<number | undefined>): number {
@@ -124,7 +149,7 @@ export function buildWeeklyCoverageReport(input: {
     importLagSamples.push(...(repository.scanner.importLagSamplesMs ?? []));
   }
 
-  return {
+  const report: WeeklyCoverageReport = {
     periodStart: start.toISOString(),
     periodEnd: end.toISOString(),
     totalRepositories: input.repositories.length,
@@ -189,4 +214,49 @@ export function buildWeeklyCoverageReport(input: {
       )
     }
   };
+  const findings = buildWeeklyFindingsSection(input.repositories);
+  if (findings) report.findings = findings;
+  return report;
+}
+
+function buildWeeklyFindingsSection(
+  repositories: readonly RepositoryWeeklyMetrics[]
+): WeeklyFindingsSection | undefined {
+  const withFindings = repositories
+    .map((repository) => repository.findings)
+    .filter((findings): findings is RepositoryFindingsMetrics => Boolean(findings));
+  if (!withFindings.length) return undefined;
+  const section: WeeklyFindingsSection = {
+    source: "deterministic-scanners",
+    open: sum(withFindings.map((findings) => findings.open)),
+    breached: sum(withFindings.map((findings) => findings.breached)),
+    fixed: sum(withFindings.map((findings) => findings.fixed)),
+    suppressed: sum(withFindings.map((findings) => findings.suppressed)),
+    riskAccepted: sum(withFindings.map((findings) => findings.riskAccepted)),
+    ticketFailures: sum(withFindings.map((findings) => findings.ticketFailures)),
+    bySeverity: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+    byOwner: {},
+    otherOwners: 0,
+    ageBuckets: { "0-7d": 0, "8-30d": 0, "31-90d": 0, "over-90d": 0 }
+  };
+  const owners = new Map<string, number>();
+  for (const findings of withFindings) {
+    for (const [severity, count] of Object.entries(findings.bySeverity)) {
+      section.bySeverity[severity as keyof WeeklyFindingsSection["bySeverity"]] += count;
+    }
+    for (const [bucket, count] of Object.entries(findings.ageBuckets)) {
+      section.ageBuckets[bucket as keyof WeeklyFindingsSection["ageBuckets"]] += count;
+    }
+    for (const [owner, count] of Object.entries(findings.byOwner)) {
+      owners.set(owner, (owners.get(owner) ?? 0) + count);
+    }
+  }
+  const ranked = [...owners.entries()].sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0])
+  );
+  for (const [owner, count] of ranked.slice(0, MAX_WEEKLY_FINDING_OWNERS)) {
+    section.byOwner[owner] = count;
+  }
+  section.otherOwners = sum(ranked.slice(MAX_WEEKLY_FINDING_OWNERS).map(([, count]) => count));
+  return section;
 }

@@ -2042,3 +2042,82 @@ test("a skipped rescan caller job expects no rescan artifact", async () => {
   await createHandler(store, fetchStub)(handlerInput());
   assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
 });
+
+test("an enabled findings lifecycle ingests accepted default-branch scanner evidence", async () => {
+  const semgrepFinding = {
+    check_id: "auth.rule",
+    path: "src/auth.ts",
+    start: { line: 4 },
+    extra: {
+      severity: "ERROR",
+      message: "Authorization is bypassed",
+      metadata: { impact: "Privileged access can bypass authorization" }
+    }
+  };
+  const fingerprint = scannerFingerprint([
+    "semgrep",
+    semgrepFinding.check_id,
+    semgrepFinding.path,
+    semgrepFinding.start.line,
+    semgrepFinding.extra.message
+  ]);
+  const zip = buildSecurityZip({
+    semgrep: { results: [semgrepFinding] },
+    gate: actualGateFixture({
+      passed: false,
+      failures: ["Semgrep auth.rule at src/auth.ts:4"],
+      policyFindings: [{ source: "semgrep", ruleId: "auth.rule", fingerprint }]
+    })
+  });
+  for (const [event, branch, expected] of [
+    ["push", "main", 1],
+    ["pull_request", "feature", 0]
+  ] as const) {
+    const store = new MemoryStore();
+    await seedRepository(store);
+    const { fetchStub } = createFetchStub({
+      workflowRun: trustedWorkflowRun({ event, head_branch: branch }),
+      jobs: defaultSecurityJobs(),
+      artifactPages: [[artifactRecord(501, "guardianbot-evidence-500-2", zip, {
+        workflow_run: {
+          id: 500,
+          repository_id: 99,
+          head_repository_id: 99,
+          head_branch: branch,
+          head_sha: HEAD_SHA
+        }
+      })]],
+      zipByArtifactId: { 501: zip }
+    });
+    await createScannerWorkflowRunHandler({
+      appId: "1",
+      privateKey: "private",
+      store,
+      fetchImpl: fetchStub,
+      apiClientFactory: createApiClient(fetchStub),
+      environment: TEST_ENV,
+      now: () => TEST_NOW,
+      findingsLifecycle: {
+        options: {
+          enabled: true,
+          slaDays: { critical: 7, high: 30 },
+          githubIssues: false
+        },
+        providers: []
+      }
+    })(handlerInput());
+    assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+    const records = await store.listFindingLifecycle(99);
+    assert.equal(records.length, expected, event);
+    if (expected) {
+      assert.equal(records[0]?.fingerprint, fingerprint);
+      assert.equal(records[0]?.status, "open");
+      assert.equal(records[0]?.owner, "unowned");
+      assert.deepEqual(Object.keys(records[0]?.streams ?? {}), ["semgrep"]);
+      assert.deepEqual(
+        (await store.listFindingLifecycleStreams(99)).map((watermark) => watermark.stream),
+        ["semgrep", "trivy-fs"]
+      );
+    }
+  }
+});

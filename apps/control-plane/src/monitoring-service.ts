@@ -5,6 +5,7 @@ import {
 } from "@guardianbot/core";
 import {
   buildWeeklyCoverageReport,
+  evaluateFindingsLifecycle,
   evaluateRepositoryMonitoring,
   type EvidenceKind,
   type EvidenceRequirement,
@@ -17,11 +18,13 @@ import {
   worstMonitoringStatus
 } from "@guardianbot/monitoring";
 import type {
+  FindingLifecycleRecord,
   MonitoringAlertInput,
   MonitoringRepositoryInventory,
   MonitoringSnapshotRecord,
   MonitoringWeeklyReportRecord,
   PersistedMonitoringCheck,
+  RepositoryRecord,
   ScannerWorkflowRunRecord,
   Store
 } from "./store.js";
@@ -102,6 +105,15 @@ export interface MonitoringServiceOptions {
   evidenceMaxAgeMs?: number;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   logger?: Pick<Console, "error">;
+  /**
+   * Deterministic finding lifecycle. When absent or disabled, snapshots, alerts,
+   * and weekly reports keep exactly their previous checks and shape.
+   */
+  findingsLifecycle?: {
+    enabled: boolean;
+    /** Retries outstanding ticket and notifier updates before evaluation. */
+    syncTickets?: (repository: RepositoryRecord, now: Date) => Promise<unknown>;
+  };
 }
 
 export interface MonitoringServiceState {
@@ -346,6 +358,34 @@ export class MonitoringService {
     }
   }
 
+  /**
+   * Adds `findings-sla` and `findings-ticketing` checks for active repositories when
+   * the lifecycle is enabled. Ticket retry failures are logged without failing the
+   * cycle; the stored per-ticket error keeps `findings-ticketing` raised instead.
+   */
+  private async evaluateFindings(
+    repository: RepositoryRecord,
+    clock: MonitoringClock
+  ) {
+    const lifecycle = this.options.findingsLifecycle;
+    if (!lifecycle?.enabled || repository.repositoryState !== "active") return undefined;
+    if (lifecycle.syncTickets) {
+      try {
+        await lifecycle.syncTickets(repository, clock.now());
+      } catch (error) {
+        this.logger.error(
+          JSON.stringify({
+            event: "findings_ticket_retry_failed",
+            repositoryId: repository.repositoryId,
+            errorKind: error instanceof Error ? error.name : "unknown"
+          })
+        );
+      }
+    }
+    const records = await this.store.listFindingLifecycle(repository.repositoryId);
+    return evaluateFindingsLifecycle(records.map(toFindingLifecycleInput), clock);
+  }
+
   private async performReconciliation(
     signal?: AbortSignal
   ): Promise<MonitoringRunResult> {
@@ -401,6 +441,13 @@ export class MonitoringService {
           },
           runClock
         );
+        const findings = await this.evaluateFindings(item.repository, runClock);
+        if (findings) {
+          snapshot.checks.push(...findings.checks);
+          snapshot.overallStatus = worstMonitoringStatus(
+            snapshot.checks.map((check) => check.status)
+          );
+        }
         if (snapshot.overallStatus === "failing") failingRepositories += 1;
         if (snapshot.overallStatus === "warning") warningRepositories += 1;
         const persisted = toPersistedSnapshot(
@@ -413,7 +460,9 @@ export class MonitoringService {
         activeAlerts += alerts.length;
         await this.store.saveMonitoringSnapshot(persisted, alerts);
         repositoriesEvaluated += 1;
-        weeklyRepositories.push(toWeeklyRepositoryMetrics(item, snapshot));
+        const weekly = toWeeklyRepositoryMetrics(item, snapshot);
+        if (findings) weekly.findings = findings.metrics;
+        weeklyRepositories.push(weekly);
       }
       // Reached only when every repository was persisted, so the aggregate report is
       // built from a complete inventory and its "latest-reconciliation" provenance holds.
@@ -1254,6 +1303,18 @@ function startOfUtcWeek(value: Date): Date {
   const daysSinceMonday = (start.getUTCDay() + 6) % 7;
   start.setUTCDate(start.getUTCDate() - daysSinceMonday);
   return start;
+}
+
+function toFindingLifecycleInput(record: FindingLifecycleRecord) {
+  return {
+    status: record.status,
+    severity: record.severity,
+    owner: record.owner,
+    // Aging follows the current open episode so a reopened finding restarts its age.
+    firstSeenAt: record.openedAt,
+    slaDueAt: record.slaDueAt,
+    ticketFailed: Object.values(record.tickets).some((ticket) => Boolean(ticket?.error))
+  };
 }
 
 function toPersistedSnapshot(

@@ -48,6 +48,7 @@ import {
   postgresPoolConfig,
   reviewFindingRetentionOptionsFromEnvironment,
   webhookRetentionOptionsFromEnvironment,
+  type FindingLifecycleRecord,
   type ReviewFindingRecord
 } from "../src/store.js";
 
@@ -3648,4 +3649,130 @@ test("PostgresStore release DAST evidence is digest, environment, and default-br
     await stubbedPostgresStore().store.getReleaseDastEvidence(99, digest, "staging", "main"),
     undefined
   );
+});
+
+function lifecycleRecord(
+  overrides: Partial<FindingLifecycleRecord> = {}
+): FindingLifecycleRecord {
+  return {
+    repositoryId: 20,
+    fingerprint: "f".repeat(64),
+    source: "semgrep",
+    ruleId: "rule.one",
+    severity: "high",
+    path: "src/app.ts",
+    line: 4,
+    status: "open",
+    owner: "@acme/app",
+    streams: { semgrep: "2026-07-27T11:40:00.000Z" },
+    firstSeenAt: "2026-07-27T11:40:00.000Z",
+    openedAt: "2026-07-27T11:40:00.000Z",
+    lastSeenAt: "2026-07-27T11:40:00.000Z",
+    slaDueAt: "2026-08-26T11:40:00.000Z",
+    lastRunId: 500,
+    lastRunAttempt: 1,
+    tickets: {},
+    updatedAt: "2026-07-27T12:00:00.000Z",
+    ...overrides
+  };
+}
+
+test("MemoryStore finding lifecycle saves, removes, and isolates repositories", async () => {
+  const store = new MemoryStore();
+  const watermark = {
+    repositoryId: 20,
+    stream: "semgrep",
+    runStartedAt: "2026-07-27T11:30:00.000Z",
+    runId: 500,
+    runAttempt: 1,
+    updatedAt: "2026-07-27T12:00:00.000Z"
+  };
+  await store.saveFindingLifecycle(20, [lifecycleRecord()], [watermark]);
+  assert.equal((await store.listFindingLifecycle(20)).length, 1);
+  assert.deepEqual(await store.listFindingLifecycle(21), []);
+  assert.deepEqual(await store.listFindingLifecycleStreams(20), [watermark]);
+  await assert.rejects(
+    store.saveFindingLifecycle(21, [lifecycleRecord()]),
+    /must belong to one repository/
+  );
+  const listed = await store.listFindingLifecycle(20);
+  listed[0]!.streams.mutated = "x";
+  assert.equal((await store.listFindingLifecycle(20))[0]?.streams.mutated, undefined);
+  await store.saveFindingLifecycle(20, [], [], ["f".repeat(64)]);
+  assert.deepEqual(await store.listFindingLifecycle(20), []);
+});
+
+test("MemoryStore finding lifecycle lock serializes writers per repository", async () => {
+  const store = new MemoryStore();
+  const first = await store.acquireFindingLifecycleLock(20);
+  let secondAcquired = false;
+  const second = store.acquireFindingLifecycleLock(20).then((lock) => {
+    secondAcquired = true;
+    return lock;
+  });
+  const other = await store.acquireFindingLifecycleLock(21);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondAcquired, false);
+  await first.release();
+  await (await second).release();
+  await other.release();
+  assert.equal(secondAcquired, true);
+});
+
+test("PostgresStore finding lifecycle writes are transactional and use their own lock namespace", async () => {
+  const harness = stubbedPostgresStore();
+  await harness.store.migrate();
+  const migrationTexts = harness.clientQueries.map((query) => query.text);
+  assert.ok(migrationTexts.some((text) => text.includes("CREATE TABLE IF NOT EXISTS finding_lifecycle (")));
+  assert.ok(migrationTexts.some((text) => text.includes("CREATE TABLE IF NOT EXISTS finding_lifecycle_streams")));
+  const migrationLock = harness.clientQueries.find((query) =>
+    query.text.includes("pg_try_advisory_lock")
+  )?.values;
+
+  harness.clientQueries.length = 0;
+  await harness.store.saveFindingLifecycle(
+    20,
+    [lifecycleRecord()],
+    [
+      {
+        repositoryId: 20,
+        stream: "semgrep",
+        runStartedAt: "2026-07-27T11:30:00.000Z",
+        runId: 500,
+        runAttempt: 1,
+        updatedAt: "2026-07-27T12:00:00.000Z"
+      }
+    ],
+    ["e".repeat(64)]
+  );
+  const texts = harness.clientQueries.map((query) => query.text);
+  assert.equal(texts[0], "BEGIN");
+  assert.match(texts[1] ?? "", /DELETE FROM finding_lifecycle/);
+  assert.deepEqual(harness.clientQueries[1]?.values, [20, ["e".repeat(64)]]);
+  assert.match(texts[2] ?? "", /INSERT INTO finding_lifecycle/);
+  assert.match(texts[3] ?? "", /INSERT INTO finding_lifecycle_streams/);
+  assert.equal(texts.at(-1), "COMMIT");
+
+  harness.clientQueries.length = 0;
+  const lock = await harness.store.acquireFindingLifecycleLock(20);
+  const lockValues = harness.clientQueries[0]?.values;
+  await lock.release();
+  assert.match(harness.clientQueries[0]?.text ?? "", /pg_advisory_lock\(\$1, \$2\)/);
+  assert.notDeepEqual(lockValues, migrationLock);
+  const monitoringLock = await harness.store.acquireMonitoringLock();
+  assert.ok(monitoringLock);
+  const monitoringValues = harness.clientQueries.at(-1)?.values;
+  await monitoringLock.release();
+  assert.notEqual((lockValues as unknown[])[0], (monitoringValues as unknown[] | undefined)?.[0]);
+});
+
+test("PostgresStore finding lifecycle save rolls back on failure", async () => {
+  const harness = stubbedPostgresStore(undefined, (text) => {
+    if (/INSERT INTO finding_lifecycle\s*\(/.test(text)) throw new Error("write failed");
+    return undefined;
+  });
+  await assert.rejects(harness.store.saveFindingLifecycle(20, [lifecycleRecord()]), /write failed/);
+  const texts = harness.clientQueries.map((query) => query.text);
+  assert.equal(texts.at(-1), "ROLLBACK");
+  assert.ok(harness.releases.length >= 1);
 });

@@ -60,6 +60,10 @@ flowchart LR
 AI findings remain advisory. Scanner crashes and missing evidence fail deterministic
 enforcement.
 
+When the control plane enables it, accepted default-branch and deployed-digest
+scanner evidence also feeds the [findings lifecycle](findings-lifecycle.md):
+per-fingerprint ownership, SLA aging, optional tickets, and breach alerts.
+
 ## Image and DAST
 
 ```mermaid

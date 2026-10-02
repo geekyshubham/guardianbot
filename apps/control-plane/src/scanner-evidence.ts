@@ -30,6 +30,12 @@ import {
   type DigitalOceanDeploymentService
 } from "./digitalocean-deployment.js";
 import { createReleaseGateEvaluator } from "./release-gate.js";
+import {
+  recordAcceptedRunLifecycle,
+  type FindingsLifecycleRuntime,
+  type LifecycleFindingObservation,
+  type LifecycleObservation
+} from "./findings-lifecycle.js";
 import type { GuardianScannerWorkflowRun } from "./service.js";
 import type {
   ScannerArtifactRecord,
@@ -98,6 +104,8 @@ interface ScannerEvidenceHandlerOptions {
     fetchImpl: typeof fetch,
     apiBase: string
   ) => Promise<GitHubApiClient>;
+  /** Optional deterministic finding lifecycle; absent or disabled leaves acceptance unchanged. */
+  findingsLifecycle?: FindingsLifecycleRuntime;
 }
 
 interface GitHubWorkflowRun {
@@ -1247,7 +1255,7 @@ async function processSecurityArtifact(
   defaultBranch: string,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -1408,6 +1416,36 @@ async function processSecurityArtifact(
       contentType: "application/json"
     });
   }
+  return [
+    lifecycleObservation("semgrep", !semgrepFailed, normalizedSemgrepFindings, semgrepFindings),
+    lifecycleObservation("trivy-fs", !trivyFailed, normalizedTrivyFindings, trivyFindings)
+  ];
+}
+
+/**
+ * Lifecycle view of one deterministic scan stream. A stream is complete only when
+ * the scanner succeeded and none of its unique findings were dropped by the bound.
+ */
+function lifecycleObservation(
+  stream: string,
+  succeeded: boolean,
+  normalized: readonly NormalizedFinding[],
+  kept: readonly NormalizedFinding[],
+  source?: LifecycleFindingObservation["source"]
+): LifecycleObservation {
+  const unique = new Set(normalized.map((finding) => finding.fingerprint)).size;
+  return {
+    stream,
+    complete: succeeded && unique <= kept.length && unique < MAX_FINDINGS,
+    findings: kept.map((finding) => ({
+      source: source ?? finding.source,
+      fingerprint: finding.fingerprint,
+      ruleId: finding.ruleId,
+      severity: finding.severity,
+      path: finding.path,
+      line: finding.line
+    }))
+  };
 }
 
 function parseBuildDigestReport(report: unknown): Record<string, unknown> {
@@ -1581,7 +1619,7 @@ async function processImageArtifact(
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined,
   deploymentService: DigitalOceanDeploymentService
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -1603,7 +1641,8 @@ async function processImageArtifact(
     throw new Error("Trivy image scanner reported scanner_error");
   }
   validateTrivyScannerReport(trivyJson, "trivy-image.json");
-  const trivyFindings = dedupeFindings(normalizeTrivy(trivyJson));
+  const normalizedImageFindings = normalizeTrivy(trivyJson);
+  const trivyFindings = dedupeFindings(normalizedImageFindings);
   const actualCriticalCount = countCriticalImageFindings(trivyJson);
   const policyCriticalCount = asRecord(policyJson)?.criticalFindings;
   if (
@@ -1754,6 +1793,15 @@ async function processImageArtifact(
       contentType: "application/json"
     });
   }
+  return [
+    lifecycleObservation(
+      "trivy-image",
+      true,
+      normalizedImageFindings,
+      trivyFindings,
+      "trivy-image"
+    )
+  ];
 }
 
 function selectAttestedPreviousSbom(
@@ -1993,7 +2041,7 @@ async function processDastArtifact(
   run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch" | "startedAt">,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -2012,6 +2060,22 @@ async function processDastArtifact(
   const findings = normalizeZapFindings(zapJson);
   const isNightly = exit.profile === "authenticated-full";
   const evidencePrefix = isNightly ? "zap-nightly" : "zap-smoke";
+  // The stream is bound to the validated deployment environment; the scan status
+  // already ties it to the deployed digest. Hitting the bound means truncation.
+  const observations: LifecycleObservation[] = [
+    {
+      stream: `zap:${isNightly ? "nightly" : "smoke"}:${exit.deploymentEnvironment}`,
+      complete: exit.zapExitCode < 3 && findings.length < MAX_FINDINGS,
+      findings: findings.map((finding) => ({
+        source: "zap",
+        fingerprint: finding.fingerprint,
+        ruleId: finding.ruleId,
+        severity: finding.severity,
+        path: finding.path,
+        line: finding.line
+      }))
+    }
+  ];
   await recordEvidence(store, base, {
     evidenceKey: `${evidencePrefix}-summary`,
     kind: evidencePrefix,
@@ -2064,9 +2128,9 @@ async function processDastArtifact(
         details:
           "DefectDojo ZAP import requires the XML report emitted by GuardianBot v0.2.28 or newer"
       });
-      return;
+      return observations;
     }
-    if (!zapXmlBytes) return;
+    if (!zapXmlBytes) return observations;
     await maybeImportToDefectDojo(store, env, defectDojoSettings, {
       repositoryId: artifact.repositoryId,
       repositoryFullName,
@@ -2089,6 +2153,7 @@ async function processDastArtifact(
       environment: exit.deploymentEnvironment
     });
   }
+  return observations;
 }
 
 function artifactType(name: string): EvidenceArtifactType | undefined {
@@ -2431,6 +2496,7 @@ export function createScannerWorkflowRunHandler(
       throw new RetryableScannerEvidenceError(validationError);
     }
     let acceptedArtifacts = 0;
+    const lifecycleObservations: LifecycleObservation[] = [];
     const reconciliationErrors: string[] = [];
     for (const type of expectedTypes) {
       const expectedName = expectedArtifactName(type, run.runId, run.runAttempt);
@@ -2490,6 +2556,7 @@ export function createScannerWorkflowRunHandler(
                 ? IMAGE_RESCAN_FILES
                 : IMAGE_FILES;
         const archive = await parseArtifactArchive(zipPath, allowedFiles);
+        let artifactObservations: LifecycleObservation[];
         validateArtifactProvenance(
           archive,
           type,
@@ -2504,7 +2571,7 @@ export function createScannerWorkflowRunHandler(
           now()
         );
         if (type === "security") {
-          await processSecurityArtifact(
+          artifactObservations = await processSecurityArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2516,7 +2583,7 @@ export function createScannerWorkflowRunHandler(
             defectDojoSettings
           );
         } else if (type === "dast") {
-          await processDastArtifact(
+          artifactObservations = await processDastArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2536,8 +2603,11 @@ export function createScannerWorkflowRunHandler(
             workflowRecord,
             trustPolicy
           );
+          // Deployed-digest rescans are a freeze/coverage signal only. They do not feed the
+          // findings lifecycle, so they can neither open nor fix trivy-image stream records.
+          artifactObservations = [];
         } else {
-          await processImageArtifact(
+          artifactObservations = await processImageArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2556,6 +2626,7 @@ export function createScannerWorkflowRunHandler(
           processedAt: now().toISOString()
         });
         acceptedArtifacts += 1;
+        lifecycleObservations.push(...artifactObservations);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof RetryableScannerEvidenceError) {
@@ -2590,10 +2661,23 @@ export function createScannerWorkflowRunHandler(
       });
       throw new RetryableScannerEvidenceError(validationError);
     }
-    await options.store.upsertScannerWorkflowRun({
+    const acceptedRecord: ScannerWorkflowRunRecord = {
       ...workflowRecord,
       validationStatus: "accepted",
       processedAt: now().toISOString()
-    });
+    };
+    if (options.findingsLifecycle?.options.enabled) {
+      // The lifecycle merge happens before the run is marked processed, so a store
+      // failure leaves the run retryable instead of silently losing observations.
+      await recordAcceptedRunLifecycle({
+        runtime: options.findingsLifecycle,
+        store: options.store,
+        repository,
+        run: acceptedRecord,
+        observations: lifecycleObservations,
+        now: now()
+      });
+    }
+    await options.store.upsertScannerWorkflowRun(acceptedRecord);
   };
 }
