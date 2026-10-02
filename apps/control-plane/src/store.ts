@@ -765,6 +765,56 @@ export interface ReleaseImageEvidence {
   sbom?: { status: ScannerEvidenceStatus; observedAt: string };
 }
 
+/** Distinct-finding counts per normalized severity from one complete scanner report. */
+export interface ScanSeverityCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+export interface ReleaseCommitScanSummary {
+  status: ScannerEvidenceStatus;
+  observedAt: string;
+  /** Absent for legacy, truncated, or malformed summaries, so callers fail closed. */
+  severities?: ScanSeverityCounts;
+}
+
+/**
+ * Semgrep and filesystem Trivy summaries from the newest accepted default-branch push security
+ * artifact for one exact commit. Both summaries come from the same artifact.
+ */
+export interface ReleaseCommitScanEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  headSha: string;
+  semgrep?: ReleaseCommitScanSummary;
+  trivy?: ReleaseCommitScanSummary;
+}
+
+/**
+ * Newest verified deployed-digest rescan of one exact digest, joined with the promotion-freeze
+ * record of the same artifact. `frozen` is true unless that freeze record is a clean success, so
+ * a missing or malformed sibling fails closed. `artifactAccepted` is false when evidence
+ * validation completed but reconciliation (such as the DefectDojo import) has not yet succeeded:
+ * such a rescan still freezes, but never counts as fresh coverage.
+ */
+export interface ImageRescanEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  imageDigest: string;
+  environment: string;
+  observedAt: string;
+  criticalFindings: number;
+  frozen: boolean;
+  artifactAccepted: boolean;
+}
+
 /** Latest accepted DAST summary bound to an exact deployed digest and environment. */
 export interface ReleaseDastEvidence {
   repositoryId: number;
@@ -1883,6 +1933,21 @@ export interface Store {
     environment: string,
     defaultBranch: string
   ): Promise<ReleaseDastEvidence | undefined>;
+  getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined>;
+  /**
+   * Newest verified default-branch schedule rescan of an exact digest, in one environment or,
+   * when `environment` is omitted, in any environment.
+   */
+  getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined>;
   claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean>;
@@ -2816,7 +2881,10 @@ export class MemoryStore implements Store {
             ...evidence,
             artifactType: artifact?.artifactType ?? evidence.artifactType
           };
-          const key = `${run?.event ?? "unknown"}:${enriched.artifactType ?? "unknown"}:${evidence.evidenceKey}`;
+          // Deployment rows keep the newest row per status, so a newer failed promotion cannot
+          // hide the digest that is still running from the deployed-digest rescan check.
+          const statusDimension = evidence.kind === "deployment" ? evidence.status : "";
+          const key = `${run?.event ?? "unknown"}:${enriched.artifactType ?? "unknown"}:${evidence.evidenceKey}:${statusDimension}`;
           if (!evidenceByKey.has(key)) {
             evidenceByKey.set(key, cloneScannerEvidence(enriched));
           }
@@ -3210,6 +3278,127 @@ export class MemoryStore implements Store {
         status: evidence.status,
         observedAt: evidence.observedAt
       };
+    }
+    return undefined;
+  }
+
+  async getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined> {
+    const runs = [...this.scannerRuns.values()]
+      .filter(
+        (run) =>
+          run.repositoryId === repositoryId &&
+          run.headSha === headSha &&
+          run.headBranch === defaultBranch &&
+          run.event === "push" &&
+          run.validationStatus === "accepted"
+      )
+      .sort(compareScannerRunsNewestFirst);
+    for (const run of runs) {
+      const artifact = [...this.scannerArtifacts.values()]
+        .filter(
+          (candidate) =>
+            candidate.repositoryId === repositoryId &&
+            candidate.runId === run.runId &&
+            candidate.runAttempt === run.runAttempt &&
+            candidate.artifactType === "security" &&
+            candidate.validationStatus === "accepted"
+        )
+        .sort((left, right) => right.artifactId - left.artifactId)[0];
+      if (!artifact) continue;
+      const sibling = (evidenceKey: string, kind: string) => {
+        const evidence = this.scannerEvidence.get(
+          scannerEvidenceKey(
+            repositoryId,
+            run.runId,
+            run.runAttempt,
+            artifact.artifactId,
+            evidenceKey
+          )
+        );
+        return evidence?.kind === kind && evidence.source === kind ? evidence : undefined;
+      };
+      return releaseCommitScanEvidence(
+        repositoryId,
+        headSha,
+        run.runId,
+        run.runAttempt,
+        artifact.artifactId,
+        sibling("semgrep-summary", "semgrep"),
+        sibling("trivy-summary", "trivy")
+      );
+    }
+    return undefined;
+  }
+
+  async getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.kind === "image-rescan" &&
+          evidence.source === "trivy" &&
+          evidence.status === "success" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest &&
+          typeof evidence.environment === "string" &&
+          evidence.evidenceKey === `image-rescan:${evidence.environment}` &&
+          (environment === undefined || evidence.environment === environment)
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const evidence of candidates) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      if (
+        !run ||
+        run.headBranch !== defaultBranch ||
+        run.event !== "schedule" ||
+        !VERIFIED_RESCAN_STATUSES.includes(run.validationStatus) ||
+        artifact?.artifactType !== "image-rescan" ||
+        !VERIFIED_RESCAN_STATUSES.includes(artifact.validationStatus)
+      ) {
+        continue;
+      }
+      const freeze = this.scannerEvidence.get(
+        scannerEvidenceKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId,
+          `promotion-freeze:${evidence.environment}`
+        )
+      );
+      return imageRescanEvidence(
+        {
+          repositoryId,
+          runId: evidence.runId,
+          runAttempt: evidence.runAttempt,
+          artifactId: evidence.artifactId,
+          imageDigest,
+          environment: evidence.environment!,
+          observedAt: evidence.observedAt,
+          criticalFindings: evidence.payload?.criticalFindings
+        },
+        run.validationStatus === "accepted" && artifact.validationStatus === "accepted",
+        freeze
+      );
     }
     return undefined;
   }
@@ -3629,6 +3818,92 @@ function scannerEvidenceKey(
 }
 
 const RELEASE_DAST_SUMMARY_KEYS = ["zap-smoke-summary", "zap-nightly-summary"];
+
+/**
+ * A rescan artifact is `failed` when its evidence verified and was recorded but reconciliation
+ * (the DefectDojo import) has not succeeded yet. Its freeze still counts.
+ */
+const VERIFIED_RESCAN_STATUSES: readonly string[] = ["accepted", "failed"];
+
+const SCAN_SEVERITY_KEYS = ["critical", "high", "medium", "low", "info"] as const;
+
+function scanSeverityCounts(value: unknown): ScanSeverityCounts | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const counts = {} as ScanSeverityCounts;
+  for (const key of SCAN_SEVERITY_KEYS) {
+    const count = record[key];
+    if (!Number.isSafeInteger(count) || Number(count) < 0) return undefined;
+    counts[key] = Number(count);
+  }
+  return counts;
+}
+
+function releaseCommitScanSummary(
+  evidence: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined
+): ReleaseCommitScanSummary | undefined {
+  if (!evidence) return undefined;
+  return {
+    status: evidence.status,
+    observedAt: evidence.observedAt,
+    severities: scanSeverityCounts(evidence.payload?.releaseSeverities)
+  };
+}
+
+function releaseCommitScanEvidence(
+  repositoryId: number,
+  headSha: string,
+  runId: number,
+  runAttempt: number,
+  artifactId: number,
+  semgrep: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined,
+  trivy: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined
+): ReleaseCommitScanEvidence {
+  return {
+    repositoryId,
+    runId,
+    runAttempt,
+    artifactId,
+    headSha,
+    semgrep: releaseCommitScanSummary(semgrep),
+    trivy: releaseCommitScanSummary(trivy)
+  };
+}
+
+function imageRescanEvidence(
+  rescan: Omit<ImageRescanEvidence, "criticalFindings" | "frozen" | "artifactAccepted"> & {
+    criticalFindings: unknown;
+  },
+  artifactAccepted: boolean,
+  freeze: Pick<ScannerEvidenceRecord, "kind" | "source" | "status" | "digest" | "environment"> &
+    { payload?: Record<string, unknown> } | undefined
+): ImageRescanEvidence {
+  const criticalFindings =
+    Number.isSafeInteger(rescan.criticalFindings) && Number(rescan.criticalFindings) >= 0
+      ? Number(rescan.criticalFindings)
+      : -1;
+  // Only a clean freeze sibling bound to the same digest and environment unfreezes.
+  const clean =
+    criticalFindings === 0 &&
+    freeze?.kind === "promotion-freeze" &&
+    freeze.source === "guardianbot" &&
+    freeze.status === "success" &&
+    freeze.digest === rescan.imageDigest &&
+    freeze.environment === rescan.environment &&
+    freeze.payload?.active === false;
+  return {
+    repositoryId: rescan.repositoryId,
+    runId: rescan.runId,
+    runAttempt: rescan.runAttempt,
+    artifactId: rescan.artifactId,
+    imageDigest: rescan.imageDigest,
+    environment: rescan.environment,
+    observedAt: rescan.observedAt,
+    criticalFindings,
+    frozen: !clean,
+    artifactAccepted
+  };
+}
 
 function releaseImageEvidence(
   signature: Pick<
@@ -5161,7 +5436,8 @@ export class PostgresStore implements Store {
            evidence.repository_id,
            evidence.evidence_key,
            runs.event,
-           artifacts.artifact_type
+           artifacts.artifact_type,
+           CASE WHEN evidence.kind='deployment' THEN evidence.status ELSE '' END
          )
            evidence.*,
            artifacts.artifact_type AS monitoring_artifact_type
@@ -5184,6 +5460,7 @@ export class PostgresStore implements Store {
                   evidence.evidence_key,
                   runs.event,
                   artifacts.artifact_type,
+                  CASE WHEN evidence.kind='deployment' THEN evidence.status ELSE '' END,
                   evidence.observed_at DESC,
                   evidence.run_id DESC,
                   evidence.run_attempt DESC`
@@ -5717,6 +5994,176 @@ export class PostgresStore implements Store {
       status: row.status === "success" ? "success" : "failure",
       observedAt: new Date(row.observed_at).toISOString()
     };
+  }
+
+  async getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined> {
+    // The newest accepted security artifact is chosen first and only then joined to its
+    // summaries, so a newer artifact without summaries never falls back to an older one.
+    const result = await this.pool.query(
+      `WITH latest AS (
+         SELECT artifacts.repository_id,
+                artifacts.run_id,
+                artifacts.run_attempt,
+                artifacts.artifact_id
+         FROM scanner_workflow_runs AS runs
+         JOIN scanner_artifacts AS artifacts
+           ON artifacts.repository_id=runs.repository_id
+          AND artifacts.run_id=runs.run_id
+          AND artifacts.run_attempt=runs.run_attempt
+         WHERE runs.repository_id=$1
+           AND runs.head_sha=$2
+           AND runs.head_branch=$3
+           AND runs.event='push'
+           AND runs.validation_status='accepted'
+           AND artifacts.artifact_type='security'
+           AND artifacts.validation_status='accepted'
+         ORDER BY COALESCE(runs.completed_at, runs.started_at, runs.processed_at) DESC NULLS LAST,
+                  runs.run_id DESC,
+                  runs.run_attempt DESC,
+                  artifacts.artifact_id DESC
+         LIMIT 1
+       )
+       SELECT latest.run_id,
+              latest.run_attempt,
+              latest.artifact_id,
+              semgrep.status AS semgrep_status,
+              semgrep.observed_at AS semgrep_observed_at,
+              semgrep.payload->'releaseSeverities' AS semgrep_severities,
+              trivy.status AS trivy_status,
+              trivy.observed_at AS trivy_observed_at,
+              trivy.payload->'releaseSeverities' AS trivy_severities
+       FROM latest
+       LEFT JOIN scanner_evidence AS semgrep
+         ON semgrep.repository_id=latest.repository_id
+        AND semgrep.run_id=latest.run_id
+        AND semgrep.run_attempt=latest.run_attempt
+        AND semgrep.artifact_id=latest.artifact_id
+        AND semgrep.evidence_key='semgrep-summary'
+        AND semgrep.kind='semgrep'
+        AND semgrep.source='semgrep'
+       LEFT JOIN scanner_evidence AS trivy
+         ON trivy.repository_id=latest.repository_id
+        AND trivy.run_id=latest.run_id
+        AND trivy.run_attempt=latest.run_attempt
+        AND trivy.artifact_id=latest.artifact_id
+        AND trivy.evidence_key='trivy-summary'
+        AND trivy.kind='trivy'
+        AND trivy.source='trivy'`,
+      [repositoryId, headSha, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const summary = (prefix: "semgrep" | "trivy") =>
+      row[`${prefix}_status`]
+        ? {
+            status: row[`${prefix}_status`],
+            observedAt: new Date(row[`${prefix}_observed_at`]).toISOString(),
+            payload: { releaseSeverities: row[`${prefix}_severities`] ?? undefined }
+          }
+        : undefined;
+    return releaseCommitScanEvidence(
+      repositoryId,
+      headSha,
+      Number(row.run_id),
+      Number(row.run_attempt),
+      Number(row.artifact_id),
+      summary("semgrep"),
+      summary("trivy")
+    );
+  }
+
+  async getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT evidence.run_id,
+              evidence.run_attempt,
+              evidence.artifact_id,
+              evidence.environment,
+              evidence.observed_at,
+              evidence.payload->'criticalFindings' AS critical_findings,
+              runs.validation_status AS run_status,
+              artifacts.validation_status AS artifact_status,
+              freeze_row.kind AS freeze_kind,
+              freeze_row.source AS freeze_source,
+              freeze_row.status AS freeze_status,
+              freeze_row.digest AS freeze_digest,
+              freeze_row.environment AS freeze_environment,
+              freeze_row.payload->'active' AS freeze_active
+       FROM scanner_evidence AS evidence
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=evidence.repository_id
+        AND runs.run_id=evidence.run_id
+        AND runs.run_attempt=evidence.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=evidence.repository_id
+        AND artifacts.run_id=evidence.run_id
+        AND artifacts.run_attempt=evidence.run_attempt
+        AND artifacts.artifact_id=evidence.artifact_id
+       LEFT JOIN scanner_evidence AS freeze_row
+         ON freeze_row.repository_id=evidence.repository_id
+        AND freeze_row.run_id=evidence.run_id
+        AND freeze_row.run_attempt=evidence.run_attempt
+        AND freeze_row.artifact_id=evidence.artifact_id
+        AND freeze_row.evidence_key='promotion-freeze:' || evidence.environment
+       WHERE evidence.repository_id=$1
+         AND evidence.kind='image-rescan'
+         AND evidence.source='trivy'
+         AND evidence.status='success'
+         AND evidence.fingerprint IS NULL
+         AND evidence.digest=$2
+         AND evidence.environment IS NOT NULL
+         AND evidence.evidence_key='image-rescan:' || evidence.environment
+         AND ($4::text IS NULL OR evidence.environment=$4)
+         AND runs.head_branch=$3
+         AND runs.event='schedule'
+         AND runs.validation_status = ANY($5::text[])
+         AND artifacts.artifact_type='image-rescan'
+         AND artifacts.validation_status = ANY($5::text[])
+       ORDER BY evidence.observed_at DESC,
+                evidence.run_id DESC,
+                evidence.run_attempt DESC
+       LIMIT 1`,
+      [
+        repositoryId,
+        imageDigest,
+        defaultBranch,
+        environment ?? null,
+        VERIFIED_RESCAN_STATUSES
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return imageRescanEvidence(
+      {
+        repositoryId,
+        runId: Number(row.run_id),
+        runAttempt: Number(row.run_attempt),
+        artifactId: Number(row.artifact_id),
+        imageDigest,
+        environment: String(row.environment),
+        observedAt: new Date(row.observed_at).toISOString(),
+        criticalFindings: row.critical_findings
+      },
+      row.run_status === "accepted" && row.artifact_status === "accepted",
+      row.freeze_kind
+        ? {
+            kind: String(row.freeze_kind),
+            source: String(row.freeze_source),
+            status: row.freeze_status === "success" ? "success" : "failure",
+            digest: row.freeze_digest ?? undefined,
+            environment: row.freeze_environment ?? undefined,
+            payload: { active: row.freeze_active }
+          }
+        : undefined
+    );
   }
 
   async claimDeploymentPromotion(

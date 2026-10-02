@@ -10,8 +10,10 @@ import {
   normalizeSemgrep,
   normalizeTrivy,
   SbomDiffError,
+  SEMGREP_NATIVE_SEVERITY,
   stableFingerprint,
   type NormalizedFinding,
+  type NormalizedSeverity,
   type SbomDiff
 } from "@guardianbot/core";
 import { createAppJwt } from "./app-auth.js";
@@ -1060,6 +1062,54 @@ function summarizeFindings(findings: readonly NormalizedFinding[]): Record<strin
   return summary;
 }
 
+const SEVERITY_RANK: Readonly<Record<NormalizedSeverity, number>> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4
+};
+
+/**
+ * Release-gate view of one complete scanner report. Every distinct fingerprint is counted (the
+ * evidence bound never truncates it) at the higher of its GuardianBot severity and its native
+ * scanner severity, so the counts are an upper bound on how DefectDojo rates the same report.
+ */
+function releaseSeverityCounts(
+  findings: readonly NormalizedFinding[],
+  nativeSeverities: readonly (NormalizedSeverity | undefined)[] = []
+): Record<NormalizedSeverity, number> {
+  const highest = new Map<string, NormalizedSeverity>();
+  findings.forEach((finding, index) => {
+    let severity = finding.severity;
+    const native = nativeSeverities[index];
+    if (native && SEVERITY_RANK[native] > SEVERITY_RANK[severity]) severity = native;
+    const previous = highest.get(finding.fingerprint);
+    if (!previous || SEVERITY_RANK[severity] > SEVERITY_RANK[previous]) {
+      highest.set(finding.fingerprint, severity);
+    }
+  });
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const severity of highest.values()) counts[severity] += 1;
+  return counts;
+}
+
+/**
+ * Native Semgrep severities in report order, matching normalizeSemgrep's one-to-one mapping.
+ * DefectDojo rates Semgrep INFO as Low, so INFO is raised to low here.
+ */
+function semgrepNativeSeverities(report: unknown): (NormalizedSeverity | undefined)[] {
+  const results = asRecord(report)?.results;
+  if (!Array.isArray(results)) return [];
+  return results.map((entry) => {
+    const native =
+      SEMGREP_NATIVE_SEVERITY[
+        String(asRecord(asRecord(entry)?.extra)?.severity ?? "WARNING").toUpperCase()
+      ];
+    return native === "info" ? "low" : native;
+  });
+}
+
 async function recordEvidence(
   store: Store,
   base: Omit<ScannerEvidenceRecord, "evidenceKey" | "kind" | "source" | "status" | "observedAt">,
@@ -1109,6 +1159,8 @@ async function maybeImportToDefectDojo(
     evidenceKey?: string;
     digest?: string;
     environment?: string;
+    /** Extra test-title segment so per-environment reimports never close each other's findings. */
+    testScope?: string;
   }
 ): Promise<void> {
   if (!settings) return;
@@ -1119,10 +1171,22 @@ async function maybeImportToDefectDojo(
     apiTokenRef: settings.apiTokenRef
   });
   const client = new DefectDojoClient(config);
-  const profile = input.artifactType === "dast" ? "dast" : input.artifactType.startsWith("image") ? "image" : "security";
+  // Deployed-digest rescans get their own engagement so a scheduled rescan never closes or
+  // replaces the build-time image findings the release gate reads from `${branch}/image`.
+  const profile =
+    input.artifactType === "dast"
+      ? "dast"
+      : input.artifactType === "image-rescan"
+        ? "image-rescan"
+        : input.artifactType.startsWith("image")
+          ? "image"
+          : "security";
   const branch = input.headBranch;
   const isDefaultBranch = branch === input.defaultBranch;
   const engagementDates = defectDojoEngagementDates(input.startedAt);
+  const testTitle = input.testScope
+    ? `${branch}/${profile}/${input.testScope}`
+    : `${branch}/${profile}`;
   const tags = buildDefectDojoTags({
     repositoryId: input.repositoryId,
     repositorySlug: input.repositoryFullName,
@@ -1159,7 +1223,7 @@ async function maybeImportToDefectDojo(
       },
       test: {
         scanType: input.scanType,
-        title: `${branch}/${profile}`,
+        title: testTitle,
         branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
@@ -1171,7 +1235,7 @@ async function maybeImportToDefectDojo(
     }
     const imported = (await client.importScan({
       scanType: input.scanType,
-      testTitle: `${branch}/${profile}`,
+      testTitle,
       fileName: input.fileName,
       contentType: input.contentType,
       report: input.report,
@@ -1313,7 +1377,17 @@ async function processSecurityArtifact(
     status: semgrepFailed ? "failure" : "success",
     observedAt: new Date().toISOString(),
     details: `semgrep findings: ${semgrepFindings.length}`,
-    payload: summarizeFindings(semgrepFindings)
+    payload: {
+      ...summarizeFindings(semgrepFindings),
+      ...(semgrepFailed
+        ? {}
+        : {
+            releaseSeverities: releaseSeverityCounts(
+              normalizedSemgrepFindings,
+              semgrepNativeSeverities(semgrepJson)
+            )
+          })
+    }
   });
   for (const finding of semgrepFindings) {
     await recordEvidence(store, base, {
@@ -1340,7 +1414,12 @@ async function processSecurityArtifact(
     status: trivyFailed ? "failure" : "success",
     observedAt: new Date().toISOString(),
     details: `trivy findings: ${trivyFindings.length}`,
-    payload: summarizeFindings(trivyFindings)
+    payload: {
+      ...summarizeFindings(trivyFindings),
+      ...(trivyFailed
+        ? {}
+        : { releaseSeverities: releaseSeverityCounts(normalizedTrivyFindings) })
+    }
   });
   for (const finding of trivyFindings) {
     await recordEvidence(store, base, {
@@ -1721,6 +1800,7 @@ async function processImageArtifact(
         runAttempt: artifact.runAttempt,
         headSha: run.headSha,
         imageReference: promotion.imageReference,
+        defaultBranch,
         // Consulted only by profiles that opt in with requireReleaseGate.
         releaseEvidence: {
           defaultBranch,
@@ -1885,10 +1965,14 @@ async function processImageRescanArtifact(
   store: Store,
   archive: ParsedArtifactArchive,
   artifact: ScannerArtifactRecord,
+  repositoryFullName: string,
+  repositoryVisibility: "public" | "private" | "internal",
   defaultBranch: string,
-  run: Pick<ScannerWorkflowRunRecord, "headBranch" | "workflowRef" | "event">,
-  trustPolicy: EvidenceTrustPolicy
-): Promise<void> {
+  run: Pick<ScannerWorkflowRunRecord, "headBranch" | "workflowRef" | "event" | "startedAt">,
+  trustPolicy: EvidenceTrustPolicy,
+  env: Record<string, string | undefined>,
+  defectDojoSettings: DefectDojoSettings | undefined
+): Promise<LifecycleObservation[]> {
   if (
     run.event !== "schedule" ||
     run.headBranch !== defaultBranch ||
@@ -2010,7 +2094,8 @@ async function processImageRescanArtifact(
     }
   });
   // Promotion required zero Critical findings, so every Critical finding on the deployed digest
-  // is new since promotion. The freeze is a recorded signal only; it never changes the deployment.
+  // is new since promotion. The freeze never changes the running app; the deployment service
+  // refuses to re-promote a frozen digest and the release gate reads it as a blocker.
   await recordEvidence(store, base, {
     evidenceKey: `promotion-freeze:${environment}`,
     kind: "promotion-freeze",
@@ -2029,6 +2114,42 @@ async function processImageRescanArtifact(
       deploymentRunId: deployed.runId
     }
   });
+  // Imported after the freeze is recorded, so a DefectDojo outage retries the artifact without
+  // ever hiding the freeze. The engagement is separate from the build-time `image` profile the
+  // release gate reads, and the test is per environment so reimports never close each other.
+  await maybeImportToDefectDojo(store, env, defectDojoSettings, {
+    repositoryId: artifact.repositoryId,
+    repositoryFullName,
+    visibility: repositoryVisibility,
+    defaultBranch,
+    headBranch: defaultBranch,
+    artifactId: artifact.artifactId,
+    runId: artifact.runId,
+    runAttempt: artifact.runAttempt,
+    headSha: deployed.headSha,
+    startedAt: run.startedAt,
+    artifactType: artifact.artifactType,
+    scanType: "Trivy Scan",
+    fileName: "trivy-image.json",
+    report: trivyBytes,
+    contentType: "application/json",
+    evidenceKey: `defectdojo-import:Trivy Scan:rescan:${environment}`,
+    digest: imageDigest,
+    environment,
+    testScope: environment
+  });
+  // Its own stream per environment: a Critical-only rescan can open or refresh findings and
+  // fix ones it no longer reports, without touching the build-time trivy-image stream.
+  const normalized = normalizeTrivy(trivyJson);
+  return [
+    lifecycleObservation(
+      `trivy-image-rescan:${environment}`,
+      true,
+      normalized,
+      dedupeFindings(normalized),
+      "trivy-image"
+    )
+  ];
 }
 
 async function processDastArtifact(
@@ -2595,17 +2716,18 @@ export function createScannerWorkflowRunHandler(
             defectDojoSettings
           );
         } else if (type === "image-rescan") {
-          await processImageRescanArtifact(
+          artifactObservations = await processImageRescanArtifact(
             options.store,
             archive,
             artifactRecord,
+            repository.fullName,
+            repository.visibility as "public" | "private" | "internal",
             repository.defaultBranch,
             workflowRecord,
-            trustPolicy
+            trustPolicy,
+            env,
+            defectDojoSettings
           );
-          // Deployed-digest rescans are a freeze/coverage signal only. They do not feed the
-          // findings lifecycle, so they can neither open nor fix trivy-image stream records.
-          artifactObservations = [];
         } else {
           artifactObservations = await processImageArtifact(
             options.store,

@@ -1491,6 +1491,58 @@ test("a fresh deployment gets one evidence window before rescan coverage alerts"
   );
 });
 
+test("a newer failed promotion does not hide the running digest from rescan monitoring", async () => {
+  const store = new MemoryStore();
+  const digest = await seedDeployedImageRepository(store);
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 502 }));
+  for (const record of rescanEvidence(digest, "failure")) {
+    await store.upsertScannerEvidence(record);
+  }
+  // A later promotion of another digest failed, so the earlier digest is still running.
+  await store.upsertScannerWorkflowRun(
+    scannerRun({ runId: 503, event: "push", startedAt: "2026-07-27T11:00:00.000Z" })
+  );
+  await store.upsertScannerEvidence(
+    evidence("deployment:staging", "deployment", "failure", {
+      runId: 503,
+      artifactId: 706,
+      artifactType: "image-promotion",
+      digest: `sha256:${"f".repeat(64)}`,
+      environment: "staging",
+      observedAt: "2026-07-27T11:10:00.000Z"
+    })
+  );
+  const inventory = await store.listMonitoringRepositoryInventory();
+  assert.deepEqual(
+    inventory[0]?.latestScannerEvidence
+      .filter((item) => item.evidenceKey === "deployment:staging")
+      .map((item) => item.status)
+      .sort(),
+    ["failure", "success"]
+  );
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-rescan-coverage")?.status,
+    "passing"
+  );
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-promotion-freeze")?.status,
+    "failing"
+  );
+  // The digest-bound deployment requirement still sees the running digest's success row; the
+  // two-day-old fixture only warns on age instead of reporting the deployment missing.
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-deployment")?.status,
+    "warning"
+  );
+});
+
 test("image configs without deployment gain no rescan checks", async () => {
   const store = new MemoryStore();
   await seedConfiguredRepository(store);

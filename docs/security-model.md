@@ -135,8 +135,9 @@ The principal failure-isolation rules are:
 - A model-backend outage does not block deterministic security jobs.
 - A DAST or deployment profile authorizes exactly one repository/target
   relationship.
-- Scheduled findings may freeze future promotion but do not interrupt a running
-  workload.
+- Scheduled findings freeze future promotion of the affected digest (enforced
+  by the deployment reconciler and the release gate) but do not interrupt a
+  running workload.
 - Removing App access stops new control-plane actions without deleting retained
   audit evidence.
 

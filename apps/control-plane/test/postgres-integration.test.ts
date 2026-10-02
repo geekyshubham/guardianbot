@@ -705,6 +705,176 @@ function watermark(
   };
 }
 
+test("parity: deployed-digest rescans bind the freeze sibling and verification status", { skip }, async () => {
+  const observed = await parity(async (store) => {
+    await store.upsertRepository(repository(30));
+    const rescan = async (options: {
+      runId: number;
+      environment: string;
+      imageDigest: string;
+      observedAt: string;
+      critical: unknown;
+      freeze?: { active: unknown; status: "success" | "failure"; digest?: string } | null;
+      event?: ScannerWorkflowEvent;
+      headBranch?: string;
+      validationStatus?: "accepted" | "failed" | "rejected";
+      evidenceKey?: string;
+    }) => {
+      await seedRun(store, {
+        repositoryId: 30,
+        runId: options.runId,
+        event: options.event ?? "schedule",
+        headBranch: options.headBranch,
+        artifactType: "image-rescan"
+      });
+      if (options.validationStatus && options.validationStatus !== "accepted") {
+        const run = await store.getScannerWorkflowRun(30, options.runId, 1);
+        await store.upsertScannerWorkflowRun({ ...run!, validationStatus: options.validationStatus });
+      }
+      const base = { repositoryId: 30, runId: options.runId };
+      await seedEvidence(store, {
+        ...base,
+        evidenceKey: options.evidenceKey ?? `image-rescan:${options.environment}`,
+        kind: "image-rescan",
+        source: "trivy",
+        status: "success",
+        observedAt: options.observedAt,
+        digest: options.imageDigest,
+        environment: options.environment,
+        payload: { criticalFindings: options.critical }
+      });
+      if (options.freeze !== null) {
+        const freeze = options.freeze ?? { active: options.critical !== 0, status: "success" };
+        await seedEvidence(store, {
+          ...base,
+          evidenceKey: `promotion-freeze:${options.environment}`,
+          kind: "promotion-freeze",
+          source: "guardianbot",
+          status: freeze.status,
+          observedAt: options.observedAt,
+          digest: freeze.digest ?? options.imageDigest,
+          environment: options.environment,
+          payload: { active: freeze.active }
+        });
+      }
+    };
+    // Digest 1: clean in staging, then a newer frozen rescan in production.
+    await rescan({ runId: 100, environment: "staging", imageDigest: digest("1"), observedAt: "2026-08-01T01:00:00.000Z", critical: 0 });
+    await rescan({ runId: 101, environment: "production", imageDigest: digest("1"), observedAt: "2026-08-01T02:00:00.000Z", critical: 2 });
+    // Digest 2: newest rescan failed reconciliation (still verified); an older push run is ignored.
+    await rescan({ runId: 110, environment: "staging", imageDigest: digest("2"), observedAt: "2026-08-01T01:00:00.000Z", critical: 0 });
+    await rescan({ runId: 111, environment: "staging", imageDigest: digest("2"), observedAt: "2026-08-01T03:00:00.000Z", critical: 0, validationStatus: "failed" });
+    await rescan({ runId: 112, environment: "staging", imageDigest: digest("2"), observedAt: "2026-08-01T05:00:00.000Z", critical: 0, event: "push" });
+    await rescan({ runId: 113, environment: "staging", imageDigest: digest("2"), observedAt: "2026-08-01T06:00:00.000Z", critical: 0, validationStatus: "rejected" });
+    // Digest 3: missing freeze sibling, a freeze bound to another digest, and a malformed count.
+    await rescan({ runId: 120, environment: "staging", imageDigest: digest("3"), observedAt: "2026-08-01T01:00:00.000Z", critical: 0, freeze: null });
+    await rescan({ runId: 121, environment: "production", imageDigest: digest("3"), observedAt: "2026-08-01T01:00:00.000Z", critical: 0, freeze: { active: false, status: "success", digest: digest("9") } });
+    await rescan({ runId: 122, environment: "qa", imageDigest: digest("3"), observedAt: "2026-08-01T01:00:00.000Z", critical: "0" });
+    // Digest 4: only on another branch, or under a mismatched evidence key.
+    await rescan({ runId: 130, environment: "staging", imageDigest: digest("4"), observedAt: "2026-08-01T01:00:00.000Z", critical: 0, headBranch: "feature" });
+    await rescan({ runId: 131, environment: "staging", imageDigest: digest("4"), observedAt: "2026-08-01T02:00:00.000Z", critical: 0, evidenceKey: "image-rescan:production" });
+    const read = (imageDigest: string, environment?: string) =>
+      store.getLatestImageRescanEvidence(30, imageDigest, "main", environment);
+    return {
+      oneAny: await read(digest("1")),
+      oneStaging: await read(digest("1"), "staging"),
+      two: await read(digest("2")),
+      threeStaging: await read(digest("3"), "staging"),
+      threeProduction: await read(digest("3"), "production"),
+      threeQa: await read(digest("3"), "qa"),
+      four: await read(digest("4")),
+      otherRepository: await store.getLatestImageRescanEvidence(31, digest("1"), "main")
+    };
+  });
+  assert.equal(observed.oneAny.environment, "production");
+  assert.equal(observed.oneAny.frozen, true);
+  assert.equal(observed.oneStaging.frozen, false);
+  assert.equal(observed.two.runId, 111);
+  assert.equal(observed.two.artifactAccepted, false);
+  assert.equal(observed.two.frozen, false);
+  assert.equal(observed.threeStaging.frozen, true);
+  assert.equal(observed.threeProduction.frozen, true);
+  assert.equal(observed.threeQa.criticalFindings, -1);
+  assert.equal(observed.threeQa.frozen, true);
+  assert.equal("four" in observed, false);
+  assert.equal("otherRepository" in observed, false);
+});
+
+test("parity: commit scan summaries come from the newest accepted push security artifact", { skip }, async () => {
+  const sha = "f".repeat(40);
+  const counts = (critical: number) => ({ critical, high: 1, medium: 0, low: 0, info: 0 });
+  const observed = await parity(async (store) => {
+    await store.upsertRepository(repository(40));
+    const security = async (options: {
+      runId: number;
+      startedAt: string;
+      event?: ScannerWorkflowEvent;
+      semgrep?: Record<string, unknown>;
+      trivy?: Record<string, unknown> | null;
+      semgrepStatus?: "success" | "failure";
+    }) => {
+      await seedRun(store, {
+        repositoryId: 40,
+        runId: options.runId,
+        headSha: sha,
+        event: options.event,
+        startedAt: options.startedAt,
+        completedAt: options.startedAt,
+        artifactType: "security"
+      });
+      await seedEvidence(store, {
+        repositoryId: 40,
+        runId: options.runId,
+        evidenceKey: "semgrep-summary",
+        kind: "semgrep",
+        source: "semgrep",
+        status: options.semgrepStatus ?? "success",
+        observedAt: options.startedAt,
+        payload: options.semgrep ?? {}
+      });
+      if (options.trivy !== null) {
+        await seedEvidence(store, {
+          repositoryId: 40,
+          runId: options.runId,
+          evidenceKey: "trivy-summary",
+          kind: "trivy",
+          source: "trivy",
+          status: "success",
+          observedAt: options.startedAt,
+          payload: options.trivy ?? { releaseSeverities: counts(0) }
+        });
+      }
+    };
+    await security({ runId: 200, startedAt: "2026-08-01T01:00:00.000Z", semgrep: { releaseSeverities: counts(5) } });
+    await security({
+      runId: 201,
+      startedAt: "2026-08-01T02:00:00.000Z",
+      semgrep: { releaseSeverities: counts(0) },
+      trivy: { releaseSeverities: { ...counts(0), low: -1 } }
+    });
+    // Newer, but a pull_request run never counts.
+    await security({ runId: 202, startedAt: "2026-08-01T03:00:00.000Z", event: "pull_request" });
+    const newest = await store.getReleaseCommitScanEvidence(40, sha, "main");
+    // A newer legacy run without severities and with no Trivy summary replaces it.
+    await security({ runId: 203, startedAt: "2026-08-01T04:00:00.000Z", trivy: null, semgrepStatus: "failure" });
+    return {
+      newest,
+      legacy: await store.getReleaseCommitScanEvidence(40, sha, "main"),
+      otherCommit: await store.getReleaseCommitScanEvidence(40, "e".repeat(40), "main"),
+      otherBranch: await store.getReleaseCommitScanEvidence(40, sha, "trunk")
+    };
+  });
+  assert.equal(observed.newest.runId, 201);
+  assert.deepEqual(observed.newest.semgrep.severities, counts(0));
+  assert.equal("severities" in observed.newest.trivy, false);
+  assert.equal(observed.legacy.runId, 203);
+  assert.equal(observed.legacy.semgrep.status, "failure");
+  assert.equal("severities" in observed.legacy.semgrep, false);
+  assert.equal("trivy" in observed.legacy, false);
+  assert.equal("otherCommit" in observed, false);
+  assert.equal("otherBranch" in observed, false);
+});
+
 test("parity: finding lifecycle saves, orders, removes and isolates records", { skip }, async () => {
   const observed = await parity(async (store) => {
     await store.upsertRepository(repository(20));

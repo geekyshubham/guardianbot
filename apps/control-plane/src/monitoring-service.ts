@@ -767,6 +767,9 @@ function deployedDigestRescanChecks(
         evidence.evidenceKey === `${DEPLOYMENT_EVIDENCE_PREFIX}${environment}` &&
         evidence.kind === "deployment" &&
         evidence.artifactType === "image-promotion" &&
+        // A failed promotion leaves the previous digest running, so only successful rows can
+        // name the deployed digest.
+        evidence.status === "success" &&
         evidence.environment === environment &&
         // Deployment rows come only from accepted default-branch push promotions. A deployment
         // older than the bounded run window stays the deployed digest; a run that is still
@@ -775,7 +778,7 @@ function deployedDigestRescanChecks(
           fromAcceptedRun(evidence, "push"))
     )
   );
-  if (!deployment || deployment.status !== "success" || !deployment.digest) {
+  if (!deployment || !deployment.digest) {
     // Without an accepted deployment there is no deployed digest to rescan; the existing
     // image-deployment requirement already reports that gap.
     return [];

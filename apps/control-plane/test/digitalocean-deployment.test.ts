@@ -230,7 +230,8 @@ function input() {
     runId: 500,
     runAttempt: 2,
     headSha: "a".repeat(40),
-    imageReference: `ghcr.io/geekyshubham/service@${NEW_DIGEST}`
+    imageReference: `ghcr.io/geekyshubham/service@${NEW_DIGEST}`,
+    defaultBranch: "main"
   };
 }
 
@@ -241,7 +242,8 @@ function routeLensInput() {
     runId: 501,
     runAttempt: 1,
     headSha: "b".repeat(40),
-    imageReference: `ghcr.io/geekyshubham/routelens@${NEW_DIGEST}`
+    imageReference: `ghcr.io/geekyshubham/routelens@${NEW_DIGEST}`,
+    defaultBranch: "main"
   };
 }
 
@@ -618,5 +620,71 @@ test("requireReleaseGate refuses promotion before any DigitalOcean call unless t
     releaseEvidence: RELEASE_EVIDENCE
   });
   assert.equal(passing?.imageDigest, NEW_DIGEST);
+  assert.ok(counter.calls > 0);
+});
+
+test("a frozen digest is refused before any DigitalOcean call, even without the release gate", async () => {
+  const counter = { calls: 0 };
+  const lookups: unknown[][] = [];
+  const build = (rescan: () => Promise<unknown>) => {
+    const store = new MemoryStore();
+    store.getLatestImageRescanEvidence = (async (...args: unknown[]) => {
+      lookups.push(args);
+      return rescan();
+    }) as MemoryStore["getLatestImageRescanEvidence"];
+    return createDigitalOceanDeploymentService({
+      store,
+      environment: environment(),
+      fetchImpl: idempotentFetch(counter),
+      now: () => NOW
+    });
+  };
+  const rescan = (frozen: boolean) => ({
+    repositoryId: 99,
+    runId: 700,
+    runAttempt: 1,
+    artifactId: 7001,
+    imageDigest: NEW_DIGEST,
+    environment: "production",
+    observedAt: NOW.toISOString(),
+    criticalFindings: frozen ? 2 : 0,
+    frozen,
+    artifactAccepted: true
+  });
+
+  await assert.rejects(
+    () => build(async () => rescan(true)).promote(input()),
+    (error: unknown) =>
+      error instanceof DigitalOceanDeploymentError &&
+      error.environment === "staging" &&
+      /Promotion freeze active.*production/.test(error.message)
+  );
+  await assert.rejects(
+    () =>
+      build(async () => {
+        throw new Error("database unavailable");
+      }).promote(input()),
+    (error: unknown) =>
+      error instanceof DigitalOceanDeploymentError && /freeze state is unavailable/.test(error.message)
+  );
+  await assert.rejects(
+    () => build(async () => undefined).promote({ ...input(), defaultBranch: "" }),
+    /promotion input is invalid/
+  );
+  await assert.rejects(
+    () =>
+      build(async () => undefined).promote({
+        ...input(),
+        releaseEvidence: { ...RELEASE_EVIDENCE, defaultBranch: "develop" }
+      }),
+    /promotion input is invalid/
+  );
+  assert.equal(counter.calls, 0);
+  // The freeze is looked up by digest across every environment on the default branch.
+  assert.deepEqual(lookups[0], [99, NEW_DIGEST, "main"]);
+
+  // A clean rescan, or a digest that was never rescanned, promotes normally.
+  assert.equal((await build(async () => rescan(false)).promote(input()))?.imageDigest, NEW_DIGEST);
+  assert.equal((await build(async () => undefined).promote(input()))?.imageDigest, NEW_DIGEST);
   assert.ok(counter.calls > 0);
 });

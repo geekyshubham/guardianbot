@@ -239,7 +239,8 @@ Monitor at minimum:
 - distinct DAST smoke/nightly freshness and DefectDojo imports;
 - exact scan/SBOM/signature/deployment digest agreement; and
 - deployed-digest rescan freshness (`image-rescan-coverage`) and the
-  `image-promotion-freeze` signal; and
+  `image-promotion-freeze` check, which mirrors the freeze the deployment
+  reconciler enforces; and
 - suppression expiry and weekly coverage snapshots.
 
 ### Private metrics and operator monitoring status
@@ -294,6 +295,33 @@ Alert `fullName`, `alertKey`, and `summary` are length-capped (255 / 256 /
 truncation is the separate boolean on `activeAlerts`. Health/readiness
 endpoints are useful process signals, not substitutes for external probes and
 evidence reconciliation.
+
+### Webhook retry and dead-letter
+
+Every accepted delivery is a durable webhook job. A failed attempt is retried
+with exponential backoff (30 seconds, doubling, capped at 30 minutes) until the
+fifth counted attempt, which moves the job to `dead-letter`:
+
+- a non-retryable backend failure (for example an unsupported protocol
+  version) dead-letters on the first attempt;
+- GitHub throttling and shutdown aborts requeue the job without consuming an
+  attempt, so neither can dead-letter it; and
+- scanner evidence failures that may clear on retry, such as a GitHub artifact
+  download error or a DefectDojo import outage after a rescan freeze was
+  recorded, leave the run `failed` and rethrow so the job is retried. Evidence
+  already written, including a promotion freeze, stays in place across
+  retries.
+
+`guardianbot_webhook_jobs_dead_letter` and `webhook_dead_letter_total` expose
+dead-lettered jobs. GuardianBot never replays a dead-lettered job by itself.
+After the cause is fixed and deployed, an operator may replay it with a guarded
+store transition that matches exactly one row by delivery ID, `dead-letter`
+status, event, attempt count, and the recorded error text, and resets that row
+to `pending` with a fresh retry budget. Treat it as a production change: confirm
+the match count is one before committing. The
+[v0.2.39 recovery](evidence/v0.2.39-live-index-recovery.md#guarded-replay-after-v0239-active)
+is the recorded example. Dead-lettered rows are purged after the retention
+below.
 
 ### Webhook queue retention
 

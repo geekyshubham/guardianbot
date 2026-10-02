@@ -137,7 +137,9 @@ sequenceDiagram
 
 When `image.deployment` is set, the nightly rescan re-examines the exact
 deployed digest, never a tag. New Critical findings record a promotion freeze
-signal in evidence and monitoring without changing the running deployment.
+that refuses any later promotion of that digest, open lifecycle findings, and,
+when DefectDojo is configured, are imported into a separate `image-rescan`
+engagement. The running deployment is never changed.
 
 ## Release promotion
 

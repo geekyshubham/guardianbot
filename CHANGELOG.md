@@ -19,8 +19,16 @@ reusable workflow commits remain immutable.
 - Nightly rescan of the exact deployed digest (`reusable-image-rescan.yml`,
   `POST /image/rescan-target`) with a bounded CycloneDX SBOM diff,
   `image-rescan:<env>` and `promotion-freeze:<env>` evidence, and
-  `image-rescan-coverage` / `image-promotion-freeze` monitoring checks. The
-  freeze is a signal only. Automated tests only; no live evidence.
+  `image-rescan-coverage` / `image-promotion-freeze` monitoring checks.
+  Automated tests only; no live evidence.
+- Promotion freeze enforcement: the DigitalOcean reconciler refuses, for every
+  profile, a digest whose newest verified rescan found Critical findings, and
+  the release gate reports it as `promotion-frozen`. `DigitalOceanPromotionInput`
+  gains a required `defaultBranch`. Automated tests only; no live evidence.
+- Deployed-digest rescan reports are imported into a separate
+  `<branch>/image-rescan` DefectDojo engagement, one Test per environment, and
+  feed the findings lifecycle on `trivy-image-rescan:<env>` streams.
+  Automated tests only; no live evidence.
 - Digest-scoped release gate (`reusable-release-gate.yml`,
   `POST /release/gate`) backed by DefectDojo findings and named, unexpired
   risk acceptances; fails closed as `gate-unavailable`. Optional DigitalOcean
@@ -59,8 +67,17 @@ reusable workflow commits remain immutable.
 
 - Enforcement readiness now requires default-branch `head_branch` on both the
   source and observation runs, and ruleset pagination is capped at 10 pages.
-- Deployed-digest rescans do not feed the findings lifecycle, so they cannot
-  open or fix `trivy-image` records.
+- Deployed-digest rescans feed the findings lifecycle only on their own
+  per-environment stream, so they cannot open or fix build-time `trivy-image`
+  stream records.
+- Release gate `deployed-rescan` now requires a fresh (48 hour), reconciled
+  rescan of the digest already deployed in the candidate environment instead
+  of a DAST summary for the candidate digest, which could not exist before the
+  first promotion. DAST imports are no longer required by the gate.
+- A commit-scoped DefectDojo Test reimported for a newer commit no longer
+  blocks every older candidate: `semgrep-summary` and `trivy-summary` record
+  release severity counts, and a candidate whose own counts are zero at every
+  blocking severity passes in its place.
 - Finding ticket sync claims work under the lifecycle lock and calls
   providers after releasing it; results are recorded only while their leased
   claim holds, and scanner merges no longer write ticket state.

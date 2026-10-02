@@ -350,27 +350,6 @@ test("malformed DefectDojo records fail closed as gate-unavailable", () => {
   assert.deepEqual(result.blockers.map((entry) => entry.code), ["gate-unavailable"]);
 });
 
-test("a required deployed rescan also requires an in-scope DAST import", () => {
-  const required = policy({ requiredEvidence: ["signature", "image-scan", "sbom", "deployed-rescan"] });
-  const rescan = {
-    digest: DIGEST,
-    environment: "staging",
-    status: "success",
-    observedAt: NOW.toISOString(),
-    ref: "evidence://2/dast"
-  };
-  const result = evaluateReleaseGate(
-    input({
-      policy: required,
-      evidence: { ...input().evidence, deployedRescan: rescan },
-      defectDojo: dojo([], [], [TESTS[0]!, TESTS[1]!])
-    })
-  );
-  assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.source]), [
-    ["defectdojo-scope-missing", "dast"]
-  ]);
-});
-
 test("missing or failing evidence blocks", () => {
   const result = evaluateReleaseGate(
     input({
@@ -387,42 +366,167 @@ test("missing or failing evidence blocks", () => {
   assert.deepEqual(noScan.blockers.map((entry) => entry.code), ["image-scan-missing"]);
 });
 
-test("deployed rescan is enforced only when required and must match digest and env", () => {
-  const required = policy({ requiredEvidence: ["signature", "image-scan", "sbom", "deployed-rescan"] });
-  assert.deepEqual(
-    evaluateReleaseGate(input({ policy: required })).blockers.map((entry) => entry.code),
-    ["deployed-rescan-missing"]
-  );
-  const rescan = {
-    digest: DIGEST,
+const REQUIRED_RESCAN = policy({
+  requiredEvidence: ["signature", "image-scan", "sbom", "deployed-rescan"]
+});
+
+function rescanResult(overrides: Record<string, unknown> = {}) {
+  return {
+    digest: OLD_DIGEST,
     environment: "staging",
-    status: "success",
-    observedAt: NOW.toISOString(),
-    ref: "evidence://2/dast"
+    observedAt: new Date(NOW.getTime() - 3_600_000).toISOString(),
+    criticalFindings: 0,
+    frozen: false,
+    artifactAccepted: true,
+    ref: "evidence://2/1/21/image-rescan:staging",
+    ...overrides
   };
+}
+
+function withRescan(deployedRescan: unknown, extra: Record<string, unknown> = {}) {
+  return input({
+    policy: REQUIRED_RESCAN,
+    evidence: { ...input().evidence, deployedRescan, ...extra } as ReleaseGateEvaluationInput["evidence"]
+  });
+}
+
+test("required rescan coverage reads the digest deployed in the candidate environment", () => {
+  const codes = (value: ReleaseGateEvaluationInput) =>
+    evaluateReleaseGate(value).blockers.map((entry) => entry.code);
+  // Unknown coverage fails closed.
+  assert.deepEqual(codes(input({ policy: REQUIRED_RESCAN })), ["deployed-rescan-missing"]);
+  assert.deepEqual(codes(withRescan({ environment: "production" })), ["deployed-rescan-missing"]);
+  // First promotion: nothing is deployed yet, so nothing can be rescanned.
+  assert.deepEqual(codes(withRescan({ environment: "staging" })), []);
+  // A fresh, reconciled rescan of the deployed digest passes a different candidate,
+  // even when that rescan froze the deployed digest: replacing it is the fix path.
+  const covered = evaluateReleaseGate(
+    withRescan({ environment: "staging", deployedDigest: OLD_DIGEST, rescan: rescanResult() })
+  );
+  assert.equal(covered.decision, "pass");
+  assert.ok(covered.evidence.some((entry) => entry.kind === "deployed-rescan"));
+  assert.deepEqual(
+    codes(
+      withRescan({
+        environment: "staging",
+        deployedDigest: OLD_DIGEST,
+        rescan: rescanResult({ frozen: true, criticalFindings: 3 })
+      })
+    ),
+    []
+  );
+  // No rescan, a rescan of another digest, or one older than 48 hours.
+  for (const rescan of [
+    undefined,
+    rescanResult({ digest: DIGEST }),
+    rescanResult({ observedAt: new Date(NOW.getTime() - 49 * 3_600_000).toISOString() }),
+    rescanResult({ observedAt: "not a date" })
+  ]) {
+    assert.deepEqual(
+      codes(withRescan({ environment: "staging", deployedDigest: OLD_DIGEST, rescan })),
+      ["deployed-rescan-missing"]
+    );
+  }
+  // Verified but not reconciled, or a malformed count.
+  for (const rescan of [
+    rescanResult({ artifactAccepted: false }),
+    rescanResult({ criticalFindings: -1 })
+  ]) {
+    assert.deepEqual(
+      codes(withRescan({ environment: "staging", deployedDigest: OLD_DIGEST, rescan })),
+      ["deployed-rescan-failed"]
+    );
+  }
+  // Coverage is not consulted unless the policy requires it.
+  assert.equal(evaluateReleaseGate(input()).decision, "pass");
+});
+
+test("a frozen candidate digest is blocked whatever the policy requires", () => {
+  const frozen = rescanResult({ digest: DIGEST, environment: "production", frozen: true });
+  const result = evaluateReleaseGate(
+    input({ evidence: { ...input().evidence, candidateRescan: frozen } })
+  );
+  assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.ref]), [
+    ["promotion-frozen", frozen.ref]
+  ]);
+  assert.match(result.blockers[0]?.message ?? "", /production/);
+  // A clean rescan, or a record for another digest, does not block.
   assert.equal(
     evaluateReleaseGate(
-      input({ policy: required, evidence: { ...input().evidence, deployedRescan: rescan } })
+      input({ evidence: { ...input().evidence, candidateRescan: { ...frozen, frozen: false } } })
     ).decision,
     "pass"
   );
-  assert.deepEqual(
+  assert.equal(
     evaluateReleaseGate(
-      input({
-        policy: required,
-        evidence: { ...input().evidence, deployedRescan: { ...rescan, digest: OLD_DIGEST } }
-      })
-    ).blockers.map((entry) => entry.code),
-    ["deployed-rescan-missing"]
+      input({ evidence: { ...input().evidence, candidateRescan: { ...frozen, digest: OLD_DIGEST } } })
+    ).decision,
+    "pass"
+  );
+});
+
+const CLEAN_COUNTS = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+
+function staleSemgrep(commitScan: unknown, overrides: Partial<ReleaseGateEvaluationInput> = {}) {
+  const tests: ReleaseDojoTest[] = [
+    { id: 1, engagement: 10, scan_type: "Semgrep JSON Report", tags: tags("security", [], 99, OLD_COMMIT) },
+    { id: 8, engagement: 10, scan_type: "Trivy Scan", tags: tags("security") },
+    TESTS[1]!
+  ];
+  return evaluateReleaseGate(
+    input({
+      evidence: { ...input().evidence, commitScan } as ReleaseGateEvaluationInput["evidence"],
+      defectDojo: dojo([finding({ id: 140, test: 1 })], [], tests),
+      ...overrides
+    })
+  );
+}
+
+test("a clean summary of the candidate commit stands in for a scan reimported for a newer commit", () => {
+  const semgrep = { status: "success", severities: CLEAN_COUNTS, ref: "evidence://5/1/50/semgrep-summary" };
+  const passed = staleSemgrep({ commit: COMMIT, semgrep });
+  assert.equal(passed.decision, "pass");
+  assert.deepEqual(
+    passed.evidence.filter((entry) => entry.kind === "commit-scan").map((entry) => entry.ref),
+    [semgrep.ref]
+  );
+  const blocked = (commitScan: unknown, overrides: Partial<ReleaseGateEvaluationInput> = {}) =>
+    staleSemgrep(commitScan, overrides).blockers.map((entry) => [entry.code, entry.source]);
+  const expected = [["defectdojo-scope-missing", "sast"]];
+  assert.deepEqual(blocked(undefined), expected);
+  assert.deepEqual(blocked({ commit: OLD_COMMIT, semgrep }), expected);
+  assert.deepEqual(blocked({ commit: COMMIT, semgrep: { ...semgrep, severities: undefined } }), expected);
+  assert.deepEqual(blocked({ commit: COMMIT, semgrep: { ...semgrep, status: "failure" } }), expected);
+  assert.deepEqual(
+    blocked({ commit: COMMIT, semgrep: { ...semgrep, severities: { ...CLEAN_COUNTS, critical: 1 } } }),
+    expected
   );
   assert.deepEqual(
-    evaluateReleaseGate(
-      input({
-        policy: required,
-        evidence: { ...input().evidence, deployedRescan: { ...rescan, status: "failure" } }
-      })
-    ).blockers.map((entry) => entry.code),
-    ["deployed-rescan-failed"]
+    blocked({ commit: COMMIT, semgrep: { ...semgrep, severities: { ...CLEAN_COUNTS, low: -1 } } }),
+    expected
+  );
+  // The filesystem Trivy summary never proves the Semgrep scan type.
+  assert.deepEqual(blocked({ commit: COMMIT, trivy: semgrep }), expected);
+  // High counts only matter when the policy blocks High.
+  const high = { commit: COMMIT, semgrep: { ...semgrep, severities: { ...CLEAN_COUNTS, high: 2 } } };
+  assert.deepEqual(blocked(high), []);
+  assert.deepEqual(blocked(high, { policy: parseReleaseGatePolicy('{"blockHigh":true}') }), expected);
+});
+
+test("a stale image import is proven only by a Critical-clean image scan under a Critical-only policy", () => {
+  const tests: ReleaseDojoTest[] = [
+    TESTS[0]!,
+    { id: 2, engagement: 11, scan_type: "Trivy Scan", tags: tags("image", [], 99, OLD_COMMIT) }
+  ];
+  const result = (overrides: Partial<ReleaseGateEvaluationInput> = {}) =>
+    evaluateReleaseGate(input({ defectDojo: dojo([finding({ id: 150, test: 2 })], [], tests), ...overrides }));
+  assert.equal(result().decision, "pass");
+  assert.deepEqual(
+    result({ policy: parseReleaseGatePolicy('{"blockHigh":true}') }).blockers.map((entry) => [
+      entry.code,
+      entry.source
+    ]),
+    [["defectdojo-scope-missing", "image"]]
   );
 });
 
