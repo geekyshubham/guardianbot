@@ -121,8 +121,10 @@ The rescan never builds, pushes, signs, or deploys. Each night it:
 The endpoint applies the same checks as the DAST session broker: repository,
 run, commit, trusted workflow SHA, hosted runner, and environment claims. It
 fails closed when the repository has no accepted deployment for the requested
-environment, when the image name does not match, or when the stored evidence is
-incomplete.
+environment or when the stored evidence is incomplete. The reusable workflow
+then fails closed when the returned reference does not match the configured
+image name and digest, and the control plane later requires the uploaded
+evidence to match the stored deployment exactly.
 
 The control plane independently verifies the uploaded evidence. It requires a
 default-branch schedule run, re-verifies the signature and SBOM attestation,
@@ -137,6 +139,9 @@ errors, and requires the reported Critical count to match the report. It records
 
 SBOM diff heuristics flag possible typosquats, dependency-confusion names, and
 version downgrades. They are advisory only and never block, waive, or approve.
+The typosquat comparison skips names longer than 64 characters and stops at a
+fixed work budget; when the budget or a list cap is reached the diff is marked
+`truncated`, so a missing signal is not evidence of a clean dependency set.
 The promotion freeze is a signal in evidence and monitoring. Rescan ingestion
 never changes the running deployment, and promotion does not yet enforce the
 freeze.

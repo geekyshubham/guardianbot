@@ -17,6 +17,10 @@ const MAX_VERSION_LENGTH = 256;
 const MAX_PURL_LENGTH = 2048;
 const MAX_TYPOSQUAT_CANDIDATES = 500;
 const MIN_TYPOSQUAT_NAME_LENGTH = 4;
+// Typosquat comparison is quadratic per pair, so names beyond this length are not compared and
+// the whole heuristic stops (marking the diff truncated) once it has spent its work budget.
+const MAX_TYPOSQUAT_NAME_LENGTH = 64;
+const MAX_TYPOSQUAT_WORK_CELLS = 5_000_000;
 
 export class SbomDiffError extends Error {}
 
@@ -289,7 +293,16 @@ function toComponent(component: IndexedComponent): SbomDiffComponent {
  * common typosquat edit). Returns max + 1 as soon as the bound is exceeded.
  */
 export function boundedEditDistance(left: string, right: string, max: number): number {
-  if (Math.abs(left.length - right.length) > max) return max + 1;
+  return boundedEditDistanceWithWork(left, right, max).distance;
+}
+
+function boundedEditDistanceWithWork(
+  left: string,
+  right: string,
+  max: number
+): { distance: number; cells: number } {
+  if (Math.abs(left.length - right.length) > max) return { distance: max + 1, cells: 0 };
+  let cells = 0;
   let beforePrevious: number[] = [];
   let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
   for (let i = 1; i <= left.length; i += 1) {
@@ -313,11 +326,12 @@ export function boundedEditDistance(left: string, right: string, max: number): n
       current.push(value);
       if (value < rowMinimum) rowMinimum = value;
     }
-    if (rowMinimum > max) return max + 1;
+    cells += right.length;
+    if (rowMinimum > max) return { distance: max + 1, cells };
     beforePrevious = previous;
     previous = current;
   }
-  return Math.min(previous[right.length]!, max + 1);
+  return { distance: Math.min(previous[right.length]!, max + 1), cells };
 }
 
 interface VersionToken {
@@ -465,22 +479,55 @@ export function diffCycloneDxSboms(previousDocument: unknown, currentDocument: u
     for (const name of names) set.add(normalizeName(ecosystem, name));
     knownByEcosystem.set(ecosystem, set);
   }
+  // Comparable known names per ecosystem, bucketed by length and sorted once, so each candidate
+  // only visits names whose length is within its edit threshold.
+  const comparableByEcosystem = new Map<string, Map<number, string[]>>();
+  for (const [ecosystem, names] of knownByEcosystem) {
+    const byLength = new Map<number, string[]>();
+    for (const name of sorted(names)) {
+      if (name.length < MIN_TYPOSQUAT_NAME_LENGTH || name.length > MAX_TYPOSQUAT_NAME_LENGTH) {
+        continue;
+      }
+      const bucket = byLength.get(name.length) ?? [];
+      bucket.push(name);
+      byLength.set(name.length, bucket);
+    }
+    comparableByEcosystem.set(ecosystem, byLength);
+  }
   let candidates = 0;
-  for (const component of added) {
+  let typosquatWork = 0;
+  let typosquatBudgetExceeded = false;
+  candidateLoop: for (const component of added) {
     if (component.name.length < MIN_TYPOSQUAT_NAME_LENGTH) continue;
+    if (component.name.length > MAX_TYPOSQUAT_NAME_LENGTH) continue;
     if (previousByBareName.has(component.name)) continue;
     const known = knownByEcosystem.get(component.ecosystem);
     if (!known || known.has(component.name)) continue;
     candidates += 1;
     if (candidates > MAX_TYPOSQUAT_CANDIDATES) break;
     const threshold = typosquatThreshold(component.name);
+    const byLength = comparableByEcosystem.get(component.ecosystem)!;
     let match: string | undefined;
-    for (const name of sorted(known)) {
-      if (name.length < MIN_TYPOSQUAT_NAME_LENGTH) continue;
-      const distance = boundedEditDistance(component.name, name, threshold);
-      if (distance > 0 && distance <= threshold) {
-        match = name;
-        break;
+    for (
+      let length = component.name.length - threshold;
+      length <= component.name.length + threshold && !match;
+      length += 1
+    ) {
+      for (const name of byLength.get(length) ?? []) {
+        if (typosquatWork >= MAX_TYPOSQUAT_WORK_CELLS) {
+          typosquatBudgetExceeded = true;
+          break candidateLoop;
+        }
+        const { distance, cells } = boundedEditDistanceWithWork(
+          component.name,
+          name,
+          threshold
+        );
+        typosquatWork += cells;
+        if (distance > 0 && distance <= threshold) {
+          match = name;
+          break;
+        }
       }
     }
     if (match) {
@@ -511,7 +558,8 @@ export function diffCycloneDxSboms(previousDocument: unknown, currentDocument: u
     removed.length > MAX_SBOM_DIFF_ENTRIES ||
     changed.length > MAX_SBOM_DIFF_ENTRIES ||
     signals.length > MAX_SBOM_DIFF_SIGNALS ||
-    candidates > MAX_TYPOSQUAT_CANDIDATES;
+    candidates > MAX_TYPOSQUAT_CANDIDATES ||
+    typosquatBudgetExceeded;
   return {
     schemaVersion: SBOM_DIFF_SCHEMA_VERSION,
     previousComponentCount: previousSbom.componentCount,

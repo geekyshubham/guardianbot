@@ -217,3 +217,51 @@ test("SBOM diff caps reported entries and flags truncation", () => {
   assert.equal(diff.added.length, MAX_SBOM_DIFF_ENTRIES);
   assert.equal(diff.truncated, true);
 });
+
+test("SBOM diff typosquat heuristic stays bounded on long shared-prefix names", () => {
+  // Regression: long names sharing a prefix used to run the full quadratic edit distance for
+  // every known/new pair, stalling synchronous control-plane ingestion for seconds.
+  const prefix = "a".repeat(390);
+  const longPrevious = Array.from({ length: 500 }, (_, index) =>
+    library(`pkg:npm/${prefix}-p${index}@1`, `${prefix}-p${index}`, "1")
+  );
+  const longAdded = Array.from({ length: 20 }, (_, index) =>
+    library(`pkg:npm/${prefix}-n${index}@1`, `${prefix}-n${index}`, "1")
+  );
+  let started = performance.now();
+  const longDiff = diffCycloneDxSboms(
+    sbom(longPrevious),
+    sbom([...longPrevious, ...longAdded, library("pkg:npm/expresss@1", "expresss", "1")])
+  );
+  assert.ok(performance.now() - started < 2_000);
+  assert.equal(longDiff.addedCount, 21);
+  assert.deepEqual(
+    longDiff.signals.map((signal) => signal.key),
+    ["npm/expresss"]
+  );
+  assert.equal(longDiff.truncated, false);
+
+  // Names inside the comparable length still share a work budget; exceeding it is reported as
+  // truncation instead of silently running unbounded.
+  const shortPrefix = "b".repeat(54);
+  const digits = (index: number) => String(index).padStart(5, "0");
+  const manyPrevious = Array.from({ length: 2_000 }, (_, index) =>
+    library(`pkg:npm/${shortPrefix}${digits(index)}@1`, `${shortPrefix}${digits(index)}`, "1")
+  );
+  // Letter-only suffixes stay more than two edits from every digit-suffixed known name.
+  const letters = (index: number) =>
+    Array.from({ length: 5 }, (_, position) =>
+      String.fromCharCode(97 + (Math.floor(index / 26 ** position) % 26))
+    ).join("");
+  const manyAdded = Array.from({ length: 100 }, (_, index) =>
+    library(`pkg:npm/${shortPrefix}${letters(index)}@1`, `${shortPrefix}${letters(index)}`, "1")
+  );
+  started = performance.now();
+  const budgetDiff = diffCycloneDxSboms(
+    sbom(manyPrevious),
+    sbom([...manyPrevious, ...manyAdded])
+  );
+  assert.ok(performance.now() - started < 2_000);
+  assert.equal(budgetDiff.addedCount, 100);
+  assert.equal(budgetDiff.truncated, true);
+});
