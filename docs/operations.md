@@ -70,7 +70,15 @@ App-level environment configuration must include:
   deployment environment for each target, and its referenced exchange-secret
   environment variables; and
 - `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` and the centrally referenced
-  DigitalOcean API token.
+  DigitalOcean API token; and
+- for the opt-in [release gate](release-gate.md),
+  `GUARDIANBOT_TRUSTED_RELEASE_GATE_WORKFLOW_SHA` (falls back to
+  `GUARDIANBOT_TRUSTED_WORKFLOW_SHA`), optional
+  `GUARDIANBOT_RELEASE_GATE_POLICY_JSON`, and the existing
+  `GUARDIANBOT_DEFECTDOJO_BASE_URL_REF` / `GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF`
+  references. Without DefectDojo every release decision fails as
+  `gate-unavailable`. A DigitalOcean profile opts into gated promotion with
+  `"requireReleaseGate": true`; it defaults to `false`.
 
 The profile JSON documents contain identifiers and environment-variable names,
 not secret values. Keep each actual secret in encrypted App Platform

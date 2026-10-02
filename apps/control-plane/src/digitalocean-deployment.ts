@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { readBoundedJsonResponse } from "./github-oidc.js";
+import type { ReleaseGateEvaluator } from "./release-gate.js";
 import type { Store } from "./store.js";
 
 const DIGITALOCEAN_API_ORIGIN = "https://api.digitalocean.com";
@@ -35,6 +36,19 @@ interface DigitalOceanDeploymentProfile {
   readinessPath?: string;
   apiTokenEnv: string;
   timeoutSeconds: number;
+  requireReleaseGate: boolean;
+}
+
+/**
+ * Evidence the scanner reconciler already verified for this promotion. It is
+ * only consulted when a profile sets `requireReleaseGate`.
+ */
+export interface DigitalOceanReleaseEvidence {
+  defaultBranch: string;
+  certificateIdentity: string;
+  criticalFindings: number;
+  sbomPresent: boolean;
+  ref: string;
 }
 
 export interface DigitalOceanPromotionInput {
@@ -44,6 +58,7 @@ export interface DigitalOceanPromotionInput {
   runAttempt: number;
   headSha: string;
   imageReference: string;
+  releaseEvidence?: DigitalOceanReleaseEvidence;
 }
 
 export interface DigitalOceanPromotionResult {
@@ -79,6 +94,8 @@ interface DigitalOceanDeploymentOptions {
   now?: () => Date;
   sleep?: (milliseconds: number) => Promise<void>;
   pollIntervalMs?: number;
+  /** Required by profiles that set `requireReleaseGate`; absent means those profiles fail closed. */
+  releaseGate?: ReleaseGateEvaluator;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -240,7 +257,8 @@ function parseProfile(
       "healthPath",
       "readinessPath",
       "apiTokenEnv",
-      "timeoutSeconds"
+      "timeoutSeconds",
+      "requireReleaseGate"
     ],
     `DigitalOcean deployment profile ${id}`
   );
@@ -353,6 +371,14 @@ function parseProfile(
       `DigitalOcean deployment profile ${id} timeoutSeconds must be between 60 and 900`
     );
   }
+  if (
+    profile.requireReleaseGate !== undefined &&
+    typeof profile.requireReleaseGate !== "boolean"
+  ) {
+    throw new Error(
+      `DigitalOcean deployment profile ${id} requireReleaseGate must be a boolean`
+    );
+  }
   return {
     id,
     repository: repositorySlug(
@@ -393,7 +419,8 @@ function parseProfile(
             `DigitalOcean deployment profile ${id} readinessPath`
           ),
     apiTokenEnv,
-    timeoutSeconds
+    timeoutSeconds,
+    requireReleaseGate: profile.requireReleaseGate === true
   };
 }
 
@@ -670,6 +697,61 @@ export function createDigitalOceanDeploymentService(
     await response.body?.cancel().catch(() => undefined);
   }
 
+  async function enforceReleaseGate(
+    profile: DigitalOceanDeploymentProfile,
+    input: DigitalOceanPromotionInput,
+    imageDigest: string
+  ): Promise<void> {
+    const evidence = input.releaseEvidence;
+    if (!options.releaseGate || !evidence) {
+      throw new DigitalOceanDeploymentError(
+        "DigitalOcean profile requires a release gate decision that is unavailable",
+        profile.environment
+      );
+    }
+    let decision: Awaited<ReturnType<ReleaseGateEvaluator["evaluate"]>>;
+    try {
+      decision = await options.releaseGate.evaluate({
+        candidate: {
+          repository: profile.repository,
+          repositoryId: profile.repositoryId,
+          commit: input.headSha.toLowerCase(),
+          digest: imageDigest,
+          environment: profile.environment
+        },
+        productName: input.repository,
+        defaultBranch: evidence.defaultBranch,
+        evidence: {
+          signature: {
+            digest: imageDigest,
+            certificateIdentity: evidence.certificateIdentity,
+            ref: `${evidence.ref}/signature`
+          },
+          imageScan: {
+            criticalFindings: evidence.criticalFindings,
+            status: evidence.criticalFindings === 0 ? "success" : "failure",
+            ref: `${evidence.ref}/image-trivy-summary`
+          },
+          sbom: evidence.sbomPresent
+            ? { status: "success", ref: `${evidence.ref}/sbom` }
+            : undefined
+        }
+      });
+    } catch {
+      throw new DigitalOceanDeploymentError(
+        "Release gate is unavailable; DigitalOcean promotion refused",
+        profile.environment
+      );
+    }
+    if (decision.decision !== "pass") {
+      const codes = [...new Set(decision.blockers.map((blocker) => blocker.code))];
+      throw new DigitalOceanDeploymentError(
+        `Release gate failed (${codes.join(", ") || "unknown"}); DigitalOcean promotion refused`,
+        profile.environment
+      );
+    }
+  }
+
   return {
     async promote(
       input: DigitalOceanPromotionInput
@@ -704,6 +786,9 @@ export function createDigitalOceanDeploymentService(
           "Promoted image is not approved for this DigitalOcean profile",
           profile.environment
         );
+      }
+      if (profile.requireReleaseGate) {
+        await enforceReleaseGate(profile, input, imageDigest);
       }
 
       const leasedAt = now();

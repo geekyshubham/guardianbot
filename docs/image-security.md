@@ -73,6 +73,10 @@ destinations centrally with
 }
 ```
 
+A profile may also set `"requireReleaseGate": true` (default `false`) to
+require a passing [release gate](release-gate.md) decision before any
+DigitalOcean call.
+
 `components` supports named App Platform `service`, `worker`, and `job`
 components that all use the same approved GHCR image. Legacy single-service
 profiles may use `serviceNames`; a profile must define exactly one form. The

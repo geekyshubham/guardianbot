@@ -621,6 +621,37 @@ export interface DeployedImageEvidence extends SuccessfulDeploymentEvidence {
   certificateIdentity: string;
 }
 
+/**
+ * Accepted image-promotion evidence for one exact signed digest. Every field
+ * comes from the same accepted default-branch push run, attempt, and artifact
+ * as the Cosign signature record, so a release gate cannot mix evidence from
+ * different builds.
+ */
+export interface ReleaseImageEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  headSha: string;
+  imageDigest: string;
+  signature: { certificateIdentity: string; observedAt: string };
+  imageScan?: { status: ScannerEvidenceStatus; criticalFindings: number; observedAt: string };
+  sbom?: { status: ScannerEvidenceStatus; observedAt: string };
+}
+
+/** Latest accepted DAST summary bound to an exact deployed digest and environment. */
+export interface ReleaseDastEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  evidenceKey: string;
+  imageDigest: string;
+  environment: string;
+  status: ScannerEvidenceStatus;
+  observedAt: string;
+}
+
 export interface StoreLock {
   release(): Promise<void>;
 }
@@ -1385,6 +1416,18 @@ export interface Store {
     environment: string,
     defaultBranch: string
   ): Promise<DeployedImageEvidence | undefined>;
+  getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined>;
+  getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined>;
   claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean>;
@@ -2488,6 +2531,127 @@ export class MemoryStore implements Store {
     };
   }
 
+  async getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined> {
+    const signatures = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.evidenceKey === "signature" &&
+          evidence.kind === "signature" &&
+          evidence.source === "cosign" &&
+          evidence.status === "success" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const signature of signatures) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, signature.runId, signature.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          signature.runId,
+          signature.runAttempt,
+          signature.artifactId
+        )
+      );
+      const certificateIdentity = signature.payload?.certificateIdentity;
+      if (
+        !run ||
+        run.headSha !== headSha ||
+        run.headBranch !== defaultBranch ||
+        run.event !== "push" ||
+        run.conclusion !== "success" ||
+        run.validationStatus !== "accepted" ||
+        artifact?.artifactType !== "image-promotion" ||
+        artifact.validationStatus !== "accepted" ||
+        typeof certificateIdentity !== "string" ||
+        signature.payload?.imageDigest !== imageDigest
+      ) {
+        continue;
+      }
+      const sibling = (evidenceKey: string) =>
+        this.scannerEvidence.get(
+          scannerEvidenceKey(
+            repositoryId,
+            signature.runId,
+            signature.runAttempt,
+            signature.artifactId,
+            evidenceKey
+          )
+        );
+      const trivy = sibling("image-trivy-summary");
+      const sbom = sibling("sbom");
+      return releaseImageEvidence(
+        { ...signature, payload: { certificateIdentity } },
+        headSha,
+        imageDigest,
+        trivy?.kind === "trivy" && trivy.source === "trivy" ? trivy : undefined,
+        sbom?.kind === "sbom" && sbom.source === "trivy" ? sbom : undefined
+      );
+    }
+    return undefined;
+  }
+
+  async getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          RELEASE_DAST_SUMMARY_KEYS.includes(evidence.evidenceKey) &&
+          evidence.source === "zap" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest &&
+          evidence.environment === environment
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const evidence of candidates) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      if (
+        !run ||
+        run.headBranch !== defaultBranch ||
+        run.validationStatus !== "accepted" ||
+        artifact?.artifactType !== "dast" ||
+        artifact.validationStatus !== "accepted"
+      ) {
+        continue;
+      }
+      return {
+        repositoryId,
+        runId: evidence.runId,
+        runAttempt: evidence.runAttempt,
+        artifactId: evidence.artifactId,
+        evidenceKey: evidence.evidenceKey,
+        imageDigest,
+        environment,
+        status: evidence.status,
+        observedAt: evidence.observedAt
+      };
+    }
+    return undefined;
+  }
+
   async claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean> {
@@ -2710,6 +2874,47 @@ function scannerEvidenceKey(
   evidenceKey: string
 ): string {
   return `${scannerArtifactKey(repositoryId, runId, runAttempt, artifactId)}:${evidenceKey}`;
+}
+
+const RELEASE_DAST_SUMMARY_KEYS = ["zap-smoke-summary", "zap-nightly-summary"];
+
+function releaseImageEvidence(
+  signature: Pick<
+    ScannerEvidenceRecord,
+    "repositoryId" | "runId" | "runAttempt" | "artifactId" | "observedAt"
+  > & { payload: { certificateIdentity: string } },
+  headSha: string,
+  imageDigest: string,
+  trivy:
+    | Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload">
+    | undefined,
+  sbom: Pick<ScannerEvidenceRecord, "status" | "observedAt"> | undefined
+): ReleaseImageEvidence {
+  const criticalFindings = trivy?.payload?.criticalFindings;
+  return {
+    repositoryId: signature.repositoryId,
+    runId: signature.runId,
+    runAttempt: signature.runAttempt,
+    artifactId: signature.artifactId,
+    headSha,
+    imageDigest,
+    signature: {
+      certificateIdentity: signature.payload.certificateIdentity,
+      observedAt: signature.observedAt
+    },
+    imageScan: trivy
+      ? {
+          status: trivy.status,
+          // A missing or malformed count is reported as -1 so the gate fails closed.
+          criticalFindings:
+            Number.isSafeInteger(criticalFindings) && Number(criticalFindings) >= 0
+              ? Number(criticalFindings)
+              : -1,
+          observedAt: trivy.observedAt
+        }
+      : undefined,
+    sbom: sbom ? { status: sbom.status, observedAt: sbom.observedAt } : undefined
+  };
 }
 
 /**
@@ -4488,6 +4693,163 @@ export class PostgresStore implements Store {
       origin: String(row.origin),
       imageReference: String(row.image_reference),
       certificateIdentity: String(row.certificate_identity)
+    };
+  }
+
+  async getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT signature.run_id,
+              signature.run_attempt,
+              signature.artifact_id,
+              signature.observed_at,
+              signature.payload->>'certificateIdentity' AS certificate_identity,
+              trivy.status AS trivy_status,
+              trivy.observed_at AS trivy_observed_at,
+              trivy.payload->'criticalFindings' AS trivy_critical_findings,
+              sbom.status AS sbom_status,
+              sbom.observed_at AS sbom_observed_at
+       FROM scanner_evidence AS signature
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=signature.repository_id
+        AND runs.run_id=signature.run_id
+        AND runs.run_attempt=signature.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=signature.repository_id
+        AND artifacts.run_id=signature.run_id
+        AND artifacts.run_attempt=signature.run_attempt
+        AND artifacts.artifact_id=signature.artifact_id
+       LEFT JOIN scanner_evidence AS trivy
+         ON trivy.repository_id=signature.repository_id
+        AND trivy.run_id=signature.run_id
+        AND trivy.run_attempt=signature.run_attempt
+        AND trivy.artifact_id=signature.artifact_id
+        AND trivy.evidence_key='image-trivy-summary'
+        AND trivy.kind='trivy'
+        AND trivy.source='trivy'
+       LEFT JOIN scanner_evidence AS sbom
+         ON sbom.repository_id=signature.repository_id
+        AND sbom.run_id=signature.run_id
+        AND sbom.run_attempt=signature.run_attempt
+        AND sbom.artifact_id=signature.artifact_id
+        AND sbom.evidence_key='sbom'
+        AND sbom.kind='sbom'
+        AND sbom.source='trivy'
+       WHERE signature.repository_id=$1
+         AND signature.evidence_key='signature'
+         AND signature.kind='signature'
+         AND signature.source='cosign'
+         AND signature.status='success'
+         AND signature.fingerprint IS NULL
+         AND signature.digest=$2
+         AND jsonb_typeof(signature.payload)='object'
+         AND signature.payload->>'imageDigest'=$2
+         AND jsonb_typeof(signature.payload->'certificateIdentity')='string'
+         AND runs.head_sha=$3
+         AND runs.head_branch=$4
+         AND runs.event='push'
+         AND runs.conclusion='success'
+         AND runs.validation_status='accepted'
+         AND artifacts.artifact_type='image-promotion'
+         AND artifacts.validation_status='accepted'
+       ORDER BY signature.observed_at DESC,
+                signature.updated_at DESC,
+                signature.run_id DESC,
+                signature.run_attempt DESC
+       LIMIT 1`,
+      [repositoryId, imageDigest, headSha, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return releaseImageEvidence(
+      {
+        repositoryId,
+        runId: Number(row.run_id),
+        runAttempt: Number(row.run_attempt),
+        artifactId: Number(row.artifact_id),
+        observedAt: new Date(row.observed_at).toISOString(),
+        payload: { certificateIdentity: String(row.certificate_identity) }
+      },
+      headSha,
+      imageDigest,
+      row.trivy_status
+        ? {
+            status: row.trivy_status,
+            observedAt: new Date(row.trivy_observed_at).toISOString(),
+            payload: { criticalFindings: row.trivy_critical_findings }
+          }
+        : undefined,
+      row.sbom_status
+        ? {
+            status: row.sbom_status,
+            observedAt: new Date(row.sbom_observed_at).toISOString()
+          }
+        : undefined
+    );
+  }
+
+  async getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT evidence.run_id,
+              evidence.run_attempt,
+              evidence.artifact_id,
+              evidence.evidence_key,
+              evidence.status,
+              evidence.observed_at
+       FROM scanner_evidence AS evidence
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=evidence.repository_id
+        AND runs.run_id=evidence.run_id
+        AND runs.run_attempt=evidence.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=evidence.repository_id
+        AND artifacts.run_id=evidence.run_id
+        AND artifacts.run_attempt=evidence.run_attempt
+        AND artifacts.artifact_id=evidence.artifact_id
+       WHERE evidence.repository_id=$1
+         AND evidence.evidence_key = ANY($2::text[])
+         AND evidence.source='zap'
+         AND evidence.fingerprint IS NULL
+         AND evidence.digest=$3
+         AND evidence.environment=$4
+         AND runs.head_branch=$5
+         AND runs.validation_status='accepted'
+         AND artifacts.artifact_type='dast'
+         AND artifacts.validation_status='accepted'
+       ORDER BY evidence.observed_at DESC,
+                evidence.updated_at DESC,
+                evidence.run_id DESC,
+                evidence.run_attempt DESC
+       LIMIT 1`,
+      [
+        repositoryId,
+        RELEASE_DAST_SUMMARY_KEYS,
+        imageDigest,
+        environment,
+        defaultBranch
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId,
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      artifactId: Number(row.artifact_id),
+      evidenceKey: String(row.evidence_key),
+      imageDigest,
+      environment,
+      status: row.status === "success" ? "success" : "failure",
+      observedAt: new Date(row.observed_at).toISOString()
     };
   }
 

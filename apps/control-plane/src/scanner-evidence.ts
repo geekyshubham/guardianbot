@@ -29,6 +29,7 @@ import {
   DigitalOceanDeploymentError,
   type DigitalOceanDeploymentService
 } from "./digitalocean-deployment.js";
+import { createReleaseGateEvaluator } from "./release-gate.js";
 import type { GuardianScannerWorkflowRun } from "./service.js";
 import type {
   ScannerArtifactRecord,
@@ -1680,7 +1681,15 @@ async function processImageArtifact(
         runId: artifact.runId,
         runAttempt: artifact.runAttempt,
         headSha: run.headSha,
-        imageReference: promotion.imageReference
+        imageReference: promotion.imageReference,
+        // Consulted only by profiles that opt in with requireReleaseGate.
+        releaseEvidence: {
+          defaultBranch,
+          certificateIdentity: promotion.certificateIdentity,
+          criticalFindings: criticalCount,
+          sbomPresent: true,
+          ref: `evidence://${artifact.runId}/${artifact.runAttempt}/${artifact.artifactId}`
+        }
       });
       if (deployment) {
         await recordEvidence(store, base, {
@@ -2262,7 +2271,15 @@ export function createScannerWorkflowRunHandler(
     store: options.store,
     environment: env,
     fetchImpl: options.fetchImpl,
-    now: options.now
+    now: options.now,
+    // Configuration is read lazily, so profiles without requireReleaseGate
+    // never touch release-gate settings or DefectDojo.
+    releaseGate: createReleaseGateEvaluator({
+      store: options.store,
+      environment: env,
+      fetchImpl: options.fetchImpl,
+      now: options.now
+    })
   });
   const now = options.now ?? (() => new Date());
   const fetchImpl = options.fetchImpl ?? fetch;

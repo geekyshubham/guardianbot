@@ -134,3 +134,12 @@ sequenceDiagram
 When `image.deployment` is set, the nightly rescan re-examines the exact
 deployed digest, never a tag. New Critical findings record a promotion freeze
 signal in evidence and monitoring without changing the running deployment.
+
+## Release promotion
+
+The opt-in [release gate](release-gate.md) decides pass or fail for one exact
+repository, commit, image digest, and environment. It independently verifies
+the Cosign signer, requires the accepted image-promotion evidence for that
+digest, and queries DefectDojo for active release-blocking findings tied to the
+candidate. A named, unexpired DefectDojo risk acceptance is the only exception
+path, an unavailable DefectDojo fails closed, and AI findings are never inputs.

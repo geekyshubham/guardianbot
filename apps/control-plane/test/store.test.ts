@@ -3570,3 +3570,82 @@ test("PostgresStore selects the newest deployment before binding its signature r
   assert.match(query, /runs\.event='push'/);
   assert.match(query, /signature\.digest=latest\.digest/);
 });
+
+test("PostgresStore release image evidence binds signature, Trivy, and SBOM to one accepted push artifact", async () => {
+  const digest = `sha256:${"b".repeat(64)}`;
+  const captured: { text: string; values?: unknown[] }[] = [];
+  const harness = stubbedPostgresStore(undefined, (text, values) => {
+    if (!text.includes("signature.payload->>'certificateIdentity'")) return undefined;
+    captured.push({ text, values });
+    return {
+      rows: [
+        {
+          run_id: "400",
+          run_attempt: "1",
+          artifact_id: "401",
+          observed_at: new Date("2026-08-01T11:01:00.000Z"),
+          certificate_identity: "https://github.com/o/r/.github/workflows/reusable-image.yml@x",
+          trivy_status: "success",
+          trivy_observed_at: new Date("2026-08-01T11:00:00.000Z"),
+          trivy_critical_findings: "0",
+          sbom_status: null,
+          sbom_observed_at: null
+        }
+      ]
+    };
+  });
+  const evidence = await harness.store.getReleaseImageEvidence(99, "a".repeat(40), digest, "main");
+  assert.deepEqual(captured[0]?.values, [99, digest, "a".repeat(40), "main"]);
+  for (const clause of [
+    "artifacts.artifact_type='image-promotion'",
+    "artifacts.validation_status='accepted'",
+    "runs.event='push'",
+    "runs.validation_status='accepted'",
+    "signature.payload->>'imageDigest'=$2",
+    "trivy.artifact_id=signature.artifact_id",
+    "sbom.artifact_id=signature.artifact_id"
+  ]) {
+    assert.ok(captured[0]?.text.includes(clause), clause);
+  }
+  assert.equal(evidence?.runId, 400);
+  assert.equal(evidence?.artifactId, 401);
+  // A JSON string count is malformed and must fail closed as -1.
+  assert.equal(evidence?.imageScan?.criticalFindings, -1);
+  assert.equal(evidence?.sbom, undefined);
+});
+
+test("PostgresStore release DAST evidence is digest, environment, and default-branch scoped", async () => {
+  const digest = `sha256:${"b".repeat(64)}`;
+  const captured: { text: string; values?: unknown[] }[] = [];
+  const harness = stubbedPostgresStore(undefined, (text, values) => {
+    if (!text.includes("evidence.evidence_key = ANY($2::text[])")) return undefined;
+    captured.push({ text, values });
+    return {
+      rows: [
+        {
+          run_id: "600",
+          run_attempt: "1",
+          artifact_id: "601",
+          evidence_key: "zap-smoke-summary",
+          status: "failure",
+          observed_at: new Date("2026-08-01T11:40:00.000Z")
+        }
+      ]
+    };
+  });
+  const evidence = await harness.store.getReleaseDastEvidence(99, digest, "staging", "main");
+  assert.deepEqual(captured[0]?.values, [
+    99,
+    ["zap-smoke-summary", "zap-nightly-summary"],
+    digest,
+    "staging",
+    "main"
+  ]);
+  assert.ok(captured[0]?.text.includes("artifacts.artifact_type='dast'"));
+  assert.equal(evidence?.status, "failure");
+  assert.equal(evidence?.evidenceKey, "zap-smoke-summary");
+  assert.equal(
+    await stubbedPostgresStore().store.getReleaseDastEvidence(99, digest, "staging", "main"),
+    undefined
+  );
+});

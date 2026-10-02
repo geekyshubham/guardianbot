@@ -117,6 +117,28 @@ engagement, imports the fixture through `import-scan`, reimports it through
 of a run ID is rejected so a stale Test cannot make a first-import check pass.
 The command never prints the API token.
 
+## Release gate query
+
+The [release gate](release-gate.md) reads DefectDojo; it never writes to it.
+`DefectDojoClient.listReleaseFindings` resolves the product by exact repository
+name, then looks up the `<default-branch>/security`, `/image`, and `/dast`
+engagements by exact name (so per-branch pull-request engagements do not count
+toward the page cap), their Tests, and two finding lists per engagement:
+
+- active, unmitigated, non-duplicate, non-false-positive, in-scope findings
+  (verified only by default); and
+- risk-accepted findings with their embedded `accepted_risks`.
+
+Every listing follows DefectDojo pagination with a page bound (20 pages by
+default) and rejects cyclic `next` links. Findings whose Test is not in a
+listed engagement are dropped, and the evaluator re-checks every server-side
+filter. A Test or Finding with a malformed ID fails the query. Candidate scope
+comes only from GuardianBot Test tags
+(`guardianbot:repo-id:`, `guardianbot:env:`, `guardianbot:image:`,
+`guardianbot:commit:`), so findings for another product, environment, digest,
+or commit do not block. Query errors are reported only by error kind and fail
+the gate as `gate-unavailable`.
+
 ## Failure behavior
 
 - Import and reimport failures are normalized into `DefectDojoError` values with
