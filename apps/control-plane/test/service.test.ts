@@ -14,6 +14,7 @@ import {
   selectReviewFindings
 } from "../src/service.js";
 import { remediationBranchName } from "../src/remediation-draft.js";
+import type { RemediationValidator } from "../src/remediation-validator.js";
 import { MemoryStore } from "../src/store.js";
 
 class FakeGitHub {
@@ -53,6 +54,9 @@ class FakeGitHub {
   failPullCreation = false;
   openPulls: Array<Record<string, any>> = [];
   refTip?: string;
+  /** Workflow runs GitHub lists for a commit; `actionRunsTotal` overrides the reported total. */
+  actionRuns: Array<Record<string, any>> = [];
+  actionRunsTotal?: number;
   /** Path GitHub reports for a contents read, as it does for a symlink resolved to its target. */
   symlinkTargets: Record<string, string> = {};
   failIssueCreations = 0;
@@ -228,6 +232,16 @@ class FakeGitHub {
       const commit = this.commitDetails[sha];
       if (!commit) throw new Error(`GitHub GET ${path} returned 404: missing`);
       return commit as T;
+    }
+    if (method === "GET" && /\/actions\/runs\?head_sha=/.test(path)) {
+      return {
+        total_count: this.actionRunsTotal ?? this.actionRuns.length,
+        workflow_runs: this.actionRuns
+      } as T;
+    }
+    if (method === "DELETE" && /\/git\/refs\/heads\//.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      return undefined as T;
     }
     if (method === "GET" && /\/pulls\?state=open&head=/.test(path)) {
       return this.openPulls as T;
@@ -3966,6 +3980,10 @@ test("draft-fix opens a labelled draft PR on a new branch targeting the PR head 
   assert.ok(!github.repositoryWrites.some((write) => /\/merge|\/reviews/.test(write.path)));
   assert.match(github.comments.at(-1)?.body ?? "", /draft #501/);
   assert.match(github.comments.at(-1)?.body ?? "", /Checks: \*\*pending\*\*/);
+  assert.match(github.comments.at(-1)?.body ?? "", /deterministic validation only/);
+  // The title carries only trusted fields, never the model-written finding title.
+  assert.match(pull?.body.title ?? "", /^GuardianBot AI draft: [a-z]+ fix for [a-f0-9]{12} in src\/a\.ts$/);
+  assert.doesNotMatch(pull?.body.title ?? "", /Harden|Missing|authorization/i);
   assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 1$/m);
 });
 
@@ -4244,4 +4262,198 @@ test("a partial or truncated incremental review never records a fixed outcome", 
   const truncated = await incrementalFixedScenario({ patchSuffix: `\n+${"x".repeat(31_000)}` });
   assert.equal(truncated.retained?.outcome, undefined);
   assert.match(truncated.service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 0$/m);
+});
+
+const DRAFT_COMMIT = "c".repeat(40);
+
+async function openedDraft(options: { remediationValidator?: RemediationValidator } = {}) {
+  const context = await draftReadyService();
+  if (options.remediationValidator) {
+    (context.service as any).options.remediationValidator = options.remediationValidator;
+  }
+  await runCommand(context.service, "@guardianbot draft-fix F1");
+  return context;
+}
+
+let draftEventDelivery = 0;
+async function deliver(service: GuardianService, name: string, event: Record<string, any>) {
+  draftEventDelivery += 1;
+  await service.enqueue(name, event, `draft-event-${draftEventDelivery}`);
+  await service.processNextWebhook("worker-1");
+}
+
+function draftWorkflowRun(branch: string, headSha = DRAFT_COMMIT) {
+  return {
+    action: "completed",
+    installation: { id: 1 },
+    repository: { id: 99, full_name: "Geekyshubham/guardianbot", default_branch: "main", private: false },
+    workflow_run: {
+      id: 3001,
+      run_attempt: 1,
+      name: "CI",
+      path: ".github/workflows/ci.yml",
+      head_branch: branch,
+      head_sha: headSha,
+      head_repository: { id: 99 },
+      status: "completed",
+      conclusion: "success"
+    }
+  };
+}
+
+function closedPull(number: number, headRef: string, merged = false) {
+  return {
+    action: "closed",
+    installation: { id: 1 },
+    repository: { id: 99, full_name: "Geekyshubham/guardianbot", default_branch: "main", private: false },
+    pull_request: {
+      number,
+      merged,
+      state: "closed",
+      head: { sha: DRAFT_COMMIT, ref: headRef, repo: { id: 99 } },
+      base: { sha: "base-sha", ref: "feature/harden" }
+    }
+  };
+}
+
+test("draft-fix records the draft and reports its settled checks on the link comment", async () => {
+  const { service, github, store, branch } = await openedDraft();
+  const record = await store.getRemediationDraft(99, branch);
+  assert.equal(record?.headSha, DRAFT_COMMIT);
+  assert.equal(record?.commitCreatedByApp, true);
+  assert.equal(record?.checks, "pending");
+  const linkUpdates = () => github.updates.filter((update) => update.commentId === record?.linkCommentId);
+
+  // No runs yet, then one still running: nothing is claimed.
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  github.actionRuns = [
+    { head_sha: DRAFT_COMMIT, status: "completed", conclusion: "success" },
+    { head_sha: DRAFT_COMMIT, status: "in_progress", conclusion: null }
+  ];
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  // A total beyond the listed page is unsettled too.
+  github.actionRuns = [{ head_sha: DRAFT_COMMIT, status: "completed", conclusion: "success" }];
+  github.actionRunsTotal = 150;
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  assert.deepEqual(linkUpdates(), []);
+
+  github.actionRunsTotal = undefined;
+  github.actionRuns = [
+    { head_sha: DRAFT_COMMIT, status: "completed", conclusion: "success" },
+    { head_sha: DRAFT_COMMIT, status: "completed", conclusion: "skipped" }
+  ];
+  // A run for some other commit on the branch is ignored.
+  await deliver(service, "workflow_run", draftWorkflowRun(branch, "d".repeat(40)));
+  assert.deepEqual(linkUpdates(), []);
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  assert.equal(linkUpdates().length, 1);
+  assert.match(linkUpdates()[0]?.body ?? "", /Checks: \*\*passed\*\*.*not an approval/);
+  assert.equal((await store.getRemediationDraft(99, branch))?.checks, "passed");
+  // Redelivery of the same settled state does not rewrite the comment.
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  assert.equal(linkUpdates().length, 1);
+
+  github.actionRuns.push({ head_sha: DRAFT_COMMIT, status: "completed", conclusion: "failure" });
+  await deliver(service, "workflow_run", draftWorkflowRun(branch));
+  assert.match(linkUpdates().at(-1)?.body ?? "", /Checks: \*\*failed\*\*/);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_checks_passed_total 1$/m);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_checks_failed_total 1$/m);
+});
+
+test("a closed draft deletes its branch only while the tip is still GuardianBot's commit", async () => {
+  const deleted = await openedDraft();
+  deleted.github.refTip = DRAFT_COMMIT;
+  deleted.github.commitDetails[DRAFT_COMMIT] = { sha: DRAFT_COMMIT, parents: [{ sha: "head-sha" }] };
+  await deliver(deleted.service, "pull_request", closedPull(501, deleted.branch));
+  const deletes = deleted.github.repositoryWrites.filter((write) => write.method === "DELETE");
+  assert.deepEqual(
+    deletes.map((write) => write.path),
+    [`/repos/Geekyshubham/guardianbot/git/refs/heads/${deleted.branch}`]
+  );
+  assert.equal(await deleted.store.getRemediationDraft(99, deleted.branch), undefined);
+  assert.match(deleted.service.metrics.render(), /^guardianbot_remediation_draft_branch_deleted_total 1$/m);
+
+  // A human pushed to the branch: the tip moved, so the branch is retained.
+  const pushed = await openedDraft();
+  pushed.github.refTip = "e".repeat(40);
+  await deliver(pushed.service, "pull_request", closedPull(501, pushed.branch));
+  // GuardianBot's commit, but rewritten onto another parent: retained too.
+  const reparented = await openedDraft();
+  reparented.github.refTip = DRAFT_COMMIT;
+  reparented.github.commitDetails[DRAFT_COMMIT] = { sha: DRAFT_COMMIT, parents: [{ sha: "f".repeat(40) }] };
+  await deliver(reparented.service, "pull_request", closedPull(501, reparented.branch));
+  for (const context of [pushed, reparented]) {
+    assert.ok(!context.github.repositoryWrites.some((write) => write.method === "DELETE"));
+    assert.match(context.service.metrics.render(), /^guardianbot_remediation_draft_branch_retained_total 1$/m);
+  }
+
+  // A reused branch was not written by this command, so it is never deleted.
+  const reused = await draftReadyService();
+  existingDraftBranch(reused.github, VALIDATED_DRAFT_FILE);
+  await runCommand(reused.service, "@guardianbot draft-fix F1");
+  assert.equal((await reused.store.getRemediationDraft(99, reused.branch))?.commitCreatedByApp, false);
+  await deliver(reused.service, "pull_request", closedPull(501, reused.branch));
+  assert.ok(!reused.github.repositoryWrites.some((write) => write.method === "DELETE"));
+});
+
+test("closing the source pull request cleans up only drafts that are already closed", async () => {
+  const { service, github, store, branch } = await openedDraft();
+  github.refTip = DRAFT_COMMIT;
+  github.commitDetails[DRAFT_COMMIT] = { sha: DRAFT_COMMIT, parents: [{ sha: "head-sha" }] };
+  github.currentPulls = [{ ...sameRepositoryPull(), number: 501, state: "open" }];
+  await deliver(service, "pull_request", closedPull(12, "feature/harden", true));
+  assert.ok(!github.repositoryWrites.some((write) => write.method === "DELETE"));
+  assert.ok(await store.getRemediationDraft(99, branch));
+
+  github.currentPulls = [{ ...sameRepositoryPull(), number: 501, state: "closed" }];
+  await deliver(service, "pull_request", closedPull(12, "feature/harden", true));
+  assert.equal(github.repositoryWrites.filter((write) => write.method === "DELETE").length, 1);
+});
+
+function validator(
+  answer: (request: any) => Promise<any>,
+  allowedClassifications: RemediationValidator["allowedClassifications"] = ["public"]
+): RemediationValidator & { requests: any[] } {
+  const requests: any[] = [];
+  return {
+    requests,
+    allowedClassifications,
+    validateRemediation: async (request) => {
+      requests.push(request);
+      return answer(request);
+    }
+  };
+}
+
+test("a configured second-model validator can accept a draft but never write one it vetoes", async () => {
+  const accepting = validator(async (request) => ({
+    protocolVersion: "guardian.remediation-validation.v1",
+    requestId: request.requestId,
+    decision: "accept",
+    reasons: [],
+    backend: { backendId: "v", modelId: "m", latencyMs: 1 }
+  }));
+  const accepted = await openedDraft({ remediationValidator: accepting });
+  const sent = accepting.requests[0];
+  assert.equal(sent.classification, "public");
+  assert.equal(sent.original, "  return unsafeValue;");
+  assert.equal(sent.replacement, "return safeValue;");
+  // Only the validated change and bounded surrounding lines: no model-written prose goes back.
+  assert.deepEqual(Object.keys(sent.finding).sort(), ["endLine", "fingerprint", "path", "startLine", ...(sent.finding.category ? ["category"] : []), ...(sent.finding.severity ? ["severity"] : [])].sort());
+  const pull = accepted.github.repositoryWrites.find((write) => /\/pulls$/.test(write.path));
+  assert.match(pull?.body.body ?? "", /second-model validator also accepted it/);
+  assert.match(accepted.github.comments.at(-1)?.body ?? "", /both accepted it/);
+
+  const vetoes: Array<[string, RemediationValidator, RegExp]> = [
+    ["reject", validator(async (request) => ({ ...(await accepting.validateRemediation(request)), decision: "reject", reasons: ["introduces-vulnerability"] })), /rejected it/],
+    ["error", validator(async () => { throw new BackendError("timeout", "timed out", true); }), /did not return a valid answer/],
+    ["classification", validator(async () => { throw new Error("must not be called"); }, ["private"]), /not allowed to receive/]
+  ];
+  for (const [label, configured, message] of vetoes) {
+    const { service, github } = await openedDraft({ remediationValidator: configured });
+    assert.match(github.comments.at(-1)?.body ?? "", message, label);
+    assert.deepEqual(github.repositoryWrites, [], label);
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_validator_rejected_total 1$/m, label);
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 0$/m, label);
+  }
 });

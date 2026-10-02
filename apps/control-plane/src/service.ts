@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   assertDescriptorReference,
   buildReviewBundle,
@@ -36,12 +37,19 @@ import {
   REMEDIATION_BRANCH_PREFIX,
   REMEDIATION_DRAFT_LABEL,
   REMEDIATION_REJECTION_TEXT,
+  MAX_DRAFT_CHECK_RUNS,
+  buildRemediationValidationRequest,
   remediationBranchName,
   remediationDraftBody,
+  remediationDraftTitle,
+  remediationLinkComment,
   sha256Hex,
+  summarizeDraftChecks,
   validateRemediationDraft,
-  type RemediationRejection
+  type RemediationRejection,
+  type RemediationSecondValidation
 } from "./remediation-draft.js";
+import type { RemediationValidator } from "./remediation-validator.js";
 import { carryRecordedOutcomes, markFixedOutcomes } from "./review-value.js";
 import {
   exactSuggestion,
@@ -66,6 +74,7 @@ import {
   type ReviewFindingLifecycleState,
   type ReviewFindingRecord,
   type ReviewFindingRetentionOptions,
+  type RemediationDraftRecord,
   type ReviewState,
   type Store,
   type WebhookJob,
@@ -99,6 +108,11 @@ export interface ServiceOptions {
    * is attempted only when the installation token was actually granted `contents: write`.
    */
   remediationDrafts?: boolean;
+  /**
+   * Optional veto-only second-model validator for Mode C drafts. It runs after the deterministic
+   * validator; any rejection, error, timeout or malformed answer means no draft is written.
+   */
+  remediationValidator?: RemediationValidator;
 }
 
 export interface GuardianScannerWorkflowRun {
@@ -141,6 +155,7 @@ interface GitHubPull {
   body?: string | null;
   user: { login: string };
   draft?: boolean;
+  state?: string;
 }
 
 interface GitHubReviewComment {
@@ -564,11 +579,13 @@ export class GuardianService {
 
     if (name === "pull_request" && event.action === "closed") {
       await this.recordMergedOutcomes(event, signal);
+      await this.cleanupRemediationDrafts(event, signal);
       return;
     }
 
     if (name === "workflow_run" && event.action === "completed") {
       await this.handleScannerWorkflowRun(event, signal);
+      await this.reportRemediationDraftChecks(event, signal);
       return;
     }
 
@@ -1727,9 +1744,10 @@ export class GuardianService {
    * new `guardianbot/fix/*` branch cut from the pull request head and targeting that head branch.
    * Gated, in order, on the operator flag, a write-capable human actor (already checked by the
    * caller), the installation token actually holding `contents: write`, a same-repository head,
-   * and the deterministic validator. Nothing is merged, approved, or pushed to the contributor's
-   * branch, and the draft is linked immediately in an explicit checks-pending state because the
-   * App subscribes to no check-suite event that could confirm the draft's checks later.
+   * the deterministic validator, and (when configured) a veto-only second-model validator.
+   * Nothing is merged, approved, or pushed to the contributor's branch. The draft is linked in a
+   * checks-pending state and recorded, so a later `workflow_run` for the draft commit can update
+   * the link with the settled result and a later `pull_request.closed` can delete the branch.
    */
   private async draftFixCommand(
     github: GitHubClientLike,
@@ -1838,6 +1856,19 @@ export class GuardianService {
       await reject(validation.reason);
       return;
     }
+    const secondValidation = await this.secondValidateDraft(
+      github,
+      event,
+      owner,
+      repo,
+      issueNumber,
+      argument,
+      finding,
+      file.content,
+      validation,
+      signal
+    );
+    if (!secondValidation) return;
 
     throwIfAborted(signal);
     const branch = remediationBranchName(finding.fingerprint, pull.head.sha);
@@ -1846,7 +1877,7 @@ export class GuardianService {
     if (!branch.startsWith(REMEDIATION_BRANCH_PREFIX) || branch === headRef) {
       throw new Error("remediation branch name failed its invariant");
     }
-    const commitNeeded = await this.prepareRemediationBranch(
+    const prepared = await this.prepareRemediationBranch(
       github,
       owner,
       repo,
@@ -1854,7 +1885,7 @@ export class GuardianService {
       pull.head.sha,
       validation
     );
-    if (commitNeeded === "conflict") {
+    if (prepared === "conflict") {
       await this.rejectDraft(
         github,
         owner,
@@ -1865,8 +1896,10 @@ export class GuardianService {
       );
       return;
     }
-    if (commitNeeded) {
-      await github.request(
+    let draftHeadSha = prepared.write ? undefined : prepared.tip;
+    let commitCreatedByApp = false;
+    if (prepared.write) {
+      const written = await github.request<{ commit?: { sha?: unknown } } | undefined>(
         "PUT",
         `/repos/${owner}/${repo}/contents/${validation.path.split("/").map(encodeURIComponent).join("/")}`,
         {
@@ -1876,16 +1909,27 @@ export class GuardianService {
           branch
         }
       );
+      const commitSha = written?.commit?.sha;
+      if (typeof commitSha === "string" && /^[a-f0-9]{40}$/.test(commitSha)) {
+        draftHeadSha = commitSha;
+        commitCreatedByApp = true;
+      }
     }
+    // The title is built only from trusted fields; the model-written finding title never reaches it.
     const draft = await this.openRemediationPull(github, owner, repo, branch, headRef, {
-      title: `GuardianBot AI draft: ${safeInline(finding.title ?? "advisory remediation").slice(0, 120)}`,
+      title: remediationDraftTitle({
+        category: finding.category,
+        fingerprint: finding.fingerprint,
+        path: validation.path
+      }),
       body: remediationDraftBody({
         sourcePullNumber: issueNumber,
         path: validation.path,
         startLine: validation.startLine,
         endLine: validation.endLine,
         fingerprint: finding.fingerprint,
-        headSha: pull.head.sha
+        headSha: pull.head.sha,
+        secondValidation
       })
     });
     if (!draft) {
@@ -1908,12 +1952,232 @@ export class GuardianService {
       if (error instanceof Error && error.name === "GitHubRateLimitError") throw error;
     }
     this.metrics.increment("remediation_draft_created_total");
-    await github.createComment(
+    const link = await github.createComment(
       owner,
       repo,
       issueNumber,
-      `AI-drafted remediation for \`${safeInline(argument)}\` opened as draft #${draft.number} targeting \`${safeInline(headRef)}\`. Checks: **pending**; GuardianBot does not wait for or report the draft's checks, so confirm them on the draft before merging it. It requires human review and approval; GuardianBot did not merge, approve, or push to this branch.`
+      remediationLinkComment({
+        fingerprint: finding.fingerprint,
+        draftPullNumber: draft.number,
+        targetRef: headRef,
+        checks: "pending",
+        secondValidation
+      })
     );
+    // Without a verifiable draft commit there is nothing a later workflow run or close can be
+    // safely matched against, so the draft stays linked as pending and is never cleaned up.
+    if (!draftHeadSha || !positiveIdentifier(link?.id)) return;
+    await this.store.saveRemediationDraft({
+      repositoryId: event.repository.id,
+      branch,
+      sourcePullNumber: issueNumber,
+      draftPullNumber: draft.number,
+      targetRef: headRef,
+      fingerprint: finding.fingerprint,
+      baseHeadSha: pull.head.sha,
+      headSha: draftHeadSha,
+      commitCreatedByApp,
+      linkCommentId: link.id,
+      checks: "pending",
+      secondValidation,
+      createdAt: this.now().toISOString()
+    });
+  }
+
+  /**
+   * Runs the optional second-model validator. Returns the status to state on the draft, or
+   * undefined after replying that no draft was created. It can only veto: a configured validator
+   * that is unreachable, times out, answers malformed output, or is not allowed to see this
+   * repository's classification refuses the draft. Cancellation still propagates so the job
+   * requeues rather than being answered.
+   */
+  private async secondValidateDraft(
+    github: GitHubClientLike,
+    event: GitHubEvent,
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    argument: string,
+    finding: ReviewFindingRecord,
+    fileContent: string,
+    validation: { startLine: number; endLine: number; replacement: string },
+    signal?: AbortSignal
+  ): Promise<RemediationSecondValidation | undefined> {
+    const validator = this.options.remediationValidator;
+    if (!validator) return "not-configured";
+    const refuse = async (detail: string) => {
+      this.metrics.increment("remediation_draft_validator_rejected_total");
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        `No remediation draft was created for \`${safeInline(argument)}\`: ${detail}.`,
+        "remediation_draft_rejected_total"
+      );
+      return undefined;
+    };
+    const visibility = repositoryVisibility(event.repository);
+    const classification: DataClassification =
+      visibility === "internal" ? "restricted" : visibility;
+    if (!validator.allowedClassifications.includes(classification)) {
+      return refuse(
+        "the configured second-model validator is not allowed to receive this repository's data classification"
+      );
+    }
+    const request = buildRemediationValidationRequest({
+      requestId: randomUUID(),
+      classification,
+      finding,
+      fileContent,
+      startLine: validation.startLine,
+      endLine: validation.endLine,
+      replacement: validation.replacement
+    });
+    if (!request) return refuse("the change exceeds the second-model validator's size bounds");
+    let decision: string;
+    try {
+      decision = (await validator.validateRemediation(request, signal)).decision;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      return refuse("the configured second-model validator did not return a valid answer, so the draft was refused");
+    }
+    if (decision !== "accept") return refuse("the configured second-model validator rejected it");
+    return "accepted";
+  }
+
+  /**
+   * Reports the settled checks of a recorded draft on its link comment. GitHub sends one
+   * `workflow_run.completed` per workflow, so each event re-lists every run for the draft commit
+   * (bounded) and reports only once all of them completed. Zero runs is never a pass.
+   */
+  private async reportRemediationDraftChecks(
+    event: GitHubEvent,
+    signal?: AbortSignal
+  ): Promise<void> {
+    throwIfAborted(signal);
+    const run = event.workflow_run;
+    const repositoryId = positiveIdentifier(event.repository?.id);
+    const branch = String(run?.head_branch ?? "");
+    const headSha = String(run?.head_sha ?? "");
+    if (
+      !repositoryId ||
+      !branch.startsWith(REMEDIATION_BRANCH_PREFIX) ||
+      !/^[a-f0-9]{40}$/.test(headSha) ||
+      (run?.head_repository?.id !== undefined && run.head_repository.id !== repositoryId)
+    ) {
+      return;
+    }
+    const repository = await this.store.getRepository(repositoryId);
+    if (repository && repository.repositoryState !== "active") return;
+    const record = await this.store.getRemediationDraft(repositoryId, branch);
+    if (!record || record.headSha !== headSha) return;
+    const github = await this.client(event, [repositoryId]);
+    const [owner = "", repo = ""] = String(event.repository.full_name).split("/");
+    const listed = await github.request<{ total_count?: unknown; workflow_runs?: unknown }>(
+      "GET",
+      `/repos/${owner}/${repo}/actions/runs?head_sha=${headSha}&per_page=${MAX_DRAFT_CHECK_RUNS}`
+    );
+    const runs = Array.isArray(listed?.workflow_runs)
+      ? (listed.workflow_runs as Array<{ status?: unknown; conclusion?: unknown; head_sha?: unknown }>)
+      : [];
+    const checks = summarizeDraftChecks(
+      runs.filter((candidate) => candidate.head_sha === headSha),
+      typeof listed?.total_count === "number" ? listed.total_count : Number.POSITIVE_INFINITY
+    );
+    if (checks === "pending" || checks === record.checks) return;
+    try {
+      await github.updateComment(
+        owner,
+        repo,
+        record.linkCommentId,
+        remediationLinkComment({
+          fingerprint: record.fingerprint,
+          draftPullNumber: record.draftPullNumber,
+          targetRef: record.targetRef,
+          checks,
+          secondValidation: record.secondValidation
+        })
+      );
+    } catch (error) {
+      // A deleted link comment must not wedge the record; anything else is retried.
+      if (!String(error).includes("returned 404")) throw error;
+    }
+    if (await this.store.setRemediationDraftChecks(repositoryId, branch, headSha, checks)) {
+      this.metrics.increment(
+        checks === "passed" ? "remediation_draft_checks_passed_total" : "remediation_draft_checks_failed_total"
+      );
+    }
+  }
+
+  /**
+   * Deletes GuardianBot's own draft branches once their draft pull request is closed. A branch is
+   * deleted only when its tip is still exactly the commit GuardianBot's contents write returned
+   * and that commit's single parent is the source head it was cut from. A branch anyone pushed
+   * to, or one reused from an earlier attempt, is retained.
+   */
+  private async cleanupRemediationDrafts(event: GitHubEvent, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    const repositoryId = positiveIdentifier(event.repository?.id);
+    const pullNumber = positiveIdentifier(event.pull_request?.number);
+    if (!repositoryId || !pullNumber) return;
+    const headRef = String(event.pull_request?.head?.ref ?? "");
+    const isDraftPull =
+      headRef.startsWith(REMEDIATION_BRANCH_PREFIX) &&
+      event.pull_request?.head?.repo?.id === repositoryId;
+    const records: RemediationDraftRecord[] = isDraftPull
+      ? [await this.store.getRemediationDraft(repositoryId, headRef)].filter(
+          (record): record is RemediationDraftRecord => record?.draftPullNumber === pullNumber
+        )
+      : await this.store.listRemediationDrafts(repositoryId, pullNumber);
+    if (!records.length) return;
+    const repository = await this.store.getRepository(repositoryId);
+    if (repository && repository.repositoryState !== "active") return;
+    const github = await this.client(event, [repositoryId]);
+    const [owner = "", repo = ""] = String(event.repository.full_name).split("/");
+    for (const record of records) {
+      throwIfAborted(signal);
+      if (!/^guardianbot\/fix\/[a-f0-9]{1,12}-[a-f0-9]{1,7}$/.test(record.branch)) continue;
+      if (!isDraftPull) {
+        // The source pull request closed; its draft is cleaned up when the draft itself closes.
+        const draftPull = await this.getCurrentPull(github, owner, repo, record.draftPullNumber);
+        if (draftPull && draftPull.state !== "closed") continue;
+      }
+      const refPath = `/repos/${owner}/${repo}/git/refs/heads/${record.branch.split("/").map(encodeURIComponent).join("/")}`;
+      let tip: unknown;
+      try {
+        tip = (
+          await github.request<{ object?: { sha?: unknown } }>(
+            "GET",
+            `/repos/${owner}/${repo}/git/ref/heads/${record.branch.split("/").map(encodeURIComponent).join("/")}`
+          )
+        )?.object?.sha;
+      } catch (error) {
+        if (!String(error).includes("returned 404")) throw error;
+        await this.store.deleteRemediationDraft(repositoryId, record.branch, record.headSha);
+        continue;
+      }
+      let owned = record.commitCreatedByApp && tip === record.headSha;
+      if (owned) {
+        const commit = await github.request<{ parents?: Array<{ sha?: unknown }> }>(
+          "GET",
+          `/repos/${owner}/${repo}/commits/${encodeURIComponent(record.headSha)}`
+        );
+        owned = commit?.parents?.length === 1 && commit.parents[0]?.sha === record.baseHeadSha;
+      }
+      if (owned) {
+        try {
+          await github.request("DELETE", refPath);
+        } catch (error) {
+          if (!/returned (404|422)/.test(String(error))) throw error;
+        }
+        this.metrics.increment("remediation_draft_branch_deleted_total");
+      } else {
+        this.metrics.increment("remediation_draft_branch_retained_total");
+      }
+      await this.store.deleteRemediationDraft(repositoryId, record.branch, record.headSha);
+    }
   }
 
   /** Reads the target file at the head, refusing anything that is not a plain UTF-8 file. */
@@ -1954,7 +2218,8 @@ export class GuardianService {
 
   /**
    * Creates the draft branch at the head, or recognises one a previous attempt of this same
-   * command already created. Returns whether the remediation commit still needs to be written.
+   * command already created. Returns whether the remediation commit still needs to be written
+   * and, when it does not, the existing tip that already carries it.
    *
    * Anyone with write access can push to a `guardianbot/fix/*` branch, so an existing branch is
    * reused only when its single commit over the head touches exactly the validated file and that
@@ -1968,13 +2233,13 @@ export class GuardianService {
     branch: string,
     headSha: string,
     expected: { path: string; content: string }
-  ): Promise<boolean | "conflict"> {
+  ): Promise<{ write: true } | { write: false; tip: string } | "conflict"> {
     try {
       await github.request("POST", `/repos/${owner}/${repo}/git/refs`, {
         ref: `refs/heads/${branch}`,
         sha: headSha
       });
-      return true;
+      return { write: true };
     } catch (error) {
       if (!String(error).includes("returned 422")) throw error;
     }
@@ -1983,7 +2248,7 @@ export class GuardianService {
       `/repos/${owner}/${repo}/git/ref/heads/${branch.split("/").map(encodeURIComponent).join("/")}`
     );
     const tip = existing.object?.sha;
-    if (tip === headSha) return true;
+    if (tip === headSha) return { write: true };
     if (!tip) return "conflict";
     const commit = await github.request<{
       parents?: Array<{ sha?: string }>;
@@ -1999,7 +2264,7 @@ export class GuardianService {
       return "conflict";
     }
     const atTip = await this.getRemediationFile(github, owner, repo, expected.path, tip);
-    return atTip?.content === expected.content ? false : "conflict";
+    return atTip?.content === expected.content ? { write: false, tip } : "conflict";
   }
 
   private async openRemediationPull(

@@ -726,6 +726,38 @@ export interface DeploymentPromotionClaim {
   leaseExpiresAt: string;
 }
 
+export type RemediationDraftChecks = "pending" | "passed" | "failed";
+
+/**
+ * One Mode C draft GuardianBot opened, keyed by its branch. The record is what lets a later
+ * `workflow_run` report the draft's checks and a later `pull_request.closed` delete the branch:
+ * both act only when the branch tip still equals `headSha`, the commit GuardianBot recorded.
+ */
+export interface RemediationDraftRecord {
+  repositoryId: number;
+  branch: string;
+  sourcePullNumber: number;
+  draftPullNumber: number;
+  /** The source pull request's head branch, which the draft targets. */
+  targetRef: string;
+  fingerprint: string;
+  /** The source pull request head the branch was cut from; the draft commit's only parent. */
+  baseHeadSha: string;
+  /** The draft branch tip GuardianBot observed after writing it. */
+  headSha: string;
+  /**
+   * True only when `headSha` is the commit GuardianBot's own contents write returned. A branch
+   * reused from an earlier attempt may carry a commit someone else made, so it is never deleted.
+   */
+  commitCreatedByApp: boolean;
+  /** GuardianBot's link comment on the source pull request, updated when checks settle. */
+  linkCommentId: number;
+  checks: RemediationDraftChecks;
+  /** Whether a configured second-model validator accepted the draft, restated when checks settle. */
+  secondValidation: "accepted" | "not-configured";
+  createdAt: string;
+}
+
 export interface SuccessfulDeploymentEvidence {
   repositoryId: number;
   runId: number;
@@ -1643,6 +1675,72 @@ WHERE repository_id = $1 AND pull_number = $2
 `.trim();
 
 /**
+ * Re-applies human-recorded outcomes from the latest retained row onto findings a review computed
+ * from an earlier read. A review publishes its merged findings by overwriting the schemaless
+ * column, so a dismissal (or a merge's `ignored`) recorded while the model call was in flight
+ * would otherwise be silently lost even though the command already replied that it was recorded.
+ * `dismissed` wins over any derived outcome, matching `applyFindingOutcome`; `ignored` reaches
+ * only findings that carry no outcome. Both stores apply it inside `saveReview` against the row they overwrite, so no window remains;
+ * PostgreSQL uses the SQL form `REVIEW_FINDINGS_OUTCOME_MERGE_SQL`.
+ */
+export function carryRecordedOutcomes(
+  findings: readonly ReviewFindingRecord[],
+  latest: readonly ReviewFindingRecord[] | undefined
+): ReviewFindingRecord[] {
+  const recorded = new Map(
+    (latest ?? [])
+      .filter((finding) => finding.outcome === "dismissed" || finding.outcome === "ignored")
+      .map((finding) => [finding.fingerprint, finding])
+  );
+  if (!recorded.size) return [...findings];
+  return findings.map((finding) => {
+    const source = recorded.get(finding.fingerprint);
+    if (!source || finding.outcome === "dismissed" || finding.outcome === source.outcome) {
+      return finding;
+    }
+    if (source.outcome === "ignored" && finding.outcome !== undefined) return finding;
+    return {
+      ...finding,
+      outcome: source.outcome,
+      ...(source.outcomeAt ? { outcomeAt: source.outcomeAt } : {})
+    };
+  });
+}
+
+/**
+ * SQL form of `carryRecordedOutcomes`, used inside `saveReview`'s ON CONFLICT update. For each
+ * incoming finding it takes the last retained finding with the same fingerprint that recorded
+ * `dismissed` or `ignored`. A dismissal always wins; `ignored` applies only to a finding that
+ * carries no outcome of its own. Order is preserved, and an empty write stays an empty array.
+ */
+export const REVIEW_FINDINGS_OUTCOME_MERGE_SQL = `COALESCE((
+         SELECT jsonb_agg(
+           CASE
+             WHEN prior.outcome IS NULL
+               OR incoming.finding->>'outcome' = 'dismissed'
+               OR incoming.finding->>'outcome' = prior.outcome
+               OR (prior.outcome = 'ignored' AND incoming.finding->>'outcome' IS NOT NULL)
+             THEN incoming.finding
+             ELSE incoming.finding || jsonb_build_object('outcome', prior.outcome)
+               || CASE WHEN jsonb_typeof(prior.outcome_at) = 'string'
+                    THEN jsonb_build_object('outcomeAt', prior.outcome_at)
+                    ELSE '{}'::jsonb END
+           END
+           ORDER BY incoming.position)
+         FROM jsonb_array_elements(excluded.findings) WITH ORDINALITY AS incoming(finding, position)
+         LEFT JOIN LATERAL (
+           SELECT retained.stored->>'outcome' AS outcome, retained.stored->'outcomeAt' AS outcome_at
+           FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(reviews.findings) = 'array' THEN reviews.findings ELSE '[]'::jsonb END
+           ) WITH ORDINALITY AS retained(stored, position)
+           WHERE retained.stored->>'fingerprint' = incoming.finding->>'fingerprint'
+             AND retained.stored->>'outcome' IN ('dismissed', 'ignored')
+           ORDER BY retained.position DESC
+           LIMIT 1
+         ) prior ON true
+       ), '[]'::jsonb)`;
+
+/**
  * Writes back findings whose derived outcome changed. Unlike the feedback update it leaves
  * `feedback_total` alone: an outcome is not an engagement, and the row lock taken by
  * `REVIEW_FEEDBACK_LOCK_SQL` in the same transaction serialises it against concurrent writers.
@@ -1906,6 +2004,29 @@ export interface Store {
     issuanceKey: string,
     leaseId: string
   ): Promise<boolean>;
+  /** Upserts the draft opened from `branch`; a redelivered command converges on one record. */
+  saveRemediationDraft(record: RemediationDraftRecord): Promise<void>;
+  getRemediationDraft(
+    repositoryId: number,
+    branch: string
+  ): Promise<RemediationDraftRecord | undefined>;
+  /** Drafts opened from one source pull request, by branch, at most `limit`. */
+  listRemediationDrafts(
+    repositoryId: number,
+    sourcePullNumber: number,
+    limit?: number
+  ): Promise<RemediationDraftRecord[]>;
+  /**
+   * Records the settled checks state, only while the record still names `headSha`. Returns false
+   * when the record is gone, names another head, or already holds that state.
+   */
+  setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean>;
+  deleteRemediationDraft(repositoryId: number, branch: string, headSha: string): Promise<boolean>;
   getSuccessfulDeploymentEvidence(
     repositoryId: number,
     environment: string,
@@ -2077,6 +2198,24 @@ function iso(value: Date): string {
   return value.toISOString();
 }
 
+function toRemediationDraft(row: any): RemediationDraftRecord {
+  return {
+    repositoryId: Number(row.repository_id),
+    branch: row.branch,
+    sourcePullNumber: Number(row.source_pull_number),
+    draftPullNumber: Number(row.draft_pull_number),
+    targetRef: row.target_ref,
+    fingerprint: row.fingerprint,
+    baseHeadSha: row.base_head_sha,
+    headSha: row.head_sha,
+    commitCreatedByApp: row.commit_created_by_app === true,
+    linkCommentId: Number(row.link_comment_id),
+    checks: row.checks,
+    secondValidation: row.second_validation,
+    createdAt: fromUnknownDate(row.created_at) ?? ""
+  };
+}
+
 function fromUnknownDate(value: unknown): string | undefined {
   if (!value) return undefined;
   const date = value instanceof Date ? value : new Date(String(value));
@@ -2108,6 +2247,7 @@ export class MemoryStore implements Store {
   private monitoringWeeklyReports = new Map<string, MonitoringWeeklyReportRecord>();
   private dastSessionIssuances = new Map<string, DastSessionIssuanceRecord>();
   private deploymentPromotions = new Map<string, DeploymentPromotionClaim>();
+  private remediationDrafts = new Map<string, RemediationDraftRecord>();
   private onboardingIssueLocks = new Set<number>();
   private onboardingIssueLockWaiters = new Map<number, Array<() => void>>();
   private monitoringLockHeld = false;
@@ -2573,7 +2713,8 @@ export class MemoryStore implements Store {
     if (fence && !this.holdsWebhookLease(fence)) return false;
     this.reviews.set(key, {
       ...state,
-      findings: normalizeReviewFindings(state.findings),
+      // Mirrors the PostgreSQL merge: an outcome recorded after the writer read the row survives.
+      findings: carryRecordedOutcomes(normalizeReviewFindings(state.findings), current?.findings),
       findingsSchemaVersion: state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
       // `findingsEvictedTotal` is an increment on write, matching the server-authoritative
       // PostgreSQL counter, so the two implementations cannot disagree on a lifetime total.
@@ -3016,6 +3157,45 @@ export class MemoryStore implements Store {
       return false;
     }
     return this.dastSessionIssuances.delete(issuanceKey);
+  }
+
+  async saveRemediationDraft(record: RemediationDraftRecord): Promise<void> {
+    this.remediationDrafts.set(`${record.repositoryId}:${record.branch}`, { ...record });
+  }
+
+  async getRemediationDraft(repositoryId: number, branch: string) {
+    const record = this.remediationDrafts.get(`${repositoryId}:${branch}`);
+    return record ? { ...record } : undefined;
+  }
+
+  async listRemediationDrafts(repositoryId: number, sourcePullNumber: number, limit = 20) {
+    return [...this.remediationDrafts.values()]
+      .filter(
+        (record) =>
+          record.repositoryId === repositoryId && record.sourcePullNumber === sourcePullNumber
+      )
+      .sort((left, right) => (left.branch < right.branch ? -1 : left.branch > right.branch ? 1 : 0))
+      .slice(0, limit)
+      .map((record) => ({ ...record }));
+  }
+
+  async setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean> {
+    const key = `${repositoryId}:${branch}`;
+    const record = this.remediationDrafts.get(key);
+    if (!record || record.headSha !== headSha || record.checks === checks) return false;
+    this.remediationDrafts.set(key, { ...record, checks });
+    return true;
+  }
+
+  async deleteRemediationDraft(repositoryId: number, branch: string, headSha: string) {
+    const key = `${repositoryId}:${branch}`;
+    if (this.remediationDrafts.get(key)?.headSha !== headSha) return false;
+    return this.remediationDrafts.delete(key);
   }
 
   async getSuccessfulDeploymentEvidence(
@@ -4346,6 +4526,26 @@ export class PostgresStore implements Store {
       CREATE INDEX IF NOT EXISTS dast_session_issuances_repository_idx
         ON dast_session_issuances (repository_id, run_id DESC, run_attempt DESC);
 
+      CREATE TABLE IF NOT EXISTS remediation_drafts (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        branch TEXT NOT NULL,
+        source_pull_number INTEGER NOT NULL,
+        draft_pull_number INTEGER NOT NULL,
+        target_ref TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        base_head_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        commit_created_by_app BOOLEAN NOT NULL,
+        link_comment_id BIGINT NOT NULL,
+        checks TEXT NOT NULL DEFAULT 'pending' CHECK (checks IN ('pending', 'passed', 'failed')),
+        second_validation TEXT NOT NULL CHECK (second_validation IN ('accepted', 'not-configured')),
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, branch)
+      );
+      CREATE INDEX IF NOT EXISTS remediation_drafts_source_idx
+        ON remediation_drafts (repository_id, source_pull_number, branch);
+
       CREATE TABLE IF NOT EXISTS deployment_promotions (
         deployment_key TEXT PRIMARY KEY,
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -4975,7 +5175,10 @@ export class PostgresStore implements Store {
        head_sha=excluded.head_sha,
        reviewed_head_sha=excluded.reviewed_head_sha,
        placeholder_comment_id=excluded.placeholder_comment_id,
-       findings=excluded.findings,
+       -- The writer computed its findings from a read that may predate a dismissal or merge
+       -- outcome. ON CONFLICT holds the row lock and evaluates this against the latest committed
+       -- row, so the outcome is carried here, atomically, rather than lost (carryRecordedOutcomes).
+       findings=${REVIEW_FINDINGS_OUTCOME_MERGE_SQL},
        findings_schema_version=excluded.findings_schema_version,
        -- Server-authoritative lifetime counter: the caller supplies only this write's increment,
        -- so a writer that did not read the existing row cannot reset the accumulated total. The
@@ -5686,6 +5889,85 @@ export class PostgresStore implements Store {
          AND lease_id=$2
          AND status='leased'`,
       [issuanceKey, leaseId]
+    );
+    return result.rowCount === 1;
+  }
+
+  async saveRemediationDraft(record: RemediationDraftRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO remediation_drafts
+         (repository_id, branch, source_pull_number, draft_pull_number, target_ref, fingerprint,
+          base_head_sha, head_sha, commit_created_by_app, link_comment_id, checks,
+          second_validation, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (repository_id, branch) DO UPDATE SET
+         source_pull_number=excluded.source_pull_number,
+         draft_pull_number=excluded.draft_pull_number,
+         target_ref=excluded.target_ref,
+         fingerprint=excluded.fingerprint,
+         base_head_sha=excluded.base_head_sha,
+         head_sha=excluded.head_sha,
+         commit_created_by_app=excluded.commit_created_by_app,
+         link_comment_id=excluded.link_comment_id,
+         checks=excluded.checks,
+         second_validation=excluded.second_validation,
+         created_at=excluded.created_at,
+         updated_at=now()`,
+      [
+        record.repositoryId,
+        record.branch,
+        record.sourcePullNumber,
+        record.draftPullNumber,
+        record.targetRef,
+        record.fingerprint,
+        record.baseHeadSha,
+        record.headSha,
+        record.commitCreatedByApp,
+        record.linkCommentId,
+        record.checks,
+        record.secondValidation,
+        record.createdAt
+      ]
+    );
+  }
+
+  async getRemediationDraft(repositoryId: number, branch: string) {
+    const result = await this.pool.query(
+      `SELECT * FROM remediation_drafts WHERE repository_id=$1 AND branch=$2`,
+      [repositoryId, branch]
+    );
+    return result.rows[0] ? toRemediationDraft(result.rows[0]) : undefined;
+  }
+
+  async listRemediationDrafts(repositoryId: number, sourcePullNumber: number, limit = 20) {
+    const result = await this.pool.query(
+      `SELECT * FROM remediation_drafts
+       WHERE repository_id=$1 AND source_pull_number=$2
+       ORDER BY branch COLLATE "C"
+       LIMIT $3`,
+      [repositoryId, sourcePullNumber, limit]
+    );
+    return result.rows.map(toRemediationDraft);
+  }
+
+  async setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE remediation_drafts SET checks=$4, updated_at=now()
+       WHERE repository_id=$1 AND branch=$2 AND head_sha=$3 AND checks<>$4`,
+      [repositoryId, branch, headSha, checks]
+    );
+    return result.rowCount === 1;
+  }
+
+  async deleteRemediationDraft(repositoryId: number, branch: string, headSha: string) {
+    const result = await this.pool.query(
+      `DELETE FROM remediation_drafts WHERE repository_id=$1 AND branch=$2 AND head_sha=$3`,
+      [repositoryId, branch, headSha]
     );
     return result.rowCount === 1;
   }

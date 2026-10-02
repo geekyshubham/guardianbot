@@ -1,12 +1,16 @@
 import type {
   BackendCapabilities,
   BackendRegistryEntry,
+  RemediationValidationRequest,
+  RemediationValidationResult,
   ReviewRequest,
   ReviewResult
 } from "./types.js";
 import {
   ProtocolValidationError,
   validateBackendCapabilities,
+  validateRemediationValidationRequest,
+  validateRemediationValidationResult,
   validateReviewResult
 } from "./validator.js";
 
@@ -101,6 +105,45 @@ export class GuardianReviewClient {
     } catch (error) {
       if (error instanceof ProtocolValidationError) {
         throw new BackendError("invalid_output", error.message, true);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Asks a second model to veto a Mode C draft. Every failure surfaces as a BackendError (or the
+   * caller's AbortError), which the control plane treats exactly like a `reject`.
+   */
+  async validateRemediation(
+    request: RemediationValidationRequest,
+    signal?: AbortSignal
+  ): Promise<RemediationValidationResult> {
+    validateRemediationValidationRequest(request);
+    let response: Response;
+    try {
+      response = await this.fetch(
+        "/v1/remediation-validations",
+        { method: "POST", body: JSON.stringify(request) },
+        signal
+      );
+    } catch (error) {
+      if (error instanceof BackendError) throw error;
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      throw new BackendError("unavailable", String(error), true);
+    }
+    let body: unknown;
+    try {
+      body = await readJsonResponseLimited(response, 16 * 1024);
+    } catch (error) {
+      if (error instanceof BackendError) throw error;
+      if (signal?.aborted && error instanceof Error && error.name === "AbortError") throw error;
+      throw new BackendError("invalid_output", "Backend returned invalid JSON", false);
+    }
+    try {
+      return validateRemediationValidationResult(body, request);
+    } catch (error) {
+      if (error instanceof ProtocolValidationError) {
+        throw new BackendError("invalid_output", error.message, false);
       }
       throw error;
     }

@@ -41,9 +41,20 @@ reusable workflow commits remain immutable.
 - Findings lifecycle `findings-capacity` monitoring check: failing when the
   record bound dropped an open Critical or High finding, warning on any other
   drop or on marker issues this App did not open. Automated tests only.
+- Mode C draft check status: the link comment moves from pending to passed or
+  failed from `workflow_run` events at GuardianBot's own draft commit. Draft
+  branches are deleted on close only while their tip is still GuardianBot's
+  commit. Automated tests only; no live evidence.
+- Optional veto-only second-model validator for Mode C drafts
+  (`guardian.remediation-validation.v1`, `GUARDIANBOT_REMEDIATION_VALIDATOR_*`,
+  off by default). `guardian.review.v1` is unchanged. Automated tests only.
 
 ### Security
 
+- Mode C draft titles are built from trusted fields only (enum category,
+  fingerprint hex, sanitized path), never the model-written finding title.
+- A review save carries `dismissed` and `ignored` outcomes recorded while the
+  review ran, atomically in both stores, closing the outcome-carry race.
 - Finding ticket marker recovery trusts only issues opened by this GitHub App
   (`performed_via_github_app.id` or the App's `<slug>[bot]` login, verified
   against `GET /app`), not any Bot-authored issue.

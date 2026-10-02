@@ -1365,3 +1365,176 @@ test("parity: review state, feedback, outcomes and activity round trip", { skip 
     [1]
   );
 });
+
+test("parity: a stale review write carries outcomes recorded after its read", { skip }, async () => {
+  const observed = await parity(async (store) => {
+    await store.upsertRepository(repository(60));
+    const head = "d".repeat(40);
+    const finding = (fingerprint: string, extra: Record<string, unknown> = {}) => ({
+      fingerprint,
+      state: "open" as const,
+      firstSeenHeadSha: head,
+      lastSeenHeadSha: head,
+      firstSeenAt: "2026-08-01T10:00:00.000Z",
+      lastSeenAt: "2026-08-01T10:00:00.000Z",
+      transitions: 0,
+      reappearances: 0,
+      ...extra
+    });
+    await store.saveReview(
+      {
+        repositoryId: 60,
+        pullNumber: 7,
+        headSha: head,
+        findings: [finding("fp-a"), finding("fp-b"), finding("fp-c", { outcome: "fixed" })]
+      },
+      head
+    );
+    // A review reads the row here, then a human dismisses fp-a and the PR merges (ignored).
+    const staleRead = (await store.getReview(60, 7))!.findings;
+    const dismissed = await store.recordFindingOutcome({
+      repositoryId: 60,
+      pullNumber: 7,
+      outcome: "dismissed",
+      fingerprint: "fp-a",
+      observedAt: new Date("2026-08-01T11:00:00.000Z")
+    });
+    const ignored = await store.recordFindingOutcome({
+      repositoryId: 60,
+      pullNumber: 7,
+      outcome: "ignored",
+      observedAt: new Date("2026-08-01T12:00:00.000Z")
+    });
+    // The stale write omits both outcomes and adds a new finding.
+    const written = await store.saveReview(
+      {
+        repositoryId: 60,
+        pullNumber: 7,
+        headSha: head,
+        findings: [...staleRead, finding("fp-d")]
+      },
+      head
+    );
+    const after = (await store.getReview(60, 7))!.findings.map((item) => ({
+      fingerprint: item.fingerprint,
+      outcome: item.outcome ?? null,
+      outcomeAt: item.outcomeAt ?? null
+    }));
+    const emptied = await store.saveReview(
+      { repositoryId: 60, pullNumber: 7, headSha: head, findings: [] },
+      head
+    );
+    const emptyFindings = (await store.getReview(60, 7))!.findings;
+    return { dismissed, ignored, written, after, emptied, emptyFindings };
+  });
+
+  assert.equal(observed.dismissed, 1);
+  assert.equal(observed.ignored, 1);
+  assert.equal(observed.written, true);
+  assert.deepEqual(observed.after, [
+    { fingerprint: "fp-a", outcome: "dismissed", outcomeAt: "2026-08-01T11:00:00.000Z" },
+    { fingerprint: "fp-b", outcome: "ignored", outcomeAt: "2026-08-01T12:00:00.000Z" },
+    { fingerprint: "fp-c", outcome: "fixed", outcomeAt: null },
+    { fingerprint: "fp-d", outcome: null, outcomeAt: null }
+  ]);
+  assert.equal(observed.emptied, true);
+  assert.deepEqual(observed.emptyFindings, []);
+});
+
+test("parity: remediation draft records upsert, list, settle checks and delete by head", { skip }, async () => {
+  const observed = await parity(async (store) => {
+    await store.upsertRepository(repository(61));
+    await store.upsertRepository(repository(62));
+    const draft = (branch: string, overrides: Record<string, unknown> = {}) => ({
+      repositoryId: 61,
+      branch,
+      sourcePullNumber: 4,
+      draftPullNumber: 501,
+      targetRef: "feature/harden",
+      fingerprint: "f".repeat(64),
+      baseHeadSha: "1".repeat(40),
+      headSha: "2".repeat(40),
+      commitCreatedByApp: true,
+      linkCommentId: 7001,
+      checks: "pending" as const,
+      secondValidation: "not-configured" as const,
+      createdAt: "2026-08-01T10:00:00.000Z",
+      ...overrides
+    });
+    await store.saveRemediationDraft(draft("guardianbot/fix/bbbbbbbbbbbb-1111111"));
+    await store.saveRemediationDraft(draft("guardianbot/fix/aaaaaaaaaaaa-1111111"));
+    await store.saveRemediationDraft(
+      draft("guardianbot/fix/aaaaaaaaaaaa-1111111", { draftPullNumber: 502, commitCreatedByApp: false })
+    );
+    await store.saveRemediationDraft(draft("guardianbot/fix/cccccccccccc-1111111", { sourcePullNumber: 5 }));
+    await store.saveRemediationDraft({ ...draft("guardianbot/fix/aaaaaaaaaaaa-1111111"), repositoryId: 62 });
+    const listed = (await store.listRemediationDrafts(61, 4)).map((record) => [
+      record.branch,
+      record.draftPullNumber,
+      record.commitCreatedByApp
+    ]);
+    const bounded = (await store.listRemediationDrafts(61, 4, 1)).map((record) => record.branch);
+    const wrongHead = await store.setRemediationDraftChecks(
+      61,
+      "guardianbot/fix/bbbbbbbbbbbb-1111111",
+      "3".repeat(40),
+      "passed"
+    );
+    const settled = await store.setRemediationDraftChecks(
+      61,
+      "guardianbot/fix/bbbbbbbbbbbb-1111111",
+      "2".repeat(40),
+      "failed"
+    );
+    const repeated = await store.setRemediationDraftChecks(
+      61,
+      "guardianbot/fix/bbbbbbbbbbbb-1111111",
+      "2".repeat(40),
+      "failed"
+    );
+    const record = await store.getRemediationDraft(61, "guardianbot/fix/bbbbbbbbbbbb-1111111");
+    const missing = await store.getRemediationDraft(61, "guardianbot/fix/none");
+    const staleDelete = await store.deleteRemediationDraft(
+      61,
+      "guardianbot/fix/bbbbbbbbbbbb-1111111",
+      "3".repeat(40)
+    );
+    const deleted = await store.deleteRemediationDraft(
+      61,
+      "guardianbot/fix/bbbbbbbbbbbb-1111111",
+      "2".repeat(40)
+    );
+    const remaining = (await store.listRemediationDrafts(61, 4)).map((item) => item.branch);
+    const otherRepository = (await store.listRemediationDrafts(62, 4)).length;
+    return {
+      listed,
+      bounded,
+      wrongHead,
+      settled,
+      repeated,
+      record,
+      missing,
+      staleDelete,
+      deleted,
+      remaining,
+      otherRepository
+    };
+  });
+
+  assert.deepEqual(observed.listed, [
+    ["guardianbot/fix/aaaaaaaaaaaa-1111111", 502, false],
+    ["guardianbot/fix/bbbbbbbbbbbb-1111111", 501, true]
+  ]);
+  assert.deepEqual(observed.bounded, ["guardianbot/fix/aaaaaaaaaaaa-1111111"]);
+  assert.equal(observed.wrongHead, false);
+  assert.equal(observed.settled, true);
+  assert.equal(observed.repeated, false);
+  assert.equal(observed.record.checks, "failed");
+  assert.equal(observed.record.createdAt, "2026-08-01T10:00:00.000Z");
+  assert.equal(observed.record.targetRef, "feature/harden");
+  assert.equal("missing" in observed, false);
+  assert.equal(observed.staleDelete, false);
+  assert.equal(observed.deleted, true);
+  assert.deepEqual(observed.remaining, ["guardianbot/fix/aaaaaaaaaaaa-1111111"]);
+  assert.equal(observed.otherRepository, 1);
+});

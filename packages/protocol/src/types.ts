@@ -167,3 +167,45 @@ export interface ReviewProfileRoute {
   retryCount: 0 | 1;
   fallbackBackendId?: string;
 }
+
+/**
+ * Mode C second-model validation. A separate, versioned contract so `guardian.review.v1` stays
+ * frozen. The validator can only veto: an `accept` lets the deterministic result stand, and any
+ * `reject`, error, timeout or malformed answer means no draft is written. Reasons are closed
+ * codes rather than prose so no model text reaches a pull request.
+ */
+export const REMEDIATION_VALIDATION_PROTOCOL_VERSION = "guardian.remediation-validation.v1" as const;
+
+export type RemediationValidationReason =
+  | "does-not-address-finding"
+  | "changes-unrelated-behavior"
+  | "introduces-vulnerability"
+  | "likely-syntax-error"
+  | "insufficient-context";
+
+export interface RemediationValidationRequest {
+  protocolVersion: typeof REMEDIATION_VALIDATION_PROTOCOL_VERSION;
+  requestId: string;
+  classification: DataClassification;
+  finding: {
+    fingerprint: string;
+    category?: FindingCategory;
+    severity?: "P0" | "P1" | "P2" | "P3";
+    path: string;
+    startLine: number;
+    endLine: number;
+  };
+  /** The exact lines the draft replaces, then the replacement, then bounded surrounding lines. */
+  original: string;
+  replacement: string;
+  contextBefore: string;
+  contextAfter: string;
+}
+
+export interface RemediationValidationResult {
+  protocolVersion: typeof REMEDIATION_VALIDATION_PROTOCOL_VERSION;
+  requestId: string;
+  decision: "accept" | "reject";
+  reasons: RemediationValidationReason[];
+  backend: { backendId: string; modelId: string; latencyMs: number };
+}

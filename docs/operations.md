@@ -421,12 +421,20 @@ from `GET /app` and must match `GITHUB_APP_ID`. See the
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `GUARDIANBOT_REMEDIATION_DRAFTS` | unset (off) | `1` enables `@guardianbot draft-fix`; any other value leaves it off |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_URL` | unset (no second model) | Optional veto-only `guardian.remediation-validation.v1` endpoint. HTTPS, or HTTP on loopback; no credentials, query, or fragment |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TOKEN` | unset | Bearer token; required unless the URL is loopback |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_CLASSIFICATIONS` | required with the URL | Comma list of `public`, `private`, `restricted` the validator may receive; others refuse the draft |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TIMEOUT_MS` | `30000` | Integer from 1000 to 120000 |
 
 The flag is necessary but not sufficient: the installation must also have
 accepted `Contents: Read and write`, which the default manifest does not
 grant. See [remediation drafts](remediation-drafts.md) and
 [the optional App permission](github-app.md#optional-mode-c-permission).
-Draft branches named `guardianbot/fix/*` are not deleted automatically.
+These are control-plane settings only and never belong in a consumer
+repository. A set but malformed validator configuration fails startup. Draft
+branches named `guardianbot/fix/*` are deleted on close only while their tip
+is still GuardianBot's own commit; see
+[branch cleanup](remediation-drafts.md#branch-cleanup).
 
 ## First live AI review checklist
 
