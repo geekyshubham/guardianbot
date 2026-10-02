@@ -58,7 +58,8 @@ Production-like setup starts with [getting started](docs/getting-started.md).
 See [what is verified](docs/status.md), [how it works](docs/how-it-works.md),
 [configuration](docs/repository-configuration.md), the
 [release gate](docs/release-gate.md), the
-[findings lifecycle](docs/findings-lifecycle.md), and the
+[findings lifecycle](docs/findings-lifecycle.md),
+[roadmap traceability](docs/roadmap-traceability.md), and the
 [security model](docs/security-model.md). GitHub App creation and least-
 privilege settings are documented in [docs/github-app.md](docs/github-app.md).
 Opt-in AI-drafted remediation pull requests are described in

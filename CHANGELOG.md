@@ -5,6 +5,46 @@ reusable workflow commits remain immutable.
 
 ## [Unreleased]
 
+### Added
+
+- Optional `scanners.releaseBranches` adds exact release branch names to
+  generated caller `pull_request` and `push` triggers. Callers without it are
+  byte-identical. `guardianctl doctor` gains a report-only
+  `release-branch-rules` check. Image promotion, DAST, baselines, and
+  monitoring stay default-branch only. Automated tests only; no live evidence.
+- Organization Semgrep severity map: each shipped rule carries
+  `guardianbot-severity`, and `gate.json` records `severitySource`. Only
+  policy-mapped Critical/High Semgrep findings block in enforce mode.
+  Fingerprints are unchanged. Automated tests only; no live evidence.
+- Nightly rescan of the exact deployed digest (`reusable-image-rescan.yml`,
+  `POST /image/rescan-target`) with a bounded CycloneDX SBOM diff,
+  `image-rescan:<env>` and `promotion-freeze:<env>` evidence, and
+  `image-rescan-coverage` / `image-promotion-freeze` monitoring checks. The
+  freeze is a signal only. Automated tests only; no live evidence.
+- Digest-scoped release gate (`reusable-release-gate.yml`,
+  `POST /release/gate`) backed by DefectDojo findings and named, unexpired
+  risk acceptances; fails closed as `gate-unavailable`. Optional DigitalOcean
+  profile flag `requireReleaseGate`. Automated tests only; no live evidence.
+- Findings lifecycle with SLA aging, ownership (`findings` config section,
+  CODEOWNERS fallback), and GitHub Issues, Jira, and Slack tickets, off unless
+  `GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED` is set. Adds `findings-sla` and
+  `findings-ticketing` monitoring checks and a weekly `findings` section.
+  Automated tests only; no live evidence.
+- Review value analytics (`fixed`, `dismissed`, `ignored`, precision) in the
+  weekly report, the `@guardianbot dismiss` command, and opt-in Mode C
+  `@guardianbot draft-fix` draft pull requests behind
+  `GUARDIANBOT_REMEDIATION_DRAFTS=1` and an optional `Contents: Read and
+  write` permission. Automated tests only; no live evidence.
+- [Roadmap traceability](docs/roadmap-traceability.md) maps each roadmap item
+  to code, tests, status, and the live evidence it still needs.
+
+### Changed
+
+- Enforcement readiness now requires default-branch `head_branch` on both the
+  source and observation runs, and ruleset pagination is capped at 10 pages.
+- Deployed-digest rescans do not feed the findings lifecycle, so they cannot
+  open or fix `trivy-image` records.
+
 ## [0.2.41] - 2026-08-02
 
 ### Added
