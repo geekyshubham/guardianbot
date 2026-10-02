@@ -49,10 +49,22 @@ const CI_FILES = new Set([
   "bitbucket-pipelines.yml",
   "appveyor.yml",
   ".drone.yml",
-  "codeowners"
+  "codeowners",
+  // Repository plumbing that changes how git or local hooks treat other files.
+  ".gitattributes",
+  ".gitmodules",
+  ".pre-commit-config.yaml"
 ]);
 
-const CI_DIRECTORIES = [".github/", ".guardianbot/", ".circleci/", ".buildkite/", ".gitlab/", ".azure-pipelines/"];
+const CI_DIRECTORIES = [
+  ".github/",
+  ".guardianbot/",
+  ".circleci/",
+  ".buildkite/",
+  ".gitlab/",
+  ".azure-pipelines/",
+  ".husky/"
+];
 
 const BINARY_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "psd",
@@ -84,7 +96,7 @@ export const REMEDIATION_REJECTION_TEXT: Record<RemediationRejection, string> = 
   "invalid-path": "the finding path is not a normalized repository path",
   "forbidden-path":
     "the finding path is protected (workflow, CI, GuardianBot configuration, CODEOWNERS, or a lockfile)",
-  "binary-file": "the target file is binary",
+  "binary-file": "the target file is binary or not a plain file",
   "finding-not-open": "the finding is not open",
   "finding-dismissed": "the finding was dismissed",
   "stale-head": "the finding was not validated at the current pull request head",

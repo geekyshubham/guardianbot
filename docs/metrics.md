@@ -45,16 +45,23 @@ rather than replacing it:
 - `fixed`: on a verified incremental review, the finding was open, the
   incremental diff the model received rewrote or deleted at least one of its
   lines, and the model then stopped reporting it. A finding that disappears
-  because its file was left out of the bounded bundle, or because the
+  because its file was left out of the bounded bundle, because its patch was
+  truncated before the model saw it, because the model declared the review
+  partial or the incremental comparison was partial, or because the
   incremental base could not be verified, records nothing. If the finding
   later returns, the `fixed` outcome is withdrawn.
-- `dismissed`: a repository writer ran `@guardianbot dismiss <id>`. This is
+- `dismissed`: a human repository writer ran `@guardianbot dismiss <id>`
+  (comments from bot accounts are ignored). It replaces a derived `fixed`. This is
   the explicit negative signal. Thumbs-down reactions are not used because no
   subscribed event delivers them, and reply text is not used because it is
   dropped before storage.
 - `ignored`: still open with no outcome when the pull request merged
   (`pull_request` `closed` with `merged: true`). Closing without merging
   records nothing.
+
+A review rewrites its retained findings whole, so it re-reads the row just
+before writing and carries any `dismissed` or `ignored` recorded meanwhile. The
+window between that re-read and the write is narrowed, not eliminated.
 
 Reviewer identity and reviewer text are never stored for any of these.
 
@@ -75,7 +82,7 @@ timestamps, so a row touched for another reason does not recount old outcomes:
 
 | Value | Meaning |
 | --- | --- |
-| `unavailable` | No retained review rows were read for any repository this week |
+| `unavailable` | No retained finding was first seen, last seen, or given an outcome this week in any repository |
 | `retained-findings` | Every repository read succeeded and none was truncated |
 | `retained-findings-partial` | At least one repository read failed or hit the row cap |
 

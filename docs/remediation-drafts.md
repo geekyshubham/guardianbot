@@ -54,8 +54,11 @@ closed with a fixed reason in the reply.
 - The path is a normalized repository path and is not protected. Protected
   paths include `.github/**`, `.guardianbot/**`, other CI directories and
   files (`.circleci/`, `.gitlab-ci.yml`, `Jenkinsfile`, and similar),
-  `CODEOWNERS` anywhere, and lockfiles. The file is not binary by extension or
-  content and decodes losslessly as UTF-8 without CRLF line endings.
+  `CODEOWNERS` anywhere, repository plumbing (`.gitattributes`, `.gitmodules`,
+  `.pre-commit-config.yaml`, `.husky/**`), and lockfiles. The file is not
+  binary by extension or content and decodes losslessly as UTF-8 without CRLF
+  line endings. It must be a plain file: GitHub answers a symlink with its
+  target's path, and any path mismatch is refused.
 - The finding's whole line range lies inside one added-line range of this pull
   request's diff for that file.
 - Size bounds: at most 50 replaced lines, at most 200 suggestion lines and
@@ -73,14 +76,20 @@ deterministic only.
 When validation passes, GuardianBot:
 
 1. creates `guardianbot/fix/<fingerprint-12>-<head-7>` at the pull request's
-   head SHA. A redelivered command finds the same branch. An existing branch is
-   reused only when it is at the head or exactly one commit ahead of it;
-   anything else is refused;
+   head SHA. A redelivered command finds the same branch. Any writer can push
+   to that branch, so an existing branch is reused only when it is at the head,
+   or when it is exactly one commit ahead of the head and that commit modifies
+   only the validated file and leaves it holding exactly the validated content.
+   Anything else is refused;
 2. commits the single-file change to that branch through the contents API,
    pinned to the file's blob SHA at the head;
 3. opens a DRAFT pull request from that branch into the original pull
    request's head branch, with a fixed body stating it is AI-drafted and
-   requires human review and approval;
+   requires human review and approval. If GitHub refuses the draft, an open
+   pull request from the branch is linked only when it is a draft into that
+   same head branch; a writer's non-draft pull request or one into another
+   base is never presented as GuardianBot's, and the command replies with a
+   refusal instead;
 4. adds the `guardianbot-ai-draft` label (a failed label does not hide the
    link, because the body already says the same);
 5. replies on the original pull request with the draft number and an explicit

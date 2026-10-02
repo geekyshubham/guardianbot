@@ -42,7 +42,7 @@ import {
   validateRemediationDraft,
   type RemediationRejection
 } from "./remediation-draft.js";
-import { markFixedOutcomes } from "./review-value.js";
+import { carryRecordedOutcomes, markFixedOutcomes } from "./review-value.js";
 import {
   exactSuggestion,
   extractFindingMarker,
@@ -1213,10 +1213,26 @@ export class GuardianService {
     // `fixed` is derived only from a verified incremental review, and only against the diff files
     // the model actually received, so a finding that vanished because its file was omitted from
     // the bounded bundle, or because the base could not be verified, records no outcome at all.
-    const outcomes = fileScope.incremental
-      ? markFixedOutcomes(existing?.findings, lifecycle.findings, includedDiffFiles, now)
-      : { findings: lifecycle.findings, fixed: 0 };
-    const findingStates = outcomes.findings;
+    // A patch the model saw only a truncated prefix of cannot prove the model looked at the
+    // rewritten lines, and a review the model itself declared partial, or whose incremental
+    // comparison hit GitHub's file ceiling, cannot prove a finding stopped being reported. Both
+    // record nothing rather than a weaker `fixed`.
+    const truncatedForModel = new Set(preTruncatedPaths);
+    const outcomes =
+      fileScope.incremental && !fileScope.partialReason && !result.summary.partialReview
+        ? markFixedOutcomes(
+            existing?.findings,
+            lifecycle.findings,
+            includedDiffFiles.filter((file) => !truncatedForModel.has(file.filename)),
+            now
+          )
+        : { findings: lifecycle.findings, fixed: 0 };
+    // The column is overwritten whole, so a dismissal or merge outcome recorded while the model
+    // call was in flight is re-read and carried rather than silently dropped.
+    const findingStates = carryRecordedOutcomes(
+      outcomes.findings,
+      (await this.store.getReview(event.repository.id, pull.number))?.findings
+    );
     const reappeared = countReappearances(existing?.findings, findingStates);
     if (reappeared) {
       this.metrics.increment("finding_reappeared_total", reappeared);
@@ -1244,7 +1260,11 @@ export class GuardianService {
       this.metrics.increment("review_stale_total");
       return;
     }
-    if (outcomes.fixed) this.metrics.increment("finding_outcome_fixed_total", outcomes.fixed);
+    // Counted after the carry, so a fixed outcome a concurrent dismissal replaced is not counted.
+    const fixedNow = findingStates.filter(
+      (finding) => finding.outcome === "fixed" && finding.outcomeAt === now.toISOString()
+    ).length;
+    if (fixedNow) this.metrics.increment("finding_outcome_fixed_total", fixedNow);
 
     const publishedComments = await this.listReviewComments(
       github,
@@ -1395,8 +1415,10 @@ export class GuardianService {
     const actor = String(event.comment.user?.login ?? "");
     // A bot can never trigger a write to the repository, whatever permission its identity holds:
     // that would let one automation chain another into opening pull requests unattended.
+    // `dismiss` is the human negative signal review-value precision is computed from, so an
+    // automation must not be able to cast it either.
     if (
-      command === "draft-fix" &&
+      (command === "draft-fix" || command === "dismiss") &&
       (actor.endsWith(BOT_LOGIN_SUFFIX) || event.comment.user?.type === "Bot")
     ) {
       return;
@@ -1824,7 +1846,14 @@ export class GuardianService {
     if (!branch.startsWith(REMEDIATION_BRANCH_PREFIX) || branch === headRef) {
       throw new Error("remediation branch name failed its invariant");
     }
-    const commitNeeded = await this.prepareRemediationBranch(github, owner, repo, branch, pull.head.sha);
+    const commitNeeded = await this.prepareRemediationBranch(
+      github,
+      owner,
+      repo,
+      branch,
+      pull.head.sha,
+      validation
+    );
     if (commitNeeded === "conflict") {
       await this.rejectDraft(
         github,
@@ -1859,6 +1888,17 @@ export class GuardianService {
         headSha: pull.head.sha
       })
     });
+    if (!draft) {
+      await this.rejectDraft(
+        github,
+        owner,
+        repo,
+        issueNumber,
+        `No remediation draft was created for \`${safeInline(argument)}\`: GitHub did not open a draft pull request from \`${branch}\` into \`${safeInline(headRef)}\`, and no existing GuardianBot draft from that branch could be reused.`,
+        "remediation_draft_rejected_total"
+      );
+      return;
+    }
     try {
       await github.request("POST", `/repos/${owner}/${repo}/issues/${draft.number}/labels`, {
         labels: [REMEDIATION_DRAFT_LABEL]
@@ -1884,7 +1924,7 @@ export class GuardianService {
     path: string,
     ref: string
   ): Promise<{ content: string; sha: string; bytes: number } | undefined> {
-    let result: { type?: string; encoding?: string; content?: string; sha?: string };
+    let result: { type?: string; path?: string; encoding?: string; content?: string; sha?: string };
     try {
       result = await github.request(
         "GET",
@@ -1894,8 +1934,11 @@ export class GuardianService {
       if (String(error).includes("returned 404")) return undefined;
       throw error;
     }
+    // A symlink to a regular file is answered with the target's content and the target's path,
+    // so a path mismatch means the requested path is not itself a plain file and is refused.
     if (
       result.type !== "file" ||
+      result.path !== path ||
       result.encoding !== "base64" ||
       typeof result.content !== "string" ||
       typeof result.sha !== "string"
@@ -1912,13 +1955,19 @@ export class GuardianService {
   /**
    * Creates the draft branch at the head, or recognises one a previous attempt of this same
    * command already created. Returns whether the remediation commit still needs to be written.
+   *
+   * Anyone with write access can push to a `guardianbot/fix/*` branch, so an existing branch is
+   * reused only when its single commit over the head touches exactly the validated file and that
+   * file now holds exactly the validated content. Anything else is a conflict: GuardianBot must
+   * never open a draft whose body vouches for content its validator did not produce.
    */
   private async prepareRemediationBranch(
     github: GitHubClientLike,
     owner: string,
     repo: string,
     branch: string,
-    headSha: string
+    headSha: string,
+    expected: { path: string; content: string }
   ): Promise<boolean | "conflict"> {
     try {
       await github.request("POST", `/repos/${owner}/${repo}/git/refs`, {
@@ -1936,11 +1985,21 @@ export class GuardianService {
     const tip = existing.object?.sha;
     if (tip === headSha) return true;
     if (!tip) return "conflict";
-    const commit = await github.request<{ parents?: Array<{ sha?: string }> }>(
-      "GET",
-      `/repos/${owner}/${repo}/git/commits/${encodeURIComponent(tip)}`
-    );
-    return commit.parents?.length === 1 && commit.parents[0]?.sha === headSha ? false : "conflict";
+    const commit = await github.request<{
+      parents?: Array<{ sha?: string }>;
+      files?: Array<{ filename?: string; status?: string }>;
+    }>("GET", `/repos/${owner}/${repo}/commits/${encodeURIComponent(tip)}`);
+    if (
+      commit.parents?.length !== 1 ||
+      commit.parents[0]?.sha !== headSha ||
+      commit.files?.length !== 1 ||
+      commit.files[0]?.filename !== expected.path ||
+      commit.files[0]?.status !== "modified"
+    ) {
+      return "conflict";
+    }
+    const atTip = await this.getRemediationFile(github, owner, repo, expected.path, tip);
+    return atTip?.content === expected.content ? false : "conflict";
   }
 
   private async openRemediationPull(
@@ -1950,7 +2009,7 @@ export class GuardianService {
     branch: string,
     base: string,
     content: { title: string; body: string }
-  ): Promise<{ number: number; html_url?: string }> {
+  ): Promise<{ number: number; html_url?: string } | undefined> {
     try {
       return await github.request<{ number: number; html_url?: string }>(
         "POST",
@@ -1960,13 +2019,31 @@ export class GuardianService {
     } catch (error) {
       if (!String(error).includes("returned 422")) throw error;
     }
-    const open = await github.request<Array<{ number: number; html_url?: string }>>(
+    const open = await github.request<
+      Array<{
+        number: number;
+        html_url?: string;
+        draft?: boolean;
+        base?: { ref?: string };
+        head?: { ref?: string };
+      }>
+    >(
       "GET",
       `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`
     );
-    const existing = open[0];
-    if (!existing) throw new Error("GitHub POST pull request returned 422 without an existing draft");
-    return existing;
+    // GitHub answers 422 both for "already exists" and for "draft pull requests are not
+    // supported here"; with nothing to reuse this is a refusal, not a transient failure to retry.
+    if (!Array.isArray(open) || !open.length) return undefined;
+    // A writer can open their own pull request from this branch, possibly non-draft or into the
+    // default branch. Linking that as "GuardianBot's draft" would vouch for a pull request
+    // GuardianBot did not shape, so only a draft into the same head branch is reused.
+    const existing = open.find(
+      (candidate) =>
+        candidate.draft === true &&
+        candidate.base?.ref === base &&
+        candidate.head?.ref === branch
+    );
+    return existing ? { number: existing.number, html_url: existing.html_url } : undefined;
   }
 
   private hasReviewRoute(profile: ReviewProfile): boolean {
@@ -2250,7 +2327,11 @@ export class GuardianService {
       now,
       this.reviewFindingRetention
     );
-    const findings = lifecycle.findings;
+    // A dismissal or merge outcome recorded since `existing` was read is carried, not overwritten.
+    const findings = carryRecordedOutcomes(
+      lifecycle.findings,
+      (await this.store.getReview(repositoryId, pull.number))?.findings
+    );
     const saved = await this.store.saveReview(
       {
         repositoryId,
@@ -2312,7 +2393,11 @@ export class GuardianService {
       this.reviewFindingRetention,
       now
     );
-    const findings = lifecycle.findings;
+    // A dismissal or merge outcome recorded since `existing` was read is carried, not overwritten.
+    const findings = carryRecordedOutcomes(
+      lifecycle.findings,
+      (await this.store.getReview(repositoryId, pull.number))?.findings
+    );
     const saved = await this.store.saveReview(
       {
         repositoryId,

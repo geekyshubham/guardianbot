@@ -13,6 +13,7 @@ import {
   redactUntrustedText,
   selectReviewFindings
 } from "../src/service.js";
+import { remediationBranchName } from "../src/remediation-draft.js";
 import { MemoryStore } from "../src/store.js";
 
 class FakeGitHub {
@@ -45,6 +46,15 @@ class FakeGitHub {
   grantedPermissions?: Record<string, string>;
   repositoryWrites: Array<{ method: string; path: string; body: any }> = [];
   failRefCreation = false;
+  // Mode C reuse paths: the commit an existing draft branch points at, per-ref file contents,
+  // a pull-request creation that GitHub refuses, and the open pull requests it then lists.
+  commitDetails: Record<string, Record<string, any>> = {};
+  refContents: Record<string, Record<string, Buffer>> = {};
+  failPullCreation = false;
+  openPulls: Array<Record<string, any>> = [];
+  refTip?: string;
+  /** Path GitHub reports for a contents read, as it does for a symlink resolved to its target. */
+  symlinkTargets: Record<string, string> = {};
   failIssueCreations = 0;
   failConfigFileReads = 0;
   issueCreationDelayMs = 0;
@@ -126,7 +136,7 @@ class FakeGitHub {
       })) as T;
     }
     if (method === "GET" && /\/git\/ref\/heads\//.test(path)) {
-      return { object: { sha: this.options.refSha ?? "a".repeat(40) } } as T;
+      return { object: { sha: this.refTip ?? this.options.refSha ?? "a".repeat(40) } } as T;
     }
     if (method === "GET" && path.includes("/contents/")) {
       const encodedPath = path.split("/contents/")[1]?.split("?")[0];
@@ -149,10 +159,12 @@ class FakeGitHub {
           content: Buffer.from(this.options.codeowners, "utf8").toString("base64")
         } as T;
       }
-      const content = this.options.contents?.[repositoryPath];
+      const ref = new URLSearchParams(path.split("?")[1] ?? "").get("ref") ?? "";
+      const content = this.refContents[ref]?.[repositoryPath] ?? this.options.contents?.[repositoryPath];
       if (content) {
         return {
           type: "file",
+          path: this.symlinkTargets[repositoryPath] ?? repositoryPath,
           sha: `${repositoryPath}-sha`,
           size: content.length,
           encoding: "base64",
@@ -211,8 +223,18 @@ class FakeGitHub {
       this.repositoryWrites.push({ method, path, body });
       return { commit: { sha: "c".repeat(40) } } as T;
     }
+    if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
+      const sha = decodeURIComponent(path.split("/").at(-1) ?? "");
+      const commit = this.commitDetails[sha];
+      if (!commit) throw new Error(`GitHub GET ${path} returned 404: missing`);
+      return commit as T;
+    }
+    if (method === "GET" && /\/pulls\?state=open&head=/.test(path)) {
+      return this.openPulls as T;
+    }
     if (method === "POST" && /\/pulls$/.test(path)) {
       this.repositoryWrites.push({ method, path, body });
+      if (this.failPullCreation) throw new Error(`GitHub POST ${path} returned 422: exists`);
       return { number: 501, html_url: "https://example.test/pull/501" } as T;
     }
     if (method === "POST" && /\/issues\/\d+\/labels$/.test(path)) {
@@ -3957,6 +3979,142 @@ test("draft-fix refuses a stale head before any repository write", async () => {
   assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
 });
 
+const VALIDATED_DRAFT_FILE = DRAFT_FILE.split("\n")
+  .map((line, index) => (index === 9 ? "return safeValue;" : line))
+  .join("\n");
+
+async function draftReadyService() {
+  const context = await reviewWithSuggestion({ remediationDrafts: true });
+  context.github.grantedPermissions = { contents: "write" };
+  context.github.currentPulls = [sameRepositoryPull()];
+  const fingerprint = (await context.store.getReview(99, 12))?.findings[0]?.fingerprint ?? "";
+  return { ...context, branch: remediationBranchName(fingerprint, "head-sha") };
+}
+
+/** Points the existing draft branch at a commit over the head that changed `files` to `content`. */
+function existingDraftBranch(
+  github: FakeGitHub,
+  content: string,
+  files: Array<{ filename: string; status: string }> = [{ filename: "src/a.ts", status: "modified" }],
+  parents = [{ sha: "head-sha" }]
+) {
+  const tip = "b".repeat(40);
+  github.failRefCreation = true;
+  github.refTip = tip;
+  github.commitDetails[tip] = { sha: tip, parents, files };
+  github.refContents[tip] = { "src/a.ts": Buffer.from(content, "utf8") };
+}
+
+test("draft-fix refuses a symlinked target because GitHub reports the resolved path", async () => {
+  const { service, github } = await draftReadyService();
+  github.symlinkTargets["src/a.ts"] = "src/real.ts";
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /No remediation draft was created .*not a plain file/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+});
+
+test("draft-fix reuses an existing draft branch only when it holds exactly the validated change", async () => {
+  const { service, github } = await draftReadyService();
+  existingDraftBranch(github, VALIDATED_DRAFT_FILE);
+  await runCommand(service, "@guardianbot draft-fix F1");
+  // No contents write: the branch already carries the validated commit.
+  assert.deepEqual(
+    github.repositoryWrites.map((write) => `${write.method} ${write.path.split("/").slice(4).join("/")}`),
+    ["POST git/refs", "POST pulls", "POST issues/501/labels"]
+  );
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #501/);
+});
+
+test("draft-fix refuses an existing draft branch a writer pushed other content to", async () => {
+  const cases: Array<[string, Parameters<typeof existingDraftBranch>[2]?, Parameters<typeof existingDraftBranch>[3]?]> = [
+    // Same single file, different bytes than the validator produced.
+    [VALIDATED_DRAFT_FILE.replace("return safeValue;", "return exfiltrate();")],
+    // Validated file plus a second file in the same commit.
+    [VALIDATED_DRAFT_FILE, [
+      { filename: "src/a.ts", status: "modified" },
+      { filename: ".github/workflows/ci.yml", status: "modified" }
+    ]],
+    // One file, but not the validated one.
+    [VALIDATED_DRAFT_FILE, [{ filename: "src/b.ts", status: "modified" }]],
+    // More than one commit over the head.
+    [VALIDATED_DRAFT_FILE, undefined, [{ sha: "c".repeat(40) }]]
+  ];
+  for (const [content, files, parents] of cases) {
+    const { service, github } = await draftReadyService();
+    existingDraftBranch(github, content, files, parents);
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /already exists with unrelated commits/);
+    assert.deepEqual(github.repositoryWrites.map((write) => write.method), ["POST"]);
+    assert.ok(!github.repositoryWrites.some((write) => /\/pulls$/.test(write.path)));
+  }
+});
+
+test("draft-fix links only an existing GuardianBot-shaped draft and otherwise refuses", async () => {
+  const refused = async (openPulls: (branch: string) => Array<Record<string, any>>) => {
+    const { service, github, branch } = await draftReadyService();
+    github.failPullCreation = true;
+    github.openPulls = openPulls(branch);
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /GitHub did not open a draft pull request/);
+    assert.ok(!github.repositoryWrites.some((write) => write.path.endsWith("/labels")));
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 0$/m);
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+  };
+  // GitHub refused the draft (for example drafts are unsupported) and nothing exists to reuse.
+  await refused(() => []);
+  // A writer's own non-draft pull request, or a draft into another base, is not GuardianBot's.
+  await refused((branch) => [
+    { number: 77, draft: false, base: { ref: "feature/harden" }, head: { ref: branch } },
+    { number: 78, draft: true, base: { ref: "main" }, head: { ref: branch } }
+  ]);
+
+  const { service, github, branch } = await draftReadyService();
+  github.failPullCreation = true;
+  github.openPulls = [{ number: 79, draft: true, base: { ref: "feature/harden" }, head: { ref: branch } }];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #79/);
+  assert.ok(github.repositoryWrites.some((write) => write.path.endsWith("/issues/79/labels")));
+});
+
+test("dismiss from a bot is ignored and records nothing", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  const before = github.comments.length;
+  await runCommand(service, "@guardianbot dismiss F1", { login: "helper[bot]", type: "Bot" });
+  await runCommand(service, "@guardianbot dismiss F1", { login: "helper", type: "Bot" });
+  assert.equal(github.comments.length, before);
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, undefined);
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_dismissed_total 0$/m);
+});
+
+test("a dismissal recorded while a later review is in flight survives that review's write", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  const fingerprint = (await store.getReview(99, 12))?.findings[0]?.fingerprint ?? "";
+  const event = createPullEvent("head-sha-2");
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = Array.from({ length: 6 }, () => [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }
+  ]);
+  const backend = (service as any).options.reviewClientFactory();
+  const original = backend.resultFactory;
+  backend.resultFactory = async (request: ReviewRequest) => {
+    // The human dismisses between this review's initial read and its write.
+    await store.recordFindingOutcome({
+      repositoryId: 99,
+      pullNumber: 12,
+      outcome: "dismissed",
+      fingerprint,
+      observedAt: new Date()
+    });
+    return original(request);
+  };
+  await service.enqueue("pull_request", event, "delivery-dismiss-in-flight");
+  await service.processNextWebhook("worker-1");
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.reviewedHeadSha, "head-sha-2");
+  assert.equal(review?.findings.find((finding) => finding.fingerprint === fingerprint)?.outcome, "dismissed");
+});
+
 test("dismiss records an outcome without retaining who dismissed it, and merge marks the rest ignored", async () => {
   const { service, github, store } = await reviewWithSuggestion();
   await runCommand(service, "@guardianbot dismiss F1");
@@ -4002,7 +4160,7 @@ test("a merged pull request marks still-open findings ignored; a closed one reco
   assert.match(service.metrics.render(), /^guardianbot_finding_outcome_ignored_total 1$/m);
 });
 
-test("a verified incremental review marks a finding fixed when its lines were rewritten", async () => {
+async function incrementalFixedScenario(options: { partialReview?: boolean; patchSuffix?: string } = {}) {
   const previousHead = "1".repeat(40);
   const currentHead = "2".repeat(40);
   const event = createPullEvent(currentHead);
@@ -4017,10 +4175,17 @@ test("a verified incremental review marks a finding fixed when its lines were re
     files: [{
       filename: "src/incremental.ts",
       status: "modified",
-      patch: "@@ -20 +20 @@\n-unsafe\n+safe"
+      patch: `@@ -20 +20 @@\n-unsafe\n+safe${options.patchSuffix ?? ""}`
     }]
   }];
-  const backend = new FakeBackend((request) => ({ ...createResult(request), findings: [] }));
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return {
+      ...result,
+      summary: { ...result.summary, partialReview: options.partialReview ?? false },
+      findings: []
+    };
+  });
   const store = new MemoryStore();
   await store.upsertRepository({
     installationId: 1,
@@ -4060,8 +4225,23 @@ test("a verified incremental review marks a finding fixed when its lines were re
   );
   await service.enqueue("pull_request", event, "delivery-incremental-fixed");
   await service.processNextWebhook("worker-1");
-  const retained = (await store.getReview(99, 12))?.findings[0];
+  return { retained: (await store.getReview(99, 12))?.findings[0], service };
+}
+
+test("a verified incremental review marks a finding fixed when its lines were rewritten", async () => {
+  const { retained, service } = await incrementalFixedScenario();
   assert.notEqual(retained?.state, "open");
   assert.equal(retained?.outcome, "fixed");
   assert.match(service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 1$/m);
+});
+
+test("a partial or truncated incremental review never records a fixed outcome", async () => {
+  // The model declared the review partial, so a finding missing from it proves nothing.
+  const partial = await incrementalFixedScenario({ partialReview: true });
+  assert.equal(partial.retained?.outcome, undefined);
+  assert.match(partial.service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 0$/m);
+  // The patch exceeded the per-file cap, so the model saw only a prefix of the file's diff.
+  const truncated = await incrementalFixedScenario({ patchSuffix: `\n+${"x".repeat(31_000)}` });
+  assert.equal(truncated.retained?.outcome, undefined);
+  assert.match(truncated.service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 0$/m);
 });

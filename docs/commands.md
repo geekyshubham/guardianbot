@@ -26,7 +26,8 @@ Implemented commands:
 - `@guardianbot dismiss <id>`: record a published finding as dismissed for
   review-value analytics. The advisory comment, the finding's lifecycle state,
   and deterministic scanners are unchanged; only the outcome and its timestamp
-  are retained, never who dismissed it or why. Repeating it is a no-op.
+  are retained, never who dismissed it or why. Repeating it is a no-op, and
+  comments from bot accounts are ignored.
 - `@guardianbot draft-fix <fingerprint>`: Mode C. Disabled by default; see
   [remediation drafts](remediation-drafts.md). When enabled and permitted, opens
   a labelled DRAFT pull request applying the finding's exact validated

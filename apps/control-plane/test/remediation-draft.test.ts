@@ -110,6 +110,10 @@ test("forbidden paths are matched case-insensitively", () => {
   assert.equal(isForbiddenRemediationPath(".GitHub/workflows/x.yml"), true);
   assert.equal(isForbiddenRemediationPath("docs/CODEOWNERS"), true);
   assert.equal(isForbiddenRemediationPath("Cargo.lock"), true);
+  assert.equal(isForbiddenRemediationPath(".gitattributes"), true);
+  assert.equal(isForbiddenRemediationPath("vendor/.gitmodules"), true);
+  assert.equal(isForbiddenRemediationPath(".pre-commit-config.yaml"), true);
+  assert.equal(isForbiddenRemediationPath(".husky/pre-commit"), true);
   assert.equal(isForbiddenRemediationPath("src/github/client.ts"), false);
 });
 

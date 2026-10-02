@@ -109,8 +109,50 @@ export function markFixedOutcomes(
   return { findings, fixed };
 }
 
+/**
+ * Re-applies human-recorded outcomes from the latest retained row onto findings a review computed
+ * from an earlier read. A review publishes its merged findings by overwriting the schemaless
+ * column, so a dismissal (or a merge's `ignored`) recorded while the model call was in flight
+ * would otherwise be silently lost even though the command already replied that it was recorded.
+ * `dismissed` wins over any derived outcome, matching `applyFindingOutcome`; `ignored` reaches
+ * only findings that carry no outcome. The caller re-reads immediately before its write, which
+ * narrows the window to that read-write gap rather than the whole review.
+ */
+export function carryRecordedOutcomes(
+  findings: readonly ReviewFindingRecord[],
+  latest: readonly ReviewFindingRecord[] | undefined
+): ReviewFindingRecord[] {
+  const recorded = new Map(
+    (latest ?? [])
+      .filter((finding) => finding.outcome === "dismissed" || finding.outcome === "ignored")
+      .map((finding) => [finding.fingerprint, finding])
+  );
+  if (!recorded.size) return [...findings];
+  return findings.map((finding) => {
+    const source = recorded.get(finding.fingerprint);
+    if (!source || finding.outcome === "dismissed" || finding.outcome === source.outcome) {
+      return finding;
+    }
+    if (source.outcome === "ignored" && finding.outcome !== undefined) return finding;
+    return {
+      ...finding,
+      outcome: source.outcome,
+      ...(source.outcomeAt ? { outcomeAt: source.outcomeAt } : {})
+    };
+  });
+}
+
+/** True when any of the finding's own timestamps falls inside the period. */
+function touchedInPeriod(finding: ReviewFindingRecord, start: number, end: number): boolean {
+  return (
+    within(finding.firstSeenAt, start, end) ||
+    within(finding.lastSeenAt, start, end) ||
+    within(finding.outcomeAt, start, end)
+  );
+}
+
 export interface ReviewActivityAggregate {
-  /** True when at least one retained review row was read. */
+  /** True when at least one retained finding was first seen, last seen, or given an outcome in the period. */
   measured: boolean;
   advisoryFindingsOpened: number;
   advisoryFindingsAccepted: number;
@@ -147,7 +189,12 @@ export function aggregateReviewActivity(
   const start = periodStart.getTime();
   const end = periodEnd.getTime();
   const aggregate: ReviewActivityAggregate = {
-    measured: reviews.length > 0,
+    // Measured means a retained finding was observed in the period, not merely that a row was
+    // read: the PostgreSQL read prefilters by row `updated_at` and the in-memory read does not, so
+    // a row-count test would label the same data differently per store.
+    measured: reviews.some((review) =>
+      review.findings.some((finding) => touchedInPeriod(finding, start, end))
+    ),
     advisoryFindingsOpened: 0,
     advisoryFindingsAccepted: 0,
     advisoryFindingsDismissed: 0,

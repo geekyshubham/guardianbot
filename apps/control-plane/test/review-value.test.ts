@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   aggregateReviewActivity,
+  carryRecordedOutcomes,
   markFixedOutcomes,
   removedLineNumbers
 } from "../src/review-value.js";
@@ -155,4 +156,49 @@ test("retained analytics never carry reviewer identity or prose", () => {
     NOW
   );
   assert.doesNotMatch(JSON.stringify(result), /secret body text|other/);
+});
+
+test("carryRecordedOutcomes re-applies a dismissal or merge outcome recorded after the review read", () => {
+  const dismissedAt = "2026-08-12T09:00:00.000Z";
+  const latest = [
+    finding({ fingerprint: "1", outcome: "dismissed", outcomeAt: dismissedAt }),
+    finding({ fingerprint: "2", outcome: "ignored", outcomeAt: dismissedAt }),
+    finding({ fingerprint: "3", outcome: "ignored", outcomeAt: dismissedAt })
+  ];
+  const computed = [
+    // Derived `fixed` loses to the human dismissal.
+    finding({ fingerprint: "1", state: "resolved", outcome: "fixed", outcomeAt: NOW.toISOString() }),
+    // No outcome yet: the merge's `ignored` is carried.
+    finding({ fingerprint: "2" }),
+    // Already fixed: `ignored` never overwrites an outcome.
+    finding({ fingerprint: "3", state: "resolved", outcome: "fixed", outcomeAt: NOW.toISOString() }),
+    // Not in the latest row: untouched.
+    finding({ fingerprint: "4" })
+  ];
+  const carried = carryRecordedOutcomes(computed, latest);
+  assert.deepEqual(
+    carried.map((entry) => [entry.fingerprint, entry.outcome, entry.outcomeAt]),
+    [
+      ["1", "dismissed", dismissedAt],
+      ["2", "ignored", dismissedAt],
+      ["3", "fixed", NOW.toISOString()],
+      ["4", undefined, undefined]
+    ]
+  );
+  assert.deepEqual(carryRecordedOutcomes(computed, undefined), computed);
+});
+
+test("measured needs a finding observed in the period, independent of which rows a store returns", () => {
+  const start = new Date("2026-08-10T00:00:00.000Z");
+  const end = new Date("2026-08-16T23:59:59.999Z");
+  const old = "2026-07-01T00:00:00.000Z";
+  // The in-memory store returns every row; PostgreSQL would have filtered this one out.
+  const stale = [{ pullNumber: 1, findings: [finding({ firstSeenAt: old, lastSeenAt: old })] }];
+  assert.equal(aggregateReviewActivity(stale, start, end).measured, false);
+  assert.equal(aggregateReviewActivity([{ pullNumber: 2, findings: [] }], start, end).measured, false);
+  const outcomeOnly = [{
+    pullNumber: 3,
+    findings: [finding({ firstSeenAt: old, lastSeenAt: old, outcome: "dismissed", outcomeAt: "2026-08-12T00:00:00.000Z" })]
+  }];
+  assert.equal(aggregateReviewActivity(outcomeOnly, start, end).measured, true);
 });
