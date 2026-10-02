@@ -93,6 +93,11 @@ test("release gate workflow verifies the exact signer and fails closed on any no
   );
   assert.doesNotMatch(workflow, /--certificate-identity-regexp/);
   assert.match(workflow, /\.critical\.image\["docker-manifest-digest"\] == \$digest/);
+  // cosign may emit one JSON document per signature; flatten before checking.
+  assert.match(
+    workflow,
+    /--certificate-oidc-issuer "https:\/\/token\.actions\.githubusercontent\.com" \\\n\s+\| jq -s '\[\.\[\] \| if type == "array" then \.\[\] else \. end\]' \\\n\s+> "\$verification"/
+  );
   assert.match(workflow, /set -euo pipefail/);
   assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-release-gate"\)/);
   assert.match(workflow, /new URL\("\/release\/gate", evidenceEndpoint\)/);

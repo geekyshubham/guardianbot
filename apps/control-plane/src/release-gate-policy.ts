@@ -326,6 +326,8 @@ function validRiskAcceptance(
   finding: ReleaseDojoFinding,
   now: Date
 ): { id: number; name: string; expiresAt: string } | undefined {
+  // DefectDojo marks every finding covered by a risk acceptance risk_accepted.
+  if (finding.risk_accepted !== true) return undefined;
   for (const acceptance of finding.accepted_risks ?? []) {
     if (!acceptance || !Number.isSafeInteger(acceptance.id)) continue;
     const name = typeof acceptance.name === "string" ? acceptance.name.trim() : "";
@@ -334,11 +336,11 @@ function validRiskAcceptance(
       !name ||
       !Number.isFinite(expiry) ||
       expiry <= now.getTime() ||
-      (acceptance.decision !== undefined &&
-        acceptance.decision !== null &&
-        acceptance.decision !== "A") ||
-      (Array.isArray(acceptance.accepted_findings) &&
-        !acceptance.accepted_findings.includes(finding.id))
+      // DefectDojo always serializes the decision; only "A" (accept) waives.
+      acceptance.decision !== "A" ||
+      // The acceptance must explicitly cover this finding.
+      !Array.isArray(acceptance.accepted_findings) ||
+      !acceptance.accepted_findings.includes(finding.id)
     ) {
       continue;
     }
@@ -458,22 +460,68 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
       status: "success"
     });
     const testTags = new Map<number, string[]>();
-    let scopedTests = 0;
+    const scanScope = new Map<
+      string,
+      { source: ReleaseFindingSource; inScope: number; stale: number }
+    >();
+    let malformed = 0;
     for (const test of dojo.tests) {
+      if (!Number.isSafeInteger(test?.id)) {
+        malformed += 1;
+        continue;
+      }
       const tags = lowerTags(test.tags);
       testTags.set(test.id, tags);
-      if (findingScope(new Set(tags), candidate) === "in-scope") scopedTests += 1;
+      const tagSet = new Set(tags);
+      const scope = findingScope(tagSet, candidate);
+      if (scope === "other-repository") continue;
+      const source = findingSource(tagSet);
+      const key = `${source}\u241f${String(test.scan_type ?? "")}`;
+      const entry = scanScope.get(key) ?? { source, inScope: 0, stale: 0 };
+      if (scope === "in-scope") entry.inScope += 1;
+      if (scope === "other-commit") entry.stale += 1;
+      scanScope.set(key, entry);
     }
-    if (scopedTests === 0) {
-      blockers.push({
-        code: "defectdojo-scope-missing",
-        message:
-          "DefectDojo has no GuardianBot import scoped to the candidate commit or digest"
-      });
+    // GuardianBot reimports into one Test per engagement and scan type, and
+    // DefectDojo replaces a Test's tags on reimport. A commit-scoped scan type
+    // whose Tests all name another commit no longer describes the candidate:
+    // its findings for the candidate are unknown, so the gate fails closed
+    // instead of ignoring them. Older Tests beside an in-scope Test of the
+    // same scan type are history and stay out of scope. DAST Tests are
+    // digest/environment scoped and are required only when the policy
+    // requires a deployed-digest rescan.
+    const requiredSources: ReleaseFindingSource[] = [
+      "sast",
+      "image",
+      ...(required.has("deployed-rescan") ? (["dast"] as const) : [])
+    ];
+    for (const source of requiredSources) {
+      const entries = [...scanScope.values()].filter((entry) => entry.source === source);
+      if (!entries.some((entry) => entry.inScope > 0)) {
+        blockers.push({
+          code: "defectdojo-scope-missing",
+          message: `DefectDojo has no ${source} import scoped to the candidate`,
+          source
+        });
+      }
+    }
+    for (const entry of scanScope.values()) {
+      if (entry.source !== "dast" && entry.stale > 0 && entry.inScope === 0) {
+        blockers.push({
+          code: "defectdojo-scope-missing",
+          message:
+            `a DefectDojo ${entry.source} import was last reimported for another commit, ` +
+            "so its findings for the candidate are unknown",
+          source: entry.source
+        });
+      }
     }
     const findings = new Map<number, ReleaseDojoFinding>();
     for (const finding of [...dojo.findings, ...dojo.acceptedFindings]) {
-      if (!Number.isSafeInteger(finding?.id)) continue;
+      if (!Number.isSafeInteger(finding?.id) || !Number.isSafeInteger(finding?.test)) {
+        malformed += 1;
+        continue;
+      }
       const existing = findings.get(finding.id);
       // Prefer the record that carries risk-acceptance detail.
       if (!existing || (finding.accepted_risks?.length ?? 0) > (existing.accepted_risks?.length ?? 0)) {
@@ -482,10 +530,9 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
     }
     const blocking = new Set<string>(policy.blockingSeverities);
     for (const finding of [...findings.values()].sort((left, right) => left.id - right.id)) {
-      const tags = new Set([
-        ...lowerTags(finding.tags),
-        ...(testTags.get(finding.test) ?? [])
-      ]);
+      // Scope comes only from the Test GuardianBot imported. Finding tags are
+      // editable in DefectDojo and must not move a finding out of scope.
+      const tags = new Set(testTags.get(finding.test) ?? []);
       if (findingScope(tags, candidate) !== "in-scope") {
         ignoredFindings.outOfScope += 1;
         continue;
@@ -500,8 +547,9 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
         ignoredFindings.notOpen += 1;
         continue;
       }
-      const accepted =
-        finding.risk_accepted === true || (finding.accepted_risks?.length ?? 0) > 0;
+      // Only DefectDojo's own risk_accepted state opens the exception path; an
+      // acceptance history on a finding that is no longer accepted is ignored.
+      const accepted = finding.risk_accepted === true;
       if (!accepted) {
         if (finding.active === false || (policy.verifiedOnly && finding.verified === false)) {
           ignoredFindings.notOpen += 1;
@@ -548,6 +596,12 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
         severity: label,
         source,
         ref
+      });
+    }
+    if (malformed) {
+      blockers.push({
+        code: "gate-unavailable",
+        message: "DefectDojo returned malformed Tests or findings"
       });
     }
   }

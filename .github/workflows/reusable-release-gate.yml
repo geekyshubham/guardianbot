@@ -101,6 +101,7 @@ jobs:
           cosign verify --output json "$image_ref" \
             --certificate-identity "$certificate_identity" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            | jq -s '[.[] | if type == "array" then .[] else . end]' \
             > "$verification"
           jq -e --arg digest "$image_digest" \
             'type == "array" and length > 0 and

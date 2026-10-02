@@ -24,7 +24,8 @@ DefectDojo findings are read from the repository's product (its full name) and
 the `<default-branch>/security`, `<default-branch>/image`, and
 `<default-branch>/dast` engagements. Scope is then decided by the GuardianBot
 tags on each finding's DefectDojo Test, not by product or engagement names
-alone:
+alone. Finding-level tags are ignored, because they are editable in DefectDojo
+and must not move a finding out of scope:
 
 1. the Test must carry `guardianbot:repo-id:<id>` for the candidate repository;
 2. a Test with a `guardianbot:env:` tag is in scope only for that environment;
@@ -34,6 +35,18 @@ alone:
 
 Findings on another product, another environment, an older digest, or another
 commit are counted as out of scope and do not block.
+
+The gate also requires that DefectDojo actually describes the candidate:
+
+- at least one in-scope SAST (`security`) Test and one in-scope `image` Test,
+  plus an in-scope `dast` Test when the policy requires `deployed-rescan`;
+- GuardianBot reimports into one Test per engagement and scan type, and
+  DefectDojo replaces a Test's tags on reimport. When every Test of a
+  commit-scoped scan type now names another commit, the candidate's findings
+  for that scan are unknown, so the gate fails with `defectdojo-scope-missing`
+  instead of ignoring them. In practice the gate can pass only the commit most
+  recently imported on the default branch; and
+- Tests or findings with malformed IDs fail the gate as `gate-unavailable`.
 
 ## Decision
 
@@ -46,7 +59,7 @@ The gate fails with a named blocker code for each of these conditions:
 | `image-scan-missing` / `image-scan-critical` | No accepted Trivy image result, or it is not Critical-clean. |
 | `sbom-missing` | No accepted CycloneDX SBOM for the same artifact. |
 | `deployed-rescan-missing` / `deployed-rescan-failed` | Only when the policy requires `deployed-rescan`: no successful DAST summary for the digest in the environment. |
-| `defectdojo-scope-missing` | The product or engagements needed to evaluate the candidate are absent. |
+| `defectdojo-scope-missing` | No in-scope SAST or image import (or DAST, when a rescan is required) exists, or a commit-scoped scan was last reimported for another commit. |
 | `release-blocking-finding` | An active, unmitigated in-scope finding at a blocking severity. |
 | `risk-acceptance-invalid` | A risk-accepted finding whose acceptance is unnamed, expired, or does not cover it. |
 | `gate-unavailable` | DefectDojo is unconfigured, unreachable, or returned an invalid response. |
@@ -57,8 +70,10 @@ and blocks. Signature, image scan, and SBOM evidence are always read from one
 accepted image-promotion artifact of a default-branch `push` run.
 
 The only exception path is a named DefectDojo risk acceptance with an
-expiration date in the future. The acceptance must be undecided or accepted
-(`A`) and, when it lists accepted findings, must include the finding. Each
+expiration date in the future, on a finding DefectDojo itself marks
+`risk_accepted`. The acceptance decision must be accept (`A`) and its
+`accepted_findings` list must include the finding. An acceptance history on a
+finding that is no longer risk-accepted is ignored. Each
 honoured acceptance is reported in the decision's `exceptions` list with its
 name, ID, expiry, and finding reference. GuardianBot never creates or extends
 risk acceptances.
@@ -168,7 +183,10 @@ A `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` profile may set
 the same decision for the promotion candidate after image-reference validation
 and before acquiring the deployment lease or calling DigitalOcean. A failing or
 unavailable decision refuses the promotion with the blocker codes. Profiles
-without the flag are unchanged.
+without the flag are unchanged. Do not require `deployed-rescan` for a gated
+profile's first promotion: a rescan of a digest in an environment cannot exist
+before that digest is deployed there, so such a policy refuses every new
+digest.
 
 ## Operator steps
 

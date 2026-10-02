@@ -870,14 +870,22 @@ export class DefectDojoClient {
     if (!product) {
       return { product: null, engagements: [], tests: [], findings: [], acceptedFindings: [] };
     }
-    const wanted = new Set(engagementNames);
-    const engagements = (
-      await this.listPaginated<DefectDojoEngagement>(
+    // Query each engagement by exact name: a product accumulates one
+    // engagement per pull-request branch, so listing all of them could exceed
+    // the page cap and make the gate unavailable.
+    const byId = new Map<number, DefectDojoEngagement>();
+    for (const name of engagementNames) {
+      for (const engagement of await this.listPaginated<DefectDojoEngagement>(
         "/api/v2/engagements/",
-        { product: product.id },
+        { product: product.id, name },
         maxPages
-      )
-    ).filter((engagement) => engagement.product === product.id && wanted.has(engagement.name));
+      )) {
+        if (engagement.product === product.id && engagement.name === name) {
+          byId.set(engagement.id, engagement);
+        }
+      }
+    }
+    const engagements = [...byId.values()].sort((left, right) => left.id - right.id);
     const tests: DefectDojoTest[] = [];
     const findings: DefectDojoFinding[] = [];
     const acceptedFindings: DefectDojoFinding[] = [];
@@ -916,6 +924,19 @@ export class DefectDojoClient {
           maxPages
         ))
       );
+    }
+    // A malformed id would otherwise make a finding silently fall out of scope.
+    if (
+      tests.some((test) => !Number.isSafeInteger(test?.id)) ||
+      [...findings, ...acceptedFindings].some(
+        (finding) => !Number.isSafeInteger(finding?.id) || !Number.isSafeInteger(finding?.test)
+      )
+    ) {
+      throw new DefectDojoError({
+        kind: "validation",
+        path: "release",
+        message: "DefectDojo release query returned a malformed Test or Finding"
+      });
     }
     const testIds = new Set(tests.map((test) => test.id));
     const inEngagement = (finding: DefectDojoFinding) =>

@@ -166,7 +166,13 @@ test("ignores findings for another product, environment, old digest, or old comm
     ...TESTS,
     { id: 4, engagement: 12, tags: tags("dast", [`guardianbot:image:${DIGEST}`, "guardianbot:env:production"]) },
     { id: 5, engagement: 12, tags: tags("dast", [`guardianbot:image:${OLD_DIGEST}`, "guardianbot:env:staging"]) },
-    { id: 6, engagement: 10, tags: tags("security", [], 99, OLD_COMMIT) },
+    // An older Test of an already in-scope scan type is history, not a blocker.
+    {
+      id: 6,
+      engagement: 10,
+      scan_type: "Semgrep JSON Report",
+      tags: tags("security", [], 99, OLD_COMMIT)
+    },
     { id: 7, engagement: 10, tags: tags("security", [], 123) }
   ];
   const result = evaluateReleaseGate(
@@ -212,7 +218,13 @@ test("named, unexpired risk acceptance is the only waiver", () => {
     id: 120,
     risk_accepted: true,
     accepted_risks: [
-      { id: 9, name: "CVE-2026-1 vendor fix pending", expiration_date: "2026-09-01", decision: "A" }
+      {
+        id: 9,
+        name: "CVE-2026-1 vendor fix pending",
+        expiration_date: "2026-09-01",
+        decision: "A",
+        accepted_findings: [120]
+      }
     ]
   });
   const result = evaluateReleaseGate(input({ defectDojo: dojo([], [named]) }));
@@ -230,11 +242,13 @@ test("named, unexpired risk acceptance is the only waiver", () => {
   ]);
 
   const invalid = [
-    { id: 10, name: "", expiration_date: "2026-09-01" },
-    { id: 11, name: "expired", expiration_date: "2026-07-01" },
-    { id: 12, name: "no expiry", expiration_date: null },
-    { id: 13, name: "mitigate decision", expiration_date: "2026-09-01", decision: "M" },
-    { id: 14, name: "other finding", expiration_date: "2026-09-01", accepted_findings: [999] }
+    { id: 10, name: "", expiration_date: "2026-09-01", decision: "A", accepted_findings: [121] },
+    { id: 11, name: "expired", expiration_date: "2026-07-01", decision: "A", accepted_findings: [121] },
+    { id: 12, name: "no expiry", expiration_date: null, decision: "A", accepted_findings: [121] },
+    { id: 13, name: "mitigate decision", expiration_date: "2026-09-01", decision: "M", accepted_findings: [121] },
+    { id: 14, name: "other finding", expiration_date: "2026-09-01", decision: "A", accepted_findings: [999] },
+    { id: 15, name: "no decision", expiration_date: "2026-09-01", accepted_findings: [121] },
+    { id: 16, name: "no finding list", expiration_date: "2026-09-01", decision: "A" }
   ];
   for (const acceptance of invalid) {
     const outcome = evaluateReleaseGate(
@@ -258,7 +272,103 @@ test("DefectDojo unavailability and missing scope fail closed", () => {
   assert.equal(unavailable.decision, "fail");
   assert.deepEqual(unavailable.blockers.map((entry) => entry.code), ["gate-unavailable"]);
   const unscoped = evaluateReleaseGate(input({ defectDojo: dojo([], [], []) }));
-  assert.deepEqual(unscoped.blockers.map((entry) => entry.code), ["defectdojo-scope-missing"]);
+  assert.deepEqual(
+    unscoped.blockers.map((entry) => [entry.code, entry.source]),
+    [
+      ["defectdojo-scope-missing", "sast"],
+      ["defectdojo-scope-missing", "image"]
+    ]
+  );
+  // A DAST import alone does not cover the commit-scoped SAST and image scans.
+  const dastOnly = evaluateReleaseGate(input({ defectDojo: dojo([], [], [TESTS[2]!]) }));
+  assert.equal(dastOnly.decision, "fail");
+  assert.deepEqual(
+    dastOnly.blockers.map((entry) => entry.source),
+    ["sast", "image"]
+  );
+});
+
+test("a scan type last reimported for another commit fails closed instead of hiding findings", () => {
+  // DefectDojo replaces Test tags on reimport, so the Semgrep Test now
+  // describes OLD_COMMIT and its findings for the candidate are unknown.
+  const tests: ReleaseDojoTest[] = [
+    { id: 1, engagement: 10, scan_type: "Semgrep JSON Report", tags: tags("security", [], 99, OLD_COMMIT) },
+    { id: 8, engagement: 10, scan_type: "Trivy Scan", tags: tags("security") },
+    TESTS[1]!
+  ];
+  const result = evaluateReleaseGate(
+    input({ defectDojo: dojo([finding({ id: 140, test: 1 })], [], tests) })
+  );
+  assert.equal(result.decision, "fail");
+  assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.source]), [
+    ["defectdojo-scope-missing", "sast"]
+  ]);
+});
+
+test("finding tags cannot move a finding out of its Test's scope", () => {
+  const result = evaluateReleaseGate(
+    input({
+      defectDojo: dojo([
+        finding({
+          id: 141,
+          test: 2,
+          tags: [`guardianbot:image:${OLD_DIGEST}`, "guardianbot:env:production", "guardianbot:repo-id:1"]
+        })
+      ])
+    })
+  );
+  assert.deepEqual(result.blockers.map((entry) => entry.findingId), [141]);
+});
+
+test("an acceptance history on a finding that is not risk_accepted is not a waiver", () => {
+  const result = evaluateReleaseGate(
+    input({
+      defectDojo: dojo([
+        finding({
+          id: 142,
+          test: 2,
+          risk_accepted: false,
+          accepted_risks: [
+            { id: 30, name: "old", expiration_date: "2026-09-01", decision: "A", accepted_findings: [142] }
+          ]
+        })
+      ])
+    })
+  );
+  assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.findingId]), [
+    ["release-blocking-finding", 142]
+  ]);
+  assert.deepEqual(result.exceptions, []);
+});
+
+test("malformed DefectDojo records fail closed as gate-unavailable", () => {
+  const result = evaluateReleaseGate(
+    input({
+      defectDojo: dojo([{ ...finding({ id: 143 }), test: "2" as unknown as number }])
+    })
+  );
+  assert.deepEqual(result.blockers.map((entry) => entry.code), ["gate-unavailable"]);
+});
+
+test("a required deployed rescan also requires an in-scope DAST import", () => {
+  const required = policy({ requiredEvidence: ["signature", "image-scan", "sbom", "deployed-rescan"] });
+  const rescan = {
+    digest: DIGEST,
+    environment: "staging",
+    status: "success",
+    observedAt: NOW.toISOString(),
+    ref: "evidence://2/dast"
+  };
+  const result = evaluateReleaseGate(
+    input({
+      policy: required,
+      evidence: { ...input().evidence, deployedRescan: rescan },
+      defectDojo: dojo([], [], [TESTS[0]!, TESTS[1]!])
+    })
+  );
+  assert.deepEqual(result.blockers.map((entry) => [entry.code, entry.source]), [
+    ["defectdojo-scope-missing", "dast"]
+  ]);
 });
 
 test("missing or failing evidence blocks", () => {

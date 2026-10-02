@@ -71,19 +71,35 @@ function request(overrides: Record<string, unknown> = {}): Record<string, unknow
   };
 }
 
-const TEST_TAGS = [
-  `guardianbot:repo-id:${REPOSITORY_ID}`,
-  `guardianbot:commit:${HEAD_SHA}`,
-  "guardianbot:profile:image"
-];
+function testTags(profile: string, extra: string[] = []): string[] {
+  return [
+    `guardianbot:repo-id:${REPOSITORY_ID}`,
+    `guardianbot:commit:${HEAD_SHA}`,
+    `guardianbot:profile:${profile}`,
+    ...extra
+  ];
+}
 
 function dojoResult(
   findings: DefectDojoReleaseFindings["findings"] = []
 ): DefectDojoReleaseFindings {
   return {
     product: { id: 7, name: "Geekyshubham/service" },
-    engagements: [{ id: 11, name: "main/image", product: 7 }],
-    tests: [{ id: 2, engagement: 11, scan_type: "Trivy Scan", tags: TEST_TAGS }],
+    engagements: [
+      { id: 10, name: "main/security", product: 7 },
+      { id: 11, name: "main/image", product: 7 },
+      { id: 12, name: "main/dast", product: 7 }
+    ],
+    tests: [
+      { id: 1, engagement: 10, scan_type: "Semgrep JSON Report", tags: testTags("security") },
+      { id: 2, engagement: 11, scan_type: "Trivy Scan", tags: testTags("image") },
+      {
+        id: 3,
+        engagement: 12,
+        scan_type: "ZAP Scan",
+        tags: testTags("dast", [`guardianbot:image:${DIGEST}`, "guardianbot:env:staging"])
+      }
+    ],
     findings,
     acceptedFindings: []
   };

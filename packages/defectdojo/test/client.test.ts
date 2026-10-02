@@ -762,3 +762,30 @@ test("release finding query fails instead of truncating past its page cap", asyn
     /maxPages/
   );
 });
+
+test("release finding query looks engagements up by exact name and rejects malformed records", async () => {
+  const calls: URL[] = [];
+  const client = releaseClient((url) => {
+    if (url.pathname === "/api/v2/products/") {
+      return createJsonResponse({ next: null, results: [{ id: 8, name: "acme/app" }] });
+    }
+    if (url.pathname === "/api/v2/engagements/") {
+      return createJsonResponse({
+        next: null,
+        results: [{ id: 1, name: url.searchParams.get("name"), product: 8 }]
+      });
+    }
+    if (url.pathname === "/api/v2/tests/") {
+      return createJsonResponse({ next: null, results: [{ id: 10, engagement: 1 }] });
+    }
+    return createJsonResponse({ next: null, results: [{ id: 5, test: "10", severity: "Critical" }] });
+  }, calls);
+  await assert.rejects(
+    () => client.listReleaseFindings({ productName: "acme/app", engagementNames: ["main/image"] }),
+    (error: unknown) =>
+      error instanceof DefectDojoError && /malformed Test or Finding/.test(error.message)
+  );
+  const engagementQuery = calls.find((url) => url.pathname === "/api/v2/engagements/");
+  assert.equal(engagementQuery?.searchParams.get("name"), "main/image");
+  assert.equal(engagementQuery?.searchParams.get("product"), "8");
+});
