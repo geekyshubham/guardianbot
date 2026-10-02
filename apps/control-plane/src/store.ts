@@ -2021,6 +2021,12 @@ function fromUnknownDate(value: unknown): string | undefined {
 export class MemoryStore implements Store {
   private repositories = new Map<number, RepositoryRecord>();
   private reviews = new Map<string, ReviewState>();
+  /**
+   * Write order of each review row, advanced wherever the PostgreSQL statements set
+   * `updated_at=now()`, so activity pages are ordered by the most recent write in both stores.
+   */
+  private reviewWrites = new Map<string, number>();
+  private reviewWriteSequence = 0;
   private webhooks = new Map<string, WebhookJob>();
   private repositoryIndexes = new Map<
     string,
@@ -2423,6 +2429,10 @@ export class MemoryStore implements Store {
     }
   }
 
+  private touchReview(key: string): void {
+    this.reviewWrites.set(key, ++this.reviewWriteSequence);
+  }
+
   /** Mirrors `REVIEW_FINDINGS_DISCARD_SQL`; see `Store.setRepositoryState` for why removal clears. */
   private discardRetainedFindings(repositoryIds: readonly number[]): void {
     const removed = new Set(repositoryIds);
@@ -2434,6 +2444,7 @@ export class MemoryStore implements Store {
         findingsEvictedTotal: (review.findingsEvictedTotal ?? 0) + review.findings.length,
         findingsLastEvictedAt: new Date().toISOString()
       });
+      this.touchReview(key);
     }
   }
 
@@ -2467,10 +2478,12 @@ export class MemoryStore implements Store {
       // production. An existing row keeps whatever version already wrote its findings.
       findingsSchemaVersion:
         current?.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION_DEFAULT,
-      findingsEvictedTotal: current?.findingsEvictedTotal,
+      // Both counters are NOT NULL DEFAULT 0 columns, so a head-only row reads back as zero there.
+      findingsEvictedTotal: current?.findingsEvictedTotal ?? 0,
       findingsLastEvictedAt: current?.findingsLastEvictedAt,
-      feedbackTotal: current?.feedbackTotal
+      feedbackTotal: current?.feedbackTotal ?? 0
     });
+    this.touchReview(key);
   }
 
   /** True while `fence` still names the live, unexpired holder of its delivery's lease. */
@@ -2506,6 +2519,7 @@ export class MemoryStore implements Store {
       // per-finding records eviction is free to drop.
       feedbackTotal: (current?.feedbackTotal ?? 0) + (state.feedbackTotal ?? 0)
     });
+    this.touchReview(key);
     return true;
   }
 
@@ -2537,6 +2551,7 @@ export class MemoryStore implements Store {
       findings: applied.findings,
       feedbackTotal: (review.feedbackTotal ?? 0) + 1
     });
+    this.touchReview(key);
     return true;
   }
 
@@ -2547,6 +2562,7 @@ export class MemoryStore implements Store {
     const applied = applyFindingOutcome(review.findings, input);
     if (!applied.changed) return 0;
     this.reviews.set(key, { ...review, findings: applied.findings });
+    this.touchReview(key);
     return applied.changed;
   }
 
@@ -2559,9 +2575,14 @@ export class MemoryStore implements Store {
     // PostgreSQL prefilter is a strict superset optimisation and the caller filters by the
     // finding timestamps either way, so both stores produce the same aggregate.
     const bounded = Math.max(1, Math.min(MAX_REVIEW_ACTIVITY_ROWS, Math.trunc(limit)));
+    // Most recent write first, then pull number, matching `REVIEW_ACTIVITY_SQL`.
+    const written = (review: ReviewState) =>
+      this.reviewWrites.get(`${review.repositoryId}:${review.pullNumber}`) ?? 0;
     const rows = [...this.reviews.values()]
       .filter((review) => review.repositoryId === repositoryId)
-      .sort((left, right) => right.pullNumber - left.pullNumber);
+      .sort(
+        (left, right) => written(right) - written(left) || right.pullNumber - left.pullNumber
+      );
     return {
       reviews: rows.slice(0, bounded).map((review) => ({
         pullNumber: review.pullNumber,
@@ -2809,7 +2830,7 @@ export class MemoryStore implements Store {
           repository: { ...repository },
           index: index ? structuredClone(index) : undefined,
           latestScannerRuns: latestRuns,
-          latestScannerEvidence: [...evidenceByKey.values()]
+          latestScannerEvidence: [...evidenceByKey.values()].sort(compareMonitoringEvidence)
         };
       });
   }
@@ -3333,7 +3354,8 @@ export class MemoryStore implements Store {
   ): Promise<FindingLifecycleStreamWatermark[]> {
     return [...this.findingLifecycleStreams.values()]
       .filter((watermark) => watermark.repositoryId === repositoryId)
-      .sort((left, right) => left.stream.localeCompare(right.stream))
+      // Byte order, matching the Postgres `COLLATE "C"` read, so the order never depends on locale.
+      .sort((left, right) => (left.stream < right.stream ? -1 : left.stream > right.stream ? 1 : 0))
       .map((watermark) => ({ ...watermark }));
   }
 
@@ -3529,6 +3551,22 @@ function compareScannerEvidenceNewestFirst(
     timestamp(right.observedAt) - timestamp(left.observedAt) ||
     right.runId - left.runId ||
     right.runAttempt - left.runAttempt
+  );
+}
+
+/**
+ * Monitoring evidence order, shared by both stores: newest first, then a fixed key order so rows
+ * from one run that share an observation time never depend on write or index order.
+ */
+function compareMonitoringEvidence(
+  left: ScannerEvidenceRecord,
+  right: ScannerEvidenceRecord
+): number {
+  return (
+    compareScannerEvidenceNewestFirst(left, right) ||
+    left.evidenceKey.localeCompare(right.evidenceKey) ||
+    (left.artifactType ?? "").localeCompare(right.artifactType ?? "") ||
+    left.artifactId - right.artifactId
   );
 }
 
@@ -5102,9 +5140,8 @@ export class PostgresStore implements Store {
                     ORDER BY COALESCE(
                                runs.completed_at,
                                runs.started_at,
-                               runs.processed_at,
-                               runs.updated_at
-                             ) DESC,
+                               runs.processed_at
+                             ) DESC NULLS LAST,
                              runs.run_id DESC,
                              runs.run_attempt DESC
                   ) AS monitoring_rank
@@ -5148,7 +5185,6 @@ export class PostgresStore implements Store {
                   runs.event,
                   artifacts.artifact_type,
                   evidence.observed_at DESC,
-                  evidence.updated_at DESC,
                   evidence.run_id DESC,
                   evidence.run_attempt DESC`
       )
@@ -5182,7 +5218,10 @@ export class PostgresStore implements Store {
         latestScannerRuns:
           runsByRepository.get(repository.repositoryId)?.map(cloneScannerWorkflowRun) ?? [],
         latestScannerEvidence:
-          evidenceByRepository.get(repository.repositoryId)?.map(cloneScannerEvidence) ?? []
+          evidenceByRepository
+            .get(repository.repositoryId)
+            ?.map(cloneScannerEvidence)
+            .sort(compareMonitoringEvidence) ?? []
       };
     });
   }
@@ -5414,7 +5453,6 @@ export class PostgresStore implements Store {
          AND jsonb_typeof(evidence.payload)='object'
          AND jsonb_typeof(evidence.payload->'origin')='string'
        ORDER BY evidence.observed_at DESC,
-                evidence.updated_at DESC,
                 evidence.run_id DESC,
                 evidence.run_attempt DESC
        LIMIT 1`,
@@ -5484,7 +5522,6 @@ export class PostgresStore implements Store {
            AND jsonb_typeof(evidence.payload)='object'
            AND jsonb_typeof(evidence.payload->'origin')='string'
          ORDER BY evidence.observed_at DESC,
-                  evidence.updated_at DESC,
                   evidence.run_id DESC,
                   evidence.run_attempt DESC
          LIMIT 1
@@ -5588,7 +5625,6 @@ export class PostgresStore implements Store {
          AND artifacts.artifact_type='image-promotion'
          AND artifacts.validation_status='accepted'
        ORDER BY signature.observed_at DESC,
-                signature.updated_at DESC,
                 signature.run_id DESC,
                 signature.run_attempt DESC
        LIMIT 1`,
@@ -5657,7 +5693,6 @@ export class PostgresStore implements Store {
          AND artifacts.artifact_type='dast'
          AND artifacts.validation_status='accepted'
        ORDER BY evidence.observed_at DESC,
-                evidence.updated_at DESC,
                 evidence.run_id DESC,
                 evidence.run_attempt DESC
        LIMIT 1`,
@@ -5928,7 +5963,7 @@ export class PostgresStore implements Store {
       `SELECT *
        FROM finding_lifecycle_streams
        WHERE repository_id=$1
-       ORDER BY stream ASC`,
+       ORDER BY stream COLLATE "C" ASC`,
       [repositoryId]
     );
     return result.rows.map((row) => ({

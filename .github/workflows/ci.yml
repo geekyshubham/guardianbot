@@ -22,3 +22,39 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+
+  postgres-parity:
+    # The MemoryStore most tests run against is only evidence about production while it agrees
+    # with PostgresStore, so the parity suite runs against a real server on every change.
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_USER: guardianbot
+          POSTGRES_PASSWORD: guardianbot-ci
+          POSTGRES_DB: guardianbot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U guardianbot -d guardianbot_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GUARDIANBOT_TEST_DATABASE_URL: postgres://guardianbot:guardianbot-ci@127.0.0.1:5432/guardianbot_test
+      # Fail closed: without this a missing URL would skip the suite and the job would pass.
+      GUARDIANBOT_TEST_DATABASE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Real-PostgreSQL store parity
+        working-directory: apps/control-plane
+        run: npx tsx --test test/postgres-integration.test.ts

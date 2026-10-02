@@ -46,6 +46,14 @@ reusable workflow commits remain immutable.
   write` permission. Automated tests only; no live evidence.
 - [Roadmap traceability](docs/roadmap-traceability.md) maps each roadmap item
   to code, tests, status, and the live evidence it still needs.
+- Opt-in real-PostgreSQL parity suite
+  (`apps/control-plane/test/postgres-integration.test.ts`, gated on
+  `GUARDIANBOT_TEST_DATABASE_URL`) runs each scenario against `MemoryStore` and
+  a migrated `PostgresStore` in a throwaway schema and requires identical
+  results. A new `postgres-parity` CI job runs it against
+  `postgres:16-alpine` pinned by digest and fails closed through
+  `GUARDIANBOT_TEST_DATABASE_REQUIRED=1`. Passed locally on PostgreSQL 16.15;
+  the CI job has not run yet.
 
 ### Changed
 
@@ -60,6 +68,16 @@ reusable workflow commits remain immutable.
   Critical or High findings last; every drop is recorded.
 - Jira label lookup uses `/rest/api/2/search/jql` with bounded
   `nextPageToken` paging instead of the removed `/rest/api/2/search`.
+
+### Fixed
+
+- Store parity defects found by the real-PostgreSQL suite: deployed-image,
+  release-image, release-DAST, and monitoring evidence no longer tie-break on
+  row write time (`updated_at`) before run id and attempt; monitoring ranks a
+  run with no timestamp oldest instead of by write time and orders evidence
+  with one shared comparator; lifecycle stream watermarks sort in byte order
+  in both stores; `MemoryStore` review activity is ordered by most recent
+  write like PostgreSQL, and head-only reviews read back zero counters.
 
 ## [0.2.41] - 2026-08-02
 
