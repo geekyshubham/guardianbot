@@ -814,6 +814,174 @@ test("parity: finding lifecycle saves, orders, removes and isolates records", { 
   assert.equal(observed.rejected, true);
 });
 
+test("parity: finding ticket claims, capacity state and marker scans", { skip }, async () => {
+  const observed = await parity(async (store) => {
+    await store.upsertRepository(repository(20));
+    await store.upsertRepository(repository(21));
+    const fingerprint = (fill: string) => fill.repeat(64);
+    const ticketed = {
+      jira: { ref: "SEC-1", state: "open" as const, contentSha: "9".repeat(64), updatedAt: "2026-07-27T12:00:00.000Z" }
+    };
+    await store.saveFindingLifecycle(20, [
+      lifecycleRecord({ fingerprint: fingerprint("a") }),
+      lifecycleRecord({ fingerprint: fingerprint("b") }),
+      lifecycleRecord({ fingerprint: fingerprint("c") })
+    ]);
+    await store.saveFindingLifecycle(21, [lifecycleRecord({ repositoryId: 21, fingerprint: fingerprint("a") })]);
+    const lease = (claimId: string, claimedAt: string, leaseExpiresAt: string) => ({
+      claimId,
+      claimedAt,
+      leaseExpiresAt
+    });
+    const targets = [
+      { fingerprint: fingerprint("a"), provider: "jira" as const },
+      { fingerprint: fingerprint("b"), provider: "jira" as const },
+      { fingerprint: fingerprint("b"), provider: "slack" as const }
+    ];
+    const sortTargets = (list: Array<{ fingerprint: string; provider: string }>) =>
+      list.map((target) => `${target.fingerprint[0]}:${target.provider}`).sort();
+    const firstGrant = sortTargets(
+      await store.claimFindingTickets(
+        20,
+        lease("pass-1", "2026-07-27T12:00:00.000Z", "2026-07-27T12:10:00.000Z"),
+        targets
+      )
+    );
+    // A live claim is never granted to another pass; another repository is independent.
+    const contended = sortTargets(
+      await store.claimFindingTickets(
+        20,
+        lease("pass-2", "2026-07-27T12:05:00.000Z", "2026-07-27T12:15:00.000Z"),
+        [targets[0]!, { fingerprint: fingerprint("c"), provider: "jira" }]
+      )
+    );
+    const otherRepository = sortTargets(
+      await store.claimFindingTickets(
+        21,
+        lease("pass-2", "2026-07-27T12:05:00.000Z", "2026-07-27T12:15:00.000Z"),
+        [targets[0]!]
+      )
+    );
+    const completed = await store.completeFindingTicketClaim(20, "pass-1", targets[0]!, ticketed.jira);
+    const completedTwice = await store.completeFindingTicketClaim(20, "pass-1", targets[0]!, ticketed.jira);
+    // pass-1's claim on b:jira expires and pass-3 takes it over; pass-1's late result is discarded.
+    const takeover = sortTargets(
+      await store.claimFindingTickets(
+        20,
+        lease("pass-3", "2026-07-27T12:20:00.000Z", "2026-07-27T12:30:00.000Z"),
+        [targets[1]!]
+      )
+    );
+    const lateResult = await store.completeFindingTicketClaim(20, "pass-1", targets[1]!, {
+      ref: "SEC-LATE",
+      state: "open",
+      updatedAt: "2026-07-27T12:21:00.000Z"
+    });
+    const newerResult = await store.completeFindingTicketClaim(20, "pass-3", targets[1]!, {
+      ref: "SEC-2",
+      state: "open",
+      updatedAt: "2026-07-27T12:22:00.000Z"
+    });
+    // Releasing pass-1 frees b:slack only, so another pass may claim it at once.
+    await store.releaseFindingTicketClaims(20, "pass-1");
+    const afterRelease = sortTargets(
+      await store.claimFindingTickets(
+        20,
+        lease("pass-4", "2026-07-27T12:23:00.000Z", "2026-07-27T12:33:00.000Z"),
+        [targets[2]!]
+      )
+    );
+    // A merge from an older read never overwrites claim-recorded tickets.
+    await store.saveFindingLifecycle(20, [
+      lifecycleRecord({ fingerprint: fingerprint("a"), tickets: {}, lastSeenAt: "2026-07-28T00:00:00.000Z" })
+    ]);
+    // Removing a record drops its claims, so the slack claim on b is free once b is gone.
+    await store.saveFindingLifecycle(20, [], [], [fingerprint("b")]);
+    const afterRemoval = sortTargets(
+      await store.claimFindingTickets(
+        20,
+        lease("pass-5", "2026-07-27T12:24:00.000Z", "2026-07-27T12:34:00.000Z"),
+        [targets[2]!]
+      )
+    );
+    let invalidClaim = false;
+    try {
+      await store.claimFindingTickets(20, lease("bad id!", "2026-07-27T12:00:00.000Z", "2026-07-27T12:10:00.000Z"), []);
+    } catch {
+      invalidClaim = true;
+    }
+
+    const noState = await store.getFindingLifecycleState(20);
+    await store.saveFindingLifecycle(20, [], [], [], {
+      dropped: 4,
+      droppedCriticalHigh: 1,
+      observedAt: "2026-07-28T00:00:00.000Z"
+    });
+    await store.recordFindingTicketMarkerScan(20, 3, "2026-07-28T01:00:00.000Z");
+    await store.saveFindingLifecycle(20, [], [], [], {
+      dropped: 0,
+      droppedCriticalHigh: 0,
+      observedAt: "2026-07-29T00:00:00.000Z"
+    });
+    await store.recordFindingTicketMarkerScan(21, 0, "2026-07-29T02:00:00.000Z");
+    let invalidCount = false;
+    try {
+      await store.recordFindingTicketMarkerScan(20, -1, "2026-07-29T03:00:00.000Z");
+    } catch {
+      invalidCount = true;
+    }
+    const records = await store.listFindingLifecycle(20);
+    return {
+      firstGrant,
+      contended,
+      otherRepository,
+      completed,
+      completedTwice,
+      takeover,
+      lateResult,
+      newerResult,
+      afterRelease,
+      afterRemoval,
+      invalidClaim,
+      tickets: records.map((record) => [record.fingerprint[0], record.tickets]),
+      noState,
+      state: await store.getFindingLifecycleState(20),
+      otherState: await store.getFindingLifecycleState(21),
+      invalidCount
+    };
+  });
+
+  assert.deepEqual(observed.firstGrant, ["a:jira", "b:jira", "b:slack"]);
+  assert.deepEqual(observed.contended, ["c:jira"]);
+  assert.deepEqual(observed.otherRepository, ["a:jira"]);
+  assert.equal(observed.completed, true);
+  assert.equal(observed.completedTwice, false);
+  assert.deepEqual(observed.takeover, ["b:jira"]);
+  assert.equal(observed.lateResult, false);
+  assert.equal(observed.newerResult, true);
+  assert.deepEqual(observed.afterRelease, ["b:slack"]);
+  assert.deepEqual(observed.afterRemoval, ["b:slack"]);
+  assert.equal(observed.invalidClaim, true);
+  assert.deepEqual(Object.fromEntries(observed.tickets), {
+    a: { jira: { ref: "SEC-1", state: "open", contentSha: "9".repeat(64), updatedAt: "2026-07-27T12:00:00.000Z" } },
+    c: {}
+  });
+  assert.equal(observed.noState, undefined, "no state row exists before the first write");
+  assert.deepEqual(observed.state, {
+    repositoryId: 20,
+    droppedTotal: 4,
+    lastDropped: 0,
+    lastDroppedCriticalHigh: 0,
+    lastDroppedAt: "2026-07-28T00:00:00.000Z",
+    untrustedMarkers: 3,
+    untrustedMarkersObservedAt: "2026-07-28T01:00:00.000Z",
+    updatedAt: "2026-07-29T00:00:00.000Z"
+  });
+  assert.equal(observed.otherState.untrustedMarkers, 0);
+  assert.equal(observed.otherState.droppedTotal, 0);
+  assert.equal(observed.invalidCount, true);
+});
+
 test("parity: finding lifecycle lock serialises holders for one repository", { skip }, async () => {
   const observed = await parity(async (store) => {
     await store.upsertRepository(repository(20));
