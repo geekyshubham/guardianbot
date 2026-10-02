@@ -22,7 +22,9 @@ A candidate is the tuple:
 
 DefectDojo findings are read from the repository's product (its full name) and
 the `<default-branch>/security`, `<default-branch>/image`, and
-`<default-branch>/dast` engagements. Scope is then decided by the GuardianBot
+`<default-branch>/dast` engagements. Deployed-digest rescans import into a
+separate `<default-branch>/image-rescan` engagement that the gate does not
+read; their result reaches the gate through control-plane evidence instead. Scope is then decided by the GuardianBot
 tags on each finding's DefectDojo Test, not by product or engagement names
 alone. Finding-level tags are ignored, because they are editable in DefectDojo
 and must not move a finding out of scope:
@@ -38,14 +40,26 @@ commit are counted as out of scope and do not block.
 
 The gate also requires that DefectDojo actually describes the candidate:
 
-- at least one in-scope SAST (`security`) Test and one in-scope `image` Test,
-  plus an in-scope `dast` Test when the policy requires `deployed-rescan`;
+- at least one in-scope SAST (`security`) Test and one in-scope `image` Test.
+  DAST Tests are never required: they describe digests already deployed;
 - GuardianBot reimports into one Test per engagement and scan type, and
   DefectDojo replaces a Test's tags on reimport. When every Test of a
-  commit-scoped scan type now names another commit, the candidate's findings
-  for that scan are unknown, so the gate fails with `defectdojo-scope-missing`
-  instead of ignoring them. In practice the gate can pass only the commit most
-  recently imported on the default branch; and
+  commit-scoped scan type now names a newer commit, DefectDojo no longer
+  describes the candidate. The gate then accepts the candidate commit's own
+  accepted scan summary in its place, and otherwise fails with
+  `defectdojo-scope-missing`:
+  - a Semgrep or filesystem Trivy Test is proven by the matching
+    `semgrep-summary` or `trivy-summary` of the newest accepted default-branch
+    `push` security artifact for the candidate commit. The summary must be a
+    successful scan with release severity counts, which count every distinct
+    finding at the higher of its policy and native severity, and must be zero
+    at every blocking severity. Summaries recorded before this change carry no
+    counts and never prove anything;
+  - an `image` Trivy Test is proven by the candidate's own Critical-clean image
+    scan, only while the policy blocks Critical alone, because the image scan
+    reports Critical findings only; and
+  - these counts ignore DefectDojo triage, so they can only be stricter than
+    DefectDojo. A proven scan is listed as `commit-scan` evidence; and
 - Tests or findings with malformed IDs fail the gate as `gate-unavailable`.
 
 ## Decision
@@ -58,8 +72,9 @@ The gate fails with a named blocker code for each of these conditions:
 | `wrong-signer` | The signature identity is not the trusted `reusable-image.yml` at the trusted SHA. |
 | `image-scan-missing` / `image-scan-critical` | No accepted Trivy image result, or it is not Critical-clean. |
 | `sbom-missing` | No accepted CycloneDX SBOM for the same artifact. |
-| `deployed-rescan-missing` / `deployed-rescan-failed` | Only when the policy requires `deployed-rescan`: no successful DAST summary for the digest in the environment. |
-| `defectdojo-scope-missing` | No in-scope SAST or image import (or DAST, when a rescan is required) exists, or a commit-scoped scan was last reimported for another commit. |
+| `promotion-frozen` | Always enforced: the newest verified scheduled rescan of the candidate digest, in any environment, found Critical findings or has no clean freeze record. |
+| `deployed-rescan-missing` / `deployed-rescan-failed` | Only when the policy requires `deployed-rescan`: the digest GuardianBot last deployed in the candidate environment has no verified rescan within 48 hours, or its rescan was not fully reconciled (DefectDojo import pending) or has a malformed count. Nothing deployed yet is not a blocker. |
+| `defectdojo-scope-missing` | No in-scope SAST or image import exists, or a commit-scoped scan was last reimported for another commit and no clean summary of the candidate commit stands in for it. |
 | `release-blocking-finding` | An active, unmitigated in-scope finding at a blocking severity. |
 | `risk-acceptance-invalid` | A risk-accepted finding whose acceptance is unnamed, expired, or does not cover it. |
 | `gate-unavailable` | DefectDojo is unconfigured, unreachable, or returned an invalid response. |
@@ -173,7 +188,11 @@ configuration errors return 400, 401, 403, or 503 and never a decision.
 ```
 
 `blockingSeverities` must include `critical`; `blockHigh: true` adds `high`.
-`requiredEvidence` must include `signature` and may add `deployed-rescan`.
+`requiredEvidence` must include `signature` and may add `deployed-rescan`,
+which requires current rescan coverage of whatever is already running in the
+candidate environment. A freeze on that running digest does not block a
+different candidate, since promoting a Critical-clean replacement is how a
+freeze is fixed.
 Unknown fields are rejected and leave the gate unconfigured (503).
 
 ## DigitalOcean promotion gate
@@ -183,10 +202,11 @@ A `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` profile may set
 the same decision for the promotion candidate after image-reference validation
 and before acquiring the deployment lease or calling DigitalOcean. A failing or
 unavailable decision refuses the promotion with the blocker codes. Profiles
-without the flag are unchanged. Do not require `deployed-rescan` for a gated
-profile's first promotion: a rescan of a digest in an environment cannot exist
-before that digest is deployed there, so such a policy refuses every new
-digest.
+without the flag skip the gate, but every profile still refuses a frozen
+digest (see [image security](image-security.md#deployed-digest-rescan)).
+`deployed-rescan` is safe to require for a gated profile: it checks the digest
+already deployed, and the first promotion into an empty environment has
+nothing to rescan.
 
 ## Operator steps
 
@@ -203,7 +223,8 @@ DefectDojo state, and operator machines do not hold DefectDojo credentials.
 
 ## Verification status
 
-The evaluator, endpoint, store queries, DigitalOcean flag, and workflow
-structure are covered by unit tests only. No live release gate run, live
+The evaluator, endpoint, store queries, DigitalOcean flag, freeze
+enforcement, and workflow structure are covered by unit tests, and the new
+store queries by the real-PostgreSQL parity suite, only. No live release gate run, live
 DefectDojo risk-acceptance query, or gated DigitalOcean promotion has been
 recorded. See [status](status.md) for what is verified live.

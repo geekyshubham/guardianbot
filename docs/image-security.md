@@ -146,9 +146,32 @@ version downgrades. They are advisory only and never block, waive, or approve.
 The typosquat comparison skips names longer than 64 characters and stops at a
 fixed work budget; when the budget or a list cap is reached the diff is marked
 `truncated`, so a missing signal is not evidence of a clean dependency set.
-The promotion freeze is a signal in evidence and monitoring. Rescan ingestion
-never changes the running deployment, and promotion does not yet enforce the
-freeze.
+Rescan ingestion never changes the running deployment. The freeze is enforced
+at promotion instead:
+
+- the DigitalOcean reconciler refuses to promote a digest whose newest
+  verified default-branch rescan, in any environment, found Critical findings
+  or left a missing, unreadable, or mismatched freeze record. This applies to
+  every profile, not only those with `requireReleaseGate`. A store error while
+  reading the freeze also refuses the promotion;
+- a different digest that is itself Critical-clean is the fix path and is
+  allowed, so a frozen environment is repaired by promoting a replacement; and
+- the release gate reports the same condition as `promotion-frozen`.
+
+A rescan whose evidence verified but whose DefectDojo import failed still
+counts as a verified freeze; the artifact is retried through the webhook
+backoff and dead-letter path (default five attempts), and its freeze is
+recorded before the import is attempted.
+
+When DefectDojo is configured, the rescan's Trivy report is imported into a
+separate `<default-branch>/image-rescan` engagement, one Test per environment
+(`<default-branch>/image-rescan/<environment>`), tagged with the environment,
+the deployed digest, and the commit that built it. That engagement is outside
+the release gate's engagements, so a rescan never closes or replaces the
+build-time `image` findings the gate reads. The rescan also feeds the findings
+lifecycle on its own `trivy-image-rescan:<environment>` stream, so new Critical
+findings on a running digest get SLA aging, owners, and tickets. The rescan
+reports Critical findings only.
 
 Monitoring adds two checks for repositories with `image.deployment`:
 

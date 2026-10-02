@@ -59,9 +59,10 @@ rather than replacing it:
   (`pull_request` `closed` with `merged: true`). Closing without merging
   records nothing.
 
-A review rewrites its retained findings whole, so it re-reads the row just
-before writing and carries any `dismissed` or `ignored` recorded meanwhile. The
-window between that re-read and the write is narrowed, not eliminated.
+A review rewrites its retained findings whole. The store merges the write with
+the row it replaces in the same statement, carrying any `dismissed` or
+`ignored` outcome already recorded for a fingerprint, so an outcome recorded
+while a review was running is never lost.
 
 Reviewer identity and reviewer text are never stored for any of these.
 
@@ -102,6 +103,11 @@ so no repository, category, or reviewer text reaches a label:
 | `guardianbot_remediation_draft_created_total` | Mode C draft pull requests opened |
 | `guardianbot_remediation_draft_rejected_total` | `draft-fix` refused by scope or validation |
 | `guardianbot_remediation_draft_unavailable_total` | `draft-fix` with the flag off or no `contents: write` |
+| `guardianbot_remediation_draft_validator_rejected_total` | Drafts the optional second-model validator vetoed, failed on, or was not allowed to see |
+| `guardianbot_remediation_draft_checks_passed_total` | Draft link comments settled to checks passed |
+| `guardianbot_remediation_draft_checks_failed_total` | Draft link comments settled to checks failed |
+| `guardianbot_remediation_draft_branch_deleted_total` | Draft branches deleted on close because GuardianBot still owned the tip |
+| `guardianbot_remediation_draft_branch_retained_total` | Draft branches left in place on close because ownership could not be proven |
 
 Image protection is counted from the latest reconciliation only when the
 required scan, SBOM, signature, and deployment evidence agree on the exact

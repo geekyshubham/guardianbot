@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import test from "node:test";
 import {
   FINDING_TICKET_MARKER_PREFIX,
   FindingTicketError,
   createGitHubIssuesProvider,
+  createInstallationIssueClientFactory,
   createJiraProvider,
   createSlackNotifier,
   defaultTicketRetryPolicy,
@@ -59,13 +61,17 @@ interface IssueCall {
   body?: any;
 }
 
+const APP_IDENTITY = { id: 4242, slug: "guardianbot" };
+
 function issueClient(
-  handler: (call: IssueCall) => unknown
+  handler: (call: IssueCall) => unknown,
+  appIdentity: FindingIssueClient["appIdentity"] | null = APP_IDENTITY
 ): { client: FindingIssueClient; calls: IssueCall[] } {
   const calls: IssueCall[] = [];
   return {
     calls,
     client: {
+      appIdentity: appIdentity ?? undefined,
       async request<T>(method: string, path: string, body?: unknown): Promise<T> {
         const call = { method, path, body };
         calls.push(call);
@@ -116,22 +122,92 @@ test("GitHub issues are created once, updated by number, and closed without dupl
   assert.equal(created, 1);
 });
 
-test("a lost issue reference is recovered from the bot-authored marker, never a human issue", async () => {
+test("a lost issue reference is recovered only from an issue this App opened", async () => {
   const marker = `<!-- ${FINDING_TICKET_MARKER_PREFIX}${FINGERPRINT} -->`;
-  const { client, calls } = issueClient((call) => {
-    if (call.method === "GET") {
-      return [
-        { number: 7, body: marker, user: { type: "User" } },
-        { number: 9, body: marker, user: { type: "Bot" } }
-      ];
-    }
-    return {};
-  });
+  const markerIssues = [
+    { number: 7, body: marker, user: { login: "mallory", type: "User" } },
+    { number: 9, body: marker, user: { login: "other-app[bot]", type: "Bot" } },
+    {
+      number: 11,
+      body: marker,
+      user: { login: "mallory", type: "User" },
+      performed_via_github_app: { id: 99, slug: "other-app" }
+    },
+    { number: 12, body: "no marker here", user: { login: "mallory", type: "User" } },
+    { number: 13, body: marker, user: { login: "guardianbot[bot]", type: "Bot" } }
+  ];
+  const { client, calls } = issueClient((call) => (call.method === "GET" ? markerIssues : {}));
   const provider = createGitHubIssuesProvider({ clientFactory: async () => client, retry: NO_WAIT });
-  const result = await provider.session(repository()).sync(content(), undefined);
-  assert.deepEqual(result, { ref: "9" });
+  const session = provider.session(repository());
+  assert.equal(session.markerScan?.(), undefined, "no scan has run yet");
+  const result = await session.sync(content(), undefined);
+  assert.deepEqual(result, { ref: "13" });
   assert.equal(calls.some((call) => call.method === "POST"), false);
-  assert.equal(calls.at(-1)?.path, "/repos/acme/service/issues/9");
+  assert.equal(calls.at(-1)?.path, "/repos/acme/service/issues/13");
+  assert.deepEqual(session.markerScan?.(), { untrusted: 3 });
+
+  const viaApp = issueClient((call) =>
+    call.method === "GET"
+      ? [{ number: 21, body: marker, user: { login: "octo", type: "User" }, performed_via_github_app: { id: 4242 } }]
+      : {}
+  );
+  const appSession = createGitHubIssuesProvider({ clientFactory: async () => viaApp.client, retry: NO_WAIT }).session(
+    repository()
+  );
+  assert.deepEqual(await appSession.sync(content(), undefined), { ref: "21" });
+});
+
+test("without a known App identity no marker is trusted and a new issue is opened", async () => {
+  const marker = `<!-- ${FINDING_TICKET_MARKER_PREFIX}${FINGERPRINT} -->`;
+  const { client, calls } = issueClient(
+    (call) => {
+      if (call.method === "GET") return [{ number: 13, body: marker, user: { login: "guardianbot[bot]", type: "Bot" } }];
+      if (call.method === "POST") return { number: 50 };
+      return {};
+    },
+    null
+  );
+  const session = createGitHubIssuesProvider({ clientFactory: async () => client, retry: NO_WAIT }).session(
+    repository()
+  );
+  assert.deepEqual(await session.sync(content(), undefined), { ref: "50" });
+  assert.equal(calls.some((call) => call.method === "PATCH"), false);
+  assert.deepEqual(session.markerScan?.(), { untrusted: 1 });
+});
+
+test("the installation client verifies the App identity once and fails closed on a mismatch", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+  let appId: unknown = 4242;
+  const requests: string[] = [];
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    requests.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+    if (url.endsWith("/app")) return Response.json({ id: appId, slug: "guardianbot" });
+    return Response.json({ token: "ghs_test" }, { status: 201 });
+  }) as typeof fetch;
+  const factory = createInstallationIssueClientFactory({
+    appId: "4242",
+    privateKey: pem,
+    fetchImpl,
+    apiBase: "https://api.example.test"
+  });
+  const client = await factory(repository());
+  assert.deepEqual(client.appIdentity, { id: 4242, slug: "guardianbot" });
+  await factory(repository());
+  assert.equal(requests.filter((request) => request === "GET /app").length, 1, "identity is cached");
+
+  appId = 7;
+  const mismatched = createInstallationIssueClientFactory({
+    appId: "4242",
+    privateKey: pem,
+    fetchImpl,
+    apiBase: "https://api.example.test"
+  });
+  await assert.rejects(mismatched(repository()), (error) => {
+    assert.equal(sanitizeTicketError(error), "github-issues app identity does not match GITHUB_APP_ID");
+    return true;
+  });
 });
 
 test("a deleted issue falls back to the marker search, and a closed finding is never created", async () => {
@@ -235,7 +311,8 @@ test("Jira issues are found by label, created once, and transitioned to done on 
   const { fetchImpl, calls } = fetchRecorder((url, init) => {
     const method = init.method ?? "GET";
     if (url.includes("/rest/api/2/search")) {
-      return Response.json({ issues: searchHits });
+      assert.ok(url.includes("/rest/api/2/search/jql?"), "only the enhanced search endpoint is used");
+      return Response.json({ issues: searchHits, isLast: true });
     }
     if (method === "POST" && url.endsWith("/rest/api/2/issue")) {
       return Response.json({ key: "SEC-12" }, { status: 201 });
@@ -265,6 +342,10 @@ test("Jira issues are found by label, created once, and transitioned to done on 
   assert.deepEqual(create?.body.fields.labels, ["guardianbot", jiraFindingLabel(FINGERPRINT)]);
   assert.match(String(create?.headers.authorization), /^Basic /);
 
+  const search = new URL(calls.find((call) => call.url.includes("/search/jql"))!.url);
+  assert.equal(search.searchParams.get("fields"), "key");
+  assert.match(String(search.searchParams.get("jql")), /^project = "SEC" AND labels = "guardianbot-finding-e{64}"/);
+
   searchHits = [{ key: "SEC-12" }];
   calls.length = 0;
   assert.deepEqual(await session.sync(content(), undefined), { ref: "SEC-12" });
@@ -278,6 +359,42 @@ test("Jira issues are found by label, created once, and transitioned to done on 
   });
   const transition = calls.find((call) => call.method === "POST" && call.url.endsWith("/transitions"));
   assert.deepEqual(transition?.body, { transition: { id: "31" } });
+});
+
+test("Jira search follows nextPageToken within a page cap", async () => {
+  const tokens: Array<string | null> = [];
+  let pages = 0;
+  const endless = { value: false };
+  const { fetchImpl } = fetchRecorder((url) => {
+    if (url.includes("/search/jql")) {
+      tokens.push(new URL(url).searchParams.get("nextPageToken"));
+      pages += 1;
+      if (endless.value) return Response.json({ issues: [], isLast: false, nextPageToken: `t${pages}` });
+      return pages === 1
+        ? Response.json({ issues: [], isLast: false, nextPageToken: "page-2" })
+        : Response.json({ issues: [{ key: "SEC-77" }], isLast: true });
+    }
+    return new Response(null, { status: 204 });
+  });
+  const jira = createJiraProvider({
+    baseUrl: "https://jira.example.test",
+    email: "bot@example.test",
+    apiToken: "jira-token",
+    projectKey: "SEC",
+    issueType: "Bug",
+    fetchImpl,
+    retry: NO_WAIT
+  });
+  assert.deepEqual(await jira.session(repository()).sync(content(), undefined), { ref: "SEC-77" });
+  assert.deepEqual(tokens, [null, "page-2"]);
+
+  endless.value = true;
+  pages = 0;
+  await assert.rejects(jira.session(repository()).sync(content(), undefined), (error) => {
+    assert.equal(sanitizeTicketError(error), "jira search exceeded its page limit");
+    return true;
+  });
+  assert.ok(pages <= 15, "the page cap bounds the search even across retries");
 });
 
 test("ticket endpoints must be HTTPS without embedded credentials", () => {

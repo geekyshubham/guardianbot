@@ -239,7 +239,8 @@ Monitor at minimum:
 - distinct DAST smoke/nightly freshness and DefectDojo imports;
 - exact scan/SBOM/signature/deployment digest agreement; and
 - deployed-digest rescan freshness (`image-rescan-coverage`) and the
-  `image-promotion-freeze` signal; and
+  `image-promotion-freeze` check, which mirrors the freeze the deployment
+  reconciler enforces; and
 - suppression expiry and weekly coverage snapshots.
 
 ### Private metrics and operator monitoring status
@@ -294,6 +295,33 @@ Alert `fullName`, `alertKey`, and `summary` are length-capped (255 / 256 /
 truncation is the separate boolean on `activeAlerts`. Health/readiness
 endpoints are useful process signals, not substitutes for external probes and
 evidence reconciliation.
+
+### Webhook retry and dead-letter
+
+Every accepted delivery is a durable webhook job. A failed attempt is retried
+with exponential backoff (30 seconds, doubling, capped at 30 minutes) until the
+fifth counted attempt, which moves the job to `dead-letter`:
+
+- a non-retryable backend failure (for example an unsupported protocol
+  version) dead-letters on the first attempt;
+- GitHub throttling and shutdown aborts requeue the job without consuming an
+  attempt, so neither can dead-letter it; and
+- scanner evidence failures that may clear on retry, such as a GitHub artifact
+  download error or a DefectDojo import outage after a rescan freeze was
+  recorded, leave the run `failed` and rethrow so the job is retried. Evidence
+  already written, including a promotion freeze, stays in place across
+  retries.
+
+`guardianbot_webhook_jobs_dead_letter` and `webhook_dead_letter_total` expose
+dead-lettered jobs. GuardianBot never replays a dead-lettered job by itself.
+After the cause is fixed and deployed, an operator may replay it with a guarded
+store transition that matches exactly one row by delivery ID, `dead-letter`
+status, event, attempt count, and the recorded error text, and resets that row
+to `pending` with a fresh retry budget. Treat it as a production change: confirm
+the match count is one before committing. The
+[v0.2.39 recovery](evidence/v0.2.39-live-index-recovery.md#guarded-replay-after-v0239-active)
+is the recorded example. Dead-lettered rows are purged after the retention
+below.
 
 ### Webhook queue retention
 
@@ -382,7 +410,10 @@ GitHub issues use a repository-scoped installation token limited to
 notifier failures are retried with bounded backoff, stored as a sanitized
 error on the lifecycle record, retried on the next ingestion and monitoring
 cycle, and raised as the `findings-ticketing` monitoring alert. Open findings
-past their due date raise `findings-sla`; see the
+past their due date raise `findings-sla`, and records dropped over the
+5000-record bound or ignored foreign marker issues raise `findings-capacity`.
+Marker recovery trusts only issues this App opened; the App identity is read
+from `GET /app` and must match `GITHUB_APP_ID`. See the
 [SLA breach runbook](runbooks/sla-breach.md).
 
 ### Remediation drafts
@@ -390,12 +421,20 @@ past their due date raise `findings-sla`; see the
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `GUARDIANBOT_REMEDIATION_DRAFTS` | unset (off) | `1` enables `@guardianbot draft-fix`; any other value leaves it off |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_URL` | unset (no second model) | Optional veto-only `guardian.remediation-validation.v1` endpoint. HTTPS, or HTTP on loopback; no credentials, query, or fragment |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TOKEN` | unset | Bearer token; required unless the URL is loopback |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_CLASSIFICATIONS` | required with the URL | Comma list of `public`, `private`, `restricted` the validator may receive; others refuse the draft |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TIMEOUT_MS` | `30000` | Integer from 1000 to 120000 |
 
 The flag is necessary but not sufficient: the installation must also have
 accepted `Contents: Read and write`, which the default manifest does not
 grant. See [remediation drafts](remediation-drafts.md) and
 [the optional App permission](github-app.md#optional-mode-c-permission).
-Draft branches named `guardianbot/fix/*` are not deleted automatically.
+These are control-plane settings only and never belong in a consumer
+repository. A set but malformed validator configuration fails startup. Draft
+branches named `guardianbot/fix/*` are deleted on close only while their tip
+is still GuardianBot's own commit; see
+[branch cleanup](remediation-drafts.md#branch-cleanup).
 
 ## First live AI review checklist
 

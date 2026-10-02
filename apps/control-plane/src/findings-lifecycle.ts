@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { parseGuardianConfig, type GuardianConfig } from "@guardianbot/core";
 import { isFindingSlaBreached } from "@guardianbot/monitoring";
 import type {
@@ -511,6 +512,8 @@ export interface IngestFindingObservationsResult {
   ingested: boolean;
   changed: number;
   staleStreams: string[];
+  /** Records forced out by the bound after long-fixed records were retired. */
+  dropped: number;
 }
 
 /**
@@ -521,7 +524,12 @@ export interface IngestFindingObservationsResult {
 export async function ingestFindingObservations(
   input: IngestFindingObservationsInput
 ): Promise<IngestFindingObservationsResult> {
-  const result: IngestFindingObservationsResult = { ingested: false, changed: 0, staleStreams: [] };
+  const result: IngestFindingObservationsResult = {
+    ingested: false,
+    changed: 0,
+    staleStreams: [],
+    dropped: 0
+  };
   if (!input.options.enabled || !isTrustedLifecycleRun(input.run, input.repository)) return result;
   const observations = mergeObservations(input.observations);
   if (!observations.length) return result;
@@ -614,7 +622,13 @@ export async function ingestFindingObservations(
       if (context) record.owner = resolveFindingOwner(record, context);
       record.slaDueAt = computeSlaDueAt(record.severity, record.openedAt, input.options.slaDays);
     }
-    const removed = retireFixedRecords(byFingerprint);
+    const bound = enforceFindingLifecycleBound(byFingerprint);
+    // A record that was already stored and is now over the bound has to leave the store
+    // too, or the next page read would silently miss it.
+    const removed = [
+      ...bound.retired,
+      ...bound.dropped.filter((record) => before.has(record.fingerprint)).map((record) => record.fingerprint)
+    ];
     const changed = [...byFingerprint.values()].filter(
       (record) => before.get(record.fingerprint) !== recordSignature(record)
     );
@@ -628,21 +642,48 @@ export async function ingestFindingObservations(
         ...runOrder,
         updatedAt: nowIso
       })),
-      removed
+      removed,
+      {
+        dropped: bound.dropped.length,
+        droppedCriticalHigh: bound.dropped.filter(isOpenCriticalOrHigh).length,
+        observedAt: nowIso
+      }
     );
     result.ingested = true;
     result.changed = changed.length + removed.length;
+    result.dropped = bound.dropped.length;
     return result;
   } finally {
     await lock.release();
   }
 }
 
-/** Keeps a repository within its bound by retiring the longest-fixed records first. */
-function retireFixedRecords(byFingerprint: Map<string, FindingLifecycleRecord>): string[] {
-  const overflow = byFingerprint.size - MAX_FINDING_LIFECYCLE_RECORDS;
-  if (overflow <= 0) return [];
-  const retirable = [...byFingerprint.values()]
+const SEVERITY_DROP_ORDER: Record<FindingLifecycleSeverity, number> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4
+};
+
+function isOpenCriticalOrHigh(record: FindingLifecycleRecord): boolean {
+  return record.status === "open" && (record.severity === "critical" || record.severity === "high");
+}
+
+/**
+ * Keeps a repository within its bound. Long-fixed records without an open ticket are
+ * retired first; that is routine. Anything still over the bound is a real loss and is
+ * returned as `dropped` so the merge records it and monitoring raises an alert. The
+ * drop order spends low-severity and non-open work first and Critical or High open
+ * findings only when nothing else is left, newest first within each tier.
+ */
+export function enforceFindingLifecycleBound(
+  byFingerprint: Map<string, FindingLifecycleRecord>,
+  bound = MAX_FINDING_LIFECYCLE_RECORDS
+): { retired: string[]; dropped: FindingLifecycleRecord[] } {
+  const overflow = byFingerprint.size - bound;
+  if (overflow <= 0) return { retired: [], dropped: [] };
+  const retired = [...byFingerprint.values()]
     .filter(
       (record) =>
         record.status === "fixed" &&
@@ -655,16 +696,21 @@ function retireFixedRecords(byFingerprint: Map<string, FindingLifecycleRecord>):
     )
     .slice(0, overflow)
     .map((record) => record.fingerprint);
-  for (const fingerprint of retirable) byFingerprint.delete(fingerprint);
-  // Anything still over the bound is the newest open work; the newest insertions are
-  // dropped rather than the store growing without limit.
-  if (byFingerprint.size > MAX_FINDING_LIFECYCLE_RECORDS) {
-    const newest = [...byFingerprint.values()]
-      .sort((left, right) => (Date.parse(right.firstSeenAt) || 0) - (Date.parse(left.firstSeenAt) || 0))
-      .slice(0, byFingerprint.size - MAX_FINDING_LIFECYCLE_RECORDS);
-    for (const record of newest) byFingerprint.delete(record.fingerprint);
-  }
-  return retirable;
+  for (const fingerprint of retired) byFingerprint.delete(fingerprint);
+  const remaining = byFingerprint.size - bound;
+  if (remaining <= 0) return { retired, dropped: [] };
+  const dropped = [...byFingerprint.values()]
+    .sort(
+      (left, right) =>
+        Number(isOpenCriticalOrHigh(left)) - Number(isOpenCriticalOrHigh(right)) ||
+        Number(left.status === "open") - Number(right.status === "open") ||
+        SEVERITY_DROP_ORDER[left.severity] - SEVERITY_DROP_ORDER[right.severity] ||
+        (Date.parse(right.firstSeenAt) || 0) - (Date.parse(left.firstSeenAt) || 0) ||
+        left.fingerprint.localeCompare(right.fingerprint)
+    )
+    .slice(0, remaining);
+  for (const record of dropped) byFingerprint.delete(record.fingerprint);
+  return { retired, dropped };
 }
 
 // ---------------------------------------------------------------------------
@@ -714,8 +760,22 @@ function providerApplies(
   return repository.visibility !== "public" && context?.config?.findings?.githubIssues === true;
 }
 
+/** How long a ticket claim protects its provider call before another pass may take it over. */
+export const FINDING_TICKET_CLAIM_LEASE_MS = 10 * 60_000;
+
+interface TicketWork {
+  record: FindingLifecycleRecord;
+  provider: FindingTicketProvider;
+  content: FindingTicketContent;
+  contentSha: string;
+  previous: FindingTicketState | undefined;
+}
+
 /**
- * Brings provider tickets in line with lifecycle records. Each provider failure is
+ * Brings provider tickets in line with lifecycle records. The work is chosen and
+ * claimed under the lifecycle lock, the lock is released, and only then are providers
+ * called, so a slow provider never holds the lock that scanner merges need. Each
+ * result is recorded only while its claim still holds. Each provider failure is
  * sanitized and stored on the record (so monitoring raises `findings-ticketing`) and
  * retried on the next pass; it never fails scanner acceptance or monitoring.
  */
@@ -726,6 +786,7 @@ export async function syncFindingTickets(input: {
   slaDays: FindingsLifecycleOptions["slaDays"];
   now: Date;
   limit?: number;
+  claimId?: string;
 }): Promise<FindingTicketPassResult> {
   const result: FindingTicketPassResult = { attempted: 0, failed: 0 };
   if (!input.providers.length) return result;
@@ -737,66 +798,103 @@ export async function syncFindingTickets(input: {
   const limit = input.limit ?? MAX_TICKET_SYNCS_PER_PASS;
   const repositoryId = input.repository.repositoryId;
   const nowIso = input.now.toISOString();
+  const claim = {
+    claimId: input.claimId ?? randomUUID(),
+    claimedAt: nowIso,
+    leaseExpiresAt: new Date(input.now.getTime() + FINDING_TICKET_CLAIM_LEASE_MS).toISOString()
+  };
+  let work: TicketWork[] = [];
   const lock = await input.store.acquireFindingLifecycleLock(repositoryId);
   try {
     const records = await input.store.listFindingLifecycle(repositoryId, MAX_FINDING_LIFECYCLE_RECORDS);
-    const sessions = new Map<string, FindingTicketSession | Error>();
-    const changed = new Map<string, FindingLifecycleRecord>();
     for (const record of records) {
-      if (result.attempted >= limit) break;
+      if (work.length >= limit) break;
       const content = ticketContentFor(input.repository, record, input.slaDays, input.now);
       for (const provider of providers) {
-        if (result.attempted >= limit) break;
+        if (work.length >= limit) break;
         const previous = record.tickets[provider.name];
         if (!previous && content.state === "closed") continue;
         const contentSha = provider.contentSha(content);
         if (previous && !previous.error && previous.contentSha === contentSha) continue;
-        result.attempted += 1;
-        let next: FindingTicketState;
-        try {
-          let session = sessions.get(provider.name);
-          if (!session) {
-            try {
-              session = provider.session(input.repository);
-            } catch (error) {
-              session = error instanceof Error ? error : new Error("ticket provider failed");
-            }
-            sessions.set(provider.name, session);
-          }
-          if (session instanceof Error) throw session;
-          const synced = await session.sync(content, previous);
-          next = {
-            ref: synced.ref ?? previous?.ref,
-            state: content.state,
-            contentSha,
-            updatedAt: nowIso
-          };
-        } catch (error) {
-          result.failed += 1;
-          next = {
-            ref: previous?.ref,
-            state: previous?.state,
-            contentSha: previous?.contentSha,
-            error: sanitizeTicketError(error),
-            updatedAt: nowIso
-          };
-        }
-        if (next.ref === undefined) delete next.ref;
-        if (next.state === undefined) delete next.state;
-        if (next.contentSha === undefined) delete next.contentSha;
-        const target = changed.get(record.fingerprint) ?? structuredClone(record);
-        target.tickets[provider.name] = next;
-        target.updatedAt = nowIso;
-        changed.set(record.fingerprint, target);
+        work.push({ record, provider, content, contentSha, previous });
       }
     }
-    if (changed.size) {
-      await input.store.saveFindingLifecycle(repositoryId, [...changed.values()]);
+    if (work.length) {
+      const granted = new Set(
+        (
+          await input.store.claimFindingTickets(
+            repositoryId,
+            claim,
+            work.map((item) => ({ fingerprint: item.record.fingerprint, provider: item.provider.name }))
+          )
+        ).map((target) => `${target.fingerprint}:${target.provider}`)
+      );
+      // Work another pass already holds is left to that pass.
+      work = work.filter((item) => granted.has(`${item.record.fingerprint}:${item.provider.name}`));
     }
-    return result;
   } finally {
     await lock.release();
   }
+  if (!work.length) return result;
+  try {
+    const sessions = new Map<string, FindingTicketSession | Error>();
+    for (const item of work) {
+      result.attempted += 1;
+      const { provider, previous } = item;
+      let next: FindingTicketState;
+      try {
+        let session = sessions.get(provider.name);
+        if (!session) {
+          try {
+            session = provider.session(input.repository);
+          } catch (error) {
+            session = error instanceof Error ? error : new Error("ticket provider failed");
+          }
+          sessions.set(provider.name, session);
+        }
+        if (session instanceof Error) throw session;
+        const synced = await session.sync(item.content, previous);
+        next = {
+          ref: synced.ref ?? previous?.ref,
+          state: item.content.state,
+          contentSha: item.contentSha,
+          updatedAt: nowIso
+        };
+      } catch (error) {
+        result.failed += 1;
+        next = {
+          ref: previous?.ref,
+          state: previous?.state,
+          contentSha: previous?.contentSha,
+          error: sanitizeTicketError(error),
+          updatedAt: nowIso
+        };
+      }
+      if (next.ref === undefined) delete next.ref;
+      if (next.state === undefined) delete next.state;
+      if (next.contentSha === undefined) delete next.contentSha;
+      // A claim lost to a takeover after its lease expired discards this result, so a
+      // late pass can never overwrite what the newer pass recorded.
+      await input.store.completeFindingTicketClaim(
+        repositoryId,
+        claim.claimId,
+        { fingerprint: item.record.fingerprint, provider: provider.name },
+        next
+      );
+    }
+    for (const [name, session] of sessions) {
+      if (name !== "github-issues" || session instanceof Error || !session.markerScan) continue;
+      const scan = session.markerScan();
+      if (scan) {
+        await input.store.recordFindingTicketMarkerScan(repositoryId, scan.untrusted, nowIso);
+      }
+    }
+  } finally {
+    // Unfinished work (a store failure mid-pass) is retried promptly instead of waiting
+    // out the lease.
+    await input.store.releaseFindingTicketClaims(repositoryId, claim.claimId);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

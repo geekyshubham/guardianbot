@@ -2,7 +2,7 @@
  * Pure, deterministic release-gate policy evaluation.
  *
  * Inputs are limited to accepted control-plane evidence (signature, image
- * scan, SBOM, optional deployed-digest rescan) and DefectDojo findings. AI
+ * scan, SBOM, commit scan summaries, deployed-digest rescans) and DefectDojo findings. AI
  * review output is never an input, so it cannot block, waive, or approve a
  * release. The only exception path is a named, unexpired DefectDojo risk
  * acceptance. Anything the evaluator cannot prove fails closed.
@@ -71,12 +71,52 @@ export interface ReleaseSbomEvidence {
   ref: string;
 }
 
-export interface ReleaseRescanEvidence {
+/** Hours a deployed-digest rescan stays fresh; the rescan workflow runs nightly. */
+export const RELEASE_RESCAN_MAX_AGE_HOURS = 48;
+
+export interface ReleaseRescanResult {
   digest: string;
   environment: string;
-  status: string;
   observedAt: string;
+  /** -1 when the recorded count is malformed. */
+  criticalFindings: number;
+  frozen: boolean;
+  /** False when the rescan was verified but its DefectDojo reconciliation has not succeeded. */
+  artifactAccepted: boolean;
   ref: string;
+}
+
+/**
+ * Coverage of the environment the candidate is promoted into. `deployedDigest`
+ * is the digest GuardianBot last deployed there, absent before the first
+ * promotion; `rescan` is the newest verified scheduled rescan of that digest.
+ */
+export interface ReleaseRescanEvidence {
+  environment: string;
+  deployedDigest?: string;
+  rescan?: ReleaseRescanResult;
+}
+
+export interface ReleaseSeverityCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+export interface ReleaseCommitScanSummary {
+  status: string;
+  /** Absent for legacy or failed summaries, which never prove anything. */
+  severities?: ReleaseSeverityCounts;
+  ref: string;
+}
+
+/** Semgrep and filesystem Trivy summaries from the candidate commit's own security artifact. */
+export interface ReleaseCommitScanEvidence {
+  commit: string;
+  semgrep?: ReleaseCommitScanSummary;
+  trivy?: ReleaseCommitScanSummary;
 }
 
 export interface ReleaseGateEvidenceInput {
@@ -84,6 +124,9 @@ export interface ReleaseGateEvidenceInput {
   imageScan?: ReleaseImageScanEvidence;
   sbom?: ReleaseSbomEvidence;
   deployedRescan?: ReleaseRescanEvidence;
+  /** Newest verified rescan of the candidate digest itself, in any environment. */
+  candidateRescan?: ReleaseRescanResult;
+  commitScan?: ReleaseCommitScanEvidence;
 }
 
 export interface ReleaseDojoRiskAcceptance {
@@ -136,6 +179,7 @@ export type ReleaseGateBlockerCode =
   | "sbom-missing"
   | "deployed-rescan-missing"
   | "deployed-rescan-failed"
+  | "promotion-frozen"
   | "defectdojo-scope-missing"
   | "release-blocking-finding"
   | "risk-acceptance-invalid";
@@ -162,7 +206,13 @@ export interface ReleaseGateException {
 }
 
 export interface ReleaseGateEvidenceRef {
-  kind: "signature" | "image-scan" | "sbom" | "deployed-rescan" | "defectdojo";
+  kind:
+    | "signature"
+    | "image-scan"
+    | "sbom"
+    | "deployed-rescan"
+    | "commit-scan"
+    | "defectdojo";
   ref: string;
   status: string;
 }
@@ -353,6 +403,56 @@ function findingRef(id: number): string {
   return `defectdojo://findings/${id}`;
 }
 
+/**
+ * Local proof that a commit-scoped scan of the candidate commit is clean at
+ * every blocking severity. Used only when DefectDojo's Test for that scan type
+ * was reimported for a newer commit, so DefectDojo no longer describes the
+ * candidate. Counts are an upper bound on DefectDojo's rating and ignore its
+ * triage, so they can only be stricter than DefectDojo.
+ */
+function commitScanProof(
+  source: ReleaseFindingSource,
+  scanType: string,
+  evidence: ReleaseGateEvidenceInput,
+  candidate: ReleaseCandidate,
+  policy: ReleaseGatePolicy
+): string | undefined {
+  const clean = (summary: ReleaseCommitScanSummary | undefined) => {
+    if (summary?.status !== "success" || !summary.severities) return false;
+    const counts = summary.severities;
+    return SEVERITIES.every((severity) => {
+      const count = counts[severity];
+      if (!Number.isSafeInteger(count) || count < 0) return false;
+      return !policy.blockingSeverities.includes(severity) || count === 0;
+    });
+  };
+  if (source === "sast") {
+    const scan = evidence.commitScan;
+    if (!scan || scan.commit !== candidate.commit) return undefined;
+    const summary =
+      scanType === "Semgrep JSON Report"
+        ? scan.semgrep
+        : scanType === "Trivy Scan"
+          ? scan.trivy
+          : undefined;
+    return clean(summary) ? summary?.ref : undefined;
+  }
+  if (source === "image" && scanType === "Trivy Scan") {
+    // The image scan reports Critical findings only, so it proves nothing for
+    // a policy that also blocks lower severities.
+    const scan = evidence.imageScan;
+    if (
+      policy.blockingSeverities.length === 1 &&
+      policy.blockingSeverities[0] === "critical" &&
+      scan?.status === "success" &&
+      scan.criticalFindings === 0
+    ) {
+      return scan.ref;
+    }
+  }
+  return undefined;
+}
+
 export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseGateDecision {
   const { candidate, evidence, policy, now } = input;
   const blockers: ReleaseGateBlocker[] = [];
@@ -423,27 +523,65 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
     });
   }
 
-  const rescan =
-    evidence.deployedRescan &&
-    evidence.deployedRescan.digest === candidate.digest &&
-    evidence.deployedRescan.environment === candidate.environment
+  // A digest whose own scheduled rescan found Critical findings is never
+  // promoted again, to any environment, whatever the policy requires.
+  const candidateRescan =
+    evidence.candidateRescan?.digest === candidate.digest ? evidence.candidateRescan : undefined;
+  if (candidateRescan?.frozen) {
+    blockers.push({
+      code: "promotion-frozen",
+      message:
+        `a promotion freeze is active for the candidate digest (rescan in ${candidateRescan.environment})`,
+      ref: candidateRescan.ref
+    });
+  }
+
+  const coverage =
+    evidence.deployedRescan?.environment === candidate.environment
       ? evidence.deployedRescan
       : undefined;
-  if (rescan) {
-    evidenceRefs.push({ kind: "deployed-rescan", ref: rescan.ref, status: rescan.status });
+  if (coverage?.rescan) {
+    evidenceRefs.push({
+      kind: "deployed-rescan",
+      ref: coverage.rescan.ref,
+      status: coverage.rescan.frozen ? "frozen" : "success"
+    });
   }
+  // Required coverage means the digest running in the candidate environment
+  // is still being rescanned. Its own freeze does not block a different
+  // candidate: promoting a Critical-clean replacement is how a freeze is fixed.
   if (required.has("deployed-rescan")) {
-    if (!rescan) {
+    if (!coverage) {
       blockers.push({
         code: "deployed-rescan-missing",
-        message: "no accepted DAST rescan exists for the candidate digest in the candidate environment"
+        message: "deployed-digest rescan coverage for the candidate environment is unknown"
       });
-    } else if (rescan.status !== "success") {
-      blockers.push({
-        code: "deployed-rescan-failed",
-        message: "the deployed-digest DAST rescan did not complete successfully",
-        ref: rescan.ref
-      });
+    } else if (coverage.deployedDigest !== undefined) {
+      const rescan =
+        coverage.rescan?.digest === coverage.deployedDigest &&
+        coverage.rescan.environment === candidate.environment
+          ? coverage.rescan
+          : undefined;
+      const observedAt = Date.parse(rescan?.observedAt ?? "");
+      if (
+        !rescan ||
+        !Number.isFinite(observedAt) ||
+        now.getTime() - observedAt > RELEASE_RESCAN_MAX_AGE_HOURS * 3_600_000
+      ) {
+        blockers.push({
+          code: "deployed-rescan-missing",
+          message:
+            `no verified rescan of the digest deployed in ${candidate.environment} ` +
+            `within ${RELEASE_RESCAN_MAX_AGE_HOURS} hours`,
+          ref: rescan?.ref
+        });
+      } else if (!rescan.artifactAccepted || rescan.criticalFindings < 0) {
+        blockers.push({
+          code: "deployed-rescan-failed",
+          message: "the deployed-digest rescan was not fully reconciled",
+          ref: rescan.ref
+        });
+      }
     }
   }
 
@@ -462,7 +600,7 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
     const testTags = new Map<number, string[]>();
     const scanScope = new Map<
       string,
-      { source: ReleaseFindingSource; inScope: number; stale: number }
+      { source: ReleaseFindingSource; scanType: string; inScope: number; stale: number }
     >();
     let malformed = 0;
     for (const test of dojo.tests) {
@@ -476,43 +614,52 @@ export function evaluateReleaseGate(input: ReleaseGateEvaluationInput): ReleaseG
       const scope = findingScope(tagSet, candidate);
       if (scope === "other-repository") continue;
       const source = findingSource(tagSet);
-      const key = `${source}\u241f${String(test.scan_type ?? "")}`;
-      const entry = scanScope.get(key) ?? { source, inScope: 0, stale: 0 };
+      const scanType = String(test.scan_type ?? "");
+      const key = `${source}\u241f${scanType}`;
+      const entry = scanScope.get(key) ?? { source, scanType, inScope: 0, stale: 0 };
       if (scope === "in-scope") entry.inScope += 1;
       if (scope === "other-commit") entry.stale += 1;
       scanScope.set(key, entry);
     }
     // GuardianBot reimports into one Test per engagement and scan type, and
     // DefectDojo replaces a Test's tags on reimport. A commit-scoped scan type
-    // whose Tests all name another commit no longer describes the candidate:
-    // its findings for the candidate are unknown, so the gate fails closed
-    // instead of ignoring them. Older Tests beside an in-scope Test of the
-    // same scan type are history and stay out of scope. DAST Tests are
-    // digest/environment scoped and are required only when the policy
-    // requires a deployed-digest rescan.
-    const requiredSources: ReleaseFindingSource[] = [
-      "sast",
-      "image",
-      ...(required.has("deployed-rescan") ? (["dast"] as const) : [])
-    ];
-    for (const source of requiredSources) {
+    // whose Tests all name another commit no longer describes the candidate.
+    // Its findings for the candidate are then known only from the candidate
+    // commit's own accepted summaries: a summary that is clean at every
+    // blocking severity stands in for it, anything else fails closed. Older
+    // Tests beside an in-scope Test of the same scan type are history and stay
+    // out of scope. DAST Tests are digest and environment scoped, describe
+    // only digests already deployed, and are never required.
+    const proven = new Set<ReleaseFindingSource>();
+    const unproven = new Set<ReleaseFindingSource>();
+    for (const entry of scanScope.values()) {
+      if (entry.source === "dast" || entry.stale === 0 || entry.inScope > 0) continue;
+      const proof = commitScanProof(entry.source, entry.scanType, evidence, candidate, policy);
+      if (proof) {
+        proven.add(entry.source);
+        evidenceRefs.push({ kind: "commit-scan", ref: proof, status: "success" });
+        continue;
+      }
+      unproven.add(entry.source);
+      blockers.push({
+        code: "defectdojo-scope-missing",
+        message:
+          `a DefectDojo ${entry.source} import was last reimported for another commit, ` +
+          "and no clean scan summary of the candidate commit stands in for it",
+        source: entry.source
+      });
+    }
+    for (const source of ["sast", "image"] as const) {
       const entries = [...scanScope.values()].filter((entry) => entry.source === source);
-      if (!entries.some((entry) => entry.inScope > 0)) {
+      if (
+        !entries.some((entry) => entry.inScope > 0) &&
+        !proven.has(source) &&
+        !unproven.has(source)
+      ) {
         blockers.push({
           code: "defectdojo-scope-missing",
           message: `DefectDojo has no ${source} import scoped to the candidate`,
           source
-        });
-      }
-    }
-    for (const entry of scanScope.values()) {
-      if (entry.source !== "dast" && entry.stale > 0 && entry.inScope === 0) {
-        blockers.push({
-          code: "defectdojo-scope-missing",
-          message:
-            `a DefectDojo ${entry.source} import was last reimported for another commit, ` +
-            "so its findings for the candidate are unknown",
-          source: entry.source
         });
       }
     }

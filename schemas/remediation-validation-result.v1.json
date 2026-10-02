@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GuardianBot Remediation Validation Result",
+  "$id": "https://guardianbot.dev/schemas/remediation-validation-result.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "requestId",
+    "decision",
+    "reasons",
+    "backend"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "const": "guardian.remediation-validation.v1"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "decision": {
+      "enum": [
+        "accept",
+        "reject"
+      ]
+    },
+    "reasons": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "does-not-address-finding",
+          "changes-unrelated-behavior",
+          "introduces-vulnerability",
+          "likely-syntax-error",
+          "insufficient-context"
+        ]
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backendId",
+        "modelId",
+        "latencyMs"
+      ],
+      "properties": {
+        "backendId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "modelId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "latencyMs": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

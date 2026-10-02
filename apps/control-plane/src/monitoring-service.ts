@@ -361,8 +361,8 @@ export class MonitoringService {
   }
 
   /**
-   * Adds `findings-sla` and `findings-ticketing` checks for active repositories when
-   * the lifecycle is enabled. Ticket retry failures are logged without failing the
+   * Adds `findings-sla`, `findings-ticketing` and `findings-capacity` checks for active
+   * repositories when the lifecycle is enabled. Ticket retry failures are logged without failing the
    * cycle; the stored per-ticket error keeps `findings-ticketing` raised instead.
    */
   private async evaluateFindings(
@@ -385,7 +385,13 @@ export class MonitoringService {
       }
     }
     const records = await this.store.listFindingLifecycle(repository.repositoryId);
-    return evaluateFindingsLifecycle(records.map(toFindingLifecycleInput), clock);
+    const state = await this.store.getFindingLifecycleState(repository.repositoryId);
+    return evaluateFindingsLifecycle(records.map(toFindingLifecycleInput), clock, {
+      lastDropped: state?.lastDropped ?? 0,
+      lastDroppedCriticalHigh: state?.lastDroppedCriticalHigh ?? 0,
+      droppedTotal: state?.droppedTotal ?? 0,
+      untrustedMarkers: state?.untrustedMarkers ?? 0
+    });
   }
 
   private async performReconciliation(
@@ -761,6 +767,9 @@ function deployedDigestRescanChecks(
         evidence.evidenceKey === `${DEPLOYMENT_EVIDENCE_PREFIX}${environment}` &&
         evidence.kind === "deployment" &&
         evidence.artifactType === "image-promotion" &&
+        // A failed promotion leaves the previous digest running, so only successful rows can
+        // name the deployed digest.
+        evidence.status === "success" &&
         evidence.environment === environment &&
         // Deployment rows come only from accepted default-branch push promotions. A deployment
         // older than the bounded run window stays the deployed digest; a run that is still
@@ -769,7 +778,7 @@ function deployedDigestRescanChecks(
           fromAcceptedRun(evidence, "push"))
     )
   );
-  if (!deployment || deployment.status !== "success" || !deployment.digest) {
+  if (!deployment || !deployment.digest) {
     // Without an accepted deployment there is no deployed digest to rescan; the existing
     // image-deployment requirement already reports that gap.
     return [];

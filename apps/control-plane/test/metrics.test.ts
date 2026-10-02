@@ -233,7 +233,12 @@ test("review-value and remediation draft counters are bare aggregates that start
     "finding_outcome_ignored_total",
     "remediation_draft_created_total",
     "remediation_draft_rejected_total",
-    "remediation_draft_unavailable_total"
+    "remediation_draft_unavailable_total",
+    "remediation_draft_validator_rejected_total",
+    "remediation_draft_checks_passed_total",
+    "remediation_draft_checks_failed_total",
+    "remediation_draft_branch_deleted_total",
+    "remediation_draft_branch_retained_total"
   ] as const;
   let rendered = metrics.render();
   for (const name of names) {

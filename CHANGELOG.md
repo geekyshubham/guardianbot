@@ -19,8 +19,16 @@ reusable workflow commits remain immutable.
 - Nightly rescan of the exact deployed digest (`reusable-image-rescan.yml`,
   `POST /image/rescan-target`) with a bounded CycloneDX SBOM diff,
   `image-rescan:<env>` and `promotion-freeze:<env>` evidence, and
-  `image-rescan-coverage` / `image-promotion-freeze` monitoring checks. The
-  freeze is a signal only. Automated tests only; no live evidence.
+  `image-rescan-coverage` / `image-promotion-freeze` monitoring checks.
+  Automated tests only; no live evidence.
+- Promotion freeze enforcement: the DigitalOcean reconciler refuses, for every
+  profile, a digest whose newest verified rescan found Critical findings, and
+  the release gate reports it as `promotion-frozen`. `DigitalOceanPromotionInput`
+  gains a required `defaultBranch`. Automated tests only; no live evidence.
+- Deployed-digest rescan reports are imported into a separate
+  `<branch>/image-rescan` DefectDojo engagement, one Test per environment, and
+  feed the findings lifecycle on `trivy-image-rescan:<env>` streams.
+  Automated tests only; no live evidence.
 - Digest-scoped release gate (`reusable-release-gate.yml`,
   `POST /release/gate`) backed by DefectDojo findings and named, unexpired
   risk acceptances; fails closed as `gate-unavailable`. Optional DigitalOcean
@@ -30,6 +38,26 @@ reusable workflow commits remain immutable.
   `GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED` is set. Adds `findings-sla` and
   `findings-ticketing` monitoring checks and a weekly `findings` section.
   Automated tests only; no live evidence.
+- Findings lifecycle `findings-capacity` monitoring check: failing when the
+  record bound dropped an open Critical or High finding, warning on any other
+  drop or on marker issues this App did not open. Automated tests only.
+- Mode C draft check status: the link comment moves from pending to passed or
+  failed from `workflow_run` events at GuardianBot's own draft commit. Draft
+  branches are deleted on close only while their tip is still GuardianBot's
+  commit. Automated tests only; no live evidence.
+- Optional veto-only second-model validator for Mode C drafts
+  (`guardian.remediation-validation.v1`, `GUARDIANBOT_REMEDIATION_VALIDATOR_*`,
+  off by default). `guardian.review.v1` is unchanged. Automated tests only.
+
+### Security
+
+- Mode C draft titles are built from trusted fields only (enum category,
+  fingerprint hex, sanitized path), never the model-written finding title.
+- A review save carries `dismissed` and `ignored` outcomes recorded while the
+  review ran, atomically in both stores, closing the outcome-carry race.
+- Finding ticket marker recovery trusts only issues opened by this GitHub App
+  (`performed_via_github_app.id` or the App's `<slug>[bot]` login, verified
+  against `GET /app`), not any Bot-authored issue.
 - Review value analytics (`fixed`, `dismissed`, `ignored`, precision) in the
   weekly report, the `@guardianbot dismiss` command, and opt-in Mode C
   `@guardianbot draft-fix` draft pull requests behind
@@ -37,13 +65,47 @@ reusable workflow commits remain immutable.
   write` permission. Automated tests only; no live evidence.
 - [Roadmap traceability](docs/roadmap-traceability.md) maps each roadmap item
   to code, tests, status, and the live evidence it still needs.
+- Opt-in real-PostgreSQL parity suite
+  (`apps/control-plane/test/postgres-integration.test.ts`, gated on
+  `GUARDIANBOT_TEST_DATABASE_URL`) runs each scenario against `MemoryStore` and
+  a migrated `PostgresStore` in a throwaway schema and requires identical
+  results. A new `postgres-parity` CI job runs it against
+  `postgres:16-alpine` pinned by digest and fails closed through
+  `GUARDIANBOT_TEST_DATABASE_REQUIRED=1`. Passed locally on PostgreSQL 16.15;
+  the CI job has not run yet.
 
 ### Changed
 
 - Enforcement readiness now requires default-branch `head_branch` on both the
   source and observation runs, and ruleset pagination is capped at 10 pages.
-- Deployed-digest rescans do not feed the findings lifecycle, so they cannot
-  open or fix `trivy-image` records.
+- Deployed-digest rescans feed the findings lifecycle only on their own
+  per-environment stream, so they cannot open or fix build-time `trivy-image`
+  stream records.
+- Release gate `deployed-rescan` now requires a fresh (48 hour), reconciled
+  rescan of the digest already deployed in the candidate environment instead
+  of a DAST summary for the candidate digest, which could not exist before the
+  first promotion. DAST imports are no longer required by the gate.
+- A commit-scoped DefectDojo Test reimported for a newer commit no longer
+  blocks every older candidate: `semgrep-summary` and `trivy-summary` record
+  release severity counts, and a candidate whose own counts are zero at every
+  blocking severity passes in its place.
+- Finding ticket sync claims work under the lifecycle lock and calls
+  providers after releasing it; results are recorded only while their leased
+  claim holds, and scanner merges no longer write ticket state.
+- The findings record bound retires long-fixed records first and drops open
+  Critical or High findings last; every drop is recorded.
+- Jira label lookup uses `/rest/api/2/search/jql` with bounded
+  `nextPageToken` paging instead of the removed `/rest/api/2/search`.
+
+### Fixed
+
+- Store parity defects found by the real-PostgreSQL suite: deployed-image,
+  release-image, release-DAST, and monitoring evidence no longer tie-break on
+  row write time (`updated_at`) before run id and attempt; monitoring ranks a
+  run with no timestamp oldest instead of by write time and orders evidence
+  with one shared comparator; lifecycle stream watermarks sort in byte order
+  in both stores; `MemoryStore` review activity is ordered by most recent
+  write like PostgreSQL, and head-only reviews read back zero counters.
 
 ## [0.2.41] - 2026-08-02
 

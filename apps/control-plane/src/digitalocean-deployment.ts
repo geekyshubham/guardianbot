@@ -58,6 +58,8 @@ export interface DigitalOceanPromotionInput {
   runAttempt: number;
   headSha: string;
   imageReference: string;
+  /** Default branch whose scheduled rescans decide whether the candidate digest is frozen. */
+  defaultBranch: string;
   releaseEvidence?: DigitalOceanReleaseEvidence;
 }
 
@@ -752,6 +754,38 @@ export function createDigitalOceanDeploymentService(
     }
   }
 
+  /**
+   * A digest whose newest verified scheduled rescan found Critical findings (or left an
+   * unreadable or missing freeze record) is never promoted again, to any environment. A
+   * different digest that is itself Critical-clean is the fix path and stays allowed.
+   */
+  async function enforcePromotionFreeze(
+    profile: DigitalOceanDeploymentProfile,
+    input: DigitalOceanPromotionInput,
+    imageDigest: string
+  ): Promise<void> {
+    let rescan: Awaited<ReturnType<Store["getLatestImageRescanEvidence"]>>;
+    try {
+      rescan = await options.store.getLatestImageRescanEvidence(
+        input.repositoryId,
+        imageDigest,
+        input.defaultBranch
+      );
+    } catch {
+      throw new DigitalOceanDeploymentError(
+        "Promotion freeze state is unavailable; DigitalOcean promotion refused",
+        profile.environment
+      );
+    }
+    if (rescan?.frozen) {
+      throw new DigitalOceanDeploymentError(
+        `Promotion freeze active for this digest (rescan in ${rescan.environment}); ` +
+          "DigitalOcean promotion refused",
+        profile.environment
+      );
+    }
+  }
+
   return {
     async promote(
       input: DigitalOceanPromotionInput
@@ -769,6 +803,13 @@ export function createDigitalOceanDeploymentService(
         positiveSafeInteger(input.runId, "promotion runId");
         positiveSafeInteger(input.runAttempt, "promotion runAttempt");
         exactSha(input.headSha, "promotion headSha");
+        if (
+          !input.defaultBranch ||
+          (input.releaseEvidence !== undefined &&
+            input.releaseEvidence.defaultBranch !== input.defaultBranch)
+        ) {
+          throw new Error("promotion default branch is missing or inconsistent");
+        }
       } catch {
         throw new DigitalOceanDeploymentError(
           "DigitalOcean promotion input is invalid",
@@ -787,6 +828,7 @@ export function createDigitalOceanDeploymentService(
           profile.environment
         );
       }
+      await enforcePromotionFreeze(profile, input, imageDigest);
       if (profile.requireReleaseGate) {
         await enforceReleaseGate(profile, input, imageDigest);
       }

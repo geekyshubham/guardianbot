@@ -40,7 +40,7 @@ accepted until the live evidence listed in
 
 - Release-branch PR coverage and the organization Semgrep severity map.
 - Nightly rescan of the exact deployed digest with a bounded CycloneDX SBOM
-  diff and a promotion-freeze signal.
+  diff and an enforced promotion freeze.
 - Digest-scoped release gate backed by DefectDojo findings and risk
   acceptances.
 - Findings lifecycle with SLA aging, ownership, and GitHub Issues, Jira, and

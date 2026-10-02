@@ -2,7 +2,10 @@
 
 The `findings-sla` monitoring alert means at least one open deterministic
 scanner finding is past its SLA due date. `findings-ticketing` means a ticket or
-notifier update failed and is being retried.
+notifier update failed and is being retried. `findings-capacity` means the
+latest merge dropped records over the repository's 5000-record bound (failing
+when an open Critical or High finding was among them), or that issues carrying a
+finding marker were ignored because this GitHub App did not open them.
 
 1. Identify the repository from the alert. Use the weekly report `findings`
    section for counts by severity, owner, and age bucket; it never contains
@@ -20,6 +23,11 @@ notifier update failed and is being retried.
    record (provider, method, and HTTP status), then the referenced credential
    and provider availability. Do not paste tokens or webhook URLs into tickets
    or logs.
+6. For a `findings-capacity` drop, reduce the open backlog (fix, suppress with
+   an owner, or tune noisy rules) until merges fit the bound; dropped findings
+   come back on the next scan that still reports them once there is room. For
+   ignored markers, look for issues copying the `guardianbot-finding:` marker;
+   GuardianBot never edits them and opens its own issue instead.
 
 Failure policy:
 

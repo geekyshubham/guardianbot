@@ -1282,3 +1282,22 @@ test("generated callers stay byte-identical unless image.deployment opts into th
     2
   );
 });
+
+test("CI runs the real-PostgreSQL parity suite against a digest-pinned server and fails closed", () => {
+  const ci = repositoryFile(".github/workflows/ci.yml");
+  assert.match(ci, /^  postgres-parity:$/m);
+  assert.match(
+    ci,
+    /image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777/
+  );
+  // Every service image in CI carries a digest, never a floating tag alone.
+  for (const [, image] of ci.matchAll(/^\s+image: (\S+)$/gm)) {
+    assert.match(image, /@sha256:[a-f0-9]{64}$/, image);
+  }
+  for (const [, action] of ci.matchAll(/uses: (\S+)/g)) {
+    assert.match(action, /@[a-f0-9]{40}$/, action);
+  }
+  assert.match(ci, /GUARDIANBOT_TEST_DATABASE_REQUIRED: "1"/);
+  assert.match(ci, /npx tsx --test test\/postgres-integration\.test\.ts/);
+  assert.match(ci, /^permissions:\n  contents: read$/m);
+});

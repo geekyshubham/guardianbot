@@ -20,7 +20,11 @@ import {
   type ReleaseGateEvidenceInput,
   type ReleaseGatePolicy
 } from "./release-gate-policy.js";
-import type { Store } from "./store.js";
+import type {
+  ImageRescanEvidence,
+  ReleaseCommitScanSummary,
+  Store
+} from "./store.js";
 
 export const RELEASE_GATE_OIDC_AUDIENCE = "guardianbot-release-gate";
 export const RELEASE_GATE_ENVIRONMENT = "guardianbot-release-gate";
@@ -64,7 +68,7 @@ export interface ReleaseGateEvaluateInput {
   /** Exact DefectDojo product name, which GuardianBot imports as the repository full name. */
   productName: string;
   defaultBranch: string;
-  evidence: Omit<ReleaseGateEvidenceInput, "deployedRescan">;
+  evidence: Omit<ReleaseGateEvidenceInput, "deployedRescan" | "candidateRescan" | "commitScan">;
 }
 
 export interface ReleaseGateEvaluator {
@@ -345,6 +349,79 @@ async function readDefectDojo(
   }
 }
 
+function rescanResult(
+  rescan: ImageRescanEvidence
+): NonNullable<ReleaseGateEvidenceInput["candidateRescan"]> {
+  return {
+    digest: rescan.imageDigest,
+    environment: rescan.environment,
+    observedAt: rescan.observedAt,
+    criticalFindings: rescan.criticalFindings,
+    frozen: rescan.frozen,
+    artifactAccepted: rescan.artifactAccepted,
+    ref:
+      `evidence://${rescan.runId}/${rescan.runAttempt}/${rescan.artifactId}/` +
+      `image-rescan:${rescan.environment}`
+  };
+}
+
+/** Control-plane evidence the gate reads itself, so every caller gets the same view. */
+async function readStoredEvidence(
+  store: Store,
+  candidate: ReleaseCandidate,
+  defaultBranch: string,
+  coverageRequired: boolean
+): Promise<Pick<ReleaseGateEvidenceInput, "deployedRescan" | "candidateRescan" | "commitScan">> {
+  const candidateRescan = await store.getLatestImageRescanEvidence(
+    candidate.repositoryId,
+    candidate.digest,
+    defaultBranch
+  );
+  let deployedRescan: ReleaseGateEvidenceInput["deployedRescan"];
+  if (coverageRequired) {
+    const deployed = await store.getLatestDeployedImageEvidence(
+      candidate.repositoryId,
+      candidate.environment,
+      defaultBranch
+    );
+    const rescan = deployed
+      ? await store.getLatestImageRescanEvidence(
+          candidate.repositoryId,
+          deployed.imageDigest,
+          defaultBranch,
+          candidate.environment
+        )
+      : undefined;
+    deployedRescan = {
+      environment: candidate.environment,
+      deployedDigest: deployed?.imageDigest,
+      rescan: rescan && rescanResult(rescan)
+    };
+  }
+  const scan = await store.getReleaseCommitScanEvidence(
+    candidate.repositoryId,
+    candidate.commit,
+    defaultBranch
+  );
+  const summary = (key: "semgrep-summary" | "trivy-summary", value: ReleaseCommitScanSummary | undefined) =>
+    scan && value
+      ? {
+          status: value.status,
+          severities: value.severities,
+          ref: `evidence://${scan.runId}/${scan.runAttempt}/${scan.artifactId}/${key}`
+        }
+      : undefined;
+  return {
+    candidateRescan: candidateRescan && rescanResult(candidateRescan),
+    deployedRescan,
+    commitScan: scan && {
+      commit: scan.headSha,
+      semgrep: summary("semgrep-summary", scan.semgrep),
+      trivy: summary("trivy-summary", scan.trivy)
+    }
+  };
+}
+
 export function createReleaseGateEvaluator(
   options: ReleaseGateEvaluatorOptions
 ): ReleaseGateEvaluator {
@@ -361,24 +438,12 @@ export function createReleaseGateEvaluator(
         throw new ReleaseGateError("release gate is not configured", 503);
       }
       const { candidate } = input;
-      let deployedRescan: ReleaseGateEvidenceInput["deployedRescan"];
-      if (config.policy.requiredEvidence.includes("deployed-rescan")) {
-        const dast = await options.store.getReleaseDastEvidence(
-          candidate.repositoryId,
-          candidate.digest,
-          candidate.environment,
-          input.defaultBranch
-        );
-        if (dast) {
-          deployedRescan = {
-            digest: dast.imageDigest,
-            environment: dast.environment,
-            status: dast.status,
-            observedAt: dast.observedAt,
-            ref: `evidence://${dast.runId}/${dast.runAttempt}/${dast.artifactId}/${dast.evidenceKey}`
-          };
-        }
-      }
+      const stored = await readStoredEvidence(
+        options.store,
+        candidate,
+        input.defaultBranch,
+        config.policy.requiredEvidence.includes("deployed-rescan")
+      );
       const defectDojo = await readDefectDojo(
         reader,
         input.productName,
@@ -387,7 +452,7 @@ export function createReleaseGateEvaluator(
       );
       return evaluateReleaseGate({
         candidate,
-        evidence: { ...input.evidence, deployedRescan },
+        evidence: { ...input.evidence, ...stored },
         expectedCertificateIdentity: config.expectedCertificateIdentity,
         defectDojo,
         policy: config.policy,

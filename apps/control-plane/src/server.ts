@@ -14,6 +14,7 @@ import {
   ImageRescanTargetError
 } from "./image-rescan.js";
 import { createReleaseGateService, ReleaseGateError } from "./release-gate.js";
+import { remediationValidatorFromEnvironment } from "./remediation-validator.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
 import { startImageSmokeServer } from "./image-smoke.js";
@@ -208,7 +209,10 @@ async function start() {
       repositoryIndexService,
       // Mode C is opt-in at the deployment and still requires the installation to hold
       // contents:write; any value other than exactly "1" leaves it off.
-      remediationDrafts: process.env.GUARDIANBOT_REMEDIATION_DRAFTS === "1"
+      remediationDrafts: process.env.GUARDIANBOT_REMEDIATION_DRAFTS === "1",
+      // Optional veto-only second model for drafts, read from control-plane env only. A set but
+      // malformed configuration fails startup instead of running without the requested veto.
+      remediationValidator: remediationValidatorFromEnvironment(process.env)
     },
     store
   );

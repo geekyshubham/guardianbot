@@ -29,6 +29,13 @@ type CounterName =
   | "remediation_draft_created_total"
   | "remediation_draft_rejected_total"
   | "remediation_draft_unavailable_total"
+  // Veto-only second-model refusals (reject, error, timeout, malformed, classification), the
+  // settled checks of recorded drafts, and draft-branch cleanup outcomes on close.
+  | "remediation_draft_validator_rejected_total"
+  | "remediation_draft_checks_passed_total"
+  | "remediation_draft_checks_failed_total"
+  | "remediation_draft_branch_deleted_total"
+  | "remediation_draft_branch_retained_total"
   | "commands_authorized_total"
   | "commands_rejected_total"
   | "github_failures_total"
@@ -86,6 +93,11 @@ export class GuardianMetrics {
       "remediation_draft_created_total",
       "remediation_draft_rejected_total",
       "remediation_draft_unavailable_total",
+      "remediation_draft_validator_rejected_total",
+      "remediation_draft_checks_passed_total",
+      "remediation_draft_checks_failed_total",
+      "remediation_draft_branch_deleted_total",
+      "remediation_draft_branch_retained_total",
       "commands_authorized_total",
       "commands_rejected_total",
       "github_failures_total",

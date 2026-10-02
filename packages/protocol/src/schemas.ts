@@ -315,3 +315,80 @@ export const backendCapabilitiesSchema = {
     usageReporting: { type: "boolean" }
   }
 } as const;
+
+export const REMEDIATION_VALIDATION_TEXT_LIMIT = 8_000;
+export const REMEDIATION_VALIDATION_CONTEXT_LIMIT = 4_000;
+
+export const remediationValidationReasonValues = [
+  "does-not-address-finding",
+  "changes-unrelated-behavior",
+  "introduces-vulnerability",
+  "likely-syntax-error",
+  "insufficient-context"
+] as const;
+
+export const remediationValidationRequestSchema = {
+  $id: "https://guardianbot.dev/schemas/remediation-validation-request.v1.json",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "protocolVersion",
+    "requestId",
+    "classification",
+    "finding",
+    "original",
+    "replacement",
+    "contextBefore",
+    "contextAfter"
+  ],
+  properties: {
+    protocolVersion: { const: "guardian.remediation-validation.v1" },
+    requestId: { type: "string", minLength: 1, maxLength: 128 },
+    classification: { enum: ["public", "private", "restricted"] },
+    finding: {
+      type: "object",
+      additionalProperties: false,
+      required: ["fingerprint", "path", "startLine", "endLine"],
+      properties: {
+        fingerprint: { type: "string", minLength: 1, maxLength: 128 },
+        category: findingSchema.properties.category,
+        severity: findingSchema.properties.severity,
+        path: { type: "string", minLength: 1, maxLength: 400 },
+        startLine: { type: "integer", minimum: 1 },
+        endLine: { type: "integer", minimum: 1 }
+      }
+    },
+    original: { type: "string", maxLength: REMEDIATION_VALIDATION_TEXT_LIMIT },
+    replacement: { type: "string", minLength: 1, maxLength: REMEDIATION_VALIDATION_TEXT_LIMIT },
+    contextBefore: { type: "string", maxLength: REMEDIATION_VALIDATION_CONTEXT_LIMIT },
+    contextAfter: { type: "string", maxLength: REMEDIATION_VALIDATION_CONTEXT_LIMIT }
+  }
+} as const;
+
+export const remediationValidationResultSchema = {
+  $id: "https://guardianbot.dev/schemas/remediation-validation-result.v1.json",
+  type: "object",
+  additionalProperties: false,
+  required: ["protocolVersion", "requestId", "decision", "reasons", "backend"],
+  properties: {
+    protocolVersion: { const: "guardian.remediation-validation.v1" },
+    requestId: { type: "string", minLength: 1, maxLength: 128 },
+    decision: { enum: ["accept", "reject"] },
+    reasons: {
+      type: "array",
+      maxItems: remediationValidationReasonValues.length,
+      uniqueItems: true,
+      items: { enum: remediationValidationReasonValues }
+    },
+    backend: {
+      type: "object",
+      additionalProperties: false,
+      required: ["backendId", "modelId", "latencyMs"],
+      properties: {
+        backendId: { type: "string", minLength: 1, maxLength: 128 },
+        modelId: { type: "string", minLength: 1, maxLength: 128 },
+        latencyMs: { type: "number", minimum: 0 }
+      }
+    }
+  }
+} as const;

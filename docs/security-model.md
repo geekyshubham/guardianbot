@@ -36,11 +36,20 @@ grant it. The trust boundary is:
   exact changed-line range. A deterministic validator rejects protected paths
   (workflows, CI, GuardianBot config, CODEOWNERS, lockfiles), binaries, stale
   heads, oversize changes, and any change outside the range. No model output
-  is used beyond that suggestion, and no second model is consulted.
+  is used beyond that suggestion. The draft title is built from trusted
+  fields only, never the model-written finding title. An optional second-model
+  validator (`guardian.remediation-validation.v1`, off by default) can only
+  veto: it sees the change and bounded surrounding lines, never model prose,
+  and any error or rejection refuses the draft. Its credentials stay in
+  control-plane environment.
 - Target: a new `guardianbot/fix/*` branch cut from the pull request head and
   a DRAFT pull request into the head branch. GuardianBot never merges,
   approves, or pushes to the contributor's branch, and its draft does not
-  change deterministic gates.
+  change deterministic gates. Check status reported on the link comment is a
+  summary of workflow runs at GuardianBot's own commit, not an approval.
+- Cleanup: on close, the draft branch is deleted only while its tip is still
+  the single commit GuardianBot wrote on the recorded head; a branch a human
+  pushed to, rewrote, or that was reused is retained.
 
 Details are in [remediation drafts](remediation-drafts.md).
 
@@ -135,8 +144,9 @@ The principal failure-isolation rules are:
 - A model-backend outage does not block deterministic security jobs.
 - A DAST or deployment profile authorizes exactly one repository/target
   relationship.
-- Scheduled findings may freeze future promotion but do not interrupt a running
-  workload.
+- Scheduled findings freeze future promotion of the affected digest (enforced
+  by the deployment reconciler and the release gate) but do not interrupt a
+  running workload.
 - Removing App access stops new control-plane actions without deleting retained
   audit evidence.
 

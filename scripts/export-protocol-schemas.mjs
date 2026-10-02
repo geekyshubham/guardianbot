@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   backendCapabilitiesSchema,
+  remediationValidationRequestSchema,
+  remediationValidationResultSchema,
   reviewRequestSchema,
   reviewResultSchema
 } from "../packages/protocol/dist/schemas.js";
@@ -9,7 +11,17 @@ import {
 const definitions = [
   ["review-request.v1.json", "GuardianBot Review Request", reviewRequestSchema],
   ["review-result.v1.json", "GuardianBot Review Result", reviewResultSchema],
-  ["backend-capabilities.v1.json", "GuardianBot Backend Capabilities", backendCapabilitiesSchema]
+  ["backend-capabilities.v1.json", "GuardianBot Backend Capabilities", backendCapabilitiesSchema],
+  [
+    "remediation-validation-request.v1.json",
+    "GuardianBot Remediation Validation Request",
+    remediationValidationRequestSchema
+  ],
+  [
+    "remediation-validation-result.v1.json",
+    "GuardianBot Remediation Validation Result",
+    remediationValidationResultSchema
+  ]
 ];
 const check = process.argv.includes("--check");
 for (const [name, title, schema] of definitions) {
