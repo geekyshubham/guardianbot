@@ -255,9 +255,11 @@ the stated live evidence must also be captured where required.
   workers replaying the same delivery. Suite after the fixes: **438 tests, 0
   failures** (control-plane 257). One finding was triaged as **not a defect**
   and deliberately left unchanged. **Not closed:** the `PostgresStore` lease
-  fence is asserted only against the statement's source text, since this
-  environment has no live PostgreSQL, so its parameter numbering and
-  `ON CONFLICT` interaction are unverified at runtime; a request in flight when
+  fence was originally asserted only against the statement's source text. The
+  real-PostgreSQL parity suite now exercises it (missing delivery, live lease,
+  wrong owner) against PostgreSQL 16.15 in a local development cluster, and a
+  digest-pinned `postgres-parity` CI job is added but has **not run yet**. This
+  is test evidence, not production evidence; a request in flight when
   the drain budget expires is still terminated unanswered and redelivered;
   `review_stale_total` no longer distinguishes a moved head SHA from a lost
   lease; and the per-file cancellation checkpoint inside a rebuild has no test.
