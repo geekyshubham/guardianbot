@@ -193,19 +193,73 @@ export function findingsLifecycleOptionsFromEnvironment(
 // Ownership
 // ---------------------------------------------------------------------------
 
-/** Same glob semantics as GuardianBot's CODEOWNERS reviewer evidence. */
-function pathMatchesPattern(pattern: string, path: string): boolean {
+type GlobToken =
+  | { kind: "literal"; value: string }
+  | { kind: "segment" }
+  | { kind: "any" }
+  | { kind: "single" };
+
+/**
+ * Same glob semantics as GuardianBot's CODEOWNERS reviewer evidence (`**` crosses
+ * `/`, `*` and `?` do not, a pattern without `/` matches any basename suffix, a
+ * trailing `/` matches everything below), evaluated as a linear-time NFA rather
+ * than a backtracking RegExp. CODEOWNERS and ownership rules are repository-
+ * controlled, so a crafted `a/**a**a**b` style pattern must not stall the
+ * control-plane event loop while the lifecycle lock is held.
+ */
+export function pathMatchesPattern(pattern: string, path: string): boolean {
   const normalized = pattern.replace(/^\/+/, "");
   if (!normalized) return false;
-  const escaped = normalized
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\u0000")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]")
-    .replace(/\u0000/g, ".*");
-  const directory = normalized.endsWith("/") ? ".*" : "";
-  const prefix = normalized.includes("/") ? "^" : "(?:^|/)";
-  return new RegExp(`${prefix}${escaped}${directory}$`).test(path);
+  const tokens: GlobToken[] = [];
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index];
+    if (char === "*" && normalized[index + 1] === "*") {
+      tokens.push({ kind: "any" });
+      index += 1;
+    } else if (char === "*") {
+      tokens.push({ kind: "segment" });
+    } else if (char === "?") {
+      tokens.push({ kind: "single" });
+    } else {
+      tokens.push({ kind: "literal", value: char as string });
+    }
+  }
+  if (normalized.endsWith("/")) tokens.push({ kind: "any" });
+  const anchored = normalized.includes("/");
+  const end = tokens.length;
+
+  const closure = (states: Uint8Array) => {
+    for (let index = 0; index < end; index += 1) {
+      const kind = tokens[index]?.kind;
+      if (states[index] && (kind === "segment" || kind === "any")) states[index + 1] = 1;
+    }
+  };
+  let current = new Uint8Array(end + 1);
+  current[0] = 1;
+  closure(current);
+  for (let position = 0; position < path.length; position += 1) {
+    // UTF-16 code units, matching the non-unicode RegExp this replaces.
+    const char = path[position] as string;
+    const next = new Uint8Array(end + 1);
+    for (let index = 0; index < end; index += 1) {
+      if (!current[index]) continue;
+      const token = tokens[index] as GlobToken;
+      if (token.kind === "literal") {
+        if (token.value === char) next[index + 1] = 1;
+      } else if (token.kind === "single") {
+        if (char !== "/") next[index + 1] = 1;
+      } else if (token.kind === "segment") {
+        if (char !== "/") next[index] = 1;
+      } else if (char !== "\n" && char !== "\r" && char !== "\u2028" && char !== "\u2029") {
+        next[index] = 1;
+      }
+    }
+    // An unanchored pattern may start matching after any directory separator.
+    if (!anchored && char === "/") next[0] = 1;
+    closure(next);
+    current = next;
+  }
+  return current[end] === 1;
 }
 
 export interface CodeOwnersRule {
@@ -360,6 +414,28 @@ function boundedText(value: string | undefined, maximum: number): string | undef
   return text.length <= maximum ? text : text.slice(0, maximum);
 }
 
+/**
+ * DAST locations are full request URIs whose query strings, fragments, or userinfo can
+ * carry tokens or session identifiers. Lifecycle records feed tickets, so only the
+ * origin and path of a URL are kept; repository paths drop the scanner mount prefix.
+ */
+export function lifecycleRecordPath(
+  source: FindingLifecycleSource,
+  path: string | undefined
+): string | undefined {
+  if (!path) return undefined;
+  if (source === "zap" || /^[a-z][a-z0-9+.-]*:\/\//i.test(path)) {
+    try {
+      const url = new URL(path);
+      if (url.origin === "null") return undefined;
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return undefined;
+    }
+  }
+  return repositoryRelativePath(path) ?? path;
+}
+
 function mergeObservations(observations: readonly LifecycleObservation[]): LifecycleObservation[] {
   const byStream = new Map<string, { complete: boolean; findings: Map<string, LifecycleFindingObservation> }>();
   for (const observation of observations) {
@@ -507,7 +583,7 @@ export async function ingestFindingObservations(
         record.source = finding.source;
         record.ruleId = boundedText(finding.ruleId, 256) ?? "unknown";
         record.severity = finding.severity;
-        record.path = boundedText(repositoryRelativePath(finding.path) ?? finding.path, 1_024);
+        record.path = boundedText(lifecycleRecordPath(finding.source, finding.path), 1_024);
         record.line =
           Number.isSafeInteger(finding.line) && Number(finding.line) > 0 ? finding.line : undefined;
         record.streams[observation.stream] = observedAt;

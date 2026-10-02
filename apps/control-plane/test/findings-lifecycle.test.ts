@@ -16,7 +16,9 @@ import {
   findingsLifecycleOptionsFromEnvironment,
   ingestFindingObservations,
   isTrustedLifecycleRun,
+  lifecycleRecordPath,
   parseCodeOwners,
+  pathMatchesPattern,
   recordAcceptedRunLifecycle,
   resolveFindingOwner,
   syncFindingTickets,
@@ -332,6 +334,67 @@ test("ownership prefers config rules, then CODEOWNERS, then the service owner, e
     parseCodeOwners("* @acme/platform\nsrc/ @acme/par\n[guardianbot-truncated]"),
     [{ pattern: "*", owners: ["@acme/platform"] }]
   );
+});
+
+test("ownership globs keep CODEOWNERS semantics and run in linear time on crafted patterns", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["*", "src/a.ts", true],
+    ["*.ts", "src/deep/a.ts", true],
+    ["*.ts", "src/a.tsx", false],
+    ["src/*.ts", "src/a.ts", true],
+    ["src/*.ts", "src/deep/a.ts", false],
+    ["src/**", "src/deep/a.ts", true],
+    ["/src/", "src/deep/a.ts", true],
+    ["src/", "lib/src/a.ts", false],
+    ["docs", "a/docs", true],
+    ["a?c", "abc", true],
+    ["a?c", "a/c", false],
+    ["src/[x].ts", "src/[x].ts", true],
+    ["src/(.*).ts", "src/a.ts", false]
+  ];
+  for (const [pattern, path, expected] of cases) {
+    assert.equal(pathMatchesPattern(pattern, path), expected, `${pattern} vs ${path}`);
+  }
+  const started = performance.now();
+  // These patterns backtracked for seconds with the previous RegExp translation.
+  assert.equal(pathMatchesPattern(`a/${"**a".repeat(8)}b`, `a/${"a".repeat(2_000)}`), false);
+  assert.equal(pathMatchesPattern(`${"*a".repeat(50)}b`, "a".repeat(2_000)), false);
+  const context = {
+    codeOwners: parseCodeOwners(`a/${"**a".repeat(8)}b @acme/evil\n`.repeat(1_000))
+  };
+  assert.equal(
+    resolveFindingOwner({ source: "semgrep", path: `a/${"a".repeat(500)}` }, context),
+    UNOWNED_FINDING_OWNER
+  );
+  assert.ok(performance.now() - started < 2_000, "crafted globs must not stall the event loop");
+});
+
+test("DAST locations keep only origin and path so URI secrets never reach tickets", async () => {
+  assert.equal(
+    lifecycleRecordPath("zap", "https://user:pw@app.example.test/login?token=s3cret#frag"),
+    "https://app.example.test/login"
+  );
+  assert.equal(lifecycleRecordPath("zap", "not a url?session=s3cret"), undefined);
+  assert.equal(lifecycleRecordPath("semgrep", "/src/app/a.ts"), "app/a.ts");
+
+  const store = new MemoryStore();
+  const record = await seed(store);
+  await ingest(store, record, [
+    observation("zap:nightly:staging", [
+      {
+        source: "zap",
+        fingerprint: fingerprint("dast"),
+        ruleId: "10202",
+        severity: "high",
+        title: "Absence of Anti-CSRF Tokens",
+        path: "https://app.example.test/account?session=s3cret&api_key=k3y"
+      }
+    ])
+  ]);
+  const stored = await byFingerprint(store, "dast");
+  assert.equal(stored?.path, "https://app.example.test/account");
+  const ticket = ticketContentFor(record, stored as FindingLifecycleRecord, OPTIONS.slaDays, NOW);
+  assert.equal(JSON.stringify(ticket).includes("s3cret"), false);
 });
 
 test("only accepted default-branch push or schedule runs of active repositories are trusted", async () => {
