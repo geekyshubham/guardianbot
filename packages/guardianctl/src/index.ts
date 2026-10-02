@@ -2371,22 +2371,11 @@ async function inspectRulesets(
   defaultBranch: string,
   expectedCheck: string
 ): Promise<RulesetInspection> {
-  const rulesets: Ruleset[] = [];
-  let rulesetsObservable = false;
-  try {
-    for (let page = 1; ; page += 1) {
-      const batch = await github.request<Ruleset[]>(
-        "GET",
-        `/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100&page=${page}`
-      );
-      rulesetsObservable = true;
-      rulesets.push(...batch);
-      if (batch.length < 100) break;
-    }
-  } catch (error) {
-    const status = githubErrorStatus(error);
-    if (!status || ![403, 404].includes(status)) throw error;
-  }
+  const { rulesets, observable: rulesetsObservable } = await loadBranchRulesets(
+    github,
+    owner,
+    repo
+  );
 
   const detailed: Ruleset[] = [];
   for (const summary of rulesets) {
@@ -2497,6 +2486,39 @@ export interface ReleaseBranchRuleCoverage {
   detail: string;
 }
 
+/** Ruleset listing cap (100 per page), matching verify-enforcement-readiness.mjs. */
+const MAX_RULESET_PAGES = 10;
+
+/**
+ * Bounded ruleset listing shared by default-branch and release-branch
+ * inspection. Exceeding the page cap fails closed (callers report the rule as
+ * not ready/unobservable) instead of paginating without limit.
+ */
+async function loadBranchRulesets(
+  github: GitHubClient,
+  owner: string,
+  repo: string
+): Promise<{ rulesets: Ruleset[]; observable: boolean }> {
+  const rulesets: Ruleset[] = [];
+  try {
+    for (let page = 1; page <= MAX_RULESET_PAGES; page += 1) {
+      const batch = await github.request<Ruleset[]>(
+        "GET",
+        `/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100&page=${page}`
+      );
+      rulesets.push(...batch);
+      if (batch.length < 100) return { rulesets, observable: true };
+    }
+  } catch (error) {
+    const status = githubErrorStatus(error);
+    if (!status || ![403, 404].includes(status)) throw error;
+    return { rulesets: [], observable: false };
+  }
+  throw new Error(
+    `ruleset listing exceeded ${MAX_RULESET_PAGES} pages; fail closed`
+  );
+}
+
 /**
  * Report-only inspection: for each configured scanners.releaseBranches entry,
  * determine whether an active strict ruleset (or classic branch protection)
@@ -2510,22 +2532,11 @@ async function inspectReleaseBranchRules(
   releaseBranches: readonly string[],
   expectedCheck: string
 ): Promise<ReleaseBranchRuleCoverage[]> {
-  const rulesets: Ruleset[] = [];
-  let rulesetsObservable = false;
-  try {
-    for (let page = 1; ; page += 1) {
-      const batch = await github.request<Ruleset[]>(
-        "GET",
-        `/repos/${owner}/${repo}/rulesets?includes_parents=true&per_page=100&page=${page}`
-      );
-      rulesetsObservable = true;
-      rulesets.push(...batch);
-      if (batch.length < 100) break;
-    }
-  } catch (error) {
-    const status = githubErrorStatus(error);
-    if (!status || ![403, 404].includes(status)) throw error;
-  }
+  const { rulesets, observable: rulesetsObservable } = await loadBranchRulesets(
+    github,
+    owner,
+    repo
+  );
   const active = rulesets.filter(
     (ruleset) =>
       (!ruleset.target || ruleset.target === "branch") &&

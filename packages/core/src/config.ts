@@ -172,6 +172,12 @@ const BRANCH_PATTERN = /^(?!\/)(?!.*(?:\/\/|\.\.|@\{))[^\s~^:?*[\\]+(?<![/.])$/;
 /** Upper bound on scanners.releaseBranches so caller triggers stay reviewable. */
 export const MAX_SCANNER_RELEASE_BRANCHES = 20;
 const MAX_BRANCH_NAME_LENGTH = 255;
+/**
+ * Conservative character set for scanners.releaseBranches. GitHub Actions
+ * branch filters treat * ** ? + [ ] ! and backslash as pattern syntax, so only
+ * characters that are literal in both trigger filters and refs are accepted.
+ */
+const RELEASE_BRANCH_CHARACTERS = /^[A-Za-z0-9._/-]+$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -532,14 +538,17 @@ export function validateGuardianConfig(config: unknown): string[] {
     if (typeof config.scanners.semgrep !== "boolean") errors.push("scanners.semgrep must be boolean");
     if (typeof config.scanners.trivy !== "boolean") errors.push("scanners.trivy must be boolean");
     if (config.scanners.releaseBranches !== undefined) {
-      // Exact branch names only: BRANCH_PATTERN already rejects glob metacharacters
-      // (* ? [ ~ ^ :); refs/ prefixes are rejected so triggers and ruleset checks agree.
+      // Exact branch names only: the character set excludes every GitHub Actions
+      // filter metacharacter (* ? + [ ] ! backslash) and expression syntax, BRANCH_PATTERN
+      // enforces git ref rules, and refs/ prefixes are rejected so triggers and
+      // ruleset checks agree.
       stringArray(config.scanners.releaseBranches, "scanners.releaseBranches", errors, {
         validate: (entry) =>
           entry.length <= MAX_BRANCH_NAME_LENGTH &&
+          RELEASE_BRANCH_CHARACTERS.test(entry) &&
           BRANCH_PATTERN.test(entry) &&
           !entry.startsWith("refs/") &&
-          !entry.startsWith("!")
+          !entry.endsWith(".lock")
       });
       if (
         Array.isArray(config.scanners.releaseBranches) &&

@@ -992,3 +992,86 @@ test("release-branch callers keep image promotion and DAST on the default branch
   // No untrusted ref or PR data is interpolated into the generated caller.
   assert.doesNotMatch(caller, /github\.head_ref|github\.event\.pull_request/);
 });
+
+test("enforce gate blocks only policy-mapped Semgrep severity when the workflow script runs", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, mkdtempSync, readFileSync: read, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptStart = workflow.indexOf("node <<'NODE'\n", stepStart) + "node <<'NODE'\n".length;
+  const scriptEnd = workflow.indexOf("\n          NODE\n", scriptStart);
+  assert.ok(stepStart >= 0 && scriptEnd > scriptStart);
+  const script = workflow
+    .slice(scriptStart, scriptEnd)
+    .split("\n")
+    .map((line) => line.replace(/^ {10}/, ""))
+    .join("\n");
+
+  const run = (metadata: Record<string, unknown> | undefined) => {
+    const directory = mkdtempSync(join(tmpdir(), "guardianbot-gate-"));
+    try {
+      mkdirSync(join(directory, "guardianbot-evidence"));
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "semgrep.json"),
+        JSON.stringify({
+          results: [
+            {
+              check_id: "rule",
+              path: "a.py",
+              start: { line: 1 },
+              extra: { severity: "ERROR", message: "m", ...(metadata ? { metadata } : {}) }
+            }
+          ]
+        })
+      );
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "trivy.json"),
+        JSON.stringify({ SchemaVersion: 2, ArtifactName: ".", ArtifactType: "filesystem", Results: [] })
+      );
+      writeFileSync(join(directory, "guardianbot-evidence", "suppressions.json"), "[]");
+      writeFileSync(join(directory, "baseline.json"), JSON.stringify(["f".repeat(64)]));
+      writeFileSync(join(directory, "gate.js"), script);
+      const result = spawnSync(process.execPath, ["gate.js"], {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          PATH: process.env.PATH ?? "",
+          SCANNER_MODE: "enforce",
+          BASELINE_PATH: "baseline.json",
+          GITHUB_REPOSITORY: "acme/service",
+          GITHUB_SHA: "a".repeat(40),
+          GITHUB_RUN_ID: "1",
+          GITHUB_RUN_ATTEMPT: "1",
+          GITHUB_STEP_SUMMARY: join(directory, "summary.md")
+        }
+      });
+      const gate = JSON.parse(read(join(directory, "guardianbot-evidence", "gate.json"), "utf8")) as {
+        passed: boolean;
+        policyFindings: Array<{ severity: string; severitySource: string }>;
+      };
+      return { status: result.status, gate, summary: read(join(directory, "summary.md"), "utf8") };
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  const mapped = run({ "guardianbot-severity": "high" });
+  assert.equal(mapped.status, 1);
+  assert.equal(mapped.gate.passed, false);
+  assert.equal(mapped.gate.policyFindings[0]?.severitySource, "policy");
+
+  const unmapped = run(undefined);
+  assert.equal(unmapped.status, 0);
+  assert.equal(unmapped.gate.passed, true);
+  // Unmapped native ERROR stays visible as a High policy finding and is flagged.
+  assert.equal(unmapped.gate.policyFindings[0]?.severity, "high");
+  assert.equal(unmapped.gate.policyFindings[0]?.severitySource, "native");
+  assert.match(unmapped.summary, /Semgrep rule `rule` has no policy severity mapping/);
+  assert.match(unmapped.summary, /- ⚠️ Semgrep rule at a\.py:1 \(no policy severity mapping\)|⚠️ Semgrep rule/);
+
+  const mappedDown = run({ "guardianbot-severity": "medium" });
+  assert.equal(mappedDown.status, 0);
+  assert.deepEqual(mappedDown.gate.policyFindings, []);
+});

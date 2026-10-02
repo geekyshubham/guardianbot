@@ -232,7 +232,7 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 255,
-            "pattern": "^[^\\s~^:?*\\[\\\\!/][^\\s~^:?*\\[\\\\]*$"
+            "pattern": "^(?!/)(?!refs/)(?!.*(?:\\.\\.|//))(?!.*\\.lock$)[A-Za-z0-9._/-]+(?<![/.])$"
           }
         },
         "suppressions": {

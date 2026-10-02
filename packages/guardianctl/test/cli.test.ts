@@ -2940,3 +2940,27 @@ test("parseGateForBaseline accepts policy findings carrying severitySource uncha
   assert.deepEqual(parsed.fingerprints, [FINGERPRINT, SECOND_FINGERPRINT]);
   assert.equal(parsed.gateSha256, sha256Hex(source));
 });
+
+test("release-branch ruleset inspection is bounded and fails closed on endless pagination", async () => {
+  const github = new MockGitHub();
+  const state = github.add(healthyState("service", { mode: "enforce" }));
+  withReleaseBranches(state, ["release/1.x"]);
+  // 100 non-matching rulesets per page on every page would loop forever if unbounded.
+  state.rulesets = Array.from({ length: 100 }, (_, index) => ({
+    id: 1000 + index,
+    ...buildSecurityGateRuleset(DEFAULT_SECURITY_GATE_CHECK),
+    name: `Other ${index}`,
+    conditions: { ref_name: { include: ["refs/heads/other"], exclude: [] } }
+  }));
+  const result = await doctor(commandContext(github), "acme/service");
+  const listings = github.requests.filter(
+    (request) => request.method === "GET" && /\/rulesets\?/.test(request.path)
+  );
+  // Default-branch and release-branch inspections are each capped at 10 pages.
+  assert.ok(listings.length <= 20, `ruleset listings: ${listings.length}`);
+  const check = checkByCode(result, "release-branch-rules");
+  assert.equal(check.ok, false);
+  assert.equal(check.blocking, false);
+  assert.match(check.detail, /exceeded 10 pages; fail closed/);
+  assert.equal(checkByCode(result, "required-check-rule").ok, false);
+});

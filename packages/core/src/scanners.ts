@@ -288,7 +288,11 @@ export function evaluateGate(options: {
   );
   const blockers = introduced.filter((finding) => {
     if (finding.source === "semgrep") {
-      return finding.severity === "critical" || finding.severity === "high";
+      // Only organization policy severity blocks; native fallback is report only.
+      return (
+        finding.severitySource !== "native" &&
+        (finding.severity === "critical" || finding.severity === "high")
+      );
     }
     if (finding.source === "trivy") {
       const scannerClass = finding.scannerClass ?? "vulnerability";

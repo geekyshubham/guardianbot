@@ -92,15 +92,43 @@ test("release branches add exact pull_request and push coverage without changing
 });
 
 test("scanners.releaseBranches accepts exact branch names and rejects globs, refs, negation, and empty lists", () => {
-  const valid = config({ releaseBranches: ["release/1.x", "hotfix-2026"] });
+  const valid = config({
+    releaseBranches: [
+      "release/1.x",
+      "hotfix-2026",
+      "development-y-release",
+      "qa-z-release",
+      "master"
+    ]
+  });
   assert.deepEqual(validateGuardianConfig(valid), []);
   assert.deepEqual(validateAgainstJsonSchema(schema, valid), []);
 
-  for (const branch of ["release/*", "refs/heads/release", "!release", "release/**", "a b", "release..x", "release/"]) {
+  // GitHub Actions filter metacharacters (+ ] ! * ?), expression syntax, YAML
+  // flow/quote characters, and invalid ref names are all rejected.
+  const invalidBranches = [
+    "release/*",
+    "refs/heads/release",
+    "!release",
+    "release/**",
+    "a b",
+    "release..x",
+    "release/",
+    "release+1",
+    "release]x",
+    "release!x",
+    "${{ github.token }}",
+    "release'x",
+    'release"x',
+    "release,x",
+    "release#x",
+    "release.lock"
+  ];
+  for (const branch of invalidBranches) {
     const invalid = config({ releaseBranches: [branch] });
     assert.ok(validateGuardianConfig(invalid).length > 0, `config accepted ${branch}`);
   }
-  for (const branch of ["release/*", "!release", "a b"]) {
+  for (const branch of invalidBranches) {
     assert.ok(validateAgainstJsonSchema(schema, config({ releaseBranches: [branch] })).length > 0, `schema accepted ${branch}`);
   }
   assert.match(validateGuardianConfig(config({ releaseBranches: [] })).join("\n"), /must not be empty/);
@@ -140,11 +168,18 @@ test("Semgrep policy severity overrides native severity and unmapped rules fall 
       ["unmapped", "high", "native"]
     ]
   );
+  // Only policy-mapped Critical/High blocks; the unmapped native ERROR stays
+  // observed (report only) and the mapped-down ERROR is medium.
   const decision = evaluateGate({ findings, baselineFingerprints: new Set(), mode: "enforce" });
-  assert.deepEqual(
-    decision.blockers.map((finding) => finding.ruleId).sort(),
-    ["mapped.up", "unmapped"]
-  );
+  assert.deepEqual(decision.blockers.map((finding) => finding.ruleId), ["mapped.up"]);
+  assert.equal(decision.conclusion, "failure");
+  assert.ok(decision.observed.some((finding) => finding.ruleId === "unmapped"));
+  const unmappedOnly = evaluateGate({
+    findings: findings.filter((finding) => finding.ruleId === "unmapped"),
+    baselineFingerprints: new Set(),
+    mode: "enforce"
+  });
+  assert.equal(unmappedOnly.conclusion, "success");
   assert.deepEqual(semgrepPolicySeverity({}, undefined), { severity: "medium", severitySource: "native" });
 });
 
@@ -180,6 +215,12 @@ test("security workflow and core agree on the Semgrep severity policy", () => {
   assert.deepEqual(workflowNative, SEMGREP_NATIVE_SEVERITY);
   assert.match(workflow, /severitySource: policyMapped \? "policy" : "native"/);
   assert.match(workflow, /has no policy severity mapping; native severity used/);
+  // Core and workflow agree that only policy-mapped Semgrep severity can block.
+  assert.match(
+    workflow,
+    /const isBlockingFinding = \(finding\) =>\n\s+finding\.source !== "semgrep" \|\| finding\.severitySource === "policy";/
+  );
+  assert.match(workflow, /policyFindings\.filter\(isBlockingFinding\)/);
   // The gate still blocks only critical/high Semgrep findings.
   assert.match(
     workflow,

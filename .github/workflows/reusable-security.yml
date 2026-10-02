@@ -818,7 +818,13 @@ jobs:
             return false;
           });
 
-          const enforcedFindings = process.env.SCANNER_MODE === "enforce" ? policyFindings : [];
+          // Only rule-pack policy-mapped Semgrep severity can block. Unmapped
+          // rules stay visible in policyFindings and the summary but never fail
+          // the gate; the shipped pack is required to map every rule.
+          const isBlockingFinding = (finding) =>
+            finding.source !== "semgrep" || finding.severitySource === "policy";
+          const enforcedFindings =
+            process.env.SCANNER_MODE === "enforce" ? policyFindings.filter(isBlockingFinding) : [];
           const failures = [...executionFailures, ...enforcedFindings.map(summarizeFinding)];
 
           const repository = String(process.env.GITHUB_REPOSITORY || "").trim().toLowerCase();
@@ -893,7 +899,7 @@ jobs:
             summaryLines.push(
               "",
               ...policyFindings.map((finding) => {
-                const prefix = process.env.SCANNER_MODE === "enforce" ? "❌" : "⚠️";
+                const prefix = enforcedFindings.includes(finding) ? "❌" : "⚠️";
                 return `- ${prefix} ${summarizeFinding(finding)}`;
               })
             );

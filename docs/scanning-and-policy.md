@@ -17,10 +17,11 @@ severity replaces Semgrep's native severity. A finding from a rule with no valid
 mapping falls back to its native severity (`ERROR` maps to high, `WARNING` to
 medium, `INFO` to info). Such findings record `severitySource: "native"` in
 `gate.json` policy findings, and the job summary flags the rule as having no
-policy severity mapping. A native `ERROR` therefore still counts as high and
-can block in enforce mode, so a test requires every rule in the shipped pack to
+policy severity mapping. Only policy-mapped Critical/High Semgrep findings can
+fail the gate in enforce mode: an unmapped native `ERROR` is reported as a High
+warning but never blocks. A test requires every rule in the shipped pack to
 carry a mapping and keeps the workflow and `@guardianbot/core` severity tables
-in agreement. Severity and its source are not fingerprint inputs, so mapping
+and blocking rule in agreement. Severity and its source are not fingerprint inputs, so mapping
 changes never invalidate baselines or suppressions.
 
 By default the generated caller runs on pull requests (any base branch) and on
@@ -62,8 +63,8 @@ blocking when the repository is promoted to `enforce`.
 
 Enforcement may block:
 
-- new High/Critical Semgrep findings, using the rule pack's organization
-  severity mapping (unmapped rules fall back to native severity, as above);
+- new policy-mapped High/Critical Semgrep findings (unmapped rules are
+  reported at native severity but never block, as above);
 - High/Critical dependency vulnerabilities with a known fixed version;
 - new High/Critical Trivy misconfiguration findings;
 - new High/Critical Trivy secret findings, without publishing the matched
@@ -107,8 +108,10 @@ metadata, the exact successful deterministic scanner job, report-only config at
 each head SHA, and exact `referenced_workflows` reusable-security identity
 pinned to the immutable `workflowVersion`. The observation run must be at least
 seven days old. An active default-branch GuardianBot ruleset must strictly
-require `guardianbot/security-gate / deterministic scanners`; release-branch
-rulesets are reported by `guardianctl doctor` but not verified here. Missing, invalid,
+require `guardianbot/security-gate / deterministic scanners`. The source and
+observation runs must be default-branch runs; release-branch runs are never
+enforcement evidence. Release-branch rulesets are reported by `guardianctl
+doctor` but not verified here. Missing, invalid,
 or unauthorized API evidence fails closed. Pull requests still read their
 configuration and baseline from the base commit so they cannot weaken their own
 gate; PR checks remain report-only because they bind base-branch configuration.

@@ -630,7 +630,7 @@ function sameRunAttempt(a, b) {
  * Verify a gate workflow run against API identity requirements shared by
  * source and observation. Does not apply observation-period age checks.
  */
-function assertGateRunIdentity(run, expected, label, repository) {
+function assertGateRunIdentity(run, expected, label, repository, defaultBranch) {
   if (!isObject(run)) {
     fail(`${label} run response is invalid`);
   }
@@ -653,6 +653,11 @@ function assertGateRunIdentity(run, expected, label, repository) {
   }
   if (run.event !== "push" && run.event !== "workflow_dispatch") {
     fail(`${label} run event must be push or workflow_dispatch`);
+  }
+  // Callers may also run on configured release branches; only default-branch
+  // runs are enforcement evidence, matching guardianctl doctor/baseline.
+  if (run.head_branch !== defaultBranch) {
+    fail(`${label} run must be on the default branch`);
   }
   const workflowPath = stripWorkflowRef(run.path);
   if (workflowPath !== CALLER_WORKFLOW_PATH) {
@@ -855,7 +860,7 @@ export async function verifyEnforcementReadiness(options = {}) {
       identity: source,
       sleep
     });
-    assertGateRunIdentity(sourceBundle.run, source, "source", repository);
+    assertGateRunIdentity(sourceBundle.run, source, "source", repository, defaultBranch);
     assertDeterministicScannerJob(sourceBundle.jobs, "source");
     const sourceConfig = await resolveSourceConfig({
       headSha: source.headSha,
@@ -887,7 +892,8 @@ export async function verifyEnforcementReadiness(options = {}) {
       observationBundle.run,
       observation,
       "observation",
-      repository
+      repository,
+      defaultBranch
     );
     assertDeterministicScannerJob(observationBundle.jobs, "observation");
 
