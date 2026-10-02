@@ -6,3 +6,4 @@ export * from "./evidence.js";
 export * from "./suppressions.js";
 export * from "./repository-monitor.js";
 export * from "./weekly-report.js";
+export * from "./findings.js";

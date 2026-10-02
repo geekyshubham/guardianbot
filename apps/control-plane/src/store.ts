@@ -65,6 +65,7 @@ export interface RepositoryIndexRetrievalStatus {
 const MONITORING_LOCK_NAMESPACE = 1_196_572_738;
 const MONITORING_LOCK_KEY = 1_297_046_866;
 const ONBOARDING_ISSUE_LOCK_NAMESPACE = 1_196_572_739;
+const FINDING_LIFECYCLE_LOCK_NAMESPACE = 1_196_572_741;
 // Fixed two-int32 namespace/key pair serialising schema migrations across booting instances.
 const MIGRATION_LOCK_NAMESPACE = 1_196_572_740;
 const MIGRATION_LOCK_KEY = 1_297_046_867;
@@ -609,6 +610,177 @@ export interface SuccessfulDeploymentEvidence {
   imageDigest: string;
   observedAt: string;
   origin: string;
+}
+
+/**
+ * Lifecycle of one deterministic root cause. `open` is the only state that ages
+ * against an SLA; `fixed` is reached only when every complete trusted scan
+ * stream that observed the fingerprint has since run without it.
+ */
+export type FindingLifecycleStatus = "open" | "fixed" | "suppressed" | "risk-accepted";
+export type FindingLifecycleSeverity = "critical" | "high" | "medium" | "low" | "info";
+export type FindingLifecycleSource = "semgrep" | "trivy" | "trivy-image" | "zap";
+
+export interface FindingLifecycleRecord {
+  repositoryId: number;
+  fingerprint: string;
+  source: FindingLifecycleSource;
+  ruleId: string;
+  severity: FindingLifecycleSeverity;
+  path?: string;
+  line?: number;
+  status: FindingLifecycleStatus;
+  owner: string;
+  /** Latest trusted observation time per scan stream that still reports the finding. */
+  streams: Record<string, string>;
+  firstSeenAt: string;
+  /** Start of the current open episode; a fixed finding that returns restarts its SLA here. */
+  openedAt: string;
+  lastSeenAt: string;
+  fixedAt?: string;
+  slaDueAt?: string;
+  lastRunId: number;
+  lastRunAttempt: number;
+  /** Per-provider ticket or notification state; empty when no provider is configured. */
+  tickets: Partial<Record<FindingTicketProviderName, FindingTicketState>>;
+  updatedAt: string;
+}
+
+export type FindingTicketProviderName = "github-issues" | "jira" | "slack";
+
+export interface FindingTicketState {
+  /** Provider reference such as a GitHub issue number or Jira key; never a URL or secret. */
+  ref?: string;
+  state?: "open" | "closed";
+  /** Digest of the last rendered ticket content, so unchanged findings cost no API call. */
+  contentSha?: string;
+  /** Sanitized, bounded failure kind from the last attempt; cleared on success. */
+  error?: string;
+  updatedAt: string;
+}
+
+/**
+ * Ordering watermark for one trusted scan stream. A delayed older run can never
+ * reopen or fix findings that a newer run of the same stream already decided.
+ */
+export interface FindingLifecycleStreamWatermark {
+  repositoryId: number;
+  stream: string;
+  runStartedAt: string;
+  runId: number;
+  runAttempt: number;
+  updatedAt: string;
+}
+
+/** Upper bound for one repository's lifecycle page; open records are returned first. */
+export const MAX_FINDING_LIFECYCLE_RECORDS = 5_000;
+const FINDING_LIFECYCLE_UPSERT_CHUNK = 500;
+
+export const FINDING_LIFECYCLE_UPSERT_SQL = `INSERT INTO finding_lifecycle
+  (repository_id, fingerprint, source, rule_id, severity, path, line, status, owner,
+   streams, first_seen_at, opened_at, last_seen_at, fixed_at, sla_due_at, last_run_id, last_run_attempt,
+   tickets, updated_at)
+SELECT repository_id, fingerprint, source, rule_id, severity, path, line, status, owner,
+       streams, first_seen_at, opened_at, last_seen_at, fixed_at, sla_due_at, last_run_id, last_run_attempt,
+       tickets, updated_at
+FROM jsonb_to_recordset($1::jsonb) AS rows(
+  repository_id BIGINT, fingerprint TEXT, source TEXT, rule_id TEXT, severity TEXT,
+  path TEXT, line INTEGER, status TEXT, owner TEXT, streams JSONB, first_seen_at TIMESTAMPTZ,
+  opened_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ, fixed_at TIMESTAMPTZ, sla_due_at TIMESTAMPTZ, last_run_id BIGINT,
+  last_run_attempt INTEGER, tickets JSONB, updated_at TIMESTAMPTZ
+)
+ON CONFLICT (repository_id, fingerprint) DO UPDATE SET
+  source=excluded.source,
+  rule_id=excluded.rule_id,
+  severity=excluded.severity,
+  path=excluded.path,
+  line=excluded.line,
+  status=excluded.status,
+  owner=excluded.owner,
+  streams=excluded.streams,
+  first_seen_at=excluded.first_seen_at,
+  opened_at=excluded.opened_at,
+  last_seen_at=excluded.last_seen_at,
+  fixed_at=excluded.fixed_at,
+  sla_due_at=excluded.sla_due_at,
+  last_run_id=excluded.last_run_id,
+  last_run_attempt=excluded.last_run_attempt,
+  tickets=excluded.tickets,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_LIFECYCLE_STREAM_UPSERT_SQL = `INSERT INTO finding_lifecycle_streams
+  (repository_id, stream, run_started_at, run_id, run_attempt, updated_at)
+SELECT repository_id, stream, run_started_at, run_id, run_attempt, updated_at
+FROM jsonb_to_recordset($1::jsonb) AS rows(
+  repository_id BIGINT, stream TEXT, run_started_at TIMESTAMPTZ, run_id BIGINT,
+  run_attempt INTEGER, updated_at TIMESTAMPTZ
+)
+ON CONFLICT (repository_id, stream) DO UPDATE SET
+  run_started_at=excluded.run_started_at,
+  run_id=excluded.run_id,
+  run_attempt=excluded.run_attempt,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_LIFECYCLE_LIST_SQL = `SELECT *
+FROM finding_lifecycle
+WHERE repository_id=$1
+ORDER BY (status='open') DESC, first_seen_at ASC, fingerprint ASC
+LIMIT $2`;
+
+function assertFindingLifecycleLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_FINDING_LIFECYCLE_RECORDS) {
+    throw new Error(
+      `finding lifecycle limit must be a safe integer between 1 and ${MAX_FINDING_LIFECYCLE_RECORDS}`
+    );
+  }
+}
+
+function findingLifecycleRow(record: FindingLifecycleRecord): Record<string, unknown> {
+  return {
+    repository_id: record.repositoryId,
+    fingerprint: record.fingerprint,
+    source: record.source,
+    rule_id: record.ruleId,
+    severity: record.severity,
+    path: record.path,
+    line: record.line,
+    status: record.status,
+    owner: record.owner,
+    streams: record.streams,
+    first_seen_at: record.firstSeenAt,
+    opened_at: record.openedAt,
+    last_seen_at: record.lastSeenAt,
+    fixed_at: record.fixedAt,
+    sla_due_at: record.slaDueAt,
+    last_run_id: record.lastRunId,
+    last_run_attempt: record.lastRunAttempt,
+    tickets: record.tickets,
+    updated_at: record.updatedAt
+  };
+}
+
+function assertFindingLifecycleOwnership(
+  repositoryId: number,
+  records: readonly FindingLifecycleRecord[],
+  streams: readonly FindingLifecycleStreamWatermark[]
+): void {
+  if (
+    records.some((record) => record.repositoryId !== repositoryId) ||
+    streams.some((watermark) => watermark.repositoryId !== repositoryId)
+  ) {
+    throw new Error("finding lifecycle writes must belong to one repository");
+  }
+}
+
+function compareFindingLifecycle(
+  left: FindingLifecycleRecord,
+  right: FindingLifecycleRecord
+): number {
+  return (
+    Number(right.status === "open") - Number(left.status === "open") ||
+    Date.parse(left.firstSeenAt) - Date.parse(right.firstSeenAt) ||
+    left.fingerprint.localeCompare(right.fingerprint)
+  );
 }
 
 export interface StoreLock {
@@ -1395,6 +1567,25 @@ export interface Store {
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
   acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
+  /** Bounded lifecycle page for one repository, open records first. */
+  listFindingLifecycle(
+    repositoryId: number,
+    limit?: number
+  ): Promise<FindingLifecycleRecord[]>;
+  listFindingLifecycleStreams(repositoryId: number): Promise<FindingLifecycleStreamWatermark[]>;
+  /**
+   * Atomic upsert keyed by repository and root-cause fingerprint, together with
+   * the stream watermarks the same merge advanced and any long-fixed records the
+   * merge retired to keep the repository within its bound.
+   */
+  saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams?: readonly FindingLifecycleStreamWatermark[],
+    removedFingerprints?: readonly string[]
+  ): Promise<void>;
+  /** Serialises lifecycle merges for one repository across instances. */
+  acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock>;
 }
 
 export function postgresPoolConfig(
@@ -1475,6 +1666,10 @@ export class MemoryStore implements Store {
   private onboardingIssueLocks = new Set<number>();
   private onboardingIssueLockWaiters = new Map<number, Array<() => void>>();
   private monitoringLockHeld = false;
+  private findingLifecycle = new Map<string, FindingLifecycleRecord>();
+  private findingLifecycleStreams = new Map<string, FindingLifecycleStreamWatermark>();
+  private findingLifecycleLocks = new Set<number>();
+  private findingLifecycleLockWaiters = new Map<number, Array<() => void>>();
 
   async ping(): Promise<void> {}
   async close(): Promise<void> {}
@@ -2504,6 +2699,80 @@ export class MemoryStore implements Store {
     };
   }
 
+  async listFindingLifecycle(
+    repositoryId: number,
+    limit = MAX_FINDING_LIFECYCLE_RECORDS
+  ): Promise<FindingLifecycleRecord[]> {
+    assertFindingLifecycleLimit(limit);
+    return [...this.findingLifecycle.values()]
+      .filter((record) => record.repositoryId === repositoryId)
+      .sort(compareFindingLifecycle)
+      .slice(0, limit)
+      .map((record) => structuredClone(record));
+  }
+
+  async listFindingLifecycleStreams(
+    repositoryId: number
+  ): Promise<FindingLifecycleStreamWatermark[]> {
+    return [...this.findingLifecycleStreams.values()]
+      .filter((watermark) => watermark.repositoryId === repositoryId)
+      .sort((left, right) => left.stream.localeCompare(right.stream))
+      .map((watermark) => ({ ...watermark }));
+  }
+
+  async saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams: readonly FindingLifecycleStreamWatermark[] = [],
+    removedFingerprints: readonly string[] = []
+  ): Promise<void> {
+    assertFindingLifecycleOwnership(repositoryId, records, streams);
+    for (const fingerprint of removedFingerprints) {
+      this.findingLifecycle.delete(`${repositoryId}:${fingerprint}`);
+    }
+    for (const record of records) {
+      this.findingLifecycle.set(
+        `${record.repositoryId}:${record.fingerprint}`,
+        structuredClone(record)
+      );
+    }
+    for (const watermark of streams) {
+      this.findingLifecycleStreams.set(
+        `${watermark.repositoryId}:${watermark.stream}`,
+        { ...watermark }
+      );
+    }
+  }
+
+  async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {
+    if (this.findingLifecycleLocks.has(repositoryId)) {
+      await new Promise<void>((resolve) => {
+        const waiters = this.findingLifecycleLockWaiters.get(repositoryId) ?? [];
+        waiters.push(resolve);
+        this.findingLifecycleLockWaiters.set(repositoryId, waiters);
+      });
+    } else {
+      this.findingLifecycleLocks.add(repositoryId);
+    }
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        const waiters = this.findingLifecycleLockWaiters.get(repositoryId);
+        const next = waiters?.shift();
+        if (waiters?.length === 0) {
+          this.findingLifecycleLockWaiters.delete(repositoryId);
+        }
+        if (next) {
+          next();
+        } else {
+          this.findingLifecycleLocks.delete(repositoryId);
+        }
+      }
+    };
+  }
+
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {
     if (this.monitoringLockHeld) return undefined;
     this.monitoringLockHeld = true;
@@ -3021,6 +3290,41 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS deployment_promotions_repository_idx
         ON deployment_promotions (repository_id, environment);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        source TEXT NOT NULL,
+        rule_id TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        path TEXT,
+        line INTEGER,
+        status TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        streams JSONB NOT NULL DEFAULT '{}'::jsonb,
+        first_seen_at TIMESTAMPTZ NOT NULL,
+        opened_at TIMESTAMPTZ NOT NULL,
+        last_seen_at TIMESTAMPTZ NOT NULL,
+        fixed_at TIMESTAMPTZ,
+        sla_due_at TIMESTAMPTZ,
+        last_run_id BIGINT NOT NULL,
+        last_run_attempt INTEGER NOT NULL,
+        tickets JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, fingerprint)
+      );
+      CREATE INDEX IF NOT EXISTS finding_lifecycle_status_idx
+        ON finding_lifecycle (repository_id, status, first_seen_at);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle_streams (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        stream TEXT NOT NULL,
+        run_started_at TIMESTAMPTZ NOT NULL,
+        run_id BIGINT NOT NULL,
+        run_attempt INTEGER NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, stream)
+      );
       `);
       if (this.repositoryIndexStorageMode === "pgvector") {
         await client.query(
@@ -4524,6 +4828,120 @@ export class PostgresStore implements Store {
     };
   }
 
+  async listFindingLifecycle(
+    repositoryId: number,
+    limit = MAX_FINDING_LIFECYCLE_RECORDS
+  ): Promise<FindingLifecycleRecord[]> {
+    assertFindingLifecycleLimit(limit);
+    const result = await this.pool.query(FINDING_LIFECYCLE_LIST_SQL, [repositoryId, limit]);
+    return result.rows.map((row) => this.toFindingLifecycle(row));
+  }
+
+  async listFindingLifecycleStreams(
+    repositoryId: number
+  ): Promise<FindingLifecycleStreamWatermark[]> {
+    const result = await this.pool.query(
+      `SELECT *
+       FROM finding_lifecycle_streams
+       WHERE repository_id=$1
+       ORDER BY stream ASC`,
+      [repositoryId]
+    );
+    return result.rows.map((row) => ({
+      repositoryId: Number(row.repository_id),
+      stream: String(row.stream),
+      runStartedAt: fromUnknownDate(row.run_started_at) ?? String(row.run_started_at),
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
+    }));
+  }
+
+  async saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams: readonly FindingLifecycleStreamWatermark[] = [],
+    removedFingerprints: readonly string[] = []
+  ): Promise<void> {
+    assertFindingLifecycleOwnership(repositoryId, records, streams);
+    if (!records.length && !streams.length && !removedFingerprints.length) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      if (removedFingerprints.length) {
+        await client.query(
+          `DELETE FROM finding_lifecycle
+           WHERE repository_id=$1 AND fingerprint = ANY($2::text[])`,
+          [repositoryId, [...removedFingerprints]]
+        );
+      }
+      for (let offset = 0; offset < records.length; offset += FINDING_LIFECYCLE_UPSERT_CHUNK) {
+        const chunk = records.slice(offset, offset + FINDING_LIFECYCLE_UPSERT_CHUNK);
+        await client.query(FINDING_LIFECYCLE_UPSERT_SQL, [
+          JSON.stringify(chunk.map(findingLifecycleRow))
+        ]);
+      }
+      if (streams.length) {
+        await client.query(FINDING_LIFECYCLE_STREAM_UPSERT_SQL, [
+          JSON.stringify(
+            streams.map((watermark) => ({
+              repository_id: watermark.repositoryId,
+              stream: watermark.stream,
+              run_started_at: watermark.runStartedAt,
+              run_id: watermark.runId,
+              run_attempt: watermark.runAttempt,
+              updated_at: watermark.updatedAt
+            }))
+          )
+        ]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+      throw new Error("repositoryId must be a positive safe integer");
+    }
+    const lockKey = repositoryId % 2_147_483_647;
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        "SELECT pg_advisory_lock($1, $2)",
+        [FINDING_LIFECYCLE_LOCK_NAMESPACE, lockKey]
+      );
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          const result = await client.query<{ released: boolean }>(
+            "SELECT pg_advisory_unlock($1, $2) AS released",
+            [FINDING_LIFECYCLE_LOCK_NAMESPACE, lockKey]
+          );
+          if (!result.rows[0]?.released) {
+            throw new Error("PostgreSQL finding lifecycle advisory lock was not held");
+          }
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+    };
+  }
+
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {
     const client = await this.pool.connect();
     try {
@@ -4635,6 +5053,40 @@ export class PostgresStore implements Store {
       inventoryState: row.inventory_state,
       overallStatus: row.overall_status,
       checks: checks.map((check) => ({ ...check })) as PersistedMonitoringCheck[]
+    };
+  }
+
+  private toFindingLifecycle(row: Record<string, any>): FindingLifecycleRecord {
+    const streams: Record<string, string> = {};
+    if (row.streams && typeof row.streams === "object" && !Array.isArray(row.streams)) {
+      for (const [stream, seenAt] of Object.entries(row.streams as Record<string, unknown>)) {
+        const normalized = fromUnknownDate(seenAt);
+        if (normalized) streams[stream] = normalized;
+      }
+    }
+    return {
+      repositoryId: Number(row.repository_id),
+      fingerprint: String(row.fingerprint),
+      source: row.source,
+      ruleId: String(row.rule_id),
+      severity: row.severity,
+      path: row.path ?? undefined,
+      line: row.line === null || row.line === undefined ? undefined : Number(row.line),
+      status: row.status,
+      owner: String(row.owner),
+      streams,
+      firstSeenAt: fromUnknownDate(row.first_seen_at) ?? String(row.first_seen_at),
+      openedAt: fromUnknownDate(row.opened_at) ?? String(row.opened_at),
+      lastSeenAt: fromUnknownDate(row.last_seen_at) ?? String(row.last_seen_at),
+      fixedAt: fromUnknownDate(row.fixed_at),
+      slaDueAt: fromUnknownDate(row.sla_due_at),
+      lastRunId: Number(row.last_run_id),
+      lastRunAttempt: Number(row.last_run_attempt),
+      tickets:
+        row.tickets && typeof row.tickets === "object" && !Array.isArray(row.tickets)
+          ? structuredClone(row.tickets as FindingLifecycleRecord["tickets"])
+          : {},
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
     };
   }
 

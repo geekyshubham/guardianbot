@@ -24,6 +24,11 @@ import {
   writeMonitoringOperationsUnavailable
 } from "./monitoring-operations.js";
 import { RepositoryIndexService } from "./repository-index-service.js";
+import {
+  createFindingsLifecycleRuntime,
+  findingsLifecycleOptionsFromEnvironment,
+  syncFindingTickets
+} from "./findings-lifecycle.js";
 import { createScannerWorkflowRunHandler } from "./scanner-evidence.js";
 import { GuardianService, WebhookAuthenticationError } from "./service.js";
 import {
@@ -90,12 +95,34 @@ async function start() {
   const metrics = new GuardianMetrics();
   // Fail boot before opening listeners/workers when retention env is invalid.
   const webhookRetention = webhookRetentionOptionsFromEnvironment(process.env);
+  // Parsed before any store or listener exists so a bad lifecycle value fails boot.
+  const findingsLifecycleOptions = findingsLifecycleOptionsFromEnvironment(process.env);
   const store = await createStore();
-  const monitoring = new MonitoringService(
-    store,
-    monitoringOptionsFromEnvironment(process.env)
-  );
   const privateKey = required("GITHUB_APP_PRIVATE_KEY").replace(/\\n/g, "\n");
+  const findingsLifecycle = createFindingsLifecycleRuntime(findingsLifecycleOptions, {
+    appId: required("GITHUB_APP_ID"),
+    privateKey
+  });
+  const monitoring = new MonitoringService(store, {
+    ...monitoringOptionsFromEnvironment(process.env),
+    ...(findingsLifecycleOptions.enabled
+      ? {
+          findingsLifecycle: {
+            enabled: true,
+            syncTickets: findingsLifecycle.providers.length
+              ? (repository, now) =>
+                  syncFindingTickets({
+                    store,
+                    repository,
+                    providers: findingsLifecycle.providers,
+                    slaDays: findingsLifecycleOptions.slaDays,
+                    now
+                  })
+              : undefined
+          }
+        }
+      : {})
+  });
   const evidenceAttestation = createEvidenceAttestationService({
     environment: process.env,
     authorizeRepository: async (repositoryName, repositoryId) => {
@@ -136,7 +163,8 @@ async function start() {
         appId: required("GITHUB_APP_ID"),
         privateKey,
         store,
-        environment: process.env
+        environment: process.env,
+        findingsLifecycle
       }),
       repositoryIndexService
     },

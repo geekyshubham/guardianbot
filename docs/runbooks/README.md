@@ -6,6 +6,7 @@
 - [DAST authentication failure](dast-authentication-failure.md)
 - [False positives](false-positive.md)
 - [Suppression expiry](suppression-expiry.md)
+- [Finding SLA breach](sla-breach.md)
 - [Missing scheduled run](missing-scheduled-run.md)
 - [Compromised bridge](compromised-bridge.md)
 - [Emergency disablement](emergency-disablement.md)

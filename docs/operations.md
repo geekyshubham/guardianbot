@@ -328,6 +328,43 @@ reported" is not a bound on its own:
 The lifetime evicted counter advances by whatever a discard actually dropped, so
 `findings_evicted_total` stays a truthful operator signal in both cases.
 
+### Findings lifecycle and SLA
+
+The findings lifecycle tracks deterministic scanner findings per root-cause
+fingerprint: owner, first and last seen, status, SLA due date, and breach. It is
+fed only by accepted default-branch push or schedule evidence and by DAST
+evidence bound to the deployed digest. Pull-request evidence and AI review
+findings never reach it. Everything below is off unless configured; see
+[findings lifecycle](findings-lifecycle.md) for the model.
+
+| Environment variable | Default | Bounds |
+| --- | --- | --- |
+| `GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED` | off | `0`, `1`, `false`, or `true` |
+| `GUARDIANBOT_FINDINGS_SLA_JSON` | `{"critical":7,"high":30}` | object keyed by `critical`, `high`, `medium`, `low`; integer days 1 … 3650 |
+| `GUARDIANBOT_FINDINGS_GITHUB_ISSUES_ENABLED` | off | `0`, `1`, `false`, or `true`; also needs `findings.githubIssues: true` in the repository |
+| `GUARDIANBOT_FINDINGS_SLACK_WEBHOOK_URL_REF` | unset | name of the env var holding an HTTPS incoming-webhook URL |
+| `GUARDIANBOT_FINDINGS_JIRA_BASE_URL_REF` | unset | name of the env var holding the HTTPS Jira base URL |
+| `GUARDIANBOT_FINDINGS_JIRA_EMAIL_REF` | unset | name of the env var holding the Jira account email |
+| `GUARDIANBOT_FINDINGS_JIRA_API_TOKEN_REF` | unset | name of the env var holding the Jira API token |
+| `GUARDIANBOT_FINDINGS_JIRA_PROJECT_KEY` | unset | uppercase Jira project key |
+| `GUARDIANBOT_FINDINGS_JIRA_ISSUE_TYPE` | `Bug` | plain issue type name |
+
+Severities absent from the SLA object are recorded but neither aged against an
+SLA nor ticketed. The four Jira settings are all-or-nothing. Every `*_REF`
+names another control-plane environment variable, the same indirection as the
+DefectDojo token; consumer repositories never receive these values. Invalid
+values, a reference to an unset variable, or a ticket provider without
+`GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED=true` fail boot, and the error names
+only the variable, never its value.
+
+GitHub issues use a repository-scoped installation token limited to
+`issues: write`. They are never written to public repositories. Ticket and
+notifier failures are retried with bounded backoff, stored as a sanitized
+error on the lifecycle record, retried on the next ingestion and monitoring
+cycle, and raised as the `findings-ticketing` monitoring alert. Open findings
+past their due date raise `findings-sla`; see the
+[SLA breach runbook](runbooks/sla-breach.md).
+
 ## First live AI review checklist
 
 Use this only when enabling the first production AI-backed review. Do not treat

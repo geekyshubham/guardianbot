@@ -15,6 +15,7 @@ import {
 import {
   MemoryStore,
   buildRepositoryIndexVectorBatchStatement,
+  type FindingLifecycleRecord,
   type RepositoryRecord,
   type ScannerEvidenceRecord,
   type ScannerWorkflowRunRecord
@@ -1223,3 +1224,123 @@ function maxPlaceholder(query: string): number {
     ...[...query.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
   );
 }
+
+function lifecycleRecord(
+  overrides: Partial<FindingLifecycleRecord> = {}
+): FindingLifecycleRecord {
+  return {
+    repositoryId: 20,
+    fingerprint: "f".repeat(64),
+    source: "semgrep",
+    ruleId: "rule.one",
+    severity: "critical",
+    path: "src/app.ts",
+    line: 4,
+    status: "open",
+    owner: "@acme/app",
+    streams: { semgrep: "2026-07-01T00:00:00.000Z" },
+    firstSeenAt: "2026-07-01T00:00:00.000Z",
+    openedAt: "2026-07-01T00:00:00.000Z",
+    lastSeenAt: "2026-07-01T00:00:00.000Z",
+    slaDueAt: "2026-07-08T00:00:00.000Z",
+    lastRunId: 500,
+    lastRunAttempt: 1,
+    tickets: {},
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+test("an enabled findings lifecycle raises SLA breach and ticketing alerts and a weekly findings section", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  await store.saveFindingLifecycle(20, [
+    lifecycleRecord(),
+    lifecycleRecord({
+      fingerprint: "e".repeat(64),
+      severity: "high",
+      owner: "unowned",
+      openedAt: "2026-07-25T00:00:00.000Z",
+      firstSeenAt: "2026-07-25T00:00:00.000Z",
+      slaDueAt: "2026-08-24T00:00:00.000Z",
+      tickets: { slack: { error: "slack POST request returned 500", updatedAt: "2026-07-27T11:00:00.000Z" } }
+    }),
+    lifecycleRecord({ fingerprint: "d".repeat(64), status: "fixed", streams: {} })
+  ]);
+  const syncCalls: number[] = [];
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) },
+    findingsLifecycle: {
+      enabled: true,
+      syncTickets: async (record) => {
+        syncCalls.push(record.repositoryId);
+      }
+    }
+  });
+  await monitoring.reconcileOnce();
+  assert.deepEqual(syncCalls, [20]);
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-sla")?.status, "failing");
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-ticketing")?.status, "warning");
+  const alerts = (await store.listActiveMonitoringAlerts(20)).map((alert) => alert.alertKey);
+  assert.ok(alerts.includes("findings-sla"));
+  assert.ok(alerts.includes("findings-ticketing"));
+
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.deepEqual(weekly?.report.findings, {
+    source: "deterministic-scanners",
+    open: 2,
+    breached: 1,
+    fixed: 1,
+    suppressed: 0,
+    riskAccepted: 0,
+    ticketFailures: 1,
+    bySeverity: { critical: 1, high: 1, medium: 0, low: 0, info: 0 },
+    byOwner: { "@acme/app": 1, unowned: 1 },
+    otherOwners: 0,
+    ageBuckets: { "0-7d": 1, "8-30d": 1, "31-90d": 0, "over-90d": 0 }
+  });
+  assert.equal(weekly?.report.review.advisoryFindingsOpened, 0);
+});
+
+test("a disabled findings lifecycle leaves snapshots and weekly reports unchanged", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  await store.saveFindingLifecycle(20, [lifecycleRecord()]);
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.some((check) => check.key.startsWith("findings-")), false);
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(Object.hasOwn(weekly?.report ?? {}, "findings"), false);
+});
+
+test("a failing ticket retry is logged without failing the monitoring cycle", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  const logged: string[] = [];
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) },
+    logger: { error: (line: unknown) => logged.push(String(line)) },
+    findingsLifecycle: {
+      enabled: true,
+      syncTickets: async () => {
+        throw new Error("token=secret-value");
+      }
+    }
+  });
+  const result = await monitoring.reconcileOnce();
+  assert.equal(result.repositoriesEvaluated, 1);
+  assert.equal(logged.some((line) => line.includes("findings_ticket_retry_failed")), true);
+  assert.equal(logged.some((line) => line.includes("secret-value")), false);
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-sla")?.status, "passing");
+});

@@ -268,3 +268,67 @@ test("rejects repository secrets, backend fields, and cross-origin DAST", () => 
   assert.ok(schemaErrors.some((error) => error.includes("additional properties")));
   assert.ok(schemaErrors.some((error) => error.includes("must NOT be valid")));
 });
+
+test("accepts optional findings ownership and ticketing opt-in", () => {
+  const accepted = richConfig();
+  accepted.findings = {
+    ownership: {
+      serviceOwner: "@acme/platform",
+      rules: [
+        { paths: ["services/billing/**", "libs/payments/*.ts"], owner: "@acme/billing" },
+        { paths: ["docs/**"], owner: "@octocat" }
+      ]
+    },
+    githubIssues: true
+  };
+  assert.deepEqual(validateGuardianConfig(accepted), []);
+  assert.deepEqual(validateAgainstJsonSchema(schema, accepted), []);
+  assert.deepEqual(parseGuardianConfig(serializeGuardianConfig(accepted)), accepted);
+
+  const omitted = legacyConfig();
+  assert.equal(omitted.findings, undefined);
+  assert.deepEqual(validateGuardianConfig(omitted), []);
+  assert.deepEqual(validateAgainstJsonSchema(schema, omitted), []);
+});
+
+test("rejects invalid findings ownership, unbounded rules, and credential fields", () => {
+  const cases: Array<{ findings: unknown; expected: string }> = [
+    { findings: "yes", expected: "findings must be an object" },
+    { findings: { githubIssues: "true" }, expected: "findings.githubIssues must be boolean" },
+    { findings: { jiraToken: "x" }, expected: "findings.jiraToken is not supported" },
+    {
+      findings: { ownership: { serviceOwner: "platform team" } },
+      expected: "findings.ownership.serviceOwner must be"
+    },
+    {
+      findings: { ownership: { rules: [{ paths: ["../outside/**"], owner: "@acme/a" }] } },
+      expected: "findings.ownership.rules[0].paths[0] is invalid"
+    },
+    {
+      findings: { ownership: { rules: [{ paths: [], owner: "@acme/a" }] } },
+      expected: "findings.ownership.rules[0].paths must not be empty"
+    },
+    {
+      findings: { ownership: { rules: [{ paths: ["src/**"], owner: "acme" }] } },
+      expected: "findings.ownership.rules[0].owner must be"
+    },
+    {
+      findings: {
+        ownership: {
+          rules: Array.from({ length: 101 }, () => ({ paths: ["src/**"], owner: "@acme/a" }))
+        }
+      },
+      expected: "at most 100 rules"
+    }
+  ];
+  for (const { findings, expected } of cases) {
+    const rejected = richConfig() as unknown as Record<string, unknown>;
+    rejected.findings = findings;
+    const errors = validateGuardianConfig(rejected);
+    assert.ok(
+      errors.some((error) => error.includes(expected)),
+      `expected ${expected}; got ${errors.join("; ")}`
+    );
+    assert.ok(validateAgainstJsonSchema(schema, rejected).length > 0, `schema accepted ${expected}`);
+  }
+});
