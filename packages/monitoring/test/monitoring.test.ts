@@ -10,6 +10,7 @@ import {
   evaluateSuppressions,
   fixedClock,
   reconcileExpectedRuns,
+  reviewValueStats,
   reconcileEvidence,
   worstMonitoringStatus
 } from "../src/index.js";
@@ -402,4 +403,86 @@ test("evaluateIndexFreshness surfaces the truncation ratio so under-indexing is 
   );
   assert.equal(stale.status, "failing");
   assert.equal(stale.metadata?.truncationRatio, 0.9);
+});
+
+function reviewValueRepository(repository: string, reviewValue?: Record<string, any>) {
+  return {
+    repository,
+    visibility: "private" as const,
+    inventoryState: "enforced" as const,
+    review: {
+      prsReviewed: 0,
+      advisoryFindingsOpened: 0,
+      advisoryFindingsAccepted: 0,
+      advisoryFindingsDismissed: 0,
+      advisoryFindingsResolved: 0,
+      deterministicBlockersOpened: 0,
+      bridgeFailures: 0,
+      partialReviews: 0,
+      latencySamplesMs: []
+    },
+    scanner: {
+      expectedRuns: 0,
+      successfulRuns: 0,
+      evidenceCompleteRuns: 0,
+      missingEvidenceAlerts: 0,
+      importLagSamplesMs: []
+    },
+    monitoring: {
+      freshIndexes: 0,
+      staleIndexes: 0,
+      expiredSuppressions: 0,
+      expiringSuppressions: 0,
+      protectedDigests: 0,
+      completeEvidenceDigests: 0,
+      missingEvidenceDigests: 0
+    },
+    ...(reviewValue ? { reviewValue } : {})
+  };
+}
+
+test("review value precision is accepted over accepted plus dismissed, with its sample size", () => {
+  assert.deepEqual(reviewValueStats({ fixed: 3, dismissed: 1, ignored: 5, unresolved: 2 }), {
+    fixed: 3,
+    dismissed: 1,
+    ignored: 5,
+    unresolved: 2,
+    precision: 0.75,
+    sampleSize: 4
+  });
+  assert.equal(reviewValueStats({ fixed: 0, dismissed: 0, ignored: 9, unresolved: 1 }).precision, null);
+});
+
+test("weekly review value aggregates per repository and category and is omitted when unmeasured", () => {
+  const period = { periodStart: "2026-08-10T00:00:00.000Z", periodEnd: "2026-08-16T00:00:00.000Z" };
+  const unmeasured = buildWeeklyCoverageReport({
+    ...period,
+    repositories: [reviewValueRepository("acme/api")]
+  });
+  assert.equal("reviewValue" in unmeasured, false);
+
+  const report = buildWeeklyCoverageReport({
+    ...period,
+    repositories: [
+      reviewValueRepository("acme/web", {
+        byCategory: { security: { fixed: 1, dismissed: 1, ignored: 0, unresolved: 2 } }
+      }),
+      reviewValueRepository("acme/api", {
+        byCategory: {
+          security: { fixed: 2, dismissed: 0, ignored: 1, unresolved: 0 },
+          "Not A Category!": { fixed: 0, dismissed: 1, ignored: 0, unresolved: 0 }
+        }
+      })
+    ]
+  });
+  assert.equal(report.reviewValue?.totals.fixed, 3);
+  assert.equal(report.reviewValue?.totals.dismissed, 2);
+  assert.equal(report.reviewValue?.totals.precision, 0.6);
+  assert.equal(report.reviewValue?.totals.sampleSize, 5);
+  assert.equal(report.reviewValue?.byCategory.security?.precision, 0.75);
+  assert.equal(report.reviewValue?.byCategory.other?.dismissed, 1);
+  assert.deepEqual(
+    report.reviewValue?.repositories.map((entry) => entry.repository),
+    ["acme/api", "acme/web"]
+  );
 });

@@ -13,6 +13,7 @@ import {
   redactUntrustedText,
   selectReviewFindings
 } from "../src/service.js";
+import { remediationBranchName } from "../src/remediation-draft.js";
 import { MemoryStore } from "../src/store.js";
 
 class FakeGitHub {
@@ -41,6 +42,19 @@ class FakeGitHub {
   treeRefs: string[] = [];
   fileReads: Array<{ path: string; ref: string }> = [];
   permission = "write";
+  // Permissions the installation token reports; absent unless a test grants them explicitly.
+  grantedPermissions?: Record<string, string>;
+  repositoryWrites: Array<{ method: string; path: string; body: any }> = [];
+  failRefCreation = false;
+  // Mode C reuse paths: the commit an existing draft branch points at, per-ref file contents,
+  // a pull-request creation that GitHub refuses, and the open pull requests it then lists.
+  commitDetails: Record<string, Record<string, any>> = {};
+  refContents: Record<string, Record<string, Buffer>> = {};
+  failPullCreation = false;
+  openPulls: Array<Record<string, any>> = [];
+  refTip?: string;
+  /** Path GitHub reports for a contents read, as it does for a symlink resolved to its target. */
+  symlinkTargets: Record<string, string> = {};
   failIssueCreations = 0;
   failConfigFileReads = 0;
   issueCreationDelayMs = 0;
@@ -122,7 +136,7 @@ class FakeGitHub {
       })) as T;
     }
     if (method === "GET" && /\/git\/ref\/heads\//.test(path)) {
-      return { object: { sha: this.options.refSha ?? "a".repeat(40) } } as T;
+      return { object: { sha: this.refTip ?? this.options.refSha ?? "a".repeat(40) } } as T;
     }
     if (method === "GET" && path.includes("/contents/")) {
       const encodedPath = path.split("/contents/")[1]?.split("?")[0];
@@ -145,10 +159,12 @@ class FakeGitHub {
           content: Buffer.from(this.options.codeowners, "utf8").toString("base64")
         } as T;
       }
-      const content = this.options.contents?.[repositoryPath];
+      const ref = new URLSearchParams(path.split("?")[1] ?? "").get("ref") ?? "";
+      const content = this.refContents[ref]?.[repositoryPath] ?? this.options.contents?.[repositoryPath];
       if (content) {
         return {
           type: "file",
+          path: this.symlinkTargets[repositoryPath] ?? repositoryPath,
           sha: `${repositoryPath}-sha`,
           size: content.length,
           encoding: "base64",
@@ -197,6 +213,33 @@ class FakeGitHub {
       existing.body = String(body.body);
       this.reviewCommentUpdates.push({ id: commentId, body: existing.body });
       return { id: commentId } as T;
+    }
+    if (method === "POST" && /\/git\/refs$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      if (this.failRefCreation) throw new Error(`GitHub POST ${path} returned 422: exists`);
+      return { ref: body.ref } as T;
+    }
+    if (method === "PUT" && path.includes("/contents/")) {
+      this.repositoryWrites.push({ method, path, body });
+      return { commit: { sha: "c".repeat(40) } } as T;
+    }
+    if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
+      const sha = decodeURIComponent(path.split("/").at(-1) ?? "");
+      const commit = this.commitDetails[sha];
+      if (!commit) throw new Error(`GitHub GET ${path} returned 404: missing`);
+      return commit as T;
+    }
+    if (method === "GET" && /\/pulls\?state=open&head=/.test(path)) {
+      return this.openPulls as T;
+    }
+    if (method === "POST" && /\/pulls$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      if (this.failPullCreation) throw new Error(`GitHub POST ${path} returned 422: exists`);
+      return { number: 501, html_url: "https://example.test/pull/501" } as T;
+    }
+    if (method === "POST" && /\/issues\/\d+\/labels$/.test(path)) {
+      this.repositoryWrites.push({ method, path, body });
+      return [] as T;
     }
     if (method === "POST" && /\/pulls\/\d+\/reviews$/.test(path)) {
       this.reviews.push(body);
@@ -3772,4 +3815,433 @@ test("a stored storage key that is not canonical for its scope and commit is rej
   assert.deepEqual(indexed, []);
   assert.match(body, /repository index context was rejected by repository isolation checks/);
   assert.match(body, /Partial review/);
+});
+
+const DRAFT_FILE = `${Array.from({ length: 12 }, (_, index) =>
+  index === 9 ? "  return unsafeValue;" : `line ${index + 1}`
+).join("\n")}\n`;
+
+async function reviewWithSuggestion(options: { remediationDrafts?: boolean } = {}) {
+  const store = new MemoryStore();
+  const github = new FakeGitHub({ contents: { "src/a.ts": Buffer.from(DRAFT_FILE, "utf8") } });
+  const file = { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" };
+  github.pullFiles = Array.from({ length: 6 }, () => [file]);
+  const backend = new FakeBackend((request) =>
+    createResult(request, { suggestion: "return safeValue;" })
+  );
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend,
+      ...(options.remediationDrafts === undefined
+        ? {}
+        : { remediationDrafts: options.remediationDrafts })
+    },
+    store
+  );
+  await service.enqueue("pull_request", createPullEvent(), "delivery-suggestion");
+  await service.processNextWebhook("worker-1");
+  assert.equal(github.reviewComments.length, 1);
+  return { store, github, service };
+}
+
+function draftCommandEvent(body: string, user: Record<string, any> = { login: "reviewer" }) {
+  return {
+    action: "created",
+    installation: { id: 1 },
+    repository: {
+      id: 99,
+      full_name: "Geekyshubham/guardianbot",
+      default_branch: "main",
+      private: false
+    },
+    issue: { number: 12, pull_request: { url: "https://example.test/pull" } },
+    comment: { body, user }
+  };
+}
+
+function sameRepositoryPull(overrides: Record<string, any> = {}) {
+  return {
+    ...createPullEvent().pull_request,
+    head: {
+      sha: "head-sha",
+      ref: "feature/harden",
+      repo: { id: 99, full_name: "Geekyshubham/guardianbot" },
+      ...overrides
+    }
+  };
+}
+
+let draftDelivery = 0;
+async function runCommand(service: GuardianService, body: string, user?: Record<string, any>) {
+  draftDelivery += 1;
+  await service.enqueue("issue_comment", draftCommandEvent(body, user), `draft-${draftDelivery}`);
+  await service.processNextWebhook("worker-1");
+}
+
+test("the review row retains only a digest of the validated suggestion", async () => {
+  const { store } = await reviewWithSuggestion();
+  const finding = (await store.getReview(99, 12))?.findings[0];
+  assert.match(finding?.suggestionSha256 ?? "", /^[a-f0-9]{64}$/);
+  assert.ok(!JSON.stringify(finding).includes("safeValue"));
+});
+
+test("draft-fix is unavailable by default and writes nothing to the repository", async () => {
+  const { service, github } = await reviewWithSuggestion();
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /unavailable: they are disabled/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_unavailable_total 1$/m);
+});
+
+test("draft-fix is unavailable when the installation lacks contents:write", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not granted `contents: write`/);
+  github.grantedPermissions = { contents: "read" };
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not granted `contents: write`/);
+  assert.deepEqual(github.repositoryWrites, []);
+});
+
+test("draft-fix ignores bots and refuses readers, forks, and draft branches", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  const before = github.comments.length;
+  await runCommand(service, "@guardianbot draft-fix F1", { login: "helper[bot]", type: "Bot" });
+  await runCommand(service, "@guardianbot draft-fix F1", { login: "helper", type: "Bot" });
+  assert.equal(github.comments.length, before);
+
+  github.permission = "read";
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not authorized/);
+  github.permission = "write";
+
+  github.currentPulls = [
+    sameRepositoryPull({ repo: { id: 7, full_name: "someone/guardianbot" } }),
+    sameRepositoryPull({ repo: null }),
+    sameRepositoryPull({ ref: "guardianbot/fix/abc-1234567" })
+  ];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /forks or from GuardianBot draft branches/);
+  }
+  assert.deepEqual(github.repositoryWrites, []);
+});
+
+test("draft-fix opens a labelled draft PR on a new branch targeting the PR head branch", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull()];
+  await runCommand(service, "@guardianbot draft-fix F1");
+
+  const [ref, put, pull, label] = github.repositoryWrites;
+  assert.equal(github.repositoryWrites.length, 4);
+  assert.equal(ref?.body.sha, "head-sha");
+  assert.match(ref?.body.ref ?? "", /^refs\/heads\/guardianbot\/fix\/[a-f0-9]{12}-[a-f0-9]*$/);
+  const branch = String(ref?.body.ref).slice("refs/heads/".length);
+  assert.equal(put?.method, "PUT");
+  assert.equal(put?.body.branch, branch);
+  assert.notEqual(put?.body.branch, "feature/harden");
+  assert.equal(put?.body.sha, "src/a.ts-sha");
+  const written = Buffer.from(put?.body.content, "base64").toString("utf8");
+  const original = DRAFT_FILE.split("\n");
+  const updated = written.split("\n");
+  assert.equal(updated[9], "return safeValue;");
+  assert.deepEqual(
+    updated.filter((_, index) => index !== 9),
+    original.filter((_, index) => index !== 9)
+  );
+  assert.equal(pull?.body.draft, true);
+  assert.equal(pull?.body.base, "feature/harden");
+  assert.equal(pull?.body.head, branch);
+  assert.match(pull?.body.body ?? "", /AI-drafted remediation\. Requires human review and approval\./);
+  assert.deepEqual(label?.body, { labels: ["guardianbot-ai-draft"] });
+  assert.ok(!github.repositoryWrites.some((write) => /\/merge|\/reviews/.test(write.path)));
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #501/);
+  assert.match(github.comments.at(-1)?.body ?? "", /Checks: \*\*pending\*\*/);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 1$/m);
+});
+
+test("draft-fix refuses a stale head before any repository write", async () => {
+  const { service, github } = await reviewWithSuggestion({ remediationDrafts: true });
+  github.grantedPermissions = { contents: "write" };
+  github.currentPulls = [sameRepositoryPull({ sha: "moved-head" })];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /not validated at the current pull request head/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+});
+
+const VALIDATED_DRAFT_FILE = DRAFT_FILE.split("\n")
+  .map((line, index) => (index === 9 ? "return safeValue;" : line))
+  .join("\n");
+
+async function draftReadyService() {
+  const context = await reviewWithSuggestion({ remediationDrafts: true });
+  context.github.grantedPermissions = { contents: "write" };
+  context.github.currentPulls = [sameRepositoryPull()];
+  const fingerprint = (await context.store.getReview(99, 12))?.findings[0]?.fingerprint ?? "";
+  return { ...context, branch: remediationBranchName(fingerprint, "head-sha") };
+}
+
+/** Points the existing draft branch at a commit over the head that changed `files` to `content`. */
+function existingDraftBranch(
+  github: FakeGitHub,
+  content: string,
+  files: Array<{ filename: string; status: string }> = [{ filename: "src/a.ts", status: "modified" }],
+  parents = [{ sha: "head-sha" }]
+) {
+  const tip = "b".repeat(40);
+  github.failRefCreation = true;
+  github.refTip = tip;
+  github.commitDetails[tip] = { sha: tip, parents, files };
+  github.refContents[tip] = { "src/a.ts": Buffer.from(content, "utf8") };
+}
+
+test("draft-fix refuses a symlinked target because GitHub reports the resolved path", async () => {
+  const { service, github } = await draftReadyService();
+  github.symlinkTargets["src/a.ts"] = "src/real.ts";
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /No remediation draft was created .*not a plain file/);
+  assert.deepEqual(github.repositoryWrites, []);
+  assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+});
+
+test("draft-fix reuses an existing draft branch only when it holds exactly the validated change", async () => {
+  const { service, github } = await draftReadyService();
+  existingDraftBranch(github, VALIDATED_DRAFT_FILE);
+  await runCommand(service, "@guardianbot draft-fix F1");
+  // No contents write: the branch already carries the validated commit.
+  assert.deepEqual(
+    github.repositoryWrites.map((write) => `${write.method} ${write.path.split("/").slice(4).join("/")}`),
+    ["POST git/refs", "POST pulls", "POST issues/501/labels"]
+  );
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #501/);
+});
+
+test("draft-fix refuses an existing draft branch a writer pushed other content to", async () => {
+  const cases: Array<[string, Parameters<typeof existingDraftBranch>[2]?, Parameters<typeof existingDraftBranch>[3]?]> = [
+    // Same single file, different bytes than the validator produced.
+    [VALIDATED_DRAFT_FILE.replace("return safeValue;", "return exfiltrate();")],
+    // Validated file plus a second file in the same commit.
+    [VALIDATED_DRAFT_FILE, [
+      { filename: "src/a.ts", status: "modified" },
+      { filename: ".github/workflows/ci.yml", status: "modified" }
+    ]],
+    // One file, but not the validated one.
+    [VALIDATED_DRAFT_FILE, [{ filename: "src/b.ts", status: "modified" }]],
+    // More than one commit over the head.
+    [VALIDATED_DRAFT_FILE, undefined, [{ sha: "c".repeat(40) }]]
+  ];
+  for (const [content, files, parents] of cases) {
+    const { service, github } = await draftReadyService();
+    existingDraftBranch(github, content, files, parents);
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /already exists with unrelated commits/);
+    assert.deepEqual(github.repositoryWrites.map((write) => write.method), ["POST"]);
+    assert.ok(!github.repositoryWrites.some((write) => /\/pulls$/.test(write.path)));
+  }
+});
+
+test("draft-fix links only an existing GuardianBot-shaped draft and otherwise refuses", async () => {
+  const refused = async (openPulls: (branch: string) => Array<Record<string, any>>) => {
+    const { service, github, branch } = await draftReadyService();
+    github.failPullCreation = true;
+    github.openPulls = openPulls(branch);
+    await runCommand(service, "@guardianbot draft-fix F1");
+    assert.match(github.comments.at(-1)?.body ?? "", /GitHub did not open a draft pull request/);
+    assert.ok(!github.repositoryWrites.some((write) => write.path.endsWith("/labels")));
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_created_total 0$/m);
+    assert.match(service.metrics.render(), /^guardianbot_remediation_draft_rejected_total 1$/m);
+  };
+  // GitHub refused the draft (for example drafts are unsupported) and nothing exists to reuse.
+  await refused(() => []);
+  // A writer's own non-draft pull request, or a draft into another base, is not GuardianBot's.
+  await refused((branch) => [
+    { number: 77, draft: false, base: { ref: "feature/harden" }, head: { ref: branch } },
+    { number: 78, draft: true, base: { ref: "main" }, head: { ref: branch } }
+  ]);
+
+  const { service, github, branch } = await draftReadyService();
+  github.failPullCreation = true;
+  github.openPulls = [{ number: 79, draft: true, base: { ref: "feature/harden" }, head: { ref: branch } }];
+  await runCommand(service, "@guardianbot draft-fix F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /draft #79/);
+  assert.ok(github.repositoryWrites.some((write) => write.path.endsWith("/issues/79/labels")));
+});
+
+test("dismiss from a bot is ignored and records nothing", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  const before = github.comments.length;
+  await runCommand(service, "@guardianbot dismiss F1", { login: "helper[bot]", type: "Bot" });
+  await runCommand(service, "@guardianbot dismiss F1", { login: "helper", type: "Bot" });
+  assert.equal(github.comments.length, before);
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, undefined);
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_dismissed_total 0$/m);
+});
+
+test("a dismissal recorded while a later review is in flight survives that review's write", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  const fingerprint = (await store.getReview(99, 12))?.findings[0]?.fingerprint ?? "";
+  const event = createPullEvent("head-sha-2");
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.pullFiles = Array.from({ length: 6 }, () => [
+    { filename: "src/a.ts", status: "modified", patch: "@@ -1 +10 @@\n+line" }
+  ]);
+  const backend = (service as any).options.reviewClientFactory();
+  const original = backend.resultFactory;
+  backend.resultFactory = async (request: ReviewRequest) => {
+    // The human dismisses between this review's initial read and its write.
+    await store.recordFindingOutcome({
+      repositoryId: 99,
+      pullNumber: 12,
+      outcome: "dismissed",
+      fingerprint,
+      observedAt: new Date()
+    });
+    return original(request);
+  };
+  await service.enqueue("pull_request", event, "delivery-dismiss-in-flight");
+  await service.processNextWebhook("worker-1");
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.reviewedHeadSha, "head-sha-2");
+  assert.equal(review?.findings.find((finding) => finding.fingerprint === fingerprint)?.outcome, "dismissed");
+});
+
+test("dismiss records an outcome without retaining who dismissed it, and merge marks the rest ignored", async () => {
+  const { service, github, store } = await reviewWithSuggestion();
+  await runCommand(service, "@guardianbot dismiss F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /recorded finding `F1` as dismissed/i);
+  const review = await store.getReview(99, 12);
+  assert.equal(review?.findings[0]?.outcome, "dismissed");
+  assert.ok(!JSON.stringify(review).includes("reviewer"));
+  await runCommand(service, "@guardianbot dismiss F1");
+  assert.match(github.comments.at(-1)?.body ?? "", /already recorded as dismissed/);
+  await runCommand(service, "@guardianbot dismiss nope");
+  assert.match(github.comments.at(-1)?.body ?? "", /No open GuardianBot finding matches/);
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_dismissed_total 1$/m);
+
+  // Merging leaves the dismissal intact; it never re-labels a human decision as ignored.
+  await service.enqueue(
+    "pull_request",
+    { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: true } },
+    "delivery-merged-dismissed"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, "dismissed");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_ignored_total 0$/m);
+});
+
+test("a merged pull request marks still-open findings ignored; a closed one records nothing", async () => {
+  const { service, store } = await reviewWithSuggestion();
+  await service.enqueue(
+    "pull_request",
+    { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: false } },
+    "delivery-closed"
+  );
+  await service.processNextWebhook("worker-1");
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, undefined);
+  for (const delivery of ["delivery-merged", "delivery-merged-replay"]) {
+    await service.enqueue(
+      "pull_request",
+      { ...createPullEvent(), action: "closed", pull_request: { number: 12, merged: true } },
+      delivery
+    );
+    await service.processNextWebhook("worker-1");
+  }
+  assert.equal((await store.getReview(99, 12))?.findings[0]?.outcome, "ignored");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_ignored_total 1$/m);
+});
+
+async function incrementalFixedScenario(options: { partialReview?: boolean; patchSuffix?: string } = {}) {
+  const previousHead = "1".repeat(40);
+  const currentHead = "2".repeat(40);
+  const event = createPullEvent(currentHead);
+  event.pull_request.base.sha = "3".repeat(40);
+  const github = new FakeGitHub({ config: VALID_INCREMENTAL_CONFIG });
+  github.currentPulls = Array.from({ length: 3 }, () => event.pull_request);
+  github.comparisons = [{
+    status: "ahead",
+    base_commit: { sha: previousHead },
+    merge_base_commit: { sha: previousHead },
+    head_commit: { sha: currentHead },
+    files: [{
+      filename: "src/incremental.ts",
+      status: "modified",
+      patch: `@@ -20 +20 @@\n-unsafe\n+safe${options.patchSuffix ?? ""}`
+    }]
+  }];
+  const backend = new FakeBackend((request) => {
+    const result = createResult(request);
+    return {
+      ...result,
+      summary: { ...result.summary, partialReview: options.partialReview ?? false },
+      findings: []
+    };
+  });
+  const store = new MemoryStore();
+  await store.upsertRepository({
+    installationId: 1,
+    repositoryId: 99,
+    fullName: "Geekyshubham/guardianbot",
+    visibility: "public",
+    defaultBranch: "main",
+    scannerState: "report-only",
+    repositoryState: "active",
+    automaticReviewPaused: false
+  });
+  await store.saveReview({
+    repositoryId: 99,
+    pullNumber: 12,
+    headSha: previousHead,
+    reviewedHeadSha: previousHead,
+    placeholderCommentId: 79,
+    findings: [{
+      fingerprint: "e".repeat(64),
+      state: "open",
+      path: "src/incremental.ts",
+      startLine: 20,
+      endLine: 20,
+      category: "security",
+      lastSeenHeadSha: previousHead
+    }]
+  });
+  const service = new GuardianService(
+    {
+      appId: "1",
+      privateKey: "private",
+      webhookSecret: "secret",
+      githubClientFactory: async () => github,
+      reviewClientFactory: () => backend
+    },
+    store
+  );
+  await service.enqueue("pull_request", event, "delivery-incremental-fixed");
+  await service.processNextWebhook("worker-1");
+  return { retained: (await store.getReview(99, 12))?.findings[0], service };
+}
+
+test("a verified incremental review marks a finding fixed when its lines were rewritten", async () => {
+  const { retained, service } = await incrementalFixedScenario();
+  assert.notEqual(retained?.state, "open");
+  assert.equal(retained?.outcome, "fixed");
+  assert.match(service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 1$/m);
+});
+
+test("a partial or truncated incremental review never records a fixed outcome", async () => {
+  // The model declared the review partial, so a finding missing from it proves nothing.
+  const partial = await incrementalFixedScenario({ partialReview: true });
+  assert.equal(partial.retained?.outcome, undefined);
+  assert.match(partial.service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 0$/m);
+  // The patch exceeded the per-file cap, so the model saw only a prefix of the file's diff.
+  const truncated = await incrementalFixedScenario({ patchSuffix: `\n+${"x".repeat(31_000)}` });
+  assert.equal(truncated.retained?.outcome, undefined);
+  assert.match(truncated.service.metrics.render(), /^guardianbot_finding_outcome_fixed_total 0$/m);
 });

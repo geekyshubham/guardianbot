@@ -205,7 +205,10 @@ async function start() {
         environment: process.env,
         findingsLifecycle
       }),
-      repositoryIndexService
+      repositoryIndexService,
+      // Mode C is opt-in at the deployment and still requires the installation to hold
+      // contents:write; any value other than exactly "1" leaves it off.
+      remediationDrafts: process.env.GUARDIANBOT_REMEDIATION_DRAFTS === "1"
     },
     store
   );

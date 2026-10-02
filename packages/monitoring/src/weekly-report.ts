@@ -4,6 +4,36 @@ import type { RepositoryInventoryState } from "./status.js";
 /** Owners listed individually in the weekly findings section; the rest are folded together. */
 export const MAX_WEEKLY_FINDING_OWNERS = 50;
 
+/**
+ * Review-value outcome counts for one advisory category. `fixed` is GuardianBot's accepted signal:
+ * the finding stopped being reported after a verified incremental change rewrote its lines.
+ * `dismissed` is an explicit human command. `ignored` is a finding still open when its pull
+ * request merged. `unresolved` is a point-in-time count of findings still open with no outcome.
+ */
+export interface ReviewValueCounts {
+  fixed: number;
+  dismissed: number;
+  ignored: number;
+  unresolved: number;
+}
+
+export interface ReviewValueStats extends ReviewValueCounts {
+  /** fixed / (fixed + dismissed), or null when that sample is empty rather than a misleading 0. */
+  precision: number | null;
+  /** fixed + dismissed: the explicit-signal sample `precision` is computed over. */
+  sampleSize: number;
+}
+
+export interface ReviewValueSummary {
+  totals: ReviewValueStats;
+  byCategory: Record<string, ReviewValueStats>;
+  repositories: Array<{
+    repository: string;
+    totals: ReviewValueStats;
+    byCategory: Record<string, ReviewValueStats>;
+  }>;
+}
+
 export interface RepositoryWeeklyMetrics {
   repository: string;
   visibility: "public" | "private";
@@ -22,6 +52,11 @@ export interface RepositoryWeeklyMetrics {
     outputUnits?: number;
     estimatedCostUsd?: number;
   };
+  /**
+   * Per-category review-value counts derived from retained finding records. Absent when nothing
+   * was measured for this repository, which is a different claim from measured-and-zero.
+   */
+  reviewValue?: { byCategory: Record<string, ReviewValueCounts> };
   scanner: {
     expectedRuns: number;
     successfulRuns: number;
@@ -81,6 +116,12 @@ export interface WeeklyCoverageReport {
     outputUnits: number;
     estimatedCostUsd: number;
   };
+  /**
+   * Present only when at least one repository supplied measured review-value counts, so a report
+   * built from inputs that never measured them is byte-identical to the report before this field
+   * existed.
+   */
+  reviewValue?: ReviewValueSummary;
   scanner: {
     expectedRuns: number;
     successfulRuns: number;
@@ -112,6 +153,91 @@ function quantile(values: number[], fraction: number): number {
   const ordered = [...values].sort((left, right) => left - right);
   const index = Math.min(ordered.length - 1, Math.max(0, Math.ceil(ordered.length * fraction) - 1));
   return ordered[index] ?? 0;
+}
+
+const REVIEW_VALUE_CATEGORY = /^[a-z][a-z-]{0,31}$/;
+
+function emptyCounts(): ReviewValueCounts {
+  return { fixed: 0, dismissed: 0, ignored: 0, unresolved: 0 };
+}
+
+function count(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function addCounts(target: ReviewValueCounts, source: ReviewValueCounts): void {
+  target.fixed += count(source.fixed);
+  target.dismissed += count(source.dismissed);
+  target.ignored += count(source.ignored);
+  target.unresolved += count(source.unresolved);
+}
+
+/** Exposed so every consumer derives precision the same way, including the empty-sample rule. */
+export function reviewValueStats(counts: ReviewValueCounts): ReviewValueStats {
+  const sampleSize = counts.fixed + counts.dismissed;
+  return {
+    fixed: counts.fixed,
+    dismissed: counts.dismissed,
+    ignored: counts.ignored,
+    unresolved: counts.unresolved,
+    precision: sampleSize ? Number((counts.fixed / sampleSize).toFixed(4)) : null,
+    sampleSize
+  };
+}
+
+/**
+ * Category keys arrive from retained finding records, so they are re-bounded here: anything that
+ * is not a short lowercase slug collapses into `other` rather than becoming a report key.
+ */
+function reviewValueCategory(category: string): string {
+  return REVIEW_VALUE_CATEGORY.test(category) ? category : "other";
+}
+
+function sortedStats(byCategory: Map<string, ReviewValueCounts>): Record<string, ReviewValueStats> {
+  return Object.fromEntries(
+    [...byCategory.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([category, counts]) => [category, reviewValueStats(counts)])
+  );
+}
+
+function buildReviewValueSummary(
+  repositories: readonly RepositoryWeeklyMetrics[]
+): ReviewValueSummary | undefined {
+  const measured = repositories.filter((repository) => repository.reviewValue);
+  if (!measured.length) return undefined;
+  const totals = emptyCounts();
+  const byCategory = new Map<string, ReviewValueCounts>();
+  const perRepository: ReviewValueSummary["repositories"] = [];
+  for (const repository of [...measured].sort((left, right) =>
+    left.repository.localeCompare(right.repository)
+  )) {
+    const repositoryTotals = emptyCounts();
+    const repositoryCategories = new Map<string, ReviewValueCounts>();
+    for (const [rawCategory, counts] of Object.entries(
+      repository.reviewValue?.byCategory ?? {}
+    )) {
+      const category = reviewValueCategory(rawCategory);
+      const repositoryCategory = repositoryCategories.get(category) ?? emptyCounts();
+      addCounts(repositoryCategory, counts);
+      repositoryCategories.set(category, repositoryCategory);
+      const fleetCategory = byCategory.get(category) ?? emptyCounts();
+      addCounts(fleetCategory, counts);
+      byCategory.set(category, fleetCategory);
+      addCounts(repositoryTotals, counts);
+    }
+    addCounts(totals, repositoryTotals);
+    perRepository.push({
+      repository: repository.repository,
+      totals: reviewValueStats(repositoryTotals),
+      byCategory: sortedStats(repositoryCategories)
+    });
+  }
+  return {
+    totals: reviewValueStats(totals),
+    byCategory: sortedStats(byCategory),
+    repositories: perRepository
+  };
 }
 
 export function buildWeeklyCoverageReport(input: {
@@ -149,6 +275,8 @@ export function buildWeeklyCoverageReport(input: {
     importLagSamples.push(...(repository.scanner.importLagSamplesMs ?? []));
   }
 
+  const reviewValue = buildReviewValueSummary(input.repositories);
+
   const report: WeeklyCoverageReport = {
     periodStart: start.toISOString(),
     periodEnd: end.toISOString(),
@@ -182,6 +310,7 @@ export function buildWeeklyCoverageReport(input: {
         sum(input.repositories.map((repository) => repository.review.estimatedCostUsd)).toFixed(4)
       )
     },
+    ...(reviewValue ? { reviewValue } : {}),
     scanner: {
       expectedRuns: sum(input.repositories.map((repository) => repository.scanner.expectedRuns)),
       successfulRuns: sum(input.repositories.map((repository) => repository.scanner.successfulRuns)),

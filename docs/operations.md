@@ -385,6 +385,18 @@ cycle, and raised as the `findings-ticketing` monitoring alert. Open findings
 past their due date raise `findings-sla`; see the
 [SLA breach runbook](runbooks/sla-breach.md).
 
+### Remediation drafts
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `GUARDIANBOT_REMEDIATION_DRAFTS` | unset (off) | `1` enables `@guardianbot draft-fix`; any other value leaves it off |
+
+The flag is necessary but not sufficient: the installation must also have
+accepted `Contents: Read and write`, which the default manifest does not
+grant. See [remediation drafts](remediation-drafts.md) and
+[the optional App permission](github-app.md#optional-mode-c-permission).
+Draft branches named `guardianbot/fix/*` are not deleted automatically.
+
 ## First live AI review checklist
 
 Use this only when enabling the first production AI-backed review. Do not treat
