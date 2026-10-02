@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GuardianBot Remediation Validation Request",
+  "$id": "https://guardianbot.dev/schemas/remediation-validation-request.v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "requestId",
+    "classification",
+    "finding",
+    "original",
+    "replacement",
+    "contextBefore",
+    "contextAfter"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "const": "guardian.remediation-validation.v1"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "classification": {
+      "enum": [
+        "public",
+        "private",
+        "restricted"
+      ]
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fingerprint",
+        "path",
+        "startLine",
+        "endLine"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "category": {
+          "enum": [
+            "security",
+            "logic",
+            "reliability",
+            "concurrency",
+            "performance",
+            "contract",
+            "testing",
+            "maintainability"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        },
+        "startLine": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "endLine": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "original": {
+      "type": "string",
+      "maxLength": 8000
+    },
+    "replacement": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "contextBefore": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "contextAfter": {
+      "type": "string",
+      "maxLength": 4000
+    }
+  }
+}

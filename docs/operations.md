@@ -59,6 +59,9 @@ App-level environment configuration must include:
 - GitHub App ID, private key, and webhook secret;
 - `GUARDIANBOT_EVIDENCE_SIGNING_SECRET`;
 - exact trusted security, image, and DAST reusable-workflow SHAs;
+- optionally `GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA`, the exact trusted
+  `reusable-image-rescan.yml` SHA. It defaults to the trusted image workflow
+  SHA because both workflows ship in the same release;
 - `DATABASE_URL` and
   `GUARDIANBOT_DATABASE_CA_CERT=${guardianbot-db.CA_CERT}` for the managed
   DigitalOcean database binding;
@@ -67,7 +70,15 @@ App-level environment configuration must include:
   deployment environment for each target, and its referenced exchange-secret
   environment variables; and
 - `GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON` and the centrally referenced
-  DigitalOcean API token.
+  DigitalOcean API token; and
+- for the opt-in [release gate](release-gate.md),
+  `GUARDIANBOT_TRUSTED_RELEASE_GATE_WORKFLOW_SHA` (falls back to
+  `GUARDIANBOT_TRUSTED_WORKFLOW_SHA`), optional
+  `GUARDIANBOT_RELEASE_GATE_POLICY_JSON`, and the existing
+  `GUARDIANBOT_DEFECTDOJO_BASE_URL_REF` / `GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF`
+  references. Without DefectDojo every release decision fails as
+  `gate-unavailable`. A DigitalOcean profile opts into gated promotion with
+  `"requireReleaseGate": true`; it defaults to `false`.
 
 The profile JSON documents contain identifiers and environment-variable names,
 not secret values. Keep each actual secret in encrypted App Platform
@@ -75,6 +86,13 @@ configuration.
 The DAST broker reads accepted deployment evidence from the durable store and
 will not issue a session until the scheduled/manual run SHA matches the
 healthy deployed digest and origin.
+
+Repositories with `image.deployment` also run a nightly deployed-digest
+rescan. Each such consumer repository needs a GitHub environment named
+`guardianbot-image-rescan`; the rescan job requests an OIDC token with that
+audience and calls `POST /image/rescan-target`, which returns only the latest
+accepted deployment's exact digest and signing identity and fails closed when
+no deployment exists. Callers gain the job only after they are regenerated.
 
 To roll back App Platform, run the same verified script with the retained asset
 directory for the previous release. Database rollback is a separate,
@@ -220,6 +238,9 @@ Monitor at minimum:
 - expected workflow runs, repository-index freshness, and scanner evidence;
 - distinct DAST smoke/nightly freshness and DefectDojo imports;
 - exact scan/SBOM/signature/deployment digest agreement; and
+- deployed-digest rescan freshness (`image-rescan-coverage`) and the
+  `image-promotion-freeze` check, which mirrors the freeze the deployment
+  reconciler enforces; and
 - suppression expiry and weekly coverage snapshots.
 
 ### Private metrics and operator monitoring status
@@ -275,6 +296,33 @@ truncation is the separate boolean on `activeAlerts`. Health/readiness
 endpoints are useful process signals, not substitutes for external probes and
 evidence reconciliation.
 
+### Webhook retry and dead-letter
+
+Every accepted delivery is a durable webhook job. A failed attempt is retried
+with exponential backoff (30 seconds, doubling, capped at 30 minutes) until the
+fifth counted attempt, which moves the job to `dead-letter`:
+
+- a non-retryable backend failure (for example an unsupported protocol
+  version) dead-letters on the first attempt;
+- GitHub throttling and shutdown aborts requeue the job without consuming an
+  attempt, so neither can dead-letter it; and
+- scanner evidence failures that may clear on retry, such as a GitHub artifact
+  download error or a DefectDojo import outage after a rescan freeze was
+  recorded, leave the run `failed` and rethrow so the job is retried. Evidence
+  already written, including a promotion freeze, stays in place across
+  retries.
+
+`guardianbot_webhook_jobs_dead_letter` and `webhook_dead_letter_total` expose
+dead-lettered jobs. GuardianBot never replays a dead-lettered job by itself.
+After the cause is fixed and deployed, an operator may replay it with a guarded
+store transition that matches exactly one row by delivery ID, `dead-letter`
+status, event, attempt count, and the recorded error text, and resets that row
+to `pending` with a fresh retry budget. Treat it as a production change: confirm
+the match count is one before committing. The
+[v0.2.39 recovery](evidence/v0.2.39-live-index-recovery.md#guarded-replay-after-v0239-active)
+is the recorded example. Dead-lettered rows are purged after the retention
+below.
+
 ### Webhook queue retention
 
 The control-plane worker periodically purges only terminal webhook rows
@@ -327,6 +375,66 @@ reported" is not a bound on its own:
 
 The lifetime evicted counter advances by whatever a discard actually dropped, so
 `findings_evicted_total` stays a truthful operator signal in both cases.
+
+### Findings lifecycle and SLA
+
+The findings lifecycle tracks deterministic scanner findings per root-cause
+fingerprint: owner, first and last seen, status, SLA due date, and breach. It is
+fed only by accepted default-branch push or schedule evidence and by DAST
+evidence bound to the deployed digest. Pull-request evidence and AI review
+findings never reach it. Everything below is off unless configured; see
+[findings lifecycle](findings-lifecycle.md) for the model.
+
+| Environment variable | Default | Bounds |
+| --- | --- | --- |
+| `GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED` | off | `0`, `1`, `false`, or `true` |
+| `GUARDIANBOT_FINDINGS_SLA_JSON` | `{"critical":7,"high":30}` | object keyed by `critical`, `high`, `medium`, `low`; integer days 1 … 3650 |
+| `GUARDIANBOT_FINDINGS_GITHUB_ISSUES_ENABLED` | off | `0`, `1`, `false`, or `true`; also needs `findings.githubIssues: true` in the repository |
+| `GUARDIANBOT_FINDINGS_SLACK_WEBHOOK_URL_REF` | unset | name of the env var holding an HTTPS incoming-webhook URL |
+| `GUARDIANBOT_FINDINGS_JIRA_BASE_URL_REF` | unset | name of the env var holding the HTTPS Jira base URL |
+| `GUARDIANBOT_FINDINGS_JIRA_EMAIL_REF` | unset | name of the env var holding the Jira account email |
+| `GUARDIANBOT_FINDINGS_JIRA_API_TOKEN_REF` | unset | name of the env var holding the Jira API token |
+| `GUARDIANBOT_FINDINGS_JIRA_PROJECT_KEY` | unset | uppercase Jira project key |
+| `GUARDIANBOT_FINDINGS_JIRA_ISSUE_TYPE` | `Bug` | plain issue type name |
+
+Severities absent from the SLA object are recorded but neither aged against an
+SLA nor ticketed. The four Jira settings are all-or-nothing. Every `*_REF`
+names another control-plane environment variable, the same indirection as the
+DefectDojo token; consumer repositories never receive these values. Invalid
+values, a reference to an unset variable, or a ticket provider without
+`GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED=true` fail boot, and the error names
+only the variable, never its value.
+
+GitHub issues use a repository-scoped installation token limited to
+`issues: write`. They are never written to public repositories. Ticket and
+notifier failures are retried with bounded backoff, stored as a sanitized
+error on the lifecycle record, retried on the next ingestion and monitoring
+cycle, and raised as the `findings-ticketing` monitoring alert. Open findings
+past their due date raise `findings-sla`, and records dropped over the
+5000-record bound or ignored foreign marker issues raise `findings-capacity`.
+Marker recovery trusts only issues this App opened; the App identity is read
+from `GET /app` and must match `GITHUB_APP_ID`. See the
+[SLA breach runbook](runbooks/sla-breach.md).
+
+### Remediation drafts
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `GUARDIANBOT_REMEDIATION_DRAFTS` | unset (off) | `1` enables `@guardianbot draft-fix`; any other value leaves it off |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_URL` | unset (no second model) | Optional veto-only `guardian.remediation-validation.v1` endpoint. HTTPS, or HTTP on loopback; no credentials, query, or fragment |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TOKEN` | unset | Bearer token; required unless the URL is loopback |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_CLASSIFICATIONS` | required with the URL | Comma list of `public`, `private`, `restricted` the validator may receive; others refuse the draft |
+| `GUARDIANBOT_REMEDIATION_VALIDATOR_TIMEOUT_MS` | `30000` | Integer from 1000 to 120000 |
+
+The flag is necessary but not sufficient: the installation must also have
+accepted `Contents: Read and write`, which the default manifest does not
+grant. See [remediation drafts](remediation-drafts.md) and
+[the optional App permission](github-app.md#optional-mode-c-permission).
+These are control-plane settings only and never belong in a consumer
+repository. A set but malformed validator configuration fails startup. Draft
+branches named `guardianbot/fix/*` are deleted on close only while their tip
+is still GuardianBot's own commit; see
+[branch cleanup](remediation-drafts.md#branch-cleanup).
 
 ## First live AI review checklist
 

@@ -73,6 +73,10 @@ destinations centrally with
 }
 ```
 
+A profile may also set `"requireReleaseGate": true` (default `false`) to
+require a passing [release gate](release-gate.md) decision before any
+DigitalOcean call.
+
 `components` supports named App Platform `service`, `worker`, and `job`
 components that all use the same approved GHCR image. Legacy single-service
 profiles may use `serviceNames`; a profile must define exactly one form. The
@@ -96,6 +100,87 @@ digest. Monitoring requires the image Trivy result, SBOM, signature,
 deployment, and—when configured—DAST/DefectDojo evidence to agree on that
 digest and environment. A mismatch, incomplete App Platform response, failed
 deployment, timeout, or failed probe cannot be reported as protected.
+
+## Deployed digest rescan
+
+When `image.deployment` is configured, the generated caller adds a
+schedule-only `guardianbot/image-rescan` job (cron `13 3 * * *`) that calls the
+read-only `reusable-image-rescan.yml` workflow. Callers without
+`image.deployment` are byte-identical to earlier releases. There is no new
+configuration field.
+
+The rescan never builds, pushes, signs, or deploys. Each night it:
+
+1. requests a GitHub OIDC token with audience `guardianbot-image-rescan` from
+   the `guardianbot-image-rescan` GitHub environment and calls
+   `POST /image/rescan-target`;
+2. receives the exact digest, image reference, keyless signing identity, and
+   deployment run from the latest accepted `deployment:<environment>` evidence.
+   The target is never resolved from a tag;
+3. verifies the Cosign signature and the CycloneDX SBOM attestation for that
+   identity, then pulls the image by digest and checks the pulled RepoDigest;
+4. runs the pinned Trivy image scan and generates a fresh CycloneDX SBOM; and
+5. uploads provenance-bound `image-rescan` evidence.
+
+The endpoint applies the same checks as the DAST session broker: repository,
+run, commit, trusted workflow SHA, hosted runner, and environment claims. It
+fails closed when the repository has no accepted deployment for the requested
+environment or when the stored evidence is incomplete. The reusable workflow
+then fails closed when the returned reference does not match the configured
+image name and digest, and the control plane later requires the uploaded
+evidence to match the stored deployment exactly.
+
+The control plane independently verifies the uploaded evidence. It requires a
+default-branch schedule run, re-verifies the signature and SBOM attestation,
+requires the Trivy report to name the exact deployed reference, rejects scanner
+errors, and requires the reported Critical count to match the report. It records:
+
+- `image-rescan:<environment>`: finding counts plus a bounded SBOM diff
+  (added, removed, and version-changed components keyed by purl or
+  name+ecosystem) against the previously attested SBOM; and
+- `promotion-freeze:<environment>`: `failure` when the rescan finds one or more
+  Critical vulnerabilities in the running digest, otherwise `success`.
+
+SBOM diff heuristics flag possible typosquats, dependency-confusion names, and
+version downgrades. They are advisory only and never block, waive, or approve.
+The typosquat comparison skips names longer than 64 characters and stops at a
+fixed work budget; when the budget or a list cap is reached the diff is marked
+`truncated`, so a missing signal is not evidence of a clean dependency set.
+Rescan ingestion never changes the running deployment. The freeze is enforced
+at promotion instead:
+
+- the DigitalOcean reconciler refuses to promote a digest whose newest
+  verified default-branch rescan, in any environment, found Critical findings
+  or left a missing, unreadable, or mismatched freeze record. This applies to
+  every profile, not only those with `requireReleaseGate`. A store error while
+  reading the freeze also refuses the promotion;
+- a different digest that is itself Critical-clean is the fix path and is
+  allowed, so a frozen environment is repaired by promoting a replacement; and
+- the release gate reports the same condition as `promotion-frozen`.
+
+A rescan whose evidence verified but whose DefectDojo import failed still
+counts as a verified freeze; the artifact is retried through the webhook
+backoff and dead-letter path (default five attempts), and its freeze is
+recorded before the import is attempted.
+
+When DefectDojo is configured, the rescan's Trivy report is imported into a
+separate `<default-branch>/image-rescan` engagement, one Test per environment
+(`<default-branch>/image-rescan/<environment>`), tagged with the environment,
+the deployed digest, and the commit that built it. That engagement is outside
+the release gate's engagements, so a rescan never closes or replaces the
+build-time `image` findings the gate reads. The rescan also feeds the findings
+lifecycle on its own `trivy-image-rescan:<environment>` stream, so new Critical
+findings on a running digest get SLA aging, owners, and tickets. The rescan
+reports Critical findings only.
+
+Monitoring adds two checks for repositories with `image.deployment`:
+
+- `image-rescan-coverage`: passing when a successful rescan of the deployed
+  digest is within the evidence max age, warning when it is older, and failing
+  when it is older than twice the max age or missing after the first window
+  following a deployment; and
+- `image-promotion-freeze`: failing when the latest rescan of the deployed
+  digest reports new Critical findings or has no freeze record.
 
 ## RouteLens and AstraNull
 

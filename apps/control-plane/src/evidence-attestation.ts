@@ -17,6 +17,7 @@ export type EvidenceArtifactType =
   | "security"
   | "image-validation"
   | "image-promotion"
+  | "image-rescan"
   | "dast";
 
 export interface TrustedEvidenceWorkflow {
@@ -114,6 +115,7 @@ const WORKFLOW_PATHS: Record<EvidenceArtifactType, string> = {
   security: ".github/workflows/reusable-security.yml",
   "image-validation": ".github/workflows/reusable-image.yml",
   "image-promotion": ".github/workflows/reusable-image.yml",
+  "image-rescan": ".github/workflows/reusable-image-rescan.yml",
   dast: ".github/workflows/reusable-dast.yml"
 };
 
@@ -159,6 +161,7 @@ function parseArtifactType(value: unknown): EvidenceArtifactType {
     value !== "security" &&
     value !== "image-validation" &&
     value !== "image-promotion" &&
+    value !== "image-rescan" &&
     value !== "dast"
   ) {
     throw new Error("artifactType is invalid");
@@ -211,6 +214,14 @@ export function parseEvidenceTrustPolicy(
     env,
     "GUARDIANBOT_TRUSTED_DAST_WORKFLOW_SHA"
   );
+  // The deployed-digest rescan ships in the same release as the image workflow, so an existing
+  // deployment that only pins the image SHA keeps booting and trusts the matching rescan file.
+  const imageRescanSha = env.GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA
+    ? requireSha(
+        env.GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA,
+        "GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA"
+      )
+    : imageSha;
   const configuredTtl = env.GUARDIANBOT_EVIDENCE_TOKEN_TTL_SECONDS
     ? Number(env.GUARDIANBOT_EVIDENCE_TOKEN_TTL_SECONDS)
     : DEFAULT_PROVENANCE_TTL_SECONDS;
@@ -242,6 +253,11 @@ export function parseEvidenceTrustPolicy(
         artifactType: "image-promotion",
         workflowPath: WORKFLOW_PATHS["image-promotion"],
         sha: imageSha
+      },
+      "image-rescan": {
+        artifactType: "image-rescan",
+        workflowPath: WORKFLOW_PATHS["image-rescan"],
+        sha: imageRescanSha
       },
       dast: {
         artifactType: "dast",
@@ -571,6 +587,8 @@ export function createEvidenceAttestationService(
         `repo:${request.repository}:environment:guardianbot-image-promotion`;
       const dastSubject =
         `repo:${request.repository}:environment:guardianbot-dast`;
+      const rescanSubject =
+        `repo:${request.repository}:environment:guardianbot-image-rescan`;
       if (
         (request.artifactType === "image-promotion" &&
           (oidc.environment !== "guardianbot-image-promotion" ||
@@ -580,7 +598,10 @@ export function createEvidenceAttestationService(
             normalizedSubject === promotionSubject)) ||
         (request.artifactType === "dast" &&
           (oidc.environment !== "guardianbot-dast" ||
-            normalizedSubject !== dastSubject))
+            normalizedSubject !== dastSubject)) ||
+        (request.artifactType === "image-rescan" &&
+          (oidc.environment !== "guardianbot-image-rescan" ||
+            normalizedSubject !== rescanSubject))
       ) {
         throw new EvidenceAttestationError(
           "OIDC job environment is not authorized for this artifact type",

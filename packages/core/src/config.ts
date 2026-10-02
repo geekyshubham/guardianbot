@@ -72,6 +72,12 @@ export interface GuardianConfig {
     mode: ScannerMode;
     semgrep: boolean;
     trivy: boolean;
+    /**
+     * Exact release branch names that also receive pull_request and push
+     * coverage from the generated caller. The default branch is always
+     * covered. Omit to keep the default-branch-only trigger set.
+     */
+    releaseBranches?: string[];
     suppressions?: Array<{
       fingerprint: string;
       owner: string;
@@ -129,6 +135,16 @@ export interface GuardianConfig {
     };
     excludedRoutes?: string[];
   };
+  findings?: {
+    ownership?: {
+      serviceOwner?: string;
+      rules?: Array<{
+        paths: string[];
+        owner: string;
+      }>;
+    };
+    githubIssues?: boolean;
+  };
 }
 
 const SHA_PATTERN = /^[a-f0-9]{40}$/;
@@ -162,7 +178,19 @@ const IMAGE_PROMOTION_MODES = new Set<ImagePromotionMode>([
   "enforce-only",
   "verified-default-branch"
 ]);
+const OWNER_HANDLE_PATTERN = /^@[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})(?:\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99}))?$/;
+const MAX_OWNERSHIP_RULES = 100;
+const MAX_OWNERSHIP_RULE_PATHS = 50;
 const BRANCH_PATTERN = /^(?!\/)(?!.*(?:\/\/|\.\.|@\{))[^\s~^:?*[\\]+(?<![/.])$/;
+/** Upper bound on scanners.releaseBranches so caller triggers stay reviewable. */
+export const MAX_SCANNER_RELEASE_BRANCHES = 20;
+const MAX_BRANCH_NAME_LENGTH = 255;
+/**
+ * Conservative character set for scanners.releaseBranches. GitHub Actions
+ * branch filters treat * ** ? + [ ] ! and backslash as pattern syntax, so only
+ * characters that are literal in both trigger filters and refs are accepted.
+ */
+const RELEASE_BRANCH_CHARACTERS = /^[A-Za-z0-9._/-]+$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -289,7 +317,18 @@ export function validateGuardianConfig(config: unknown): string[] {
   if (!isRecord(config)) return ["configuration must be an object"];
   unknownFields(
     config,
-    ["schemaVersion", "workflowVersion", "repository", "paths", "review", "runner", "scanners", "image", "dast"],
+    [
+      "schemaVersion",
+      "workflowVersion",
+      "repository",
+      "paths",
+      "review",
+      "runner",
+      "scanners",
+      "image",
+      "dast",
+      "findings"
+    ],
     "configuration",
     errors
   );
@@ -511,12 +550,45 @@ export function validateGuardianConfig(config: unknown): string[] {
   if (!isRecord(config.scanners)) {
     errors.push("scanners is required");
   } else {
-    unknownFields(config.scanners, ["mode", "semgrep", "trivy", "suppressions"], "scanners", errors);
+    unknownFields(
+      config.scanners,
+      ["mode", "semgrep", "trivy", "releaseBranches", "suppressions"],
+      "scanners",
+      errors
+    );
     if (!["advisory", "report-only", "enforce"].includes(String(config.scanners.mode))) {
       errors.push("scanners.mode is invalid");
     }
     if (typeof config.scanners.semgrep !== "boolean") errors.push("scanners.semgrep must be boolean");
     if (typeof config.scanners.trivy !== "boolean") errors.push("scanners.trivy must be boolean");
+    if (config.scanners.releaseBranches !== undefined) {
+      // Exact branch names only: the character set excludes every GitHub Actions
+      // filter metacharacter (* ? + [ ] ! backslash) and expression syntax, BRANCH_PATTERN
+      // enforces git ref rules, and refs/ prefixes are rejected so triggers and
+      // ruleset checks agree.
+      stringArray(config.scanners.releaseBranches, "scanners.releaseBranches", errors, {
+        validate: (entry) =>
+          entry.length <= MAX_BRANCH_NAME_LENGTH &&
+          RELEASE_BRANCH_CHARACTERS.test(entry) &&
+          BRANCH_PATTERN.test(entry) &&
+          !entry.startsWith("refs/") &&
+          !entry.endsWith(".lock")
+      });
+      if (
+        Array.isArray(config.scanners.releaseBranches) &&
+        config.scanners.releaseBranches.length > MAX_SCANNER_RELEASE_BRANCHES
+      ) {
+        errors.push(
+          `scanners.releaseBranches must contain at most ${MAX_SCANNER_RELEASE_BRANCHES} branches`
+        );
+      }
+      if (
+        Array.isArray(config.scanners.releaseBranches) &&
+        config.scanners.releaseBranches.length === 0
+      ) {
+        errors.push("scanners.releaseBranches must not be empty when set");
+      }
+    }
     if (config.scanners.suppressions !== undefined) {
       if (!Array.isArray(config.scanners.suppressions)) {
         errors.push("scanners.suppressions must be an array");
@@ -907,7 +979,67 @@ export function validateGuardianConfig(config: unknown): string[] {
       });
     }
   }
+  if (config.findings !== undefined) validateFindingsConfig(config.findings, errors);
   return errors;
+}
+
+/**
+ * Optional finding-lifecycle policy. It only names owners and opts the repository into
+ * control-plane ticketing; SLA days, ticketing credentials, and notifier endpoints are
+ * control-plane environment, never repository configuration.
+ */
+function validateFindingsConfig(findings: unknown, errors: string[]): void {
+  if (!isRecord(findings)) {
+    errors.push("findings must be an object");
+    return;
+  }
+  unknownFields(findings, ["ownership", "githubIssues"], "findings", errors);
+  if (findings.githubIssues !== undefined && typeof findings.githubIssues !== "boolean") {
+    errors.push("findings.githubIssues must be boolean");
+  }
+  if (findings.ownership === undefined) return;
+  if (!isRecord(findings.ownership)) {
+    errors.push("findings.ownership must be an object");
+    return;
+  }
+  const ownership = findings.ownership;
+  unknownFields(ownership, ["serviceOwner", "rules"], "findings.ownership", errors);
+  if (
+    ownership.serviceOwner !== undefined &&
+    (typeof ownership.serviceOwner !== "string" ||
+      !OWNER_HANDLE_PATTERN.test(ownership.serviceOwner))
+  ) {
+    errors.push("findings.ownership.serviceOwner must be an @user or @org/team handle");
+  }
+  if (ownership.rules === undefined) return;
+  if (!Array.isArray(ownership.rules)) {
+    errors.push("findings.ownership.rules must be an array");
+    return;
+  }
+  if (ownership.rules.length > MAX_OWNERSHIP_RULES) {
+    errors.push(`findings.ownership.rules must contain at most ${MAX_OWNERSHIP_RULES} rules`);
+  }
+  for (const [index, rule] of ownership.rules.entries()) {
+    const prefix = `findings.ownership.rules[${index}]`;
+    if (!isRecord(rule)) {
+      errors.push(`${prefix} must be an object`);
+      continue;
+    }
+    unknownFields(rule, ["paths", "owner"], prefix, errors);
+    const paths = stringArray(rule.paths, `${prefix}.paths`, errors, {
+      required: true,
+      validate: safeRepositoryPath
+    });
+    if (!paths.length && Array.isArray(rule.paths)) {
+      errors.push(`${prefix}.paths must not be empty`);
+    }
+    if (paths.length > MAX_OWNERSHIP_RULE_PATHS) {
+      errors.push(`${prefix}.paths must contain at most ${MAX_OWNERSHIP_RULE_PATHS} globs`);
+    }
+    if (typeof rule.owner !== "string" || !OWNER_HANDLE_PATTERN.test(rule.owner)) {
+      errors.push(`${prefix}.owner must be an @user or @org/team handle`);
+    }
+  }
 }
 
 export function parseGuardianConfigDocument(source: string): unknown {

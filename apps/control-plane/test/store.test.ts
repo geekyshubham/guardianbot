@@ -48,6 +48,7 @@ import {
   postgresPoolConfig,
   reviewFindingRetentionOptionsFromEnvironment,
   webhookRetentionOptionsFromEnvironment,
+  type FindingLifecycleRecord,
   type ReviewFindingRecord
 } from "../src/store.js";
 
@@ -3393,4 +3394,385 @@ test("PostgresStore fences the review write on the lease inside one statement", 
   assert.match(insert, /SELECT \$1::bigint[\s\S]*WHERE \$12::text IS NULL OR EXISTS/);
   assert.ok(insert.indexOf("WHERE $12::text IS NULL") < insert.indexOf("ON CONFLICT"));
   assert.equal(maxPlaceholder(insert), 14);
+});
+
+test("PostgresStore monitoring inventory reads runs and evidence from the default branch only", async () => {
+  const harness = stubbedPostgresStore();
+  await harness.store.listMonitoringRepositoryInventory();
+  const runsQuery = harness.poolQueries.find((text) => text.includes("ranked_runs"));
+  const evidenceQuery = harness.poolQueries.find((text) =>
+    text.includes("FROM scanner_evidence AS evidence")
+  );
+  assert.ok(runsQuery);
+  assert.ok(evidenceQuery);
+  // Release-branch push runs must never count as, or shadow, default-branch monitoring evidence.
+  assert.match(runsQuery, /runs\.head_branch=repositories\.default_branch/);
+  assert.match(evidenceQuery, /runs\.head_branch=repositories\.default_branch/);
+});
+
+async function seedDeployment(
+  store: MemoryStore,
+  options: {
+    runId: number;
+    headSha: string;
+    digest: string;
+    observedAt: string;
+    signatureDigest?: string | null;
+    event?: "push" | "schedule";
+  }
+): Promise<void> {
+  await store.upsertScannerWorkflowRun({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    headSha: options.headSha,
+    headBranch: "main",
+    event: options.event ?? "push",
+    workflowPath: ".github/workflows/guardianbot.yml",
+    conclusion: "success",
+    status: "completed",
+    validationStatus: "accepted",
+    referencedWorkflows: []
+  });
+  await store.upsertScannerArtifact({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    artifactId: options.runId + 1,
+    artifactName: `guardianbot-image-promotion-${options.runId}-1`,
+    artifactType: "image-promotion",
+    sizeBytes: 1,
+    expired: false,
+    validationStatus: "accepted"
+  });
+  if (options.signatureDigest !== null) {
+    await store.upsertScannerEvidence({
+      repositoryId: 77,
+      runId: options.runId,
+      runAttempt: 1,
+      artifactId: options.runId + 1,
+      evidenceKey: "signature",
+      kind: "signature",
+      source: "cosign",
+      status: "success",
+      observedAt: options.observedAt,
+      digest: options.signatureDigest ?? options.digest,
+      payload: {
+        imageReference: `ghcr.io/example/service@${options.digest}`,
+        certificateIdentity:
+          "https://github.com/geekyshubham/guardianbot/.github/workflows/reusable-image.yml@" +
+          "c".repeat(40)
+      }
+    });
+  }
+  await store.upsertScannerEvidence({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    artifactId: options.runId + 1,
+    evidenceKey: "deployment:staging",
+    kind: "deployment",
+    source: "digitalocean",
+    status: "success",
+    observedAt: options.observedAt,
+    digest: options.digest,
+    environment: "staging",
+    payload: { origin: "https://staging.example.com" }
+  });
+}
+
+test("MemoryStore returns the newest accepted deployed digest with its signature identity", async () => {
+  const store = new MemoryStore();
+  const older = `sha256:${"1".repeat(64)}`;
+  const newer = `sha256:${"2".repeat(64)}`;
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: older,
+    observedAt: "2026-07-26T10:00:00.000Z"
+  });
+  await seedDeployment(store, {
+    runId: 200,
+    headSha: "b".repeat(40),
+    digest: newer,
+    observedAt: "2026-07-27T10:00:00.000Z"
+  });
+  const deployed = await store.getLatestDeployedImageEvidence(77, "staging", "main");
+  assert.equal(deployed?.imageDigest, newer);
+  assert.equal(deployed?.headSha, "b".repeat(40));
+  assert.equal(deployed?.runId, 200);
+  assert.equal(deployed?.imageReference, `ghcr.io/example/service@${newer}`);
+  assert.match(deployed?.certificateIdentity ?? "", /reusable-image\.yml@c{40}$/);
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "production", "main"), undefined);
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "release"), undefined);
+});
+
+test("MemoryStore never falls back to an older digest when the newest deployment is unbound", async () => {
+  const store = new MemoryStore();
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: `sha256:${"1".repeat(64)}`,
+    observedAt: "2026-07-26T10:00:00.000Z"
+  });
+  await seedDeployment(store, {
+    runId: 200,
+    headSha: "b".repeat(40),
+    digest: `sha256:${"2".repeat(64)}`,
+    observedAt: "2026-07-27T10:00:00.000Z",
+    signatureDigest: `sha256:${"3".repeat(64)}`
+  });
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "main"), undefined);
+});
+
+test("MemoryStore ignores deployment rows from runs that are not default-branch pushes", async () => {
+  const store = new MemoryStore();
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: `sha256:${"1".repeat(64)}`,
+    observedAt: "2026-07-26T10:00:00.000Z",
+    event: "schedule"
+  });
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "main"), undefined);
+});
+
+test("PostgresStore selects the newest deployment before binding its signature row", async () => {
+  const digest = `sha256:${"2".repeat(64)}`;
+  const { store, poolQueries } = stubbedPostgresStore(undefined, (text, values) =>
+    text.includes("WITH latest AS")
+      ? {
+          rows: [
+            {
+              run_id: "200",
+              run_attempt: "1",
+              digest,
+              observed_at: "2026-07-27T10:00:00.000Z",
+              origin: "https://staging.example.com",
+              head_sha: "b".repeat(40),
+              image_reference: `ghcr.io/example/service@${digest}`,
+              certificate_identity: "https://github.com/x/y/.github/workflows/reusable-image.yml@" + "c".repeat(40),
+              values
+            }
+          ]
+        }
+      : undefined
+  );
+  const deployed = await store.getLatestDeployedImageEvidence(77, "staging", "main");
+  assert.equal(deployed?.imageDigest, digest);
+  assert.equal(deployed?.runId, 200);
+  assert.equal(deployed?.headSha, "b".repeat(40));
+  const query = poolQueries.find((text) => text.includes("WITH latest AS"));
+  assert.ok(query);
+  // LIMIT 1 must apply inside the CTE, before the signature join, so an unbindable newest row
+  // cannot let an older deployed digest through.
+  assert.ok(query.indexOf("LIMIT 1") < query.indexOf("JOIN scanner_evidence AS signature"));
+  assert.doesNotMatch(query, /head_sha=\$/);
+  assert.match(query, /runs\.event='push'/);
+  assert.match(query, /signature\.digest=latest\.digest/);
+});
+
+test("PostgresStore release image evidence binds signature, Trivy, and SBOM to one accepted push artifact", async () => {
+  const digest = `sha256:${"b".repeat(64)}`;
+  const captured: { text: string; values?: unknown[] }[] = [];
+  const harness = stubbedPostgresStore(undefined, (text, values) => {
+    if (!text.includes("signature.payload->>'certificateIdentity'")) return undefined;
+    captured.push({ text, values });
+    return {
+      rows: [
+        {
+          run_id: "400",
+          run_attempt: "1",
+          artifact_id: "401",
+          observed_at: new Date("2026-08-01T11:01:00.000Z"),
+          certificate_identity: "https://github.com/o/r/.github/workflows/reusable-image.yml@x",
+          trivy_status: "success",
+          trivy_observed_at: new Date("2026-08-01T11:00:00.000Z"),
+          trivy_critical_findings: "0",
+          sbom_status: null,
+          sbom_observed_at: null
+        }
+      ]
+    };
+  });
+  const evidence = await harness.store.getReleaseImageEvidence(99, "a".repeat(40), digest, "main");
+  assert.deepEqual(captured[0]?.values, [99, digest, "a".repeat(40), "main"]);
+  for (const clause of [
+    "artifacts.artifact_type='image-promotion'",
+    "artifacts.validation_status='accepted'",
+    "runs.event='push'",
+    "runs.validation_status='accepted'",
+    "signature.payload->>'imageDigest'=$2",
+    "trivy.artifact_id=signature.artifact_id",
+    "sbom.artifact_id=signature.artifact_id"
+  ]) {
+    assert.ok(captured[0]?.text.includes(clause), clause);
+  }
+  assert.equal(evidence?.runId, 400);
+  assert.equal(evidence?.artifactId, 401);
+  // A JSON string count is malformed and must fail closed as -1.
+  assert.equal(evidence?.imageScan?.criticalFindings, -1);
+  assert.equal(evidence?.sbom, undefined);
+});
+
+test("PostgresStore release DAST evidence is digest, environment, and default-branch scoped", async () => {
+  const digest = `sha256:${"b".repeat(64)}`;
+  const captured: { text: string; values?: unknown[] }[] = [];
+  const harness = stubbedPostgresStore(undefined, (text, values) => {
+    if (!text.includes("evidence.evidence_key = ANY($2::text[])")) return undefined;
+    captured.push({ text, values });
+    return {
+      rows: [
+        {
+          run_id: "600",
+          run_attempt: "1",
+          artifact_id: "601",
+          evidence_key: "zap-smoke-summary",
+          status: "failure",
+          observed_at: new Date("2026-08-01T11:40:00.000Z")
+        }
+      ]
+    };
+  });
+  const evidence = await harness.store.getReleaseDastEvidence(99, digest, "staging", "main");
+  assert.deepEqual(captured[0]?.values, [
+    99,
+    ["zap-smoke-summary", "zap-nightly-summary"],
+    digest,
+    "staging",
+    "main"
+  ]);
+  assert.ok(captured[0]?.text.includes("artifacts.artifact_type='dast'"));
+  assert.equal(evidence?.status, "failure");
+  assert.equal(evidence?.evidenceKey, "zap-smoke-summary");
+  assert.equal(
+    await stubbedPostgresStore().store.getReleaseDastEvidence(99, digest, "staging", "main"),
+    undefined
+  );
+});
+
+function lifecycleRecord(
+  overrides: Partial<FindingLifecycleRecord> = {}
+): FindingLifecycleRecord {
+  return {
+    repositoryId: 20,
+    fingerprint: "f".repeat(64),
+    source: "semgrep",
+    ruleId: "rule.one",
+    severity: "high",
+    path: "src/app.ts",
+    line: 4,
+    status: "open",
+    owner: "@acme/app",
+    streams: { semgrep: "2026-07-27T11:40:00.000Z" },
+    firstSeenAt: "2026-07-27T11:40:00.000Z",
+    openedAt: "2026-07-27T11:40:00.000Z",
+    lastSeenAt: "2026-07-27T11:40:00.000Z",
+    slaDueAt: "2026-08-26T11:40:00.000Z",
+    lastRunId: 500,
+    lastRunAttempt: 1,
+    tickets: {},
+    updatedAt: "2026-07-27T12:00:00.000Z",
+    ...overrides
+  };
+}
+
+test("MemoryStore finding lifecycle saves, removes, and isolates repositories", async () => {
+  const store = new MemoryStore();
+  const watermark = {
+    repositoryId: 20,
+    stream: "semgrep",
+    runStartedAt: "2026-07-27T11:30:00.000Z",
+    runId: 500,
+    runAttempt: 1,
+    updatedAt: "2026-07-27T12:00:00.000Z"
+  };
+  await store.saveFindingLifecycle(20, [lifecycleRecord()], [watermark]);
+  assert.equal((await store.listFindingLifecycle(20)).length, 1);
+  assert.deepEqual(await store.listFindingLifecycle(21), []);
+  assert.deepEqual(await store.listFindingLifecycleStreams(20), [watermark]);
+  await assert.rejects(
+    store.saveFindingLifecycle(21, [lifecycleRecord()]),
+    /must belong to one repository/
+  );
+  const listed = await store.listFindingLifecycle(20);
+  listed[0]!.streams.mutated = "x";
+  assert.equal((await store.listFindingLifecycle(20))[0]?.streams.mutated, undefined);
+  await store.saveFindingLifecycle(20, [], [], ["f".repeat(64)]);
+  assert.deepEqual(await store.listFindingLifecycle(20), []);
+});
+
+test("MemoryStore finding lifecycle lock serializes writers per repository", async () => {
+  const store = new MemoryStore();
+  const first = await store.acquireFindingLifecycleLock(20);
+  let secondAcquired = false;
+  const second = store.acquireFindingLifecycleLock(20).then((lock) => {
+    secondAcquired = true;
+    return lock;
+  });
+  const other = await store.acquireFindingLifecycleLock(21);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(secondAcquired, false);
+  await first.release();
+  await (await second).release();
+  await other.release();
+  assert.equal(secondAcquired, true);
+});
+
+test("PostgresStore finding lifecycle writes are transactional and use their own lock namespace", async () => {
+  const harness = stubbedPostgresStore();
+  await harness.store.migrate();
+  const migrationTexts = harness.clientQueries.map((query) => query.text);
+  assert.ok(migrationTexts.some((text) => text.includes("CREATE TABLE IF NOT EXISTS finding_lifecycle (")));
+  assert.ok(migrationTexts.some((text) => text.includes("CREATE TABLE IF NOT EXISTS finding_lifecycle_streams")));
+  const migrationLock = harness.clientQueries.find((query) =>
+    query.text.includes("pg_try_advisory_lock")
+  )?.values;
+
+  harness.clientQueries.length = 0;
+  await harness.store.saveFindingLifecycle(
+    20,
+    [lifecycleRecord()],
+    [
+      {
+        repositoryId: 20,
+        stream: "semgrep",
+        runStartedAt: "2026-07-27T11:30:00.000Z",
+        runId: 500,
+        runAttempt: 1,
+        updatedAt: "2026-07-27T12:00:00.000Z"
+      }
+    ],
+    ["e".repeat(64)]
+  );
+  const texts = harness.clientQueries.map((query) => query.text);
+  assert.equal(texts[0], "BEGIN");
+  assert.match(texts[1] ?? "", /DELETE FROM finding_lifecycle/);
+  assert.deepEqual(harness.clientQueries[1]?.values, [20, ["e".repeat(64)]]);
+  assert.match(texts[2] ?? "", /INSERT INTO finding_lifecycle/);
+  assert.match(texts[3] ?? "", /INSERT INTO finding_lifecycle_streams/);
+  assert.equal(texts.at(-1), "COMMIT");
+
+  harness.clientQueries.length = 0;
+  const lock = await harness.store.acquireFindingLifecycleLock(20);
+  const lockValues = harness.clientQueries[0]?.values;
+  await lock.release();
+  assert.match(harness.clientQueries[0]?.text ?? "", /pg_advisory_lock\(\$1, \$2\)/);
+  assert.notDeepEqual(lockValues, migrationLock);
+  const monitoringLock = await harness.store.acquireMonitoringLock();
+  assert.ok(monitoringLock);
+  const monitoringValues = harness.clientQueries.at(-1)?.values;
+  await monitoringLock.release();
+  assert.notEqual((lockValues as unknown[])[0], (monitoringValues as unknown[] | undefined)?.[0]);
+});
+
+test("PostgresStore finding lifecycle save rolls back on failure", async () => {
+  const harness = stubbedPostgresStore(undefined, (text) => {
+    if (/INSERT INTO finding_lifecycle\s*\(/.test(text)) throw new Error("write failed");
+    return undefined;
+  });
+  await assert.rejects(harness.store.saveFindingLifecycle(20, [lifecycleRecord()]), /write failed/);
+  const texts = harness.clientQueries.map((query) => query.text);
+  assert.equal(texts.at(-1), "ROLLBACK");
+  assert.ok(harness.releases.length >= 1);
 });

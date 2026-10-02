@@ -13,7 +13,9 @@ test("reusable workflows resolve attestation only from the exact workflow releas
   const workflows = [
     ".github/workflows/reusable-security.yml",
     ".github/workflows/reusable-image.yml",
-    ".github/workflows/reusable-dast.yml"
+    ".github/workflows/reusable-image-rescan.yml",
+    ".github/workflows/reusable-dast.yml",
+    ".github/workflows/reusable-release-gate.yml"
   ].map(repositoryFile);
 
   for (const workflow of workflows) {
@@ -47,7 +49,9 @@ test("reusable workflows retry only transient GitHub OIDC failures", () => {
   const workflows = new Map([
     [".github/workflows/reusable-security.yml", 1],
     [".github/workflows/reusable-image.yml", 2],
-    [".github/workflows/reusable-dast.yml", 2]
+    [".github/workflows/reusable-image-rescan.yml", 2],
+    [".github/workflows/reusable-dast.yml", 2],
+    [".github/workflows/reusable-release-gate.yml", 1]
   ]);
 
   for (const [path, expectedRequests] of workflows) {
@@ -64,6 +68,59 @@ test("reusable workflows retry only transient GitHub OIDC failures", () => {
     assert.match(workflow, /response\.status !== 429 && response\.status < 500/);
     assert.match(workflow, /attempt <= 4/);
     assert.match(workflow, /500 \* \(2 \*\* \(attempt - 1\)\)/);
+  }
+});
+
+test("release gate workflow verifies the exact signer and fails closed on any non-pass", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-release-gate.yml");
+  assert.match(workflow, /^permissions:\n  contents: read\n/m);
+  assert.match(workflow, /if: github\.event_name == 'workflow_dispatch'\n/);
+  assert.match(workflow, /environment: guardianbot-release-gate\n/);
+  assert.match(workflow, /id-token: write/);
+  assert.doesNotMatch(workflow, /secrets\./);
+  assert.doesNotMatch(workflow, /pull_request_target/);
+  assert.doesNotMatch(workflow, /contents: write|packages: write|id-token: read/);
+  assert.match(workflow, /sigstore\/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac/);
+  assert.match(workflow, /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02/);
+  for (const line of workflow.split("\n").filter((entry) => /uses: /.test(entry))) {
+    assert.match(line, /@[a-f0-9]{40}$/, `action must be pinned to a full SHA: ${line}`);
+  }
+  assert.match(
+    workflow,
+    /`\/\.github\/workflows\/reusable-image\.yml@\$\{imageWorkflowSha\}`/
+  );
+  assert.match(
+    workflow,
+    /cosign verify --output json "\$image_ref" \\\n\s+--certificate-identity "\$certificate_identity" \\\n\s+--certificate-oidc-issuer "https:\/\/token\.actions\.githubusercontent\.com"/
+  );
+  assert.doesNotMatch(workflow, /--certificate-identity-regexp/);
+  assert.match(workflow, /\.critical\.image\["docker-manifest-digest"\] == \$digest/);
+  // cosign may emit one JSON document per signature; flatten before checking.
+  assert.match(
+    workflow,
+    /--certificate-oidc-issuer "https:\/\/token\.actions\.githubusercontent\.com" \\\n\s+\| jq -s '\[\.\[\] \| if type == "array" then \.\[\] else \. end\]' \\\n\s+> "\$verification"/
+  );
+  assert.match(workflow, /set -euo pipefail/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-release-gate"\)/);
+  assert.match(workflow, /new URL\("\/release\/gate", evidenceEndpoint\)/);
+  assert.match(workflow, /if \(gateResponse\.status !== 200\)/);
+  assert.match(workflow, /decision\.candidate\.digest !== request\.imageDigest/);
+  assert.match(workflow, /if \(decision\.decision !== "pass"\) \{\n\s+throw new Error/);
+  assert.match(workflow, /GITHUB_STEP_SUMMARY/);
+  assert.match(workflow, /path: guardianbot-release-gate\//);
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{ inputs."))) {
+    assert.match(
+      line,
+      /^\s+INPUT_[A-Z0-9_]+:\s+\$\{\{ inputs\.[A-Za-z0-9-]+ \}\}$/,
+      `workflow input must enter a shell step only through an environment assignment: ${line}`
+    );
+  }
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{"))) {
+    assert.doesNotMatch(
+      line,
+      /^\s+(?:run:|node|cosign|jq|printf|docker)/,
+      `expressions must not be interpolated into scripts: ${line}`
+    );
   }
 });
 
@@ -879,4 +936,368 @@ test("pull request policy resolution binds onboarding state to the base commit",
     unresolvable.stdout,
     /The pull request base commit is not available for policy resolution\./
   );
+});
+
+test("Semgrep policy severity comes only from verified rule metadata, never workflow interpolation", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptEnd = workflow.indexOf("\n          NODE\n", stepStart);
+  assert.ok(stepStart >= 0 && scriptEnd > stepStart);
+  const step = workflow.slice(stepStart, scriptEnd);
+  // The step env is unchanged: no new expression-fed inputs reach the gate.
+  const env = step.slice(step.indexOf("        env:"), step.indexOf("        shell: bash"));
+  assert.deepEqual(
+    env.split("\n").filter((line) => /^ {10}[A-Z_]+:/.test(line)).map((line) => line.trim().split(":")[0]),
+    ["SCANNER_MODE", "BASELINE_PATH"]
+  );
+  const script = step.slice(step.indexOf("node <<'NODE'"));
+  assert.doesNotMatch(script, /\$\{\{/);
+  assert.match(script, /metadata\[SEMGREP_POLICY_SEVERITY_KEY\]/);
+  // Only critical/high Semgrep findings can block, regardless of severity source.
+  assert.match(script, /severitySource: policyMapped \? "policy" : "native"/);
+
+  // Execute the extracted normalizer so mapped and unmapped behaviour is proven.
+  const normalizerStart = script.indexOf("          const SEMGREP_POLICY_SEVERITY_KEY");
+  const semgrepTableEnd = script.indexOf("          const trivySeverity", normalizerStart);
+  const normalizeStart = script.indexOf("          const normalizeSemgrep = (report) =>");
+  const normalizeEnd = script.indexOf("          const normalizeTrivy", normalizeStart);
+  assert.ok(normalizerStart >= 0 && semgrepTableEnd > normalizerStart);
+  assert.ok(normalizeStart >= 0 && normalizeEnd > normalizeStart);
+  const source = [
+    script.slice(normalizerStart, semgrepTableEnd),
+    script.slice(normalizeStart, normalizeEnd),
+    "return normalizeSemgrep;"
+  ].join("\n");
+  const normalizeSemgrep = new Function(
+    "asRecord",
+    "fingerprintFields",
+    source
+  )(
+    (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? value : undefined,
+    (parts: unknown[]) => ({ fingerprint: parts.join("|") })
+  ) as (report: unknown) => Array<Record<string, unknown>>;
+  const [mapped, unmapped, invalid] = normalizeSemgrep({
+    results: [
+      {
+        check_id: "mapped",
+        path: "a.ts",
+        start: { line: 1 },
+        extra: { severity: "WARNING", message: "m", metadata: { "guardianbot-severity": "high" } }
+      },
+      { check_id: "unmapped", path: "b.ts", start: { line: 2 }, extra: { severity: "ERROR", message: "u" } },
+      {
+        check_id: "invalid",
+        path: "c.ts",
+        start: { line: 3 },
+        extra: { severity: "INFO", message: "i", metadata: { "guardianbot-severity": "blocker" } }
+      }
+    ]
+  });
+  assert.equal(mapped?.severity, "high");
+  assert.equal(mapped?.severitySource, "policy");
+  assert.equal(unmapped?.severity, "high");
+  assert.equal(unmapped?.severitySource, "native");
+  assert.equal(invalid?.severity, "info");
+  assert.equal(invalid?.severitySource, "native");
+  // Severity is not a fingerprint input.
+  assert.equal(mapped?.fingerprint, "semgrep|mapped|a.ts|1|m");
+});
+
+test("release-branch callers keep image promotion and DAST on the default branch", async () => {
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const caller = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    releaseBranches: ["release/1.x"],
+    image: {
+      dockerfile: "Dockerfile",
+      context: ".",
+      platform: "linux/amd64",
+      registry: "ghcr.io/example/service",
+      healthPath: "/health",
+      sbomFormat: "cyclonedx-json",
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true,
+        promotionMode: "verified-default-branch"
+      }
+    },
+    dast: {
+      allowedOrigin: "https://staging.example.com",
+      openapi: "openapi.json",
+      openapiSource: "repository-file",
+      authenticationProfile: "control-plane://profiles/service-staging",
+      sessionAssertionPath: "/session"
+    } as never
+  });
+  assert.match(caller, /pull_request:\n {4}types: \[[^\]]+\]\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(caller, /push:\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(
+    caller,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+  assert.doesNotMatch(caller, /refs\/heads\/release/);
+  // DAST jobs run only on schedule or manual dispatch, never on push.
+  const dastJobs = caller.slice(caller.indexOf("  guardianbot-dast-smoke:"));
+  assert.doesNotMatch(dastJobs.split("\n    uses:")[0] ?? "", /'push'/);
+  assert.match(caller, /guardianbot-dast-nightly:\n {4}name: guardianbot\/dast-nightly\n {4}if: github\.event_name == 'schedule'/);
+  // No untrusted ref or PR data is interpolated into the generated caller.
+  assert.doesNotMatch(caller, /github\.head_ref|github\.event\.pull_request/);
+});
+
+test("enforce gate blocks only policy-mapped Semgrep severity when the workflow script runs", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, mkdtempSync, readFileSync: read, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptStart = workflow.indexOf("node <<'NODE'\n", stepStart) + "node <<'NODE'\n".length;
+  const scriptEnd = workflow.indexOf("\n          NODE\n", scriptStart);
+  assert.ok(stepStart >= 0 && scriptEnd > scriptStart);
+  const script = workflow
+    .slice(scriptStart, scriptEnd)
+    .split("\n")
+    .map((line) => line.replace(/^ {10}/, ""))
+    .join("\n");
+
+  const run = (metadata: Record<string, unknown> | undefined) => {
+    const directory = mkdtempSync(join(tmpdir(), "guardianbot-gate-"));
+    try {
+      mkdirSync(join(directory, "guardianbot-evidence"));
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "semgrep.json"),
+        JSON.stringify({
+          results: [
+            {
+              check_id: "rule",
+              path: "a.py",
+              start: { line: 1 },
+              extra: { severity: "ERROR", message: "m", ...(metadata ? { metadata } : {}) }
+            }
+          ]
+        })
+      );
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "trivy.json"),
+        JSON.stringify({ SchemaVersion: 2, ArtifactName: ".", ArtifactType: "filesystem", Results: [] })
+      );
+      writeFileSync(join(directory, "guardianbot-evidence", "suppressions.json"), "[]");
+      writeFileSync(join(directory, "baseline.json"), JSON.stringify(["f".repeat(64)]));
+      writeFileSync(join(directory, "gate.js"), script);
+      const result = spawnSync(process.execPath, ["gate.js"], {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          PATH: process.env.PATH ?? "",
+          SCANNER_MODE: "enforce",
+          BASELINE_PATH: "baseline.json",
+          GITHUB_REPOSITORY: "acme/service",
+          GITHUB_SHA: "a".repeat(40),
+          GITHUB_RUN_ID: "1",
+          GITHUB_RUN_ATTEMPT: "1",
+          GITHUB_STEP_SUMMARY: join(directory, "summary.md")
+        }
+      });
+      const gate = JSON.parse(read(join(directory, "guardianbot-evidence", "gate.json"), "utf8")) as {
+        passed: boolean;
+        policyFindings: Array<{ severity: string; severitySource: string }>;
+      };
+      return { status: result.status, gate, summary: read(join(directory, "summary.md"), "utf8") };
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  const mapped = run({ "guardianbot-severity": "high" });
+  assert.equal(mapped.status, 1);
+  assert.equal(mapped.gate.passed, false);
+  assert.equal(mapped.gate.policyFindings[0]?.severitySource, "policy");
+
+  const unmapped = run(undefined);
+  assert.equal(unmapped.status, 0);
+  assert.equal(unmapped.gate.passed, true);
+  // Unmapped native ERROR stays visible as a High policy finding and is flagged.
+  assert.equal(unmapped.gate.policyFindings[0]?.severity, "high");
+  assert.equal(unmapped.gate.policyFindings[0]?.severitySource, "native");
+  assert.match(unmapped.summary, /Semgrep rule `rule` has no policy severity mapping/);
+  assert.match(unmapped.summary, /- ⚠️ Semgrep rule at a\.py:1 \(no policy severity mapping\)|⚠️ Semgrep rule/);
+
+  const mappedDown = run({ "guardianbot-severity": "medium" });
+  assert.equal(mappedDown.status, 0);
+  assert.deepEqual(mappedDown.gate.policyFindings, []);
+});
+
+test("deployed image rescan workflow is schedule-only, read-only, and digest-bound", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-image-rescan.yml");
+  const header = workflow.slice(0, workflow.indexOf("steps:"));
+  assert.match(header, /name: deployed digest rescan/);
+  assert.match(header, /if: github\.event_name == 'schedule'\n/);
+  assert.match(header, /environment: guardianbot-image-rescan/);
+  assert.match(
+    header,
+    /permissions:\n\s+contents: read\n\s+packages: read\n\s+id-token: write/
+  );
+  assert.doesNotMatch(workflow, /packages: write/);
+  assert.doesNotMatch(workflow, /cosign (?:sign|attest) /);
+  assert.doesNotMatch(workflow, /docker push/);
+  assert.doesNotMatch(workflow, /docker build/);
+  // Every action is pinned to a full commit SHA already used by the other reusable workflows.
+  const uses = [...workflow.matchAll(/^\s*(?:- )?uses:\s*(\S+)\s*$/gm)].map((match) => match[1]);
+  assert.deepEqual([...new Set(uses)].sort(), [
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac"
+  ]);
+  // Untrusted caller inputs enter shell steps only through environment assignments.
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{ inputs."))) {
+    assert.match(line, /^\s+INPUT_[A-Z0-9_]+:\s+\$\{\{ inputs\.[A-Za-z0-9-]+ \}\}$/);
+  }
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{"))) {
+    assert.doesNotMatch(line, /^\s+run:/, `expression interpolated into a run script: ${line}`);
+  }
+  assert.doesNotMatch(workflow, /docker login[^\n]*\$\{\{/);
+  // The digest comes only from the control plane and is validated before use.
+  assert.match(workflow, /new URL\("\/image\/rescan-target", evidenceEndpoint\)/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-image-rescan"\)/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-evidence"\)/);
+  assert.match(workflow, /target\.imageReference\.toLowerCase\(\) !== `\$\{imageName\}@\$\{target\.imageDigest\}`/);
+  assert.match(workflow, /reusable-image\\\.yml@\(\[a-f0-9\]\{40\}\)\$/);
+  assert.doesNotMatch(workflow, /:\$\{GITHUB_SHA\}/);
+  assert.doesNotMatch(workflow, /:latest/);
+  // Signature and SBOM attestation are verified against the deployed identity before pulling.
+  const verifyAt = workflow.indexOf("cosign verify --output json \"$image_reference\"");
+  const attestationAt = workflow.indexOf(
+    "cosign verify-attestation --output json --type cyclonedx \"$image_reference\""
+  );
+  const pullAt = workflow.indexOf("docker pull --platform linux/amd64 \"$image_reference\"");
+  const trivyAt = workflow.indexOf("- name: Trivy rescan of deployed digest");
+  assert.ok(verifyAt > 0 && attestationAt > verifyAt && pullAt > attestationAt && trivyAt > pullAt);
+  assert.match(workflow, /--certificate-identity "\$certificate_identity"/);
+  assert.match(
+    workflow,
+    /aquasec\/trivy:0\.70\.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e/
+  );
+  assert.match(workflow, /EVIDENCE_ARTIFACT_TYPE: image-rescan/);
+  assert.match(
+    workflow,
+    /EVIDENCE_FILES: cosign-verification\.json,rescan\.json,sbom-attestation-verification\.json,sbom\.cdx\.json,trivy-image\.json/
+  );
+  assert.match(
+    workflow,
+    /name: guardianbot-image-rescan-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/
+  );
+  // The provenance attestation script is shared verbatim with the image workflow.
+  const image = repositoryFile(".github/workflows/reusable-image.yml");
+  const attestScript = (source: string) => {
+    const start = source.indexOf("const workflowMatch = process.env.JOB_WORKFLOW_REF.match(", source.indexOf("EVIDENCE_ARTIFACT_TYPE"));
+    return source.slice(start, source.indexOf("NODE\n", start));
+  };
+  assert.equal(attestScript(workflow), attestScript(image.slice(image.indexOf("Attest promotion evidence provenance"))));
+});
+
+test("generated callers stay byte-identical unless image.deployment opts into the rescan", async () => {
+  const { createHash } = await import("node:crypto");
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const image = {
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64" as const,
+    registry: "ghcr.io/example/service",
+    healthPath: "/health",
+    sbomFormat: "cyclonedx-json" as const
+  };
+  const dast = {
+    allowedOrigin: "https://staging.example.com",
+    openapi: "openapi.yaml",
+    authenticationProfile: "control-plane://profiles/example",
+    sessionAssertionPath: "/api/me",
+    excludedRoutes: ["/logout"]
+  };
+  const base = {
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main"
+  };
+  const hash = (options: Parameters<typeof generateCallerWorkflow>[0]) =>
+    createHash("sha256").update(generateCallerWorkflow(options)).digest("hex");
+  // Hashes captured from the generator before the deployed-digest rescan existed.
+  assert.equal(
+    hash({ ...base, scannerMode: "advisory" }),
+    "d10ab3f1cf0e88de7439db3b8ba5804ae9b28307a6a8b5ab47816cc8fd8c847e"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "report-only", image }),
+    "5a16bc39ab9e0da8ebe5bef6830d0d7b33959028004f4f20972197cf5af47c69"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "enforce", image }),
+    "ddee9456ab431464aab48ba9e180f93c8b00a4f46978b6ea4b5096a5e87ed344"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "report-only", dast }),
+    "8607e40cfc8a9424558f9fb34ba930db18e4948018779276dd854525fcf1da8e"
+  );
+  assert.equal(
+    hash({ ...base, scannerMode: "enforce", image, dast }),
+    "8c5a22bdd25107e4e9810edfac026d556d57a75f71e4e4eff585ad6352032ee1"
+  );
+  for (const output of [
+    generateCallerWorkflow({ ...base, scannerMode: "enforce", image, dast }),
+    generateCallerWorkflow({ ...base, scannerMode: "advisory" })
+  ]) {
+    assert.doesNotMatch(output, /image-rescan|13 3 \* \* \*/);
+  }
+
+  const deployed = generateCallerWorkflow({
+    ...base,
+    scannerMode: "report-only",
+    image: {
+      ...image,
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true
+      }
+    }
+  });
+  assert.match(deployed, /    - cron: "23 2 \* \* \*"\n    - cron: "13 3 \* \* \*"\n/);
+  assert.match(
+    deployed,
+    /  guardianbot-image-rescan:\n    name: guardianbot\/image-rescan\n/
+  );
+  assert.match(
+    deployed,
+    /if: github\.event_name == 'schedule' && github\.event\.schedule == '13 3 \* \* \*'\n    permissions:\n      contents: read\n      packages: read\n      id-token: write\n    uses: Geekyshubham\/guardianbot\/\.github\/workflows\/reusable-image-rescan\.yml@b{40}\n    with:\n      image-name: "ghcr\.io\/example\/service"\n      deployment-environment: "staging"\n/
+  );
+  // The existing image and security jobs still skip the rescan schedule.
+  assert.equal(
+    deployed.match(/github\.event_name != 'schedule' \|\| github\.event\.schedule == '23 2 \* \* \*'/g)?.length,
+    2
+  );
+});
+
+test("CI runs the real-PostgreSQL parity suite against a digest-pinned server and fails closed", () => {
+  const ci = repositoryFile(".github/workflows/ci.yml");
+  assert.match(ci, /^  postgres-parity:$/m);
+  assert.match(
+    ci,
+    /image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777/
+  );
+  // Every service image in CI carries a digest, never a floating tag alone.
+  for (const [, image] of ci.matchAll(/^\s+image: (\S+)$/gm)) {
+    assert.match(image, /@sha256:[a-f0-9]{64}$/, image);
+  }
+  for (const [, action] of ci.matchAll(/uses: (\S+)/g)) {
+    assert.match(action, /@[a-f0-9]{40}$/, action);
+  }
+  assert.match(ci, /GUARDIANBOT_TEST_DATABASE_REQUIRED: "1"/);
+  assert.match(ci, /npx tsx --test test\/postgres-integration\.test\.ts/);
+  assert.match(ci, /^permissions:\n  contents: read$/m);
 });

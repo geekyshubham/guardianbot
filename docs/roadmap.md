@@ -32,10 +32,26 @@ DigitalOcean deployment scripts.
 - Configure a production model credential and verify live AI-backed review.
 - Complete seven-day report-only observation and live enforcement promotion.
 
+## Implemented, pending live evidence
+
+These code gaps are implemented with automated test evidence only. None is
+accepted until the live evidence listed in
+[roadmap traceability](roadmap-traceability.md) is captured.
+
+- Release-branch PR coverage and the organization Semgrep severity map.
+- Nightly rescan of the exact deployed digest with a bounded CycloneDX SBOM
+  diff and an enforced promotion freeze.
+- Digest-scoped release gate backed by DefectDojo findings and risk
+  acceptances.
+- Findings lifecycle with SLA aging, ownership, and GitHub Issues, Jira, and
+  Slack tickets (off by default).
+- Review value analytics (fixed, dismissed, ignored, precision) and opt-in
+  Mode C remediation draft pull requests.
+
 ## Production work
 
 Durable pgvector retrieval and production-scale history; independently scaled
 worker queues; complete fingerprint resolution/supersession presentation;
-inline GitHub suggestions and feedback analytics; related-repository approval
+live inline GitHub suggestions and reviewer-reaction feedback; related-repository approval
 workflow; HA and disaster recovery; rate limits and load tests; audit export;
 secret-rotation and incident drills; and a defined release rollback SLO.

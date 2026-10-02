@@ -65,6 +65,7 @@ export interface RepositoryIndexRetrievalStatus {
 const MONITORING_LOCK_NAMESPACE = 1_196_572_738;
 const MONITORING_LOCK_KEY = 1_297_046_866;
 const ONBOARDING_ISSUE_LOCK_NAMESPACE = 1_196_572_739;
+const FINDING_LIFECYCLE_LOCK_NAMESPACE = 1_196_572_741;
 // Fixed two-int32 namespace/key pair serialising schema migrations across booting instances.
 const MIGRATION_LOCK_NAMESPACE = 1_196_572_740;
 const MIGRATION_LOCK_KEY = 1_297_046_867;
@@ -182,7 +183,31 @@ export interface ReviewFindingProvenance {
    * and the ring is capped at `MAX_FEEDBACK_COMMENT_IDS` so the row cannot grow without bound.
    */
   feedbackCommentIds?: number[];
+  /**
+   * SHA-256 of the exact replacement the validated review result proposed for this finding, as
+   * rendered into the inline advisory. Retained as a digest only, so a remediation draft can prove
+   * the suggestion it is about to apply is byte-identical to the one GuardianBot validated without
+   * the store holding model output text. Absent when the finding carried no exact suggestion.
+   */
+  suggestionSha256?: string;
+  /**
+   * Derived review-value outcome, orthogonal to lifecycle `state` so the three-value state union
+   * stays readable by an older instance mid-deploy. `fixed` means the finding stopped being
+   * reported after a verified incremental head change that rewrote its line range; `dismissed`
+   * means an authorized human ran the bounded dismiss command; `ignored` means the finding was
+   * still open when the pull request merged. No reviewer identity or prose is ever recorded.
+   */
+  outcome?: ReviewFindingOutcome;
+  outcomeAt?: string;
 }
+
+export type ReviewFindingOutcome = "fixed" | "dismissed" | "ignored";
+
+export const REVIEW_FINDING_OUTCOMES: readonly ReviewFindingOutcome[] = [
+  "fixed",
+  "dismissed",
+  "ignored"
+];
 
 export interface ReviewFindingRecord extends ReviewFindingProvenance {
   fingerprint: string;
@@ -336,8 +361,29 @@ export function normalizeReviewFinding(value: unknown): ReviewFindingRecord | un
     category: optionalText(raw.category, 64),
     severity: optionalText(raw.severity, 8),
     title: optionalText(raw.title, 300),
-    ...feedbackProvenance(raw)
+    ...feedbackProvenance(raw),
+    ...suggestionProvenance(raw),
+    ...outcomeProvenance(raw)
   };
+}
+
+/** Omitted unless a well-formed digest was retained, so suggestion-free findings do not grow. */
+function suggestionProvenance(raw: Record<string, unknown>): Partial<ReviewFindingProvenance> {
+  return typeof raw.suggestionSha256 === "string" && /^[a-f0-9]{64}$/.test(raw.suggestionSha256)
+    ? { suggestionSha256: raw.suggestionSha256 }
+    : {};
+}
+
+/**
+ * Reads the derived outcome, omitting it entirely when absent or unrecognised. A value outside the
+ * closed union is dropped rather than surfaced, so a future outcome name cannot reach aggregation
+ * as an uncounted string, and a finding without an outcome normalizes to exactly its old record.
+ */
+function outcomeProvenance(raw: Record<string, unknown>): Partial<ReviewFindingProvenance> {
+  const outcome = REVIEW_FINDING_OUTCOMES.find((candidate) => candidate === raw.outcome);
+  if (!outcome) return {};
+  const outcomeAt = optionalTimestamp(raw.outcomeAt);
+  return outcomeAt ? { outcome, outcomeAt } : { outcome };
 }
 
 /**
@@ -436,6 +482,75 @@ export function applyFindingFeedback(
     recorded: true
   };
 }
+
+/**
+ * One explicit outcome observation. `dismissed` names a single fingerprint; `ignored` applies to
+ * every finding still open with no outcome when the pull request merged, so it names none.
+ */
+export type FindingOutcomeInput =
+  | {
+      repositoryId: number;
+      pullNumber: number;
+      outcome: "dismissed";
+      fingerprint: string;
+      observedAt: Date;
+    }
+  | {
+      repositoryId: number;
+      pullNumber: number;
+      outcome: "ignored";
+      observedAt: Date;
+    };
+
+export interface ApplyFindingOutcomeResult {
+  findings: ReviewFindingRecord[];
+  /** Findings whose outcome this call changed; zero for a redelivered or inapplicable event. */
+  changed: number;
+}
+
+/**
+ * Applies one outcome observation. Kept pure and exported so the precedence rules are testable
+ * without a server:
+ *
+ * - `dismissed` is an explicit human signal and replaces any derived outcome on its finding, but
+ *   re-dismissing is a no-op so a redelivered command does not count twice.
+ * - `ignored` reaches only findings still `open` that carry no outcome: a finding already fixed
+ *   or dismissed is not ignored merely because the pull request merged afterwards.
+ *
+ * Nothing is invented for a fingerprint the record does not retain.
+ */
+export function applyFindingOutcome(
+  findings: readonly ReviewFindingRecord[],
+  input: Pick<FindingOutcomeInput, "outcome" | "observedAt"> & { fingerprint?: string }
+): ApplyFindingOutcomeResult {
+  const observedIso = input.observedAt.toISOString();
+  let changed = 0;
+  const updated = findings.map((finding) => {
+    const eligible =
+      input.outcome === "dismissed"
+        ? finding.fingerprint === input.fingerprint && finding.outcome !== "dismissed"
+        : finding.state === "open" && finding.outcome === undefined;
+    if (!eligible) return { ...finding };
+    changed += 1;
+    return { ...finding, outcome: input.outcome, outcomeAt: observedIso };
+  });
+  return { findings: updated, changed };
+}
+
+/** One retained review row, as read for weekly review-value aggregation. */
+export interface ReviewActivityRecord {
+  pullNumber: number;
+  reviewedHeadSha?: string;
+  findings: ReviewFindingRecord[];
+}
+
+export interface ReviewActivityPage {
+  reviews: ReviewActivityRecord[];
+  /** True when more rows matched than `limit`, so an aggregate built from the page is partial. */
+  truncated: boolean;
+}
+
+export const MAX_REVIEW_ACTIVITY_ROWS = 1_000;
 
 export function normalizeReviewFindings(value: unknown): ReviewFindingRecord[] {
   return Array.isArray(value)
@@ -556,6 +671,11 @@ export interface MonitoringAlertRecord extends MonitoringAlertInput {
   resolvedAt?: string;
 }
 
+export type MonitoringReviewCompleteness =
+  | "unavailable"
+  | "retained-findings"
+  | "retained-findings-partial";
+
 export interface MonitoringWeeklyReportRecord {
   weekKey: string;
   periodStart: string;
@@ -563,7 +683,13 @@ export interface MonitoringWeeklyReportRecord {
   generatedAt: string;
   report: WeeklyCoverageReport;
   sourceCompleteness: {
-    review: "unavailable";
+    /**
+     * `unavailable` when no retained review row was read for any repository; `retained-findings`
+     * when the advisory finding and review-value fields were aggregated from retained finding
+     * records; `retained-findings-partial` when at least one repository's read failed or was
+     * truncated. The other review fields are not measured under any label.
+     */
+    review: MonitoringReviewCompleteness;
     scanner: "latest-reconciliation";
     monitoring: "latest-reconciliation";
     imageProtection: "latest-reconciliation";
@@ -600,6 +726,38 @@ export interface DeploymentPromotionClaim {
   leaseExpiresAt: string;
 }
 
+export type RemediationDraftChecks = "pending" | "passed" | "failed";
+
+/**
+ * One Mode C draft GuardianBot opened, keyed by its branch. The record is what lets a later
+ * `workflow_run` report the draft's checks and a later `pull_request.closed` delete the branch:
+ * both act only when the branch tip still equals `headSha`, the commit GuardianBot recorded.
+ */
+export interface RemediationDraftRecord {
+  repositoryId: number;
+  branch: string;
+  sourcePullNumber: number;
+  draftPullNumber: number;
+  /** The source pull request's head branch, which the draft targets. */
+  targetRef: string;
+  fingerprint: string;
+  /** The source pull request head the branch was cut from; the draft commit's only parent. */
+  baseHeadSha: string;
+  /** The draft branch tip GuardianBot observed after writing it. */
+  headSha: string;
+  /**
+   * True only when `headSha` is the commit GuardianBot's own contents write returned. A branch
+   * reused from an earlier attempt may carry a commit someone else made, so it is never deleted.
+   */
+  commitCreatedByApp: boolean;
+  /** GuardianBot's link comment on the source pull request, updated when checks settle. */
+  linkCommentId: number;
+  checks: RemediationDraftChecks;
+  /** Whether a configured second-model validator accepted the draft, restated when checks settle. */
+  secondValidation: "accepted" | "not-configured";
+  createdAt: string;
+}
+
 export interface SuccessfulDeploymentEvidence {
   repositoryId: number;
   runId: number;
@@ -609,6 +767,389 @@ export interface SuccessfulDeploymentEvidence {
   imageDigest: string;
   observedAt: string;
   origin: string;
+}
+
+/**
+ * The digest currently deployed to an environment, joined with the signature evidence that the
+ * same trusted promotion recorded. The rescan target is derived only from these server-side rows,
+ * never from a tag or from workflow input.
+ */
+export interface DeployedImageEvidence extends SuccessfulDeploymentEvidence {
+  imageReference: string;
+  certificateIdentity: string;
+}
+
+/**
+ * Accepted image-promotion evidence for one exact signed digest. Every field
+ * comes from the same accepted default-branch push run, attempt, and artifact
+ * as the Cosign signature record, so a release gate cannot mix evidence from
+ * different builds.
+ */
+export interface ReleaseImageEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  headSha: string;
+  imageDigest: string;
+  signature: { certificateIdentity: string; observedAt: string };
+  imageScan?: { status: ScannerEvidenceStatus; criticalFindings: number; observedAt: string };
+  sbom?: { status: ScannerEvidenceStatus; observedAt: string };
+}
+
+/** Distinct-finding counts per normalized severity from one complete scanner report. */
+export interface ScanSeverityCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+export interface ReleaseCommitScanSummary {
+  status: ScannerEvidenceStatus;
+  observedAt: string;
+  /** Absent for legacy, truncated, or malformed summaries, so callers fail closed. */
+  severities?: ScanSeverityCounts;
+}
+
+/**
+ * Semgrep and filesystem Trivy summaries from the newest accepted default-branch push security
+ * artifact for one exact commit. Both summaries come from the same artifact.
+ */
+export interface ReleaseCommitScanEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  headSha: string;
+  semgrep?: ReleaseCommitScanSummary;
+  trivy?: ReleaseCommitScanSummary;
+}
+
+/**
+ * Newest verified deployed-digest rescan of one exact digest, joined with the promotion-freeze
+ * record of the same artifact. `frozen` is true unless that freeze record is a clean success, so
+ * a missing or malformed sibling fails closed. `artifactAccepted` is false when evidence
+ * validation completed but reconciliation (such as the DefectDojo import) has not yet succeeded:
+ * such a rescan still freezes, but never counts as fresh coverage.
+ */
+export interface ImageRescanEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  imageDigest: string;
+  environment: string;
+  observedAt: string;
+  criticalFindings: number;
+  frozen: boolean;
+  artifactAccepted: boolean;
+}
+
+/** Latest accepted DAST summary bound to an exact deployed digest and environment. */
+export interface ReleaseDastEvidence {
+  repositoryId: number;
+  runId: number;
+  runAttempt: number;
+  artifactId: number;
+  evidenceKey: string;
+  imageDigest: string;
+  environment: string;
+  status: ScannerEvidenceStatus;
+  observedAt: string;
+}
+
+/**
+ * Lifecycle of one deterministic root cause. `open` is the only state that ages
+ * against an SLA; `fixed` is reached only when every complete trusted scan
+ * stream that observed the fingerprint has since run without it.
+ */
+export type FindingLifecycleStatus = "open" | "fixed" | "suppressed" | "risk-accepted";
+export type FindingLifecycleSeverity = "critical" | "high" | "medium" | "low" | "info";
+export type FindingLifecycleSource = "semgrep" | "trivy" | "trivy-image" | "zap";
+
+export interface FindingLifecycleRecord {
+  repositoryId: number;
+  fingerprint: string;
+  source: FindingLifecycleSource;
+  ruleId: string;
+  severity: FindingLifecycleSeverity;
+  path?: string;
+  line?: number;
+  status: FindingLifecycleStatus;
+  owner: string;
+  /** Latest trusted observation time per scan stream that still reports the finding. */
+  streams: Record<string, string>;
+  firstSeenAt: string;
+  /** Start of the current open episode; a fixed finding that returns restarts its SLA here. */
+  openedAt: string;
+  lastSeenAt: string;
+  fixedAt?: string;
+  slaDueAt?: string;
+  lastRunId: number;
+  lastRunAttempt: number;
+  /** Per-provider ticket or notification state; empty when no provider is configured. */
+  tickets: Partial<Record<FindingTicketProviderName, FindingTicketState>>;
+  updatedAt: string;
+}
+
+export type FindingTicketProviderName = "github-issues" | "jira" | "slack";
+
+export interface FindingTicketState {
+  /** Provider reference such as a GitHub issue number or Jira key; never a URL or secret. */
+  ref?: string;
+  state?: "open" | "closed";
+  /** Digest of the last rendered ticket content, so unchanged findings cost no API call. */
+  contentSha?: string;
+  /** Sanitized, bounded failure kind from the last attempt; cleared on success. */
+  error?: string;
+  updatedAt: string;
+}
+
+/**
+ * Ordering watermark for one trusted scan stream. A delayed older run can never
+ * reopen or fix findings that a newer run of the same stream already decided.
+ */
+export interface FindingLifecycleStreamWatermark {
+  repositoryId: number;
+  stream: string;
+  runStartedAt: string;
+  runId: number;
+  runAttempt: number;
+  updatedAt: string;
+}
+
+/**
+ * Lease on one finding's provider ticket. A ticket pass takes claims under the
+ * lifecycle lock, releases the lock, calls the provider, and then records the
+ * result only while its claim still holds, so no provider call ever runs while the
+ * lock (or any transaction) is held and two passes never sync the same ticket at once.
+ */
+export interface FindingTicketClaim {
+  claimId: string;
+  claimedAt: string;
+  /** After this instant another pass may take the claim over. */
+  leaseExpiresAt: string;
+}
+
+export interface FindingTicketClaimTarget {
+  fingerprint: string;
+  provider: FindingTicketProviderName;
+}
+
+/**
+ * Per-repository lifecycle health that is not a property of any one record: how many
+ * records the bound forced out, and how many marker-bearing GitHub issues the last
+ * marker scan refused to trust.
+ */
+export interface FindingLifecycleState {
+  repositoryId: number;
+  /** Cumulative records dropped because the repository exceeded its record bound. */
+  droppedTotal: number;
+  /** Records dropped by the most recent merge; zero once a merge fits the bound again. */
+  lastDropped: number;
+  /** Open Critical or High records among `lastDropped`. */
+  lastDroppedCriticalHigh: number;
+  lastDroppedAt?: string;
+  /** Marker-bearing issues not created by this GitHub App, from the latest marker scan. */
+  untrustedMarkers: number;
+  untrustedMarkersObservedAt?: string;
+  updatedAt: string;
+}
+
+/** Bound accounting written atomically with the merge that produced it. */
+export interface FindingLifecycleCapacityUpdate {
+  dropped: number;
+  droppedCriticalHigh: number;
+  observedAt: string;
+}
+
+/** Upper bound for one repository's lifecycle page; open records are returned first. */
+export const MAX_FINDING_LIFECYCLE_RECORDS = 5_000;
+const FINDING_LIFECYCLE_UPSERT_CHUNK = 500;
+const FINDING_TICKET_PROVIDER_NAMES: ReadonlySet<string> = new Set(["github-issues", "jira", "slack"]);
+const FINDING_TICKET_CLAIM_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+const FINDING_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
+
+// `tickets` is written on insert only. Ticket state changes solely through
+// completeFindingTicketClaim, so a merge that read the record before a provider call
+// finished can never overwrite the ticket reference that call recorded.
+export const FINDING_LIFECYCLE_UPSERT_SQL = `INSERT INTO finding_lifecycle
+  (repository_id, fingerprint, source, rule_id, severity, path, line, status, owner,
+   streams, first_seen_at, opened_at, last_seen_at, fixed_at, sla_due_at, last_run_id, last_run_attempt,
+   tickets, updated_at)
+SELECT repository_id, fingerprint, source, rule_id, severity, path, line, status, owner,
+       streams, first_seen_at, opened_at, last_seen_at, fixed_at, sla_due_at, last_run_id, last_run_attempt,
+       tickets, updated_at
+FROM jsonb_to_recordset($1::jsonb) AS rows(
+  repository_id BIGINT, fingerprint TEXT, source TEXT, rule_id TEXT, severity TEXT,
+  path TEXT, line INTEGER, status TEXT, owner TEXT, streams JSONB, first_seen_at TIMESTAMPTZ,
+  opened_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ, fixed_at TIMESTAMPTZ, sla_due_at TIMESTAMPTZ, last_run_id BIGINT,
+  last_run_attempt INTEGER, tickets JSONB, updated_at TIMESTAMPTZ
+)
+ON CONFLICT (repository_id, fingerprint) DO UPDATE SET
+  source=excluded.source,
+  rule_id=excluded.rule_id,
+  severity=excluded.severity,
+  path=excluded.path,
+  line=excluded.line,
+  status=excluded.status,
+  owner=excluded.owner,
+  streams=excluded.streams,
+  first_seen_at=excluded.first_seen_at,
+  opened_at=excluded.opened_at,
+  last_seen_at=excluded.last_seen_at,
+  fixed_at=excluded.fixed_at,
+  sla_due_at=excluded.sla_due_at,
+  last_run_id=excluded.last_run_id,
+  last_run_attempt=excluded.last_run_attempt,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_LIFECYCLE_STREAM_UPSERT_SQL = `INSERT INTO finding_lifecycle_streams
+  (repository_id, stream, run_started_at, run_id, run_attempt, updated_at)
+SELECT repository_id, stream, run_started_at, run_id, run_attempt, updated_at
+FROM jsonb_to_recordset($1::jsonb) AS rows(
+  repository_id BIGINT, stream TEXT, run_started_at TIMESTAMPTZ, run_id BIGINT,
+  run_attempt INTEGER, updated_at TIMESTAMPTZ
+)
+ON CONFLICT (repository_id, stream) DO UPDATE SET
+  run_started_at=excluded.run_started_at,
+  run_id=excluded.run_id,
+  run_attempt=excluded.run_attempt,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_TICKET_CLAIM_SQL = `INSERT INTO finding_ticket_claims
+  (repository_id, fingerprint, provider, claim_id, claimed_at, lease_expires_at)
+SELECT DISTINCT $1::bigint, fingerprint, provider, $2::text, $3::timestamptz, $4::timestamptz
+FROM jsonb_to_recordset($5::jsonb) AS rows(fingerprint TEXT, provider TEXT)
+ON CONFLICT (repository_id, fingerprint, provider) DO UPDATE SET
+  claim_id=excluded.claim_id,
+  claimed_at=excluded.claimed_at,
+  lease_expires_at=excluded.lease_expires_at
+WHERE finding_ticket_claims.lease_expires_at <= excluded.claimed_at
+RETURNING fingerprint, provider`;
+
+/**
+ * Releases the claim and writes only that provider's ticket state in one statement.
+ * A claim that another pass took over after its lease expired no longer matches, so
+ * the late result is discarded rather than overwriting the newer pass.
+ */
+export const FINDING_TICKET_COMPLETE_SQL = `WITH released AS (
+  DELETE FROM finding_ticket_claims
+  WHERE repository_id=$1 AND fingerprint=$2 AND provider=$3 AND claim_id=$4
+  RETURNING repository_id
+), recorded AS (
+  UPDATE finding_lifecycle
+  SET tickets=jsonb_set(tickets, ARRAY[$3::text], $5::jsonb, true), updated_at=$6::timestamptz
+  WHERE repository_id=$1 AND fingerprint=$2 AND EXISTS (SELECT 1 FROM released)
+  RETURNING fingerprint
+)
+SELECT EXISTS (SELECT 1 FROM recorded) AS recorded`;
+
+export const FINDING_LIFECYCLE_CAPACITY_SQL = `INSERT INTO finding_lifecycle_state
+  (repository_id, dropped_total, last_dropped, last_dropped_critical_high, last_dropped_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (repository_id) DO UPDATE SET
+  dropped_total=finding_lifecycle_state.dropped_total + excluded.dropped_total,
+  last_dropped=excluded.last_dropped,
+  last_dropped_critical_high=excluded.last_dropped_critical_high,
+  last_dropped_at=COALESCE(excluded.last_dropped_at, finding_lifecycle_state.last_dropped_at),
+  updated_at=excluded.updated_at`;
+
+export const FINDING_TICKET_MARKER_SCAN_SQL = `INSERT INTO finding_lifecycle_state
+  (repository_id, untrusted_markers, untrusted_markers_observed_at, updated_at)
+VALUES ($1, $2, $3, $3)
+ON CONFLICT (repository_id) DO UPDATE SET
+  untrusted_markers=excluded.untrusted_markers,
+  untrusted_markers_observed_at=excluded.untrusted_markers_observed_at,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_LIFECYCLE_LIST_SQL = `SELECT *
+FROM finding_lifecycle
+WHERE repository_id=$1
+ORDER BY (status='open') DESC, first_seen_at ASC, fingerprint ASC
+LIMIT $2`;
+
+function assertFindingLifecycleLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_FINDING_LIFECYCLE_RECORDS) {
+    throw new Error(
+      `finding lifecycle limit must be a safe integer between 1 and ${MAX_FINDING_LIFECYCLE_RECORDS}`
+    );
+  }
+}
+
+function findingLifecycleRow(record: FindingLifecycleRecord): Record<string, unknown> {
+  return {
+    repository_id: record.repositoryId,
+    fingerprint: record.fingerprint,
+    source: record.source,
+    rule_id: record.ruleId,
+    severity: record.severity,
+    path: record.path,
+    line: record.line,
+    status: record.status,
+    owner: record.owner,
+    streams: record.streams,
+    first_seen_at: record.firstSeenAt,
+    opened_at: record.openedAt,
+    last_seen_at: record.lastSeenAt,
+    fixed_at: record.fixedAt,
+    sla_due_at: record.slaDueAt,
+    last_run_id: record.lastRunId,
+    last_run_attempt: record.lastRunAttempt,
+    tickets: record.tickets,
+    updated_at: record.updatedAt
+  };
+}
+
+function assertFindingLifecycleOwnership(
+  repositoryId: number,
+  records: readonly FindingLifecycleRecord[],
+  streams: readonly FindingLifecycleStreamWatermark[]
+): void {
+  if (
+    records.some((record) => record.repositoryId !== repositoryId) ||
+    streams.some((watermark) => watermark.repositoryId !== repositoryId)
+  ) {
+    throw new Error("finding lifecycle writes must belong to one repository");
+  }
+}
+
+function assertFindingTicketClaim(claim: Pick<FindingTicketClaim, "claimId">): void {
+  if (!FINDING_TICKET_CLAIM_ID_PATTERN.test(claim.claimId)) {
+    throw new Error("finding ticket claim id is invalid");
+  }
+}
+
+function assertFindingTicketTarget(target: FindingTicketClaimTarget): void {
+  if (
+    !FINDING_FINGERPRINT_PATTERN.test(target.fingerprint) ||
+    !FINDING_TICKET_PROVIDER_NAMES.has(target.provider)
+  ) {
+    throw new Error("finding ticket claim target is invalid");
+  }
+}
+
+function assertFindingLifecycleCount(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+}
+
+function findingTicketClaimKey(repositoryId: number, target: FindingTicketClaimTarget): string {
+  return `${repositoryId}:${target.fingerprint}:${target.provider}`;
+}
+
+function compareFindingLifecycle(
+  left: FindingLifecycleRecord,
+  right: FindingLifecycleRecord
+): number {
+  return (
+    Number(right.status === "open") - Number(left.status === "open") ||
+    Date.parse(left.firstSeenAt) - Date.parse(right.firstSeenAt) ||
+    left.fingerprint.localeCompare(right.fingerprint)
+  );
 }
 
 export interface StoreLock {
@@ -1134,6 +1675,98 @@ WHERE repository_id = $1 AND pull_number = $2
 `.trim();
 
 /**
+ * Re-applies human-recorded outcomes from the latest retained row onto findings a review computed
+ * from an earlier read. A review publishes its merged findings by overwriting the schemaless
+ * column, so a dismissal (or a merge's `ignored`) recorded while the model call was in flight
+ * would otherwise be silently lost even though the command already replied that it was recorded.
+ * `dismissed` wins over any derived outcome, matching `applyFindingOutcome`; `ignored` reaches
+ * only findings that carry no outcome. Both stores apply it inside `saveReview` against the row they overwrite, so no window remains;
+ * PostgreSQL uses the SQL form `REVIEW_FINDINGS_OUTCOME_MERGE_SQL`.
+ */
+export function carryRecordedOutcomes(
+  findings: readonly ReviewFindingRecord[],
+  latest: readonly ReviewFindingRecord[] | undefined
+): ReviewFindingRecord[] {
+  const recorded = new Map(
+    (latest ?? [])
+      .filter((finding) => finding.outcome === "dismissed" || finding.outcome === "ignored")
+      .map((finding) => [finding.fingerprint, finding])
+  );
+  if (!recorded.size) return [...findings];
+  return findings.map((finding) => {
+    const source = recorded.get(finding.fingerprint);
+    if (!source || finding.outcome === "dismissed" || finding.outcome === source.outcome) {
+      return finding;
+    }
+    if (source.outcome === "ignored" && finding.outcome !== undefined) return finding;
+    return {
+      ...finding,
+      outcome: source.outcome,
+      ...(source.outcomeAt ? { outcomeAt: source.outcomeAt } : {})
+    };
+  });
+}
+
+/**
+ * SQL form of `carryRecordedOutcomes`, used inside `saveReview`'s ON CONFLICT update. For each
+ * incoming finding it takes the last retained finding with the same fingerprint that recorded
+ * `dismissed` or `ignored`. A dismissal always wins; `ignored` applies only to a finding that
+ * carries no outcome of its own. Order is preserved, and an empty write stays an empty array.
+ */
+export const REVIEW_FINDINGS_OUTCOME_MERGE_SQL = `COALESCE((
+         SELECT jsonb_agg(
+           CASE
+             WHEN prior.outcome IS NULL
+               OR incoming.finding->>'outcome' = 'dismissed'
+               OR incoming.finding->>'outcome' = prior.outcome
+               OR (prior.outcome = 'ignored' AND incoming.finding->>'outcome' IS NOT NULL)
+             THEN incoming.finding
+             ELSE incoming.finding || jsonb_build_object('outcome', prior.outcome)
+               || CASE WHEN jsonb_typeof(prior.outcome_at) = 'string'
+                    THEN jsonb_build_object('outcomeAt', prior.outcome_at)
+                    ELSE '{}'::jsonb END
+           END
+           ORDER BY incoming.position)
+         FROM jsonb_array_elements(excluded.findings) WITH ORDINALITY AS incoming(finding, position)
+         LEFT JOIN LATERAL (
+           SELECT retained.stored->>'outcome' AS outcome, retained.stored->'outcomeAt' AS outcome_at
+           FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(reviews.findings) = 'array' THEN reviews.findings ELSE '[]'::jsonb END
+           ) WITH ORDINALITY AS retained(stored, position)
+           WHERE retained.stored->>'fingerprint' = incoming.finding->>'fingerprint'
+             AND retained.stored->>'outcome' IN ('dismissed', 'ignored')
+           ORDER BY retained.position DESC
+           LIMIT 1
+         ) prior ON true
+       ), '[]'::jsonb)`;
+
+/**
+ * Writes back findings whose derived outcome changed. Unlike the feedback update it leaves
+ * `feedback_total` alone: an outcome is not an engagement, and the row lock taken by
+ * `REVIEW_FEEDBACK_LOCK_SQL` in the same transaction serialises it against concurrent writers.
+ */
+export const REVIEW_OUTCOME_UPDATE_SQL = `
+UPDATE reviews
+SET findings = $3::jsonb,
+    updated_at = now()
+WHERE repository_id = $1 AND pull_number = $2
+`.trim();
+
+/**
+ * Reads the review rows of one repository touched since `$2`, newest first, bounded by `$3`. The
+ * `updated_at` predicate is only a superset prefilter: every finding timestamp the aggregation
+ * reads is written in the same statement that advances `updated_at`, and the aggregation then
+ * filters each finding by its own timestamps.
+ */
+export const REVIEW_ACTIVITY_SQL = `
+SELECT pull_number, reviewed_head_sha, findings
+FROM reviews
+WHERE repository_id = $1 AND updated_at >= $2
+ORDER BY updated_at DESC, pull_number DESC
+LIMIT $3
+`.trim();
+
+/**
  * Drops every retained finding for repositories that just left the installation.
  *
  * `evictTerminalReviewFindings` is the only other thing that bounds this column, and it runs only
@@ -1314,6 +1947,17 @@ export interface Store {
   ): Promise<boolean>;
   getReview(repositoryId: number, pullNumber: number): Promise<ReviewState | undefined>;
   recordFindingFeedback(input: FindingFeedbackInput): Promise<boolean>;
+  /** Returns how many findings changed outcome; see `applyFindingOutcome`. */
+  recordFindingOutcome(input: FindingOutcomeInput): Promise<number>;
+  /**
+   * Bounded read of one repository's retained review rows for review-value aggregation. Rows are
+   * returned whole; per-finding period filtering is the caller's job.
+   */
+  listReviewActivity(
+    repositoryId: number,
+    since: Date,
+    limit?: number
+  ): Promise<ReviewActivityPage>;
   enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>): Promise<boolean>;
   claimWebhook(workerId: string, leaseMs: number, now?: Date): Promise<WebhookJob | undefined>;
   completeWebhook(deliveryId: string, workerId: string): Promise<void>;
@@ -1360,12 +2004,71 @@ export interface Store {
     issuanceKey: string,
     leaseId: string
   ): Promise<boolean>;
+  /** Upserts the draft opened from `branch`; a redelivered command converges on one record. */
+  saveRemediationDraft(record: RemediationDraftRecord): Promise<void>;
+  getRemediationDraft(
+    repositoryId: number,
+    branch: string
+  ): Promise<RemediationDraftRecord | undefined>;
+  /** Drafts opened from one source pull request, by branch, at most `limit`. */
+  listRemediationDrafts(
+    repositoryId: number,
+    sourcePullNumber: number,
+    limit?: number
+  ): Promise<RemediationDraftRecord[]>;
+  /**
+   * Records the settled checks state, only while the record still names `headSha`. Returns false
+   * when the record is gone, names another head, or already holds that state.
+   */
+  setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean>;
+  deleteRemediationDraft(repositoryId: number, branch: string, headSha: string): Promise<boolean>;
   getSuccessfulDeploymentEvidence(
     repositoryId: number,
     environment: string,
     headSha: string,
     defaultBranch: string
   ): Promise<SuccessfulDeploymentEvidence | undefined>;
+  /**
+   * Latest accepted default-branch deployment for an environment regardless of head SHA, used to
+   * pin the nightly rescan to the exact digest that is running.
+   */
+  getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined>;
+  getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined>;
+  getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined>;
+  getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined>;
+  /**
+   * Newest verified default-branch schedule rescan of an exact digest, in one environment or,
+   * when `environment` is omitted, in any environment.
+   */
+  getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined>;
   claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean>;
@@ -1395,6 +2098,54 @@ export interface Store {
   resolveMonitoringAlertsForInactiveRepositories(observedAt: Date): Promise<void>;
   acquireOnboardingIssueLock(repositoryId: number): Promise<StoreLock>;
   acquireMonitoringLock(): Promise<StoreLock | undefined>;
+  /** Bounded lifecycle page for one repository, open records first. */
+  listFindingLifecycle(
+    repositoryId: number,
+    limit?: number
+  ): Promise<FindingLifecycleRecord[]>;
+  listFindingLifecycleStreams(repositoryId: number): Promise<FindingLifecycleStreamWatermark[]>;
+  /**
+   * Atomic upsert keyed by repository and root-cause fingerprint, together with
+   * the stream watermarks the same merge advanced, any records the merge removed to
+   * keep the repository within its bound, and that bound's drop accounting. An
+   * existing record keeps its stored ticket state; only ticket claims change it.
+   */
+  saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams?: readonly FindingLifecycleStreamWatermark[],
+    removedFingerprints?: readonly string[],
+    capacity?: FindingLifecycleCapacityUpdate
+  ): Promise<void>;
+  /** Serialises lifecycle merges and ticket claims for one repository across instances. */
+  acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock>;
+  /**
+   * Claims each target that has no unexpired claim and returns the targets granted.
+   * Callers hold the lifecycle lock while claiming and release it before any provider call.
+   */
+  claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]>;
+  /**
+   * Records one provider's ticket state and releases its claim, only while `claimId`
+   * still holds the claim. Returns false when the claim was lost or the record is gone.
+   */
+  completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean>;
+  /** Releases every claim still held by `claimId`, so unfinished work is retried promptly. */
+  releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void>;
+  getFindingLifecycleState(repositoryId: number): Promise<FindingLifecycleState | undefined>;
+  recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void>;
 }
 
 export function postgresPoolConfig(
@@ -1447,6 +2198,24 @@ function iso(value: Date): string {
   return value.toISOString();
 }
 
+function toRemediationDraft(row: any): RemediationDraftRecord {
+  return {
+    repositoryId: Number(row.repository_id),
+    branch: row.branch,
+    sourcePullNumber: Number(row.source_pull_number),
+    draftPullNumber: Number(row.draft_pull_number),
+    targetRef: row.target_ref,
+    fingerprint: row.fingerprint,
+    baseHeadSha: row.base_head_sha,
+    headSha: row.head_sha,
+    commitCreatedByApp: row.commit_created_by_app === true,
+    linkCommentId: Number(row.link_comment_id),
+    checks: row.checks,
+    secondValidation: row.second_validation,
+    createdAt: fromUnknownDate(row.created_at) ?? ""
+  };
+}
+
 function fromUnknownDate(value: unknown): string | undefined {
   if (!value) return undefined;
   const date = value instanceof Date ? value : new Date(String(value));
@@ -1456,6 +2225,12 @@ function fromUnknownDate(value: unknown): string | undefined {
 export class MemoryStore implements Store {
   private repositories = new Map<number, RepositoryRecord>();
   private reviews = new Map<string, ReviewState>();
+  /**
+   * Write order of each review row, advanced wherever the PostgreSQL statements set
+   * `updated_at=now()`, so activity pages are ordered by the most recent write in both stores.
+   */
+  private reviewWrites = new Map<string, number>();
+  private reviewWriteSequence = 0;
   private webhooks = new Map<string, WebhookJob>();
   private repositoryIndexes = new Map<
     string,
@@ -1472,9 +2247,16 @@ export class MemoryStore implements Store {
   private monitoringWeeklyReports = new Map<string, MonitoringWeeklyReportRecord>();
   private dastSessionIssuances = new Map<string, DastSessionIssuanceRecord>();
   private deploymentPromotions = new Map<string, DeploymentPromotionClaim>();
+  private remediationDrafts = new Map<string, RemediationDraftRecord>();
   private onboardingIssueLocks = new Set<number>();
   private onboardingIssueLockWaiters = new Map<number, Array<() => void>>();
   private monitoringLockHeld = false;
+  private findingLifecycle = new Map<string, FindingLifecycleRecord>();
+  private findingLifecycleStreams = new Map<string, FindingLifecycleStreamWatermark>();
+  private findingLifecycleLocks = new Set<number>();
+  private findingLifecycleLockWaiters = new Map<number, Array<() => void>>();
+  private findingTicketClaims = new Map<string, FindingTicketClaim>();
+  private findingLifecycleStates = new Map<number, FindingLifecycleState>();
 
   async ping(): Promise<void> {}
   async close(): Promise<void> {}
@@ -1852,6 +2634,10 @@ export class MemoryStore implements Store {
     }
   }
 
+  private touchReview(key: string): void {
+    this.reviewWrites.set(key, ++this.reviewWriteSequence);
+  }
+
   /** Mirrors `REVIEW_FINDINGS_DISCARD_SQL`; see `Store.setRepositoryState` for why removal clears. */
   private discardRetainedFindings(repositoryIds: readonly number[]): void {
     const removed = new Set(repositoryIds);
@@ -1863,6 +2649,7 @@ export class MemoryStore implements Store {
         findingsEvictedTotal: (review.findingsEvictedTotal ?? 0) + review.findings.length,
         findingsLastEvictedAt: new Date().toISOString()
       });
+      this.touchReview(key);
     }
   }
 
@@ -1896,10 +2683,12 @@ export class MemoryStore implements Store {
       // production. An existing row keeps whatever version already wrote its findings.
       findingsSchemaVersion:
         current?.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION_DEFAULT,
-      findingsEvictedTotal: current?.findingsEvictedTotal,
+      // Both counters are NOT NULL DEFAULT 0 columns, so a head-only row reads back as zero there.
+      findingsEvictedTotal: current?.findingsEvictedTotal ?? 0,
       findingsLastEvictedAt: current?.findingsLastEvictedAt,
-      feedbackTotal: current?.feedbackTotal
+      feedbackTotal: current?.feedbackTotal ?? 0
     });
+    this.touchReview(key);
   }
 
   /** True while `fence` still names the live, unexpired holder of its delivery's lease. */
@@ -1924,7 +2713,8 @@ export class MemoryStore implements Store {
     if (fence && !this.holdsWebhookLease(fence)) return false;
     this.reviews.set(key, {
       ...state,
-      findings: normalizeReviewFindings(state.findings),
+      // Mirrors the PostgreSQL merge: an outcome recorded after the writer read the row survives.
+      findings: carryRecordedOutcomes(normalizeReviewFindings(state.findings), current?.findings),
       findingsSchemaVersion: state.findingsSchemaVersion ?? REVIEW_FINDINGS_SCHEMA_VERSION,
       // `findingsEvictedTotal` is an increment on write, matching the server-authoritative
       // PostgreSQL counter, so the two implementations cannot disagree on a lifetime total.
@@ -1935,6 +2725,7 @@ export class MemoryStore implements Store {
       // per-finding records eviction is free to drop.
       feedbackTotal: (current?.feedbackTotal ?? 0) + (state.feedbackTotal ?? 0)
     });
+    this.touchReview(key);
     return true;
   }
 
@@ -1966,7 +2757,46 @@ export class MemoryStore implements Store {
       findings: applied.findings,
       feedbackTotal: (review.feedbackTotal ?? 0) + 1
     });
+    this.touchReview(key);
     return true;
+  }
+
+  async recordFindingOutcome(input: FindingOutcomeInput): Promise<number> {
+    const key = `${input.repositoryId}:${input.pullNumber}`;
+    const review = this.reviews.get(key);
+    if (!review) return 0;
+    const applied = applyFindingOutcome(review.findings, input);
+    if (!applied.changed) return 0;
+    this.reviews.set(key, { ...review, findings: applied.findings });
+    this.touchReview(key);
+    return applied.changed;
+  }
+
+  async listReviewActivity(
+    repositoryId: number,
+    _since: Date,
+    limit = MAX_REVIEW_ACTIVITY_ROWS
+  ): Promise<ReviewActivityPage> {
+    // No `updated_at` is tracked here, so every row of the repository is a candidate; the
+    // PostgreSQL prefilter is a strict superset optimisation and the caller filters by the
+    // finding timestamps either way, so both stores produce the same aggregate.
+    const bounded = Math.max(1, Math.min(MAX_REVIEW_ACTIVITY_ROWS, Math.trunc(limit)));
+    // Most recent write first, then pull number, matching `REVIEW_ACTIVITY_SQL`.
+    const written = (review: ReviewState) =>
+      this.reviewWrites.get(`${review.repositoryId}:${review.pullNumber}`) ?? 0;
+    const rows = [...this.reviews.values()]
+      .filter((review) => review.repositoryId === repositoryId)
+      .sort(
+        (left, right) => written(right) - written(left) || right.pullNumber - left.pullNumber
+      );
+    return {
+      reviews: rows.slice(0, bounded).map((review) => ({
+        pullNumber: review.pullNumber,
+        reviewedHeadSha: review.reviewedHeadSha,
+        findings: review.findings.map((finding) => ({ ...finding }))
+      })),
+      truncated: rows.length > bounded
+    };
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
@@ -2175,6 +3005,11 @@ export class MemoryStore implements Store {
           const run = this.scannerRuns.get(
             scannerRunKey(evidence.repositoryId, evidence.runId, evidence.runAttempt)
           );
+          // Monitoring evidence is default-branch evidence only: a newer
+          // release-branch push must never shadow default-branch evidence.
+          if (run?.headBranch !== repository.defaultBranch) {
+            continue;
+          }
           const artifact = this.scannerArtifacts.get(
             scannerArtifactKey(
               evidence.repositoryId,
@@ -2187,7 +3022,10 @@ export class MemoryStore implements Store {
             ...evidence,
             artifactType: artifact?.artifactType ?? evidence.artifactType
           };
-          const key = `${run?.event ?? "unknown"}:${enriched.artifactType ?? "unknown"}:${evidence.evidenceKey}`;
+          // Deployment rows keep the newest row per status, so a newer failed promotion cannot
+          // hide the digest that is still running from the deployed-digest rescan check.
+          const statusDimension = evidence.kind === "deployment" ? evidence.status : "";
+          const key = `${run?.event ?? "unknown"}:${enriched.artifactType ?? "unknown"}:${evidence.evidenceKey}:${statusDimension}`;
           if (!evidenceByKey.has(key)) {
             evidenceByKey.set(key, cloneScannerEvidence(enriched));
           }
@@ -2201,7 +3039,7 @@ export class MemoryStore implements Store {
           repository: { ...repository },
           index: index ? structuredClone(index) : undefined,
           latestScannerRuns: latestRuns,
-          latestScannerEvidence: [...evidenceByKey.values()]
+          latestScannerEvidence: [...evidenceByKey.values()].sort(compareMonitoringEvidence)
         };
       });
   }
@@ -2321,6 +3159,45 @@ export class MemoryStore implements Store {
     return this.dastSessionIssuances.delete(issuanceKey);
   }
 
+  async saveRemediationDraft(record: RemediationDraftRecord): Promise<void> {
+    this.remediationDrafts.set(`${record.repositoryId}:${record.branch}`, { ...record });
+  }
+
+  async getRemediationDraft(repositoryId: number, branch: string) {
+    const record = this.remediationDrafts.get(`${repositoryId}:${branch}`);
+    return record ? { ...record } : undefined;
+  }
+
+  async listRemediationDrafts(repositoryId: number, sourcePullNumber: number, limit = 20) {
+    return [...this.remediationDrafts.values()]
+      .filter(
+        (record) =>
+          record.repositoryId === repositoryId && record.sourcePullNumber === sourcePullNumber
+      )
+      .sort((left, right) => (left.branch < right.branch ? -1 : left.branch > right.branch ? 1 : 0))
+      .slice(0, limit)
+      .map((record) => ({ ...record }));
+  }
+
+  async setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean> {
+    const key = `${repositoryId}:${branch}`;
+    const record = this.remediationDrafts.get(key);
+    if (!record || record.headSha !== headSha || record.checks === checks) return false;
+    this.remediationDrafts.set(key, { ...record, checks });
+    return true;
+  }
+
+  async deleteRemediationDraft(repositoryId: number, branch: string, headSha: string) {
+    const key = `${repositoryId}:${branch}`;
+    if (this.remediationDrafts.get(key)?.headSha !== headSha) return false;
+    return this.remediationDrafts.delete(key);
+  }
+
   async getSuccessfulDeploymentEvidence(
     repositoryId: number,
     environment: string,
@@ -2377,6 +3254,331 @@ export class MemoryStore implements Store {
         observedAt: evidence.observedAt,
         origin
       };
+    }
+    return undefined;
+  }
+
+  async getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.evidenceKey === `deployment:${environment}` &&
+          evidence.kind === "deployment" &&
+          evidence.source === "digitalocean" &&
+          evidence.status === "success" &&
+          evidence.environment === environment &&
+          evidence.fingerprint === undefined &&
+          typeof evidence.digest === "string" &&
+          /^sha256:[a-f0-9]{64}$/.test(evidence.digest)
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    const latest = candidates.find((evidence) => {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      return (
+        run !== undefined &&
+        run.headBranch === defaultBranch &&
+        run.event === "push" &&
+        run.conclusion === "success" &&
+        run.validationStatus === "accepted" &&
+        artifact?.artifactType === "image-promotion" &&
+        artifact.validationStatus === "accepted" &&
+        typeof evidence.payload?.origin === "string"
+      );
+    });
+    // Only the newest accepted deployment is the running digest. An older healthy row must never
+    // stand in for it when the newest one cannot be bound to its signature evidence.
+    if (!latest) return undefined;
+    const run = this.scannerRuns.get(
+      scannerRunKey(repositoryId, latest.runId, latest.runAttempt)
+    )!;
+    const signature = this.scannerEvidence.get(
+      scannerEvidenceKey(
+        repositoryId,
+        latest.runId,
+        latest.runAttempt,
+        latest.artifactId,
+        "signature"
+      )
+    );
+    const imageReference = signature?.payload?.imageReference;
+    const certificateIdentity = signature?.payload?.certificateIdentity;
+    if (
+      !signature ||
+      signature.kind !== "signature" ||
+      signature.status !== "success" ||
+      signature.digest !== latest.digest ||
+      typeof imageReference !== "string" ||
+      typeof certificateIdentity !== "string"
+    ) {
+      return undefined;
+    }
+    return {
+      repositoryId,
+      runId: latest.runId,
+      runAttempt: latest.runAttempt,
+      headSha: run.headSha,
+      environment,
+      imageDigest: latest.digest!,
+      observedAt: latest.observedAt,
+      origin: String(latest.payload!.origin),
+      imageReference,
+      certificateIdentity
+    };
+  }
+
+  async getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined> {
+    const signatures = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.evidenceKey === "signature" &&
+          evidence.kind === "signature" &&
+          evidence.source === "cosign" &&
+          evidence.status === "success" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const signature of signatures) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, signature.runId, signature.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          signature.runId,
+          signature.runAttempt,
+          signature.artifactId
+        )
+      );
+      const certificateIdentity = signature.payload?.certificateIdentity;
+      if (
+        !run ||
+        run.headSha !== headSha ||
+        run.headBranch !== defaultBranch ||
+        run.event !== "push" ||
+        run.conclusion !== "success" ||
+        run.validationStatus !== "accepted" ||
+        artifact?.artifactType !== "image-promotion" ||
+        artifact.validationStatus !== "accepted" ||
+        typeof certificateIdentity !== "string" ||
+        signature.payload?.imageDigest !== imageDigest
+      ) {
+        continue;
+      }
+      const sibling = (evidenceKey: string) =>
+        this.scannerEvidence.get(
+          scannerEvidenceKey(
+            repositoryId,
+            signature.runId,
+            signature.runAttempt,
+            signature.artifactId,
+            evidenceKey
+          )
+        );
+      const trivy = sibling("image-trivy-summary");
+      const sbom = sibling("sbom");
+      return releaseImageEvidence(
+        { ...signature, payload: { certificateIdentity } },
+        headSha,
+        imageDigest,
+        trivy?.kind === "trivy" && trivy.source === "trivy" ? trivy : undefined,
+        sbom?.kind === "sbom" && sbom.source === "trivy" ? sbom : undefined
+      );
+    }
+    return undefined;
+  }
+
+  async getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          RELEASE_DAST_SUMMARY_KEYS.includes(evidence.evidenceKey) &&
+          evidence.source === "zap" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest &&
+          evidence.environment === environment
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const evidence of candidates) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      if (
+        !run ||
+        run.headBranch !== defaultBranch ||
+        run.validationStatus !== "accepted" ||
+        artifact?.artifactType !== "dast" ||
+        artifact.validationStatus !== "accepted"
+      ) {
+        continue;
+      }
+      return {
+        repositoryId,
+        runId: evidence.runId,
+        runAttempt: evidence.runAttempt,
+        artifactId: evidence.artifactId,
+        evidenceKey: evidence.evidenceKey,
+        imageDigest,
+        environment,
+        status: evidence.status,
+        observedAt: evidence.observedAt
+      };
+    }
+    return undefined;
+  }
+
+  async getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined> {
+    const runs = [...this.scannerRuns.values()]
+      .filter(
+        (run) =>
+          run.repositoryId === repositoryId &&
+          run.headSha === headSha &&
+          run.headBranch === defaultBranch &&
+          run.event === "push" &&
+          run.validationStatus === "accepted"
+      )
+      .sort(compareScannerRunsNewestFirst);
+    for (const run of runs) {
+      const artifact = [...this.scannerArtifacts.values()]
+        .filter(
+          (candidate) =>
+            candidate.repositoryId === repositoryId &&
+            candidate.runId === run.runId &&
+            candidate.runAttempt === run.runAttempt &&
+            candidate.artifactType === "security" &&
+            candidate.validationStatus === "accepted"
+        )
+        .sort((left, right) => right.artifactId - left.artifactId)[0];
+      if (!artifact) continue;
+      const sibling = (evidenceKey: string, kind: string) => {
+        const evidence = this.scannerEvidence.get(
+          scannerEvidenceKey(
+            repositoryId,
+            run.runId,
+            run.runAttempt,
+            artifact.artifactId,
+            evidenceKey
+          )
+        );
+        return evidence?.kind === kind && evidence.source === kind ? evidence : undefined;
+      };
+      return releaseCommitScanEvidence(
+        repositoryId,
+        headSha,
+        run.runId,
+        run.runAttempt,
+        artifact.artifactId,
+        sibling("semgrep-summary", "semgrep"),
+        sibling("trivy-summary", "trivy")
+      );
+    }
+    return undefined;
+  }
+
+  async getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.kind === "image-rescan" &&
+          evidence.source === "trivy" &&
+          evidence.status === "success" &&
+          evidence.fingerprint === undefined &&
+          evidence.digest === imageDigest &&
+          typeof evidence.environment === "string" &&
+          evidence.evidenceKey === `image-rescan:${evidence.environment}` &&
+          (environment === undefined || evidence.environment === environment)
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    for (const evidence of candidates) {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      if (
+        !run ||
+        run.headBranch !== defaultBranch ||
+        run.event !== "schedule" ||
+        !VERIFIED_RESCAN_STATUSES.includes(run.validationStatus) ||
+        artifact?.artifactType !== "image-rescan" ||
+        !VERIFIED_RESCAN_STATUSES.includes(artifact.validationStatus)
+      ) {
+        continue;
+      }
+      const freeze = this.scannerEvidence.get(
+        scannerEvidenceKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId,
+          `promotion-freeze:${evidence.environment}`
+        )
+      );
+      return imageRescanEvidence(
+        {
+          repositoryId,
+          runId: evidence.runId,
+          runAttempt: evidence.runAttempt,
+          artifactId: evidence.artifactId,
+          imageDigest,
+          environment: evidence.environment!,
+          observedAt: evidence.observedAt,
+          criticalFindings: evidence.payload?.criticalFindings
+        },
+        run.validationStatus === "accepted" && artifact.validationStatus === "accepted",
+        freeze
+      );
     }
     return undefined;
   }
@@ -2504,6 +3706,180 @@ export class MemoryStore implements Store {
     };
   }
 
+  async listFindingLifecycle(
+    repositoryId: number,
+    limit = MAX_FINDING_LIFECYCLE_RECORDS
+  ): Promise<FindingLifecycleRecord[]> {
+    assertFindingLifecycleLimit(limit);
+    return [...this.findingLifecycle.values()]
+      .filter((record) => record.repositoryId === repositoryId)
+      .sort(compareFindingLifecycle)
+      .slice(0, limit)
+      .map((record) => structuredClone(record));
+  }
+
+  async listFindingLifecycleStreams(
+    repositoryId: number
+  ): Promise<FindingLifecycleStreamWatermark[]> {
+    return [...this.findingLifecycleStreams.values()]
+      .filter((watermark) => watermark.repositoryId === repositoryId)
+      // Byte order, matching the Postgres `COLLATE "C"` read, so the order never depends on locale.
+      .sort((left, right) => (left.stream < right.stream ? -1 : left.stream > right.stream ? 1 : 0))
+      .map((watermark) => ({ ...watermark }));
+  }
+
+  async saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams: readonly FindingLifecycleStreamWatermark[] = [],
+    removedFingerprints: readonly string[] = [],
+    capacity?: FindingLifecycleCapacityUpdate
+  ): Promise<void> {
+    assertFindingLifecycleOwnership(repositoryId, records, streams);
+    if (capacity) {
+      assertFindingLifecycleCount(capacity.dropped, "dropped");
+      assertFindingLifecycleCount(capacity.droppedCriticalHigh, "droppedCriticalHigh");
+    }
+    const removed = new Set(removedFingerprints);
+    for (const fingerprint of removed) {
+      this.findingLifecycle.delete(`${repositoryId}:${fingerprint}`);
+    }
+    for (const key of [...this.findingTicketClaims.keys()]) {
+      const [claimRepository, fingerprint] = key.split(":");
+      if (claimRepository === String(repositoryId) && removed.has(fingerprint ?? "")) {
+        this.findingTicketClaims.delete(key);
+      }
+    }
+    for (const record of records) {
+      const key = `${record.repositoryId}:${record.fingerprint}`;
+      const existing = this.findingLifecycle.get(key);
+      const next = structuredClone(record);
+      // Same rule as PostgreSQL: ticket state changes only through claims.
+      if (existing) next.tickets = structuredClone(existing.tickets);
+      this.findingLifecycle.set(key, next);
+    }
+    for (const watermark of streams) {
+      this.findingLifecycleStreams.set(
+        `${watermark.repositoryId}:${watermark.stream}`,
+        { ...watermark }
+      );
+    }
+    if (capacity) {
+      const existing = this.findingLifecycleStates.get(repositoryId);
+      this.findingLifecycleStates.set(repositoryId, {
+        repositoryId,
+        droppedTotal: (existing?.droppedTotal ?? 0) + capacity.dropped,
+        lastDropped: capacity.dropped,
+        lastDroppedCriticalHigh: capacity.droppedCriticalHigh,
+        lastDroppedAt: capacity.dropped > 0 ? capacity.observedAt : existing?.lastDroppedAt,
+        untrustedMarkers: existing?.untrustedMarkers ?? 0,
+        untrustedMarkersObservedAt: existing?.untrustedMarkersObservedAt,
+        updatedAt: capacity.observedAt
+      });
+    }
+  }
+
+  async claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]> {
+    assertFindingTicketClaim(claim);
+    const claimedAt = Date.parse(claim.claimedAt);
+    const granted: FindingTicketClaimTarget[] = [];
+    for (const target of targets) {
+      assertFindingTicketTarget(target);
+      const key = findingTicketClaimKey(repositoryId, target);
+      const existing = this.findingTicketClaims.get(key);
+      if (existing && !(Date.parse(existing.leaseExpiresAt) <= claimedAt)) continue;
+      this.findingTicketClaims.set(key, { ...claim });
+      granted.push({ fingerprint: target.fingerprint, provider: target.provider });
+    }
+    return granted;
+  }
+
+  async completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean> {
+    assertFindingTicketClaim({ claimId });
+    assertFindingTicketTarget(target);
+    const key = findingTicketClaimKey(repositoryId, target);
+    if (this.findingTicketClaims.get(key)?.claimId !== claimId) return false;
+    this.findingTicketClaims.delete(key);
+    const record = this.findingLifecycle.get(`${repositoryId}:${target.fingerprint}`);
+    if (!record) return false;
+    record.tickets[target.provider] = structuredClone(ticket);
+    record.updatedAt = ticket.updatedAt;
+    return true;
+  }
+
+  async releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void> {
+    assertFindingTicketClaim({ claimId });
+    for (const [key, claim] of this.findingTicketClaims) {
+      if (key.startsWith(`${repositoryId}:`) && claim.claimId === claimId) {
+        this.findingTicketClaims.delete(key);
+      }
+    }
+  }
+
+  async getFindingLifecycleState(
+    repositoryId: number
+  ): Promise<FindingLifecycleState | undefined> {
+    const state = this.findingLifecycleStates.get(repositoryId);
+    return state ? { ...state } : undefined;
+  }
+
+  async recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void> {
+    assertFindingLifecycleCount(untrustedMarkers, "untrustedMarkers");
+    const existing = this.findingLifecycleStates.get(repositoryId);
+    this.findingLifecycleStates.set(repositoryId, {
+      repositoryId,
+      droppedTotal: existing?.droppedTotal ?? 0,
+      lastDropped: existing?.lastDropped ?? 0,
+      lastDroppedCriticalHigh: existing?.lastDroppedCriticalHigh ?? 0,
+      lastDroppedAt: existing?.lastDroppedAt,
+      untrustedMarkers,
+      untrustedMarkersObservedAt: observedAt,
+      updatedAt: observedAt
+    });
+  }
+
+  async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {
+    if (this.findingLifecycleLocks.has(repositoryId)) {
+      await new Promise<void>((resolve) => {
+        const waiters = this.findingLifecycleLockWaiters.get(repositoryId) ?? [];
+        waiters.push(resolve);
+        this.findingLifecycleLockWaiters.set(repositoryId, waiters);
+      });
+    } else {
+      this.findingLifecycleLocks.add(repositoryId);
+    }
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        const waiters = this.findingLifecycleLockWaiters.get(repositoryId);
+        const next = waiters?.shift();
+        if (waiters?.length === 0) {
+          this.findingLifecycleLockWaiters.delete(repositoryId);
+        }
+        if (next) {
+          next();
+        } else {
+          this.findingLifecycleLocks.delete(repositoryId);
+        }
+      }
+    };
+  }
+
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {
     if (this.monitoringLockHeld) return undefined;
     this.monitoringLockHeld = true;
@@ -2544,6 +3920,22 @@ function compareScannerEvidenceNewestFirst(
     timestamp(right.observedAt) - timestamp(left.observedAt) ||
     right.runId - left.runId ||
     right.runAttempt - left.runAttempt
+  );
+}
+
+/**
+ * Monitoring evidence order, shared by both stores: newest first, then a fixed key order so rows
+ * from one run that share an observation time never depend on write or index order.
+ */
+function compareMonitoringEvidence(
+  left: ScannerEvidenceRecord,
+  right: ScannerEvidenceRecord
+): number {
+  return (
+    compareScannerEvidenceNewestFirst(left, right) ||
+    left.evidenceKey.localeCompare(right.evidenceKey) ||
+    (left.artifactType ?? "").localeCompare(right.artifactType ?? "") ||
+    left.artifactId - right.artifactId
   );
 }
 
@@ -2603,6 +3995,133 @@ function scannerEvidenceKey(
   evidenceKey: string
 ): string {
   return `${scannerArtifactKey(repositoryId, runId, runAttempt, artifactId)}:${evidenceKey}`;
+}
+
+const RELEASE_DAST_SUMMARY_KEYS = ["zap-smoke-summary", "zap-nightly-summary"];
+
+/**
+ * A rescan artifact is `failed` when its evidence verified and was recorded but reconciliation
+ * (the DefectDojo import) has not succeeded yet. Its freeze still counts.
+ */
+const VERIFIED_RESCAN_STATUSES: readonly string[] = ["accepted", "failed"];
+
+const SCAN_SEVERITY_KEYS = ["critical", "high", "medium", "low", "info"] as const;
+
+function scanSeverityCounts(value: unknown): ScanSeverityCounts | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const counts = {} as ScanSeverityCounts;
+  for (const key of SCAN_SEVERITY_KEYS) {
+    const count = record[key];
+    if (!Number.isSafeInteger(count) || Number(count) < 0) return undefined;
+    counts[key] = Number(count);
+  }
+  return counts;
+}
+
+function releaseCommitScanSummary(
+  evidence: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined
+): ReleaseCommitScanSummary | undefined {
+  if (!evidence) return undefined;
+  return {
+    status: evidence.status,
+    observedAt: evidence.observedAt,
+    severities: scanSeverityCounts(evidence.payload?.releaseSeverities)
+  };
+}
+
+function releaseCommitScanEvidence(
+  repositoryId: number,
+  headSha: string,
+  runId: number,
+  runAttempt: number,
+  artifactId: number,
+  semgrep: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined,
+  trivy: Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload"> | undefined
+): ReleaseCommitScanEvidence {
+  return {
+    repositoryId,
+    runId,
+    runAttempt,
+    artifactId,
+    headSha,
+    semgrep: releaseCommitScanSummary(semgrep),
+    trivy: releaseCommitScanSummary(trivy)
+  };
+}
+
+function imageRescanEvidence(
+  rescan: Omit<ImageRescanEvidence, "criticalFindings" | "frozen" | "artifactAccepted"> & {
+    criticalFindings: unknown;
+  },
+  artifactAccepted: boolean,
+  freeze: Pick<ScannerEvidenceRecord, "kind" | "source" | "status" | "digest" | "environment"> &
+    { payload?: Record<string, unknown> } | undefined
+): ImageRescanEvidence {
+  const criticalFindings =
+    Number.isSafeInteger(rescan.criticalFindings) && Number(rescan.criticalFindings) >= 0
+      ? Number(rescan.criticalFindings)
+      : -1;
+  // Only a clean freeze sibling bound to the same digest and environment unfreezes.
+  const clean =
+    criticalFindings === 0 &&
+    freeze?.kind === "promotion-freeze" &&
+    freeze.source === "guardianbot" &&
+    freeze.status === "success" &&
+    freeze.digest === rescan.imageDigest &&
+    freeze.environment === rescan.environment &&
+    freeze.payload?.active === false;
+  return {
+    repositoryId: rescan.repositoryId,
+    runId: rescan.runId,
+    runAttempt: rescan.runAttempt,
+    artifactId: rescan.artifactId,
+    imageDigest: rescan.imageDigest,
+    environment: rescan.environment,
+    observedAt: rescan.observedAt,
+    criticalFindings,
+    frozen: !clean,
+    artifactAccepted
+  };
+}
+
+function releaseImageEvidence(
+  signature: Pick<
+    ScannerEvidenceRecord,
+    "repositoryId" | "runId" | "runAttempt" | "artifactId" | "observedAt"
+  > & { payload: { certificateIdentity: string } },
+  headSha: string,
+  imageDigest: string,
+  trivy:
+    | Pick<ScannerEvidenceRecord, "status" | "observedAt" | "payload">
+    | undefined,
+  sbom: Pick<ScannerEvidenceRecord, "status" | "observedAt"> | undefined
+): ReleaseImageEvidence {
+  const criticalFindings = trivy?.payload?.criticalFindings;
+  return {
+    repositoryId: signature.repositoryId,
+    runId: signature.runId,
+    runAttempt: signature.runAttempt,
+    artifactId: signature.artifactId,
+    headSha,
+    imageDigest,
+    signature: {
+      certificateIdentity: signature.payload.certificateIdentity,
+      observedAt: signature.observedAt
+    },
+    imageScan: trivy
+      ? {
+          status: trivy.status,
+          // A missing or malformed count is reported as -1 so the gate fails closed.
+          criticalFindings:
+            Number.isSafeInteger(criticalFindings) && Number(criticalFindings) >= 0
+              ? Number(criticalFindings)
+              : -1,
+          observedAt: trivy.observedAt
+        }
+      : undefined,
+    sbom: sbom ? { status: sbom.status, observedAt: sbom.observedAt } : undefined
+  };
 }
 
 /**
@@ -3007,6 +4526,26 @@ export class PostgresStore implements Store {
       CREATE INDEX IF NOT EXISTS dast_session_issuances_repository_idx
         ON dast_session_issuances (repository_id, run_id DESC, run_attempt DESC);
 
+      CREATE TABLE IF NOT EXISTS remediation_drafts (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        branch TEXT NOT NULL,
+        source_pull_number INTEGER NOT NULL,
+        draft_pull_number INTEGER NOT NULL,
+        target_ref TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        base_head_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        commit_created_by_app BOOLEAN NOT NULL,
+        link_comment_id BIGINT NOT NULL,
+        checks TEXT NOT NULL DEFAULT 'pending' CHECK (checks IN ('pending', 'passed', 'failed')),
+        second_validation TEXT NOT NULL CHECK (second_validation IN ('accepted', 'not-configured')),
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, branch)
+      );
+      CREATE INDEX IF NOT EXISTS remediation_drafts_source_idx
+        ON remediation_drafts (repository_id, source_pull_number, branch);
+
       CREATE TABLE IF NOT EXISTS deployment_promotions (
         deployment_key TEXT PRIMARY KEY,
         repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
@@ -3021,6 +4560,64 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS deployment_promotions_repository_idx
         ON deployment_promotions (repository_id, environment);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        source TEXT NOT NULL,
+        rule_id TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        path TEXT,
+        line INTEGER,
+        status TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        streams JSONB NOT NULL DEFAULT '{}'::jsonb,
+        first_seen_at TIMESTAMPTZ NOT NULL,
+        opened_at TIMESTAMPTZ NOT NULL,
+        last_seen_at TIMESTAMPTZ NOT NULL,
+        fixed_at TIMESTAMPTZ,
+        sla_due_at TIMESTAMPTZ,
+        last_run_id BIGINT NOT NULL,
+        last_run_attempt INTEGER NOT NULL,
+        tickets JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, fingerprint)
+      );
+      CREATE INDEX IF NOT EXISTS finding_lifecycle_status_idx
+        ON finding_lifecycle (repository_id, status, first_seen_at);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle_streams (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        stream TEXT NOT NULL,
+        run_started_at TIMESTAMPTZ NOT NULL,
+        run_id BIGINT NOT NULL,
+        run_attempt INTEGER NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (repository_id, stream)
+      );
+
+      CREATE TABLE IF NOT EXISTS finding_ticket_claims (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        claim_id TEXT NOT NULL,
+        claimed_at TIMESTAMPTZ NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (repository_id, fingerprint, provider)
+      );
+      CREATE INDEX IF NOT EXISTS finding_ticket_claims_claim_idx
+        ON finding_ticket_claims (repository_id, claim_id);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle_state (
+        repository_id BIGINT PRIMARY KEY REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        dropped_total BIGINT NOT NULL DEFAULT 0,
+        last_dropped INTEGER NOT NULL DEFAULT 0,
+        last_dropped_critical_high INTEGER NOT NULL DEFAULT 0,
+        last_dropped_at TIMESTAMPTZ,
+        untrusted_markers INTEGER NOT NULL DEFAULT 0,
+        untrusted_markers_observed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
       `);
       if (this.repositoryIndexStorageMode === "pgvector") {
         await client.query(
@@ -3578,7 +5175,10 @@ export class PostgresStore implements Store {
        head_sha=excluded.head_sha,
        reviewed_head_sha=excluded.reviewed_head_sha,
        placeholder_comment_id=excluded.placeholder_comment_id,
-       findings=excluded.findings,
+       -- The writer computed its findings from a read that may predate a dismissal or merge
+       -- outcome. ON CONFLICT holds the row lock and evaluates this against the latest committed
+       -- row, so the outcome is carried here, atomically, rather than lost (carryRecordedOutcomes).
+       findings=${REVIEW_FINDINGS_OUTCOME_MERGE_SQL},
        findings_schema_version=excluded.findings_schema_version,
        -- Server-authoritative lifetime counter: the caller supplies only this write's increment,
        -- so a writer that did not read the existing row cannot reset the accumulated total. The
@@ -3683,6 +5283,65 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Records one outcome observation under the same row lock feedback capture takes, so a review
+   * publishing merged findings and an outcome write cannot lose each other's per-finding detail.
+   */
+  async recordFindingOutcome(input: FindingOutcomeInput): Promise<number> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(REVIEW_FEEDBACK_LOCK_SQL, [
+        input.repositoryId,
+        input.pullNumber
+      ]);
+      const row = locked.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return 0;
+      }
+      const applied = applyFindingOutcome(normalizeReviewFindings(row.findings), input);
+      if (!applied.changed) {
+        await client.query("ROLLBACK");
+        return 0;
+      }
+      await client.query(REVIEW_OUTCOME_UPDATE_SQL, [
+        input.repositoryId,
+        input.pullNumber,
+        JSON.stringify(applied.findings)
+      ]);
+      await client.query("COMMIT");
+      return applied.changed;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listReviewActivity(
+    repositoryId: number,
+    since: Date,
+    limit = MAX_REVIEW_ACTIVITY_ROWS
+  ): Promise<ReviewActivityPage> {
+    const bounded = Math.max(1, Math.min(MAX_REVIEW_ACTIVITY_ROWS, Math.trunc(limit)));
+    // One extra row is read so truncation is observed rather than guessed.
+    const result = await this.pool.query(REVIEW_ACTIVITY_SQL, [
+      repositoryId,
+      since.toISOString(),
+      bounded + 1
+    ]);
+    return {
+      reviews: result.rows.slice(0, bounded).map((row) => ({
+        pullNumber: Number(row.pull_number),
+        reviewedHeadSha: row.reviewed_head_sha ?? undefined,
+        findings: normalizeReviewFindings(row.findings)
+      })),
+      truncated: result.rows.length > bounded
+    };
   }
 
   async enqueueWebhook(deliveryId: string, eventName: string, payload: Record<string, any>) {
@@ -3959,9 +5618,8 @@ export class PostgresStore implements Store {
                     ORDER BY COALESCE(
                                runs.completed_at,
                                runs.started_at,
-                               runs.processed_at,
-                               runs.updated_at
-                             ) DESC,
+                               runs.processed_at
+                             ) DESC NULLS LAST,
                              runs.run_id DESC,
                              runs.run_attempt DESC
                   ) AS monitoring_rank
@@ -3981,7 +5639,8 @@ export class PostgresStore implements Store {
            evidence.repository_id,
            evidence.evidence_key,
            runs.event,
-           artifacts.artifact_type
+           artifacts.artifact_type,
+           CASE WHEN evidence.kind='deployment' THEN evidence.status ELSE '' END
          )
            evidence.*,
            artifacts.artifact_type AS monitoring_artifact_type
@@ -3998,13 +5657,14 @@ export class PostgresStore implements Store {
          JOIN repositories AS repositories
           ON repositories.repository_id=evidence.repository_id
           AND repositories.repository_state='active'
+          AND runs.head_branch=repositories.default_branch
          WHERE evidence.fingerprint IS NULL
          ORDER BY evidence.repository_id,
                   evidence.evidence_key,
                   runs.event,
                   artifacts.artifact_type,
+                  CASE WHEN evidence.kind='deployment' THEN evidence.status ELSE '' END,
                   evidence.observed_at DESC,
-                  evidence.updated_at DESC,
                   evidence.run_id DESC,
                   evidence.run_attempt DESC`
       )
@@ -4038,7 +5698,10 @@ export class PostgresStore implements Store {
         latestScannerRuns:
           runsByRepository.get(repository.repositoryId)?.map(cloneScannerWorkflowRun) ?? [],
         latestScannerEvidence:
-          evidenceByRepository.get(repository.repositoryId)?.map(cloneScannerEvidence) ?? []
+          evidenceByRepository
+            .get(repository.repositoryId)
+            ?.map(cloneScannerEvidence)
+            .sort(compareMonitoringEvidence) ?? []
       };
     });
   }
@@ -4230,6 +5893,85 @@ export class PostgresStore implements Store {
     return result.rowCount === 1;
   }
 
+  async saveRemediationDraft(record: RemediationDraftRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO remediation_drafts
+         (repository_id, branch, source_pull_number, draft_pull_number, target_ref, fingerprint,
+          base_head_sha, head_sha, commit_created_by_app, link_comment_id, checks,
+          second_validation, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (repository_id, branch) DO UPDATE SET
+         source_pull_number=excluded.source_pull_number,
+         draft_pull_number=excluded.draft_pull_number,
+         target_ref=excluded.target_ref,
+         fingerprint=excluded.fingerprint,
+         base_head_sha=excluded.base_head_sha,
+         head_sha=excluded.head_sha,
+         commit_created_by_app=excluded.commit_created_by_app,
+         link_comment_id=excluded.link_comment_id,
+         checks=excluded.checks,
+         second_validation=excluded.second_validation,
+         created_at=excluded.created_at,
+         updated_at=now()`,
+      [
+        record.repositoryId,
+        record.branch,
+        record.sourcePullNumber,
+        record.draftPullNumber,
+        record.targetRef,
+        record.fingerprint,
+        record.baseHeadSha,
+        record.headSha,
+        record.commitCreatedByApp,
+        record.linkCommentId,
+        record.checks,
+        record.secondValidation,
+        record.createdAt
+      ]
+    );
+  }
+
+  async getRemediationDraft(repositoryId: number, branch: string) {
+    const result = await this.pool.query(
+      `SELECT * FROM remediation_drafts WHERE repository_id=$1 AND branch=$2`,
+      [repositoryId, branch]
+    );
+    return result.rows[0] ? toRemediationDraft(result.rows[0]) : undefined;
+  }
+
+  async listRemediationDrafts(repositoryId: number, sourcePullNumber: number, limit = 20) {
+    const result = await this.pool.query(
+      `SELECT * FROM remediation_drafts
+       WHERE repository_id=$1 AND source_pull_number=$2
+       ORDER BY branch COLLATE "C"
+       LIMIT $3`,
+      [repositoryId, sourcePullNumber, limit]
+    );
+    return result.rows.map(toRemediationDraft);
+  }
+
+  async setRemediationDraftChecks(
+    repositoryId: number,
+    branch: string,
+    headSha: string,
+    checks: RemediationDraftChecks
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE remediation_drafts SET checks=$4, updated_at=now()
+       WHERE repository_id=$1 AND branch=$2 AND head_sha=$3 AND checks<>$4`,
+      [repositoryId, branch, headSha, checks]
+    );
+    return result.rowCount === 1;
+  }
+
+  async deleteRemediationDraft(repositoryId: number, branch: string, headSha: string) {
+    const result = await this.pool.query(
+      `DELETE FROM remediation_drafts WHERE repository_id=$1 AND branch=$2 AND head_sha=$3`,
+      [repositoryId, branch, headSha]
+    );
+    return result.rowCount === 1;
+  }
+
   async getSuccessfulDeploymentEvidence(
     repositoryId: number,
     environment: string,
@@ -4270,7 +6012,6 @@ export class PostgresStore implements Store {
          AND jsonb_typeof(evidence.payload)='object'
          AND jsonb_typeof(evidence.payload->'origin')='string'
        ORDER BY evidence.observed_at DESC,
-                evidence.updated_at DESC,
                 evidence.run_id DESC,
                 evidence.run_attempt DESC
        LIMIT 1`,
@@ -4294,6 +6035,417 @@ export class PostgresStore implements Store {
       observedAt: new Date(row.observed_at).toISOString(),
       origin: String(row.origin)
     };
+  }
+
+  async getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined> {
+    // The newest accepted deployment row is selected first and only then joined to its signature
+    // row, so an unbindable newest deployment yields nothing instead of an older digest.
+    const result = await this.pool.query(
+      `WITH latest AS (
+         SELECT evidence.repository_id,
+                evidence.run_id,
+                evidence.run_attempt,
+                evidence.artifact_id,
+                evidence.digest,
+                evidence.observed_at,
+                evidence.payload->>'origin' AS origin,
+                runs.head_sha
+         FROM scanner_evidence AS evidence
+         JOIN scanner_workflow_runs AS runs
+           ON runs.repository_id=evidence.repository_id
+          AND runs.run_id=evidence.run_id
+          AND runs.run_attempt=evidence.run_attempt
+         JOIN scanner_artifacts AS artifacts
+           ON artifacts.repository_id=evidence.repository_id
+          AND artifacts.run_id=evidence.run_id
+          AND artifacts.run_attempt=evidence.run_attempt
+          AND artifacts.artifact_id=evidence.artifact_id
+         WHERE evidence.repository_id=$1
+           AND evidence.evidence_key=$2
+           AND evidence.kind='deployment'
+           AND evidence.source='digitalocean'
+           AND evidence.status='success'
+           AND evidence.environment=$3
+           AND evidence.fingerprint IS NULL
+           AND evidence.digest ~ '^sha256:[a-f0-9]{64}$'
+           AND runs.head_branch=$4
+           AND runs.event='push'
+           AND runs.conclusion='success'
+           AND runs.validation_status='accepted'
+           AND artifacts.artifact_type='image-promotion'
+           AND artifacts.validation_status='accepted'
+           AND jsonb_typeof(evidence.payload)='object'
+           AND jsonb_typeof(evidence.payload->'origin')='string'
+         ORDER BY evidence.observed_at DESC,
+                  evidence.run_id DESC,
+                  evidence.run_attempt DESC
+         LIMIT 1
+       )
+       SELECT latest.run_id,
+              latest.run_attempt,
+              latest.digest,
+              latest.observed_at,
+              latest.origin,
+              latest.head_sha,
+              signature.payload->>'imageReference' AS image_reference,
+              signature.payload->>'certificateIdentity' AS certificate_identity
+       FROM latest
+       JOIN scanner_evidence AS signature
+         ON signature.repository_id=latest.repository_id
+        AND signature.run_id=latest.run_id
+        AND signature.run_attempt=latest.run_attempt
+        AND signature.artifact_id=latest.artifact_id
+        AND signature.evidence_key='signature'
+       WHERE signature.kind='signature'
+         AND signature.status='success'
+         AND signature.digest=latest.digest
+         AND jsonb_typeof(signature.payload->'imageReference')='string'
+         AND jsonb_typeof(signature.payload->'certificateIdentity')='string'`,
+      [repositoryId, `deployment:${environment}`, environment, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId,
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      headSha: String(row.head_sha),
+      environment,
+      imageDigest: String(row.digest),
+      observedAt: new Date(row.observed_at).toISOString(),
+      origin: String(row.origin),
+      imageReference: String(row.image_reference),
+      certificateIdentity: String(row.certificate_identity)
+    };
+  }
+
+  async getReleaseImageEvidence(
+    repositoryId: number,
+    headSha: string,
+    imageDigest: string,
+    defaultBranch: string
+  ): Promise<ReleaseImageEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT signature.run_id,
+              signature.run_attempt,
+              signature.artifact_id,
+              signature.observed_at,
+              signature.payload->>'certificateIdentity' AS certificate_identity,
+              trivy.status AS trivy_status,
+              trivy.observed_at AS trivy_observed_at,
+              trivy.payload->'criticalFindings' AS trivy_critical_findings,
+              sbom.status AS sbom_status,
+              sbom.observed_at AS sbom_observed_at
+       FROM scanner_evidence AS signature
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=signature.repository_id
+        AND runs.run_id=signature.run_id
+        AND runs.run_attempt=signature.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=signature.repository_id
+        AND artifacts.run_id=signature.run_id
+        AND artifacts.run_attempt=signature.run_attempt
+        AND artifacts.artifact_id=signature.artifact_id
+       LEFT JOIN scanner_evidence AS trivy
+         ON trivy.repository_id=signature.repository_id
+        AND trivy.run_id=signature.run_id
+        AND trivy.run_attempt=signature.run_attempt
+        AND trivy.artifact_id=signature.artifact_id
+        AND trivy.evidence_key='image-trivy-summary'
+        AND trivy.kind='trivy'
+        AND trivy.source='trivy'
+       LEFT JOIN scanner_evidence AS sbom
+         ON sbom.repository_id=signature.repository_id
+        AND sbom.run_id=signature.run_id
+        AND sbom.run_attempt=signature.run_attempt
+        AND sbom.artifact_id=signature.artifact_id
+        AND sbom.evidence_key='sbom'
+        AND sbom.kind='sbom'
+        AND sbom.source='trivy'
+       WHERE signature.repository_id=$1
+         AND signature.evidence_key='signature'
+         AND signature.kind='signature'
+         AND signature.source='cosign'
+         AND signature.status='success'
+         AND signature.fingerprint IS NULL
+         AND signature.digest=$2
+         AND jsonb_typeof(signature.payload)='object'
+         AND signature.payload->>'imageDigest'=$2
+         AND jsonb_typeof(signature.payload->'certificateIdentity')='string'
+         AND runs.head_sha=$3
+         AND runs.head_branch=$4
+         AND runs.event='push'
+         AND runs.conclusion='success'
+         AND runs.validation_status='accepted'
+         AND artifacts.artifact_type='image-promotion'
+         AND artifacts.validation_status='accepted'
+       ORDER BY signature.observed_at DESC,
+                signature.run_id DESC,
+                signature.run_attempt DESC
+       LIMIT 1`,
+      [repositoryId, imageDigest, headSha, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return releaseImageEvidence(
+      {
+        repositoryId,
+        runId: Number(row.run_id),
+        runAttempt: Number(row.run_attempt),
+        artifactId: Number(row.artifact_id),
+        observedAt: new Date(row.observed_at).toISOString(),
+        payload: { certificateIdentity: String(row.certificate_identity) }
+      },
+      headSha,
+      imageDigest,
+      row.trivy_status
+        ? {
+            status: row.trivy_status,
+            observedAt: new Date(row.trivy_observed_at).toISOString(),
+            payload: { criticalFindings: row.trivy_critical_findings }
+          }
+        : undefined,
+      row.sbom_status
+        ? {
+            status: row.sbom_status,
+            observedAt: new Date(row.sbom_observed_at).toISOString()
+          }
+        : undefined
+    );
+  }
+
+  async getReleaseDastEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    environment: string,
+    defaultBranch: string
+  ): Promise<ReleaseDastEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT evidence.run_id,
+              evidence.run_attempt,
+              evidence.artifact_id,
+              evidence.evidence_key,
+              evidence.status,
+              evidence.observed_at
+       FROM scanner_evidence AS evidence
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=evidence.repository_id
+        AND runs.run_id=evidence.run_id
+        AND runs.run_attempt=evidence.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=evidence.repository_id
+        AND artifacts.run_id=evidence.run_id
+        AND artifacts.run_attempt=evidence.run_attempt
+        AND artifacts.artifact_id=evidence.artifact_id
+       WHERE evidence.repository_id=$1
+         AND evidence.evidence_key = ANY($2::text[])
+         AND evidence.source='zap'
+         AND evidence.fingerprint IS NULL
+         AND evidence.digest=$3
+         AND evidence.environment=$4
+         AND runs.head_branch=$5
+         AND runs.validation_status='accepted'
+         AND artifacts.artifact_type='dast'
+         AND artifacts.validation_status='accepted'
+       ORDER BY evidence.observed_at DESC,
+                evidence.run_id DESC,
+                evidence.run_attempt DESC
+       LIMIT 1`,
+      [
+        repositoryId,
+        RELEASE_DAST_SUMMARY_KEYS,
+        imageDigest,
+        environment,
+        defaultBranch
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId,
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      artifactId: Number(row.artifact_id),
+      evidenceKey: String(row.evidence_key),
+      imageDigest,
+      environment,
+      status: row.status === "success" ? "success" : "failure",
+      observedAt: new Date(row.observed_at).toISOString()
+    };
+  }
+
+  async getReleaseCommitScanEvidence(
+    repositoryId: number,
+    headSha: string,
+    defaultBranch: string
+  ): Promise<ReleaseCommitScanEvidence | undefined> {
+    // The newest accepted security artifact is chosen first and only then joined to its
+    // summaries, so a newer artifact without summaries never falls back to an older one.
+    const result = await this.pool.query(
+      `WITH latest AS (
+         SELECT artifacts.repository_id,
+                artifacts.run_id,
+                artifacts.run_attempt,
+                artifacts.artifact_id
+         FROM scanner_workflow_runs AS runs
+         JOIN scanner_artifacts AS artifacts
+           ON artifacts.repository_id=runs.repository_id
+          AND artifacts.run_id=runs.run_id
+          AND artifacts.run_attempt=runs.run_attempt
+         WHERE runs.repository_id=$1
+           AND runs.head_sha=$2
+           AND runs.head_branch=$3
+           AND runs.event='push'
+           AND runs.validation_status='accepted'
+           AND artifacts.artifact_type='security'
+           AND artifacts.validation_status='accepted'
+         ORDER BY COALESCE(runs.completed_at, runs.started_at, runs.processed_at) DESC NULLS LAST,
+                  runs.run_id DESC,
+                  runs.run_attempt DESC,
+                  artifacts.artifact_id DESC
+         LIMIT 1
+       )
+       SELECT latest.run_id,
+              latest.run_attempt,
+              latest.artifact_id,
+              semgrep.status AS semgrep_status,
+              semgrep.observed_at AS semgrep_observed_at,
+              semgrep.payload->'releaseSeverities' AS semgrep_severities,
+              trivy.status AS trivy_status,
+              trivy.observed_at AS trivy_observed_at,
+              trivy.payload->'releaseSeverities' AS trivy_severities
+       FROM latest
+       LEFT JOIN scanner_evidence AS semgrep
+         ON semgrep.repository_id=latest.repository_id
+        AND semgrep.run_id=latest.run_id
+        AND semgrep.run_attempt=latest.run_attempt
+        AND semgrep.artifact_id=latest.artifact_id
+        AND semgrep.evidence_key='semgrep-summary'
+        AND semgrep.kind='semgrep'
+        AND semgrep.source='semgrep'
+       LEFT JOIN scanner_evidence AS trivy
+         ON trivy.repository_id=latest.repository_id
+        AND trivy.run_id=latest.run_id
+        AND trivy.run_attempt=latest.run_attempt
+        AND trivy.artifact_id=latest.artifact_id
+        AND trivy.evidence_key='trivy-summary'
+        AND trivy.kind='trivy'
+        AND trivy.source='trivy'`,
+      [repositoryId, headSha, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const summary = (prefix: "semgrep" | "trivy") =>
+      row[`${prefix}_status`]
+        ? {
+            status: row[`${prefix}_status`],
+            observedAt: new Date(row[`${prefix}_observed_at`]).toISOString(),
+            payload: { releaseSeverities: row[`${prefix}_severities`] ?? undefined }
+          }
+        : undefined;
+    return releaseCommitScanEvidence(
+      repositoryId,
+      headSha,
+      Number(row.run_id),
+      Number(row.run_attempt),
+      Number(row.artifact_id),
+      summary("semgrep"),
+      summary("trivy")
+    );
+  }
+
+  async getLatestImageRescanEvidence(
+    repositoryId: number,
+    imageDigest: string,
+    defaultBranch: string,
+    environment?: string
+  ): Promise<ImageRescanEvidence | undefined> {
+    const result = await this.pool.query(
+      `SELECT evidence.run_id,
+              evidence.run_attempt,
+              evidence.artifact_id,
+              evidence.environment,
+              evidence.observed_at,
+              evidence.payload->'criticalFindings' AS critical_findings,
+              runs.validation_status AS run_status,
+              artifacts.validation_status AS artifact_status,
+              freeze_row.kind AS freeze_kind,
+              freeze_row.source AS freeze_source,
+              freeze_row.status AS freeze_status,
+              freeze_row.digest AS freeze_digest,
+              freeze_row.environment AS freeze_environment,
+              freeze_row.payload->'active' AS freeze_active
+       FROM scanner_evidence AS evidence
+       JOIN scanner_workflow_runs AS runs
+         ON runs.repository_id=evidence.repository_id
+        AND runs.run_id=evidence.run_id
+        AND runs.run_attempt=evidence.run_attempt
+       JOIN scanner_artifacts AS artifacts
+         ON artifacts.repository_id=evidence.repository_id
+        AND artifacts.run_id=evidence.run_id
+        AND artifacts.run_attempt=evidence.run_attempt
+        AND artifacts.artifact_id=evidence.artifact_id
+       LEFT JOIN scanner_evidence AS freeze_row
+         ON freeze_row.repository_id=evidence.repository_id
+        AND freeze_row.run_id=evidence.run_id
+        AND freeze_row.run_attempt=evidence.run_attempt
+        AND freeze_row.artifact_id=evidence.artifact_id
+        AND freeze_row.evidence_key='promotion-freeze:' || evidence.environment
+       WHERE evidence.repository_id=$1
+         AND evidence.kind='image-rescan'
+         AND evidence.source='trivy'
+         AND evidence.status='success'
+         AND evidence.fingerprint IS NULL
+         AND evidence.digest=$2
+         AND evidence.environment IS NOT NULL
+         AND evidence.evidence_key='image-rescan:' || evidence.environment
+         AND ($4::text IS NULL OR evidence.environment=$4)
+         AND runs.head_branch=$3
+         AND runs.event='schedule'
+         AND runs.validation_status = ANY($5::text[])
+         AND artifacts.artifact_type='image-rescan'
+         AND artifacts.validation_status = ANY($5::text[])
+       ORDER BY evidence.observed_at DESC,
+                evidence.run_id DESC,
+                evidence.run_attempt DESC
+       LIMIT 1`,
+      [
+        repositoryId,
+        imageDigest,
+        defaultBranch,
+        environment ?? null,
+        VERIFIED_RESCAN_STATUSES
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return imageRescanEvidence(
+      {
+        repositoryId,
+        runId: Number(row.run_id),
+        runAttempt: Number(row.run_attempt),
+        artifactId: Number(row.artifact_id),
+        imageDigest,
+        environment: String(row.environment),
+        observedAt: new Date(row.observed_at).toISOString(),
+        criticalFindings: row.critical_findings
+      },
+      row.run_status === "accepted" && row.artifact_status === "accepted",
+      row.freeze_kind
+        ? {
+            kind: String(row.freeze_kind),
+            source: String(row.freeze_source),
+            status: row.freeze_status === "success" ? "success" : "failure",
+            digest: row.freeze_digest ?? undefined,
+            environment: row.freeze_environment ?? undefined,
+            payload: { active: row.freeze_active }
+          }
+        : undefined
+    );
   }
 
   async claimDeploymentPromotion(
@@ -4524,6 +6676,224 @@ export class PostgresStore implements Store {
     };
   }
 
+  async listFindingLifecycle(
+    repositoryId: number,
+    limit = MAX_FINDING_LIFECYCLE_RECORDS
+  ): Promise<FindingLifecycleRecord[]> {
+    assertFindingLifecycleLimit(limit);
+    const result = await this.pool.query(FINDING_LIFECYCLE_LIST_SQL, [repositoryId, limit]);
+    return result.rows.map((row) => this.toFindingLifecycle(row));
+  }
+
+  async listFindingLifecycleStreams(
+    repositoryId: number
+  ): Promise<FindingLifecycleStreamWatermark[]> {
+    const result = await this.pool.query(
+      `SELECT *
+       FROM finding_lifecycle_streams
+       WHERE repository_id=$1
+       ORDER BY stream COLLATE "C" ASC`,
+      [repositoryId]
+    );
+    return result.rows.map((row) => ({
+      repositoryId: Number(row.repository_id),
+      stream: String(row.stream),
+      runStartedAt: fromUnknownDate(row.run_started_at) ?? String(row.run_started_at),
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
+    }));
+  }
+
+  async saveFindingLifecycle(
+    repositoryId: number,
+    records: readonly FindingLifecycleRecord[],
+    streams: readonly FindingLifecycleStreamWatermark[] = [],
+    removedFingerprints: readonly string[] = [],
+    capacity?: FindingLifecycleCapacityUpdate
+  ): Promise<void> {
+    assertFindingLifecycleOwnership(repositoryId, records, streams);
+    if (capacity) {
+      assertFindingLifecycleCount(capacity.dropped, "dropped");
+      assertFindingLifecycleCount(capacity.droppedCriticalHigh, "droppedCriticalHigh");
+    }
+    if (!records.length && !streams.length && !removedFingerprints.length && !capacity) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      if (removedFingerprints.length) {
+        // A removed record's claims go with it, so an abandoned claim cannot outlive it.
+        await client.query(
+          `WITH claims AS (
+             DELETE FROM finding_ticket_claims
+             WHERE repository_id=$1 AND fingerprint = ANY($2::text[])
+           )
+           DELETE FROM finding_lifecycle
+           WHERE repository_id=$1 AND fingerprint = ANY($2::text[])`,
+          [repositoryId, [...removedFingerprints]]
+        );
+      }
+      for (let offset = 0; offset < records.length; offset += FINDING_LIFECYCLE_UPSERT_CHUNK) {
+        const chunk = records.slice(offset, offset + FINDING_LIFECYCLE_UPSERT_CHUNK);
+        await client.query(FINDING_LIFECYCLE_UPSERT_SQL, [
+          JSON.stringify(chunk.map(findingLifecycleRow))
+        ]);
+      }
+      if (streams.length) {
+        await client.query(FINDING_LIFECYCLE_STREAM_UPSERT_SQL, [
+          JSON.stringify(
+            streams.map((watermark) => ({
+              repository_id: watermark.repositoryId,
+              stream: watermark.stream,
+              run_started_at: watermark.runStartedAt,
+              run_id: watermark.runId,
+              run_attempt: watermark.runAttempt,
+              updated_at: watermark.updatedAt
+            }))
+          )
+        ]);
+      }
+      if (capacity) {
+        await client.query(FINDING_LIFECYCLE_CAPACITY_SQL, [
+          repositoryId,
+          capacity.dropped,
+          capacity.dropped,
+          capacity.droppedCriticalHigh,
+          capacity.dropped > 0 ? capacity.observedAt : null,
+          capacity.observedAt
+        ]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]> {
+    assertFindingTicketClaim(claim);
+    const unique = new Map<string, FindingTicketClaimTarget>();
+    for (const target of targets) {
+      assertFindingTicketTarget(target);
+      unique.set(findingTicketClaimKey(repositoryId, target), target);
+    }
+    if (!unique.size) return [];
+    const result = await this.pool.query(FINDING_TICKET_CLAIM_SQL, [
+      repositoryId,
+      claim.claimId,
+      claim.claimedAt,
+      claim.leaseExpiresAt,
+      JSON.stringify(
+        [...unique.values()].map((target) => ({ fingerprint: target.fingerprint, provider: target.provider }))
+      )
+    ]);
+    return result.rows.map((row) => ({
+      fingerprint: String(row.fingerprint),
+      provider: row.provider as FindingTicketProviderName
+    }));
+  }
+
+  async completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean> {
+    assertFindingTicketClaim({ claimId });
+    assertFindingTicketTarget(target);
+    const result = await this.pool.query<{ recorded: boolean }>(FINDING_TICKET_COMPLETE_SQL, [
+      repositoryId,
+      target.fingerprint,
+      target.provider,
+      claimId,
+      JSON.stringify(ticket),
+      ticket.updatedAt
+    ]);
+    return result.rows[0]?.recorded === true;
+  }
+
+  async releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void> {
+    assertFindingTicketClaim({ claimId });
+    await this.pool.query(
+      "DELETE FROM finding_ticket_claims WHERE repository_id=$1 AND claim_id=$2",
+      [repositoryId, claimId]
+    );
+  }
+
+  async getFindingLifecycleState(
+    repositoryId: number
+  ): Promise<FindingLifecycleState | undefined> {
+    const result = await this.pool.query(
+      "SELECT * FROM finding_lifecycle_state WHERE repository_id=$1",
+      [repositoryId]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId: Number(row.repository_id),
+      droppedTotal: Number(row.dropped_total ?? 0),
+      lastDropped: Number(row.last_dropped ?? 0),
+      lastDroppedCriticalHigh: Number(row.last_dropped_critical_high ?? 0),
+      lastDroppedAt: fromUnknownDate(row.last_dropped_at),
+      untrustedMarkers: Number(row.untrusted_markers ?? 0),
+      untrustedMarkersObservedAt: fromUnknownDate(row.untrusted_markers_observed_at),
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
+    };
+  }
+
+  async recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void> {
+    assertFindingLifecycleCount(untrustedMarkers, "untrustedMarkers");
+    await this.pool.query(FINDING_TICKET_MARKER_SCAN_SQL, [repositoryId, untrustedMarkers, observedAt]);
+  }
+
+  async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+      throw new Error("repositoryId must be a positive safe integer");
+    }
+    const lockKey = repositoryId % 2_147_483_647;
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        "SELECT pg_advisory_lock($1, $2)",
+        [FINDING_LIFECYCLE_LOCK_NAMESPACE, lockKey]
+      );
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          const result = await client.query<{ released: boolean }>(
+            "SELECT pg_advisory_unlock($1, $2) AS released",
+            [FINDING_LIFECYCLE_LOCK_NAMESPACE, lockKey]
+          );
+          if (!result.rows[0]?.released) {
+            throw new Error("PostgreSQL finding lifecycle advisory lock was not held");
+          }
+          client.release();
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+    };
+  }
+
   async acquireMonitoringLock(): Promise<StoreLock | undefined> {
     const client = await this.pool.connect();
     try {
@@ -4635,6 +7005,40 @@ export class PostgresStore implements Store {
       inventoryState: row.inventory_state,
       overallStatus: row.overall_status,
       checks: checks.map((check) => ({ ...check })) as PersistedMonitoringCheck[]
+    };
+  }
+
+  private toFindingLifecycle(row: Record<string, any>): FindingLifecycleRecord {
+    const streams: Record<string, string> = {};
+    if (row.streams && typeof row.streams === "object" && !Array.isArray(row.streams)) {
+      for (const [stream, seenAt] of Object.entries(row.streams as Record<string, unknown>)) {
+        const normalized = fromUnknownDate(seenAt);
+        if (normalized) streams[stream] = normalized;
+      }
+    }
+    return {
+      repositoryId: Number(row.repository_id),
+      fingerprint: String(row.fingerprint),
+      source: row.source,
+      ruleId: String(row.rule_id),
+      severity: row.severity,
+      path: row.path ?? undefined,
+      line: row.line === null || row.line === undefined ? undefined : Number(row.line),
+      status: row.status,
+      owner: String(row.owner),
+      streams,
+      firstSeenAt: fromUnknownDate(row.first_seen_at) ?? String(row.first_seen_at),
+      openedAt: fromUnknownDate(row.opened_at) ?? String(row.opened_at),
+      lastSeenAt: fromUnknownDate(row.last_seen_at) ?? String(row.last_seen_at),
+      fixedAt: fromUnknownDate(row.fixed_at),
+      slaDueAt: fromUnknownDate(row.sla_due_at),
+      lastRunId: Number(row.last_run_id),
+      lastRunAttempt: Number(row.last_run_attempt),
+      tickets:
+        row.tickets && typeof row.tickets === "object" && !Array.isArray(row.tickets)
+          ? structuredClone(row.tickets as FindingLifecycleRecord["tickets"])
+          : {},
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
     };
   }
 

@@ -102,6 +102,9 @@ function workflowForArtifactType(type: EvidenceArtifactType): {
   if (type === "dast") {
     return { path: ".github/workflows/reusable-dast.yml", sha: DAST_SHA };
   }
+  if (type === "image-rescan") {
+    return { path: ".github/workflows/reusable-image-rescan.yml", sha: IMAGE_SHA };
+  }
   return { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA };
 }
 
@@ -166,7 +169,9 @@ function buildProvenanceZip(
       ? "guardianbot-evidence"
       : artifactType === "dast"
         ? "guardianbot-dast-evidence"
-        : "guardianbot-image-evidence";
+        : artifactType === "image-rescan"
+          ? "guardianbot-image-rescan-evidence"
+          : "guardianbot-image-evidence";
   return createZip([
     ...reportEntries.map((entry) => ({
       name: `${prefix}/${entry.name}`,
@@ -1652,4 +1657,582 @@ test("persists DefectDojo reconciliation failure without mutating the completed 
     ),
     false
   );
+});
+
+test("accepts gate policy findings that carry severitySource without changing fingerprints", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const semgrepFinding = {
+    check_id: "auth.rule",
+    path: "src/auth.ts",
+    start: { line: 4 },
+    extra: {
+      severity: "WARNING",
+      message: "Authorization is bypassed",
+      metadata: { "guardianbot-severity": "high" }
+    }
+  };
+  // Severity and its source are not fingerprint inputs, so a policy mapping
+  // never invalidates existing baselines or suppressions.
+  const fingerprint = scannerFingerprint([
+    "semgrep",
+    semgrepFinding.check_id,
+    semgrepFinding.path,
+    semgrepFinding.start.line,
+    semgrepFinding.extra.message
+  ]);
+  const zip = buildSecurityZip({
+    semgrep: { results: [semgrepFinding] },
+    gate: actualGateFixture({
+      passed: false,
+      failures: ["Semgrep auth.rule at src/auth.ts:4"],
+      policyFindings: [
+        {
+          source: "semgrep",
+          ruleId: "auth.rule",
+          severity: "high",
+          severitySource: "policy",
+          fingerprint
+        }
+      ]
+    })
+  });
+  const artifact = artifactRecord(501, "guardianbot-evidence-500-2", zip);
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun(),
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[artifact]],
+    zipByArtifactId: { 501: zip }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  const gate = scannerEvidence(store).find((entry) => entry.evidenceKey === "gate");
+  assert.equal(gate?.status, "failure");
+  assert.equal(gate?.payload?.policyFindings, 1);
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+  assert.ok(scannerEvidence(store).some((entry) => entry.fingerprint === fingerprint));
+});
+
+const RESCAN_DIGEST_HEX = "2".repeat(64);
+const RESCAN_DIGEST = `sha256:${RESCAN_DIGEST_HEX}`;
+const RESCAN_REFERENCE = `ghcr.io/example/service@${RESCAN_DIGEST}`;
+const RESCAN_IDENTITY =
+  "https://github.com/geekyshubham/guardianbot/.github/workflows/reusable-image.yml@" +
+  IMAGE_SHA;
+const DEPLOYMENT_HEAD_SHA = "e".repeat(40);
+
+async function seedAcceptedDeployment(
+  store: MemoryStore,
+  digest = RESCAN_DIGEST
+): Promise<void> {
+  await store.upsertScannerWorkflowRun({
+    repositoryId: 99,
+    runId: 400,
+    runAttempt: 1,
+    headSha: DEPLOYMENT_HEAD_SHA,
+    headBranch: "main",
+    event: "push",
+    workflowPath: ".github/workflows/guardianbot.yml",
+    conclusion: "success",
+    status: "completed",
+    validationStatus: "accepted",
+    referencedWorkflows: []
+  });
+  await store.upsertScannerArtifact({
+    repositoryId: 99,
+    runId: 400,
+    runAttempt: 1,
+    artifactId: 401,
+    artifactName: "guardianbot-image-promotion-400-1",
+    artifactType: "image-promotion",
+    sizeBytes: 1,
+    expired: false,
+    validationStatus: "accepted"
+  });
+  await store.upsertScannerEvidence({
+    repositoryId: 99,
+    runId: 400,
+    runAttempt: 1,
+    artifactId: 401,
+    evidenceKey: "signature",
+    kind: "signature",
+    source: "cosign",
+    status: "success",
+    observedAt: "2026-07-26T10:00:00.000Z",
+    digest,
+    payload: {
+      imageReference: `ghcr.io/example/service@${digest}`,
+      certificateIdentity: RESCAN_IDENTITY
+    }
+  });
+  await store.upsertScannerEvidence({
+    repositoryId: 99,
+    runId: 400,
+    runAttempt: 1,
+    artifactId: 401,
+    evidenceKey: "deployment:staging",
+    kind: "deployment",
+    source: "digitalocean",
+    status: "success",
+    observedAt: "2026-07-26T10:00:00.000Z",
+    digest,
+    environment: "staging",
+    payload: { origin: "https://staging.example.com" }
+  });
+}
+
+function rescanSbom(components: Array<Record<string, unknown>>) {
+  return { bomFormat: "CycloneDX", specVersion: "1.6", version: 1, components };
+}
+
+function validRescanReports(
+  options: {
+    critical?: number;
+    previousComponents?: Array<Record<string, unknown>>;
+    currentComponents?: Array<Record<string, unknown>>;
+    rescanOverrides?: Record<string, unknown>;
+    trivyArtifactName?: string;
+    attestedDigestHex?: string;
+  } = {}
+): Record<string, unknown> {
+  const previous = rescanSbom(
+    options.previousComponents ?? [
+      { type: "library", name: "requests", version: "2.32.0", purl: "pkg:pypi/requests@2.32.0" }
+    ]
+  );
+  const current = rescanSbom(
+    options.currentComponents ?? [
+      { type: "library", name: "requests", version: "2.31.0", purl: "pkg:pypi/requests@2.31.0" },
+      { type: "library", name: "reqeusts", version: "1.0.0", purl: "pkg:pypi/reqeusts@1.0.0" }
+    ]
+  );
+  const critical = options.critical ?? 0;
+  const trivy = {
+    SchemaVersion: 2,
+    ArtifactName: options.trivyArtifactName ?? RESCAN_REFERENCE,
+    ArtifactType: "container_image",
+    Results: critical
+      ? [
+          {
+            Target: "debian",
+            Vulnerabilities: Array.from({ length: critical }, (_, index) => ({
+              VulnerabilityID: `CVE-2026-000${index}`,
+              PkgName: "openssl",
+              Severity: "CRITICAL"
+            }))
+          }
+        ]
+      : []
+  };
+  const statement = {
+    _type: "https://in-toto.io/Statement/v0.1",
+    predicateType: "https://cyclonedx.org/bom",
+    subject: [
+      {
+        name: "ghcr.io/example/service",
+        digest: { sha256: options.attestedDigestHex ?? RESCAN_DIGEST_HEX }
+      }
+    ],
+    predicate: previous
+  };
+  const sbomBytes = Buffer.from(JSON.stringify(current), "utf8");
+  return {
+    "cosign-verification.json": [
+      {
+        critical: { image: { "docker-manifest-digest": RESCAN_DIGEST } },
+        optional: {
+          Issuer: "https://token.actions.githubusercontent.com",
+          Subject: RESCAN_IDENTITY
+        }
+      }
+    ],
+    "rescan.json": {
+      schemaVersion: "1.0.0",
+      environment: "staging",
+      imageDigest: RESCAN_DIGEST,
+      imageReference: RESCAN_REFERENCE,
+      certificateIdentity: RESCAN_IDENTITY,
+      deploymentRunId: 400,
+      deploymentRunAttempt: 1,
+      deploymentHeadSha: DEPLOYMENT_HEAD_SHA,
+      criticalFindings: critical,
+      sbomSha256: createHash("sha256").update(sbomBytes).digest("hex"),
+      ...options.rescanOverrides
+    },
+    "sbom-attestation-verification.json": [
+      { payload: Buffer.from(JSON.stringify(statement), "utf8").toString("base64") }
+    ],
+    "sbom.cdx.json": sbomBytes,
+    "trivy-image.json": trivy
+  };
+}
+
+const DOJO_ENV = {
+  GUARDIANBOT_DEFECTDOJO_BASE_URL_REF: "GUARDIANBOT_DEFECTDOJO_BASE_URL",
+  GUARDIANBOT_DEFECTDOJO_API_TOKEN_REF: "GUARDIANBOT_DEFECTDOJO_API_TOKEN",
+  GUARDIANBOT_DEFECTDOJO_BASE_URL: "https://dojo.example",
+  GUARDIANBOT_DEFECTDOJO_API_TOKEN: "token"
+};
+
+async function runRescan(
+  store: MemoryStore,
+  reports: Record<string, unknown>,
+  runOverrides: Record<string, unknown> = { event: "schedule" },
+  options: { dojo?: boolean; dojoFailure?: boolean; lifecycle?: boolean } = {}
+): Promise<ReturnType<typeof createFetchStub>> {
+  const zip = buildProvenanceZip("image-rescan", reports);
+  const stub = createFetchStub({
+    workflowRun: trustedWorkflowRun(runOverrides, [
+      { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA },
+      { path: ".github/workflows/reusable-image.yml", sha: IMAGE_SHA },
+      { path: ".github/workflows/reusable-image-rescan.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      { name: "guardianbot/security-gate", status: "completed", conclusion: "skipped" },
+      { name: "guardianbot/image-security", status: "completed", conclusion: "skipped" },
+      {
+        name: "guardianbot/image-rescan / deployed digest rescan",
+        status: "completed",
+        conclusion: "success"
+      }
+    ],
+    artifactPages: [[artifactRecord(520, "guardianbot-image-rescan-500-2", zip)]],
+    zipByArtifactId: { 520: zip },
+    dojoFailure: options.dojoFailure,
+    dojoEngagement: { branch: "main", profile: "image-rescan" }
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = stub.fetchStub;
+  try {
+    await createScannerWorkflowRunHandler({
+      appId: "1",
+      privateKey: "private",
+      store,
+      fetchImpl: stub.fetchStub,
+      apiClientFactory: createApiClient(stub.fetchStub),
+      environment: options.dojo ? { ...TEST_ENV, ...DOJO_ENV } : TEST_ENV,
+      now: () => TEST_NOW,
+      ...(options.lifecycle
+        ? {
+            findingsLifecycle: {
+              options: {
+                enabled: true,
+                slaDays: { critical: 7, high: 30 },
+                githubIssues: false
+              },
+              providers: []
+            }
+          }
+        : {})
+    })(handlerInput());
+  } finally {
+    globalThis.fetch = originalFetch;
+    // The rescan never reaches DigitalOcean, and reaches DefectDojo only when configured.
+    assert.equal(
+      stub.calls.some((call) => /digitalocean/.test(call)),
+      false
+    );
+    if (!options.dojo) {
+      assert.equal(
+        stub.calls.some((call) => /dojo\.example/.test(call)),
+        false
+      );
+    }
+  }
+  return stub;
+}
+
+test("accepts a scheduled rescan of the accepted deployed digest and records the SBOM diff", async () => {
+  const store = new ForeignKeyCheckingMemoryStore();
+  await seedRepository(store);
+  await seedAcceptedDeployment(store);
+  await runRescan(store, validRescanReports());
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+  const rescan = scannerEvidence(store).find(
+    (record) => record.evidenceKey === "image-rescan:staging"
+  );
+  assert.equal(rescan?.kind, "image-rescan");
+  assert.equal(rescan?.status, "success");
+  assert.equal(rescan?.digest, RESCAN_DIGEST);
+  assert.equal(rescan?.environment, "staging");
+  assert.equal(rescan?.payload.criticalFindings, 0);
+  assert.equal(rescan?.payload.deploymentRunId, 400);
+  const diff = rescan?.payload.sbomDiff;
+  assert.equal(diff.addedCount, 1);
+  assert.equal(diff.changedCount, 1);
+  assert.equal(diff.removedCount, 0);
+  const kinds = diff.signals.map((signal: { kind: string }) => signal.kind).sort();
+  assert.deepEqual(kinds, ["typosquat", "version-downgrade"]);
+  assert.ok(diff.signals.every((signal: { advisory: boolean }) => signal.advisory === true));
+  const freeze = scannerEvidence(store).find(
+    (record) => record.evidenceKey === "promotion-freeze:staging"
+  );
+  assert.equal(freeze?.kind, "promotion-freeze");
+  assert.equal(freeze?.status, "success");
+  assert.equal(freeze?.payload.active, false);
+  // The rescan never writes deployment evidence.
+  assert.equal(
+    scannerEvidence(store).filter((record) => record.kind === "deployment").length,
+    1
+  );
+});
+
+test("new Critical findings on the deployed digest record an active promotion freeze", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  await seedAcceptedDeployment(store);
+  await runRescan(store, validRescanReports({ critical: 2 }));
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+  const freeze = scannerEvidence(store).find(
+    (record) => record.evidenceKey === "promotion-freeze:staging"
+  );
+  assert.equal(freeze?.status, "failure");
+  assert.equal(freeze?.payload.active, true);
+  assert.equal(freeze?.payload.criticalFindings, 2);
+  assert.equal(freeze?.digest, RESCAN_DIGEST);
+});
+
+test("rescan evidence is rejected unless it targets the accepted deployed digest", async () => {
+  const cases: Array<{
+    label: string;
+    seedDigest?: string;
+    seed?: boolean;
+    reports: Record<string, unknown>;
+    runOverrides?: Record<string, unknown>;
+    message: RegExp;
+  }> = [
+    {
+      label: "no deployment",
+      seed: false,
+      reports: validRescanReports(),
+      message: /does not target the accepted deployed digest/
+    },
+    {
+      label: "deployment moved to another digest",
+      seedDigest: `sha256:${"3".repeat(64)}`,
+      reports: validRescanReports(),
+      message: /does not target the accepted deployed digest/
+    },
+    {
+      label: "push event",
+      reports: validRescanReports(),
+      runOverrides: { event: "push" },
+      message: /default-branch schedule/
+    },
+    {
+      label: "critical count mismatch",
+      reports: validRescanReports({ critical: 1, rescanOverrides: { criticalFindings: 0 } }),
+      message: /critical count does not match/
+    },
+    {
+      label: "scan of another reference",
+      reports: validRescanReports({ trivyArtifactName: "ghcr.io/example/service:latest" }),
+      message: /did not scan the deployed digest/
+    },
+    {
+      label: "attestation bound to another digest",
+      reports: validRescanReports({ attestedDigestHex: "4".repeat(64) }),
+      message: /SBOM attestation verification is missing or bound to another digest/
+    },
+    {
+      label: "sbom hash mismatch",
+      reports: validRescanReports({ rescanOverrides: { sbomSha256: "0".repeat(64) } }),
+      message: /not bound to the fresh SBOM/
+    }
+  ];
+  for (const testCase of cases) {
+    const store = new MemoryStore();
+    await seedRepository(store);
+    if (testCase.seed !== false) {
+      await seedAcceptedDeployment(store, testCase.seedDigest);
+    }
+    await assert.rejects(
+      runRescan(store, testCase.reports, testCase.runOverrides ?? { event: "schedule" }),
+      undefined,
+      testCase.label
+    );
+    const artifact = scannerArtifacts(store).find((record) => record.artifactId === 520);
+    assert.equal(artifact?.validationStatus, "rejected", testCase.label);
+    assert.match(String(artifact?.validationError), testCase.message, testCase.label);
+    assert.equal(
+      scannerEvidence(store).some((record) =>
+        ["image-rescan", "promotion-freeze"].includes(record.kind)
+      ),
+      false,
+      testCase.label
+    );
+  }
+});
+
+test("a configured DefectDojo imports the rescan into its own per-environment test", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  await seedAcceptedDeployment(store);
+  const { bodies } = await runRescan(store, validRescanReports({ critical: 2 }), undefined, {
+    dojo: true
+  });
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+  const form = bodies.find((entry) => entry.url.endsWith("/api/v2/import-scan/"))
+    ?.body as FormData | undefined;
+  assert.equal(form?.get("scan_type"), "Trivy Scan");
+  assert.equal(form?.get("test_title"), "main/image-rescan/staging");
+  // The rescan imports against the deployed commit, never the scheduled run's head.
+  assert.equal(form?.get("commit_hash"), DEPLOYMENT_HEAD_SHA);
+  const tags = form?.getAll("tags").map(String) ?? [];
+  assert.ok(tags.includes("guardianbot:profile:image-rescan"), tags.join(","));
+  assert.ok(tags.includes("guardianbot:env:staging"), tags.join(","));
+  assert.ok(tags.includes(`guardianbot:image:${RESCAN_DIGEST}`), tags.join(","));
+  assert.ok(!tags.includes("guardianbot:profile:image"), tags.join(","));
+  const imported = scannerEvidence(store).find(
+    (entry) => entry.evidenceKey === "defectdojo-import:Trivy Scan:rescan:staging"
+  );
+  assert.equal(imported?.status, "success");
+  assert.equal(imported?.digest, RESCAN_DIGEST);
+});
+
+test("a DefectDojo outage retries the rescan but keeps the freeze recorded", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  await seedAcceptedDeployment(store);
+  // The retryable error reaches the webhook layer, which redelivers with backoff.
+  await assert.rejects(
+    runRescan(store, validRescanReports({ critical: 1 }), undefined, {
+      dojo: true,
+      dojoFailure: true
+    }),
+    (error: unknown) => (error as { retryable?: boolean }).retryable === true
+  );
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "failed");
+  const freeze = scannerEvidence(store).find(
+    (record) => record.evidenceKey === "promotion-freeze:staging"
+  );
+  assert.equal(freeze?.payload.active, true);
+  assert.equal(
+    scannerEvidence(store).find(
+      (entry) => entry.evidenceKey === "defectdojo-import:Trivy Scan:rescan:staging"
+    )?.status,
+    "failure"
+  );
+  // A failed reconciliation still counts as a verified freeze for promotion.
+  const rescan = await store.getLatestImageRescanEvidence(99, RESCAN_DIGEST, "main");
+  assert.equal(rescan?.frozen, true);
+  assert.equal(rescan?.artifactAccepted, false);
+});
+
+test("rescan Critical findings open lifecycle records on a per-environment stream", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  await seedAcceptedDeployment(store);
+  await runRescan(store, validRescanReports({ critical: 2 }), undefined, { lifecycle: true });
+  const records = await store.listFindingLifecycle(99);
+  assert.equal(records.length, 2);
+  assert.ok(records.every((record) => record.status === "open"));
+  assert.ok(records.every((record) => record.source === "trivy-image"));
+  assert.ok(
+    records.every(
+      (record) => JSON.stringify(Object.keys(record.streams)) === '["trivy-image-rescan:staging"]'
+    )
+  );
+  assert.deepEqual(
+    (await store.listFindingLifecycleStreams(99)).map((watermark) => watermark.stream),
+    ["trivy-image-rescan:staging"]
+  );
+});
+
+test("a skipped rescan caller job expects no rescan artifact", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const securityZip = buildSecurityZip();
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun({}, [
+      { path: ".github/workflows/reusable-security.yml", sha: SECURITY_SHA },
+      { path: ".github/workflows/reusable-image-rescan.yml", sha: IMAGE_SHA }
+    ]),
+    jobs: [
+      ...defaultSecurityJobs(),
+      { name: "guardianbot/image-rescan", status: "completed", conclusion: "skipped" }
+    ],
+    artifactPages: [[artifactRecord(511, "guardianbot-evidence-500-2", securityZip)]],
+    zipByArtifactId: { 511: securityZip }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+});
+
+test("an enabled findings lifecycle ingests accepted default-branch scanner evidence", async () => {
+  const semgrepFinding = {
+    check_id: "auth.rule",
+    path: "src/auth.ts",
+    start: { line: 4 },
+    extra: {
+      severity: "ERROR",
+      message: "Authorization is bypassed",
+      metadata: { impact: "Privileged access can bypass authorization" }
+    }
+  };
+  const fingerprint = scannerFingerprint([
+    "semgrep",
+    semgrepFinding.check_id,
+    semgrepFinding.path,
+    semgrepFinding.start.line,
+    semgrepFinding.extra.message
+  ]);
+  const zip = buildSecurityZip({
+    semgrep: { results: [semgrepFinding] },
+    gate: actualGateFixture({
+      passed: false,
+      failures: ["Semgrep auth.rule at src/auth.ts:4"],
+      policyFindings: [{ source: "semgrep", ruleId: "auth.rule", fingerprint }]
+    })
+  });
+  for (const [event, branch, expected] of [
+    ["push", "main", 1],
+    ["pull_request", "feature", 0]
+  ] as const) {
+    const store = new MemoryStore();
+    await seedRepository(store);
+    const { fetchStub } = createFetchStub({
+      workflowRun: trustedWorkflowRun({ event, head_branch: branch }),
+      jobs: defaultSecurityJobs(),
+      artifactPages: [[artifactRecord(501, "guardianbot-evidence-500-2", zip, {
+        workflow_run: {
+          id: 500,
+          repository_id: 99,
+          head_repository_id: 99,
+          head_branch: branch,
+          head_sha: HEAD_SHA
+        }
+      })]],
+      zipByArtifactId: { 501: zip }
+    });
+    await createScannerWorkflowRunHandler({
+      appId: "1",
+      privateKey: "private",
+      store,
+      fetchImpl: fetchStub,
+      apiClientFactory: createApiClient(fetchStub),
+      environment: TEST_ENV,
+      now: () => TEST_NOW,
+      findingsLifecycle: {
+        options: {
+          enabled: true,
+          slaDays: { critical: 7, high: 30 },
+          githubIssues: false
+        },
+        providers: []
+      }
+    })(handlerInput());
+    assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+    const records = await store.listFindingLifecycle(99);
+    assert.equal(records.length, expected, event);
+    if (expected) {
+      assert.equal(records[0]?.fingerprint, fingerprint);
+      assert.equal(records[0]?.status, "open");
+      assert.equal(records[0]?.owner, "unowned");
+      assert.deepEqual(Object.keys(records[0]?.streams ?? {}), ["semgrep"]);
+      assert.deepEqual(
+        (await store.listFindingLifecycleStreams(99)).map((watermark) => watermark.stream),
+        ["semgrep", "trivy-fs"]
+      );
+    }
+  }
 });

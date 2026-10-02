@@ -19,6 +19,23 @@ type CounterName =
   // no labels at all: a per-reviewer or per-repository breakdown would put an identifier into a
   // metric label, where it would be retained by every scraper indefinitely.
   | "finding_feedback_total"
+  // Review-value outcomes. Bare aggregates for the same reason: the per-repository and
+  // per-category breakdown lives only in the weekly report, never in a metric label.
+  | "finding_outcome_fixed_total"
+  | "finding_outcome_dismissed_total"
+  | "finding_outcome_ignored_total"
+  // Mode C remediation drafts: opened, refused by validation or scope, or unavailable because the
+  // deployment flag or the installation's contents:write grant is absent.
+  | "remediation_draft_created_total"
+  | "remediation_draft_rejected_total"
+  | "remediation_draft_unavailable_total"
+  // Veto-only second-model refusals (reject, error, timeout, malformed, classification), the
+  // settled checks of recorded drafts, and draft-branch cleanup outcomes on close.
+  | "remediation_draft_validator_rejected_total"
+  | "remediation_draft_checks_passed_total"
+  | "remediation_draft_checks_failed_total"
+  | "remediation_draft_branch_deleted_total"
+  | "remediation_draft_branch_retained_total"
   | "commands_authorized_total"
   | "commands_rejected_total"
   | "github_failures_total"
@@ -70,6 +87,17 @@ export class GuardianMetrics {
       "review_stale_total",
       "finding_reappeared_total",
       "finding_feedback_total",
+      "finding_outcome_fixed_total",
+      "finding_outcome_dismissed_total",
+      "finding_outcome_ignored_total",
+      "remediation_draft_created_total",
+      "remediation_draft_rejected_total",
+      "remediation_draft_unavailable_total",
+      "remediation_draft_validator_rejected_total",
+      "remediation_draft_checks_passed_total",
+      "remediation_draft_checks_failed_total",
+      "remediation_draft_branch_deleted_total",
+      "remediation_draft_branch_retained_total",
       "commands_authorized_total",
       "commands_rejected_total",
       "github_failures_total",

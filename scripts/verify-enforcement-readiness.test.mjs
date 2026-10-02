@@ -90,6 +90,7 @@ function gateRun({
     status: "completed",
     conclusion: "success",
     event: "push",
+    head_branch: "main",
     path: CALLER_WORKFLOW_PATH,
     name: "GuardianBot",
     run_started_at: startedAt,
@@ -1227,5 +1228,31 @@ test("observation missing referenced_workflows is rejected", async () => {
       )
     },
     /observation run referenced_workflows must be a non-empty array/
+  );
+});
+
+test("release-branch source run is rejected as enforcement evidence", async () => {
+  await assertFails(
+    {
+      fetchImpl: makeFetch(
+        defaultRoutes({
+          run: sourceRun({ head_branch: "release/1.x" })
+        })
+      )
+    },
+    /source run must be on the default branch/
+  );
+});
+
+test("source run without head branch metadata is rejected", async () => {
+  await assertFails(
+    {
+      fetchImpl: makeFetch(
+        defaultRoutes({
+          run: sourceRun({ head_branch: undefined })
+        })
+      )
+    },
+    /source run must be on the default branch/
   );
 });

@@ -4,6 +4,7 @@ rules:
     severity: ERROR
     message: Dynamic Python code execution can turn untrusted text into arbitrary code.
     metadata:
+      guardianbot-severity: high
       category: security
       cwe: CWE-95
       confidence: HIGH
@@ -16,6 +17,7 @@ rules:
     severity: ERROR
     message: shell=True can allow command injection when any command fragment is untrusted.
     metadata:
+      guardianbot-severity: high
       category: security
       cwe: CWE-78
       confidence: HIGH
@@ -32,6 +34,7 @@ rules:
     severity: ERROR
     message: Dynamic JavaScript execution can turn untrusted text into arbitrary code.
     metadata:
+      guardianbot-severity: high
       category: security
       cwe: CWE-95
       confidence: HIGH
@@ -44,6 +47,7 @@ rules:
     severity: ERROR
     message: Dynamic Ruby code execution can turn untrusted text into arbitrary code.
     metadata:
+      guardianbot-severity: high
       category: security
       cwe: CWE-95
       confidence: HIGH
@@ -57,6 +61,7 @@ rules:
     severity: WARNING
     message: A string shell command can allow command injection when it contains untrusted data.
     metadata:
+      guardianbot-severity: medium
       category: security
       cwe: CWE-78
       confidence: MEDIUM

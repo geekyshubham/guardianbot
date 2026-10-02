@@ -9,11 +9,15 @@ import type {
   BackendCapabilities,
   ChangedLineRange,
   ReviewFinding,
+  RemediationValidationRequest,
+  RemediationValidationResult,
   ReviewRequest,
   ReviewResult
 } from "./types.js";
 import {
   backendCapabilitiesSchema,
+  remediationValidationRequestSchema,
+  remediationValidationResultSchema,
   reviewRequestSchema,
   reviewResultSchema
 } from "./schemas.js";
@@ -28,6 +32,12 @@ const validateResultSchema = ajv.compile(reviewResultSchema) as ValidateFunction
 const validateCapabilitiesSchema = ajv.compile(
   backendCapabilitiesSchema
 ) as ValidateFunction<BackendCapabilities>;
+const validateRemediationRequestSchema = ajv.compile(
+  remediationValidationRequestSchema
+) as ValidateFunction<RemediationValidationRequest>;
+const validateRemediationResultSchema = ajv.compile(
+  remediationValidationResultSchema
+) as ValidateFunction<RemediationValidationResult>;
 
 export class ProtocolValidationError extends Error {
   constructor(
@@ -192,5 +202,33 @@ export function validateReviewResult(
 
 export function validateBackendCapabilities(value: unknown): BackendCapabilities {
   assertValid(validateCapabilitiesSchema, value, "BackendCapabilities");
+  return value;
+}
+
+export function validateRemediationValidationRequest(value: unknown): RemediationValidationRequest {
+  assertValid(validateRemediationRequestSchema, value, "RemediationValidationRequest");
+  if (value.finding.endLine < value.finding.startLine) {
+    throw new ProtocolValidationError("RemediationValidationRequest has an inverted line range");
+  }
+  return value;
+}
+
+/**
+ * Validates a second-model answer against the request it answers. A `reject` must name at least
+ * one reason and an `accept` must name none, so an answer cannot be read both ways.
+ */
+export function validateRemediationValidationResult(
+  value: unknown,
+  request: Pick<RemediationValidationRequest, "requestId">
+): RemediationValidationResult {
+  assertValid(validateRemediationResultSchema, value, "RemediationValidationResult");
+  if (value.requestId !== request.requestId) {
+    throw new ProtocolValidationError("RemediationValidationResult answers another request");
+  }
+  if ((value.decision === "reject") !== value.reasons.length > 0) {
+    throw new ProtocolValidationError(
+      "RemediationValidationResult reasons do not match its decision"
+    );
+  }
   return value;
 }

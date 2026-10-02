@@ -9,3 +9,4 @@ export * from "./webhooks.js";
 export * from "./github.js";
 export * from "./defectdojo.js";
 export * from "./review-bundle.js";
+export * from "./sbom-diff.js";

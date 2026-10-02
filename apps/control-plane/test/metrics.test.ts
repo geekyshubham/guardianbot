@@ -224,3 +224,31 @@ test("exposes finding reappearance as a counter that starts at zero", () => {
   rendered = metrics.render();
   assert.match(rendered, /^guardianbot_finding_reappeared_total 2$/m);
 });
+
+test("review-value and remediation draft counters are bare aggregates that start at zero", () => {
+  const metrics = new GuardianMetrics();
+  const names = [
+    "finding_outcome_fixed_total",
+    "finding_outcome_dismissed_total",
+    "finding_outcome_ignored_total",
+    "remediation_draft_created_total",
+    "remediation_draft_rejected_total",
+    "remediation_draft_unavailable_total",
+    "remediation_draft_validator_rejected_total",
+    "remediation_draft_checks_passed_total",
+    "remediation_draft_checks_failed_total",
+    "remediation_draft_branch_deleted_total",
+    "remediation_draft_branch_retained_total"
+  ] as const;
+  let rendered = metrics.render();
+  for (const name of names) {
+    assert.match(rendered, new RegExp(`^# TYPE guardianbot_${name} counter$`, "m"));
+    assert.match(rendered, new RegExp(`^guardianbot_${name} 0$`, "m"));
+    metrics.increment(name, 2);
+  }
+  rendered = metrics.render();
+  for (const name of names) {
+    assert.match(rendered, new RegExp(`^guardianbot_${name} 2$`, "m"));
+    assert.doesNotMatch(rendered, new RegExp(`^guardianbot_${name}\\{`, "m"));
+  }
+});

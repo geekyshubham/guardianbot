@@ -10,11 +10,13 @@ import {
   MAX_MONITORING_INTERVAL_MS,
   MIN_MONITORING_INTERVAL_MS,
   MonitoringService,
-  monitoringOptionsFromEnvironment
+  monitoringOptionsFromEnvironment,
+  reviewCompleteness
 } from "../src/monitoring-service.js";
 import {
   MemoryStore,
   buildRepositoryIndexVectorBatchStatement,
+  type FindingLifecycleRecord,
   type RepositoryRecord,
   type ScannerEvidenceRecord,
   type ScannerWorkflowRunRecord
@@ -1223,3 +1225,513 @@ function maxPlaceholder(query: string): number {
     ...[...query.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
   );
 }
+
+test("release-branch push runs neither shadow nor satisfy default-branch monitoring evidence", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store, { releaseBranches: ["release/1.x"] });
+  await store.upsertScannerWorkflowRun(scannerRun());
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  // A newer schedule-shaped run on a release branch at the same commit, with
+  // newer failing evidence, must not replace the default-branch evidence.
+  await store.upsertScannerWorkflowRun(
+    scannerRun({
+      runId: 900,
+      headBranch: "release/1.x",
+      startedAt: "2026-07-27T11:50:00.000Z",
+      completedAt: "2026-07-27T11:55:00.000Z",
+      processedAt: "2026-07-27T11:55:00.000Z"
+    })
+  );
+  for (const key of ["semgrep-summary", "trivy-summary"]) {
+    await store.upsertScannerEvidence(
+      evidence(key, key.split("-")[0] as string, "failure", {
+        runId: 900,
+        artifactId: 901,
+        observedAt: "2026-07-27T11:56:00.000Z"
+      })
+    );
+  }
+
+  const inventory = await store.listMonitoringRepositoryInventory();
+  assert.equal(inventory.length, 1);
+  assert.equal(
+    inventory[0]?.latestScannerRuns.some((run) => run.headBranch !== "main"),
+    false
+  );
+  assert.equal(
+    inventory[0]?.latestScannerEvidence.some((item) => item.runId === 900),
+    false
+  );
+
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.overallStatus, "passing");
+});
+
+test("a release-branch-only run cannot satisfy the default-branch scheduled-run expectation", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store, { releaseBranches: ["release/1.x"] });
+  await store.upsertScannerWorkflowRun(
+    scannerRun({ runId: 910, headBranch: "release/1.x", event: "push" })
+  );
+  for (const key of ["semgrep-summary", "trivy-summary"]) {
+    await store.upsertScannerEvidence(
+      evidence(key, key.split("-")[0] as string, "success", { runId: 910 })
+    );
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.notEqual(snapshot?.overallStatus, "passing");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-run")?.status,
+    "failing"
+  );
+});
+
+async function seedDeployedImageRepository(store: MemoryStore): Promise<string> {
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store);
+  const configIndex = await store.getRepositoryIndex(20, "github:20", "a".repeat(40));
+  assert.ok(configIndex);
+  const configSymbol = configIndex.symbols.find(
+    (symbol) => symbol.path === ".guardianbot/config.yml"
+  );
+  assert.ok(configSymbol);
+  const config = JSON.parse(configSymbol.content) as GuardianConfig;
+  config.image = {
+    name: "acme/service",
+    dockerfile: "Dockerfile",
+    context: ".",
+    platform: "linux/amd64",
+    registry: "ghcr.io/acme/service",
+    healthPath: "/healthz",
+    sbomFormat: "cyclonedx-json",
+    deployment: {
+      environment: "staging",
+      requireImmutableDigest: true,
+      requireSignature: true,
+      requireSbom: true
+    }
+  };
+  const updatedIndex = await indexRepositorySyntaxAware({
+    repository: "acme/service",
+    repositoryId: 20,
+    repositoryScope: "github:20",
+    visibility: "private",
+    commitSha: "a".repeat(40),
+    files: { ".guardianbot/config.yml": JSON.stringify(config) }
+  });
+  await store.replaceRepositoryIndex(
+    20,
+    updatedIndex,
+    toPersistedVectorRows(updatedIndex),
+    new Date("2026-07-27T11:50:00.000Z")
+  );
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 500 }));
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 501, event: "push" }));
+  const signedDigest = `sha256:${"d".repeat(64)}`;
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import"),
+    evidence("image-trivy-summary", "trivy", "success", {
+      artifactId: 701,
+      artifactType: "image-validation"
+    }),
+    evidence("sbom", "sbom", "success", { artifactId: 701, artifactType: "image-validation" }),
+    evidence("signature", "signature", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest
+    }),
+    evidence("deployment:staging", "deployment", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest: signedDigest,
+      environment: "staging",
+      observedAt: "2026-07-25T11:45:00.000Z"
+    })
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  return signedDigest;
+}
+
+function rescanEvidence(
+  digest: string,
+  freezeStatus: "success" | "failure",
+  observedAt = "2026-07-27T03:20:00.000Z"
+): ScannerEvidenceRecord[] {
+  const common = {
+    runId: 502,
+    artifactId: 705,
+    artifactType: "image-rescan",
+    digest,
+    environment: "staging",
+    observedAt
+  };
+  return [
+    evidence("image-rescan:staging", "image-rescan", "success", common),
+    evidence("promotion-freeze:staging", "promotion-freeze", freezeStatus, common)
+  ];
+}
+
+test("deployed digest rescan coverage alerts when missing or stale and reports freezes", async () => {
+  const store = new MemoryStore();
+  const digest = await seedDeployedImageRepository(store);
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  const check = async (key: string) =>
+    (await store.getLatestMonitoringSnapshot(20))?.checks.find((entry) => entry.key === key);
+
+  // The deployment is two days old and has never been rescanned.
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-rescan-coverage"))?.status, "failing");
+  assert.equal(await check("image-promotion-freeze"), undefined);
+  assert.ok(
+    (await store.listActiveMonitoringAlerts(20)).some(
+      (alert) => alert.alertKey === "image-rescan-coverage"
+    )
+  );
+
+  // A rescan of a different digest does not count as coverage.
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 502 }));
+  for (const record of rescanEvidence(`sha256:${"e".repeat(64)}`, "success")) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-rescan-coverage"))?.status, "failing");
+
+  for (const record of rescanEvidence(digest, "success")) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-rescan-coverage"))?.status, "passing");
+  assert.equal((await check("image-promotion-freeze"))?.status, "passing");
+  // The two-day-old fixture deployment keeps its existing staleness warning; rescan alerts clear.
+  assert.equal(
+    (await store.listActiveMonitoringAlerts(20)).some((alert) =>
+      ["image-rescan-coverage", "image-promotion-freeze"].includes(alert.alertKey)
+    ),
+    false
+  );
+
+  for (const record of rescanEvidence(digest, "failure")) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-promotion-freeze"))?.status, "failing");
+  assert.ok(
+    (await store.listActiveMonitoringAlerts(20)).some(
+      (alert) => alert.alertKey === "image-promotion-freeze"
+    )
+  );
+
+  // Rescan older than the evidence window warns, and beyond twice the window fails.
+  for (const record of rescanEvidence(digest, "success", "2026-07-25T20:00:00.000Z")) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-rescan-coverage"))?.status, "warning");
+  for (const record of rescanEvidence(digest, "success", "2026-07-24T00:00:00.000Z")) {
+    await store.upsertScannerEvidence(record);
+  }
+  await monitoring.reconcileOnce();
+  assert.equal((await check("image-rescan-coverage"))?.status, "failing");
+});
+
+test("a fresh deployment gets one evidence window before rescan coverage alerts", async () => {
+  const store = new MemoryStore();
+  const digest = await seedDeployedImageRepository(store);
+  await store.upsertScannerEvidence(
+    evidence("deployment:staging", "deployment", "success", {
+      runId: 501,
+      artifactId: 702,
+      artifactType: "image-promotion",
+      digest,
+      environment: "staging",
+      observedAt: "2026-07-27T11:45:00.000Z"
+    })
+  );
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-rescan-coverage")?.status,
+    "passing"
+  );
+});
+
+test("a newer failed promotion does not hide the running digest from rescan monitoring", async () => {
+  const store = new MemoryStore();
+  const digest = await seedDeployedImageRepository(store);
+  await store.upsertScannerWorkflowRun(scannerRun({ runId: 502 }));
+  for (const record of rescanEvidence(digest, "failure")) {
+    await store.upsertScannerEvidence(record);
+  }
+  // A later promotion of another digest failed, so the earlier digest is still running.
+  await store.upsertScannerWorkflowRun(
+    scannerRun({ runId: 503, event: "push", startedAt: "2026-07-27T11:00:00.000Z" })
+  );
+  await store.upsertScannerEvidence(
+    evidence("deployment:staging", "deployment", "failure", {
+      runId: 503,
+      artifactId: 706,
+      artifactType: "image-promotion",
+      digest: `sha256:${"f".repeat(64)}`,
+      environment: "staging",
+      observedAt: "2026-07-27T11:10:00.000Z"
+    })
+  );
+  const inventory = await store.listMonitoringRepositoryInventory();
+  assert.deepEqual(
+    inventory[0]?.latestScannerEvidence
+      .filter((item) => item.evidenceKey === "deployment:staging")
+      .map((item) => item.status)
+      .sort(),
+    ["failure", "success"]
+  );
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-rescan-coverage")?.status,
+    "passing"
+  );
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-promotion-freeze")?.status,
+    "failing"
+  );
+  // The digest-bound deployment requirement still sees the running digest's success row; the
+  // two-day-old fixture only warns on age instead of reporting the deployment missing.
+  assert.equal(
+    snapshot?.checks.find((entry) => entry.key === "image-deployment")?.status,
+    "warning"
+  );
+});
+
+test("image configs without deployment gain no rescan checks", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(
+    snapshot?.checks.some((entry) => entry.key.startsWith("image-rescan") ||
+      entry.key === "image-promotion-freeze"),
+    false
+  );
+});
+
+function lifecycleRecord(
+  overrides: Partial<FindingLifecycleRecord> = {}
+): FindingLifecycleRecord {
+  return {
+    repositoryId: 20,
+    fingerprint: "f".repeat(64),
+    source: "semgrep",
+    ruleId: "rule.one",
+    severity: "critical",
+    path: "src/app.ts",
+    line: 4,
+    status: "open",
+    owner: "@acme/app",
+    streams: { semgrep: "2026-07-01T00:00:00.000Z" },
+    firstSeenAt: "2026-07-01T00:00:00.000Z",
+    openedAt: "2026-07-01T00:00:00.000Z",
+    lastSeenAt: "2026-07-01T00:00:00.000Z",
+    slaDueAt: "2026-07-08T00:00:00.000Z",
+    lastRunId: 500,
+    lastRunAttempt: 1,
+    tickets: {},
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+test("an enabled findings lifecycle raises SLA breach and ticketing alerts and a weekly findings section", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  await store.saveFindingLifecycle(20, [
+    lifecycleRecord(),
+    lifecycleRecord({
+      fingerprint: "e".repeat(64),
+      severity: "high",
+      owner: "unowned",
+      openedAt: "2026-07-25T00:00:00.000Z",
+      firstSeenAt: "2026-07-25T00:00:00.000Z",
+      slaDueAt: "2026-08-24T00:00:00.000Z",
+      tickets: { slack: { error: "slack POST request returned 500", updatedAt: "2026-07-27T11:00:00.000Z" } }
+    }),
+    lifecycleRecord({ fingerprint: "d".repeat(64), status: "fixed", streams: {} })
+  ], [], [], { dropped: 2, droppedCriticalHigh: 1, observedAt: "2026-07-27T11:00:00.000Z" });
+  const syncCalls: number[] = [];
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) },
+    findingsLifecycle: {
+      enabled: true,
+      syncTickets: async (record) => {
+        syncCalls.push(record.repositoryId);
+      }
+    }
+  });
+  await monitoring.reconcileOnce();
+  assert.deepEqual(syncCalls, [20]);
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-sla")?.status, "failing");
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-ticketing")?.status, "warning");
+  const alerts = (await store.listActiveMonitoringAlerts(20)).map((alert) => alert.alertKey);
+  assert.ok(alerts.includes("findings-sla"));
+  assert.ok(alerts.includes("findings-ticketing"));
+  const capacity = snapshot?.checks.find((check) => check.key === "findings-capacity");
+  assert.equal(capacity?.status, "failing");
+  assert.match(String(capacity?.summary), /^1 open Critical or High finding\(s\) were dropped/);
+  assert.ok(alerts.includes("findings-capacity"));
+
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.deepEqual(weekly?.report.findings, {
+    source: "deterministic-scanners",
+    open: 2,
+    breached: 1,
+    fixed: 1,
+    suppressed: 0,
+    riskAccepted: 0,
+    ticketFailures: 1,
+    bySeverity: { critical: 1, high: 1, medium: 0, low: 0, info: 0 },
+    byOwner: { "@acme/app": 1, unowned: 1 },
+    otherOwners: 0,
+    ageBuckets: { "0-7d": 1, "8-30d": 1, "31-90d": 0, "over-90d": 0 }
+  });
+  assert.equal(weekly?.report.review.advisoryFindingsOpened, 0);
+});
+
+test("a disabled findings lifecycle leaves snapshots and weekly reports unchanged", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  await store.saveFindingLifecycle(20, [lifecycleRecord()]);
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.some((check) => check.key.startsWith("findings-")), false);
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(Object.hasOwn(weekly?.report ?? {}, "findings"), false);
+});
+
+test("a failing ticket retry is logged without failing the monitoring cycle", async () => {
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  const logged: string[] = [];
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) },
+    logger: { error: (line: unknown) => logged.push(String(line)) },
+    findingsLifecycle: {
+      enabled: true,
+      syncTickets: async () => {
+        throw new Error("token=secret-value");
+      }
+    }
+  });
+  const result = await monitoring.reconcileOnce();
+  assert.equal(result.repositoriesEvaluated, 1);
+  assert.equal(logged.some((line) => line.includes("findings_ticket_retry_failed")), true);
+  assert.equal(logged.some((line) => line.includes("secret-value")), false);
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.checks.find((check) => check.key === "findings-sla")?.status, "passing");
+});
+
+test("weekly review completeness is labelled honestly from retained findings", async () => {
+  assert.equal(reviewCompleteness(false, false), "unavailable");
+  assert.equal(reviewCompleteness(true, false), "retained-findings");
+  assert.equal(reviewCompleteness(true, true), "retained-findings-partial");
+  assert.equal(reviewCompleteness(false, true), "retained-findings-partial");
+
+  const store = new MemoryStore();
+  await seedConfiguredRepository(store);
+  const observed = new Date(INITIAL_NOW - 60_000).toISOString();
+  await store.saveReview({
+    repositoryId: 20,
+    pullNumber: 4,
+    headSha: "h".repeat(40),
+    reviewedHeadSha: "h".repeat(40),
+    findings: [
+      {
+        fingerprint: "1".repeat(64),
+        state: "resolved",
+        category: "security",
+        firstSeenAt: observed,
+        lastSeenAt: observed,
+        outcome: "fixed",
+        outcomeAt: observed
+      },
+      {
+        fingerprint: "2".repeat(64),
+        state: "open",
+        category: "security",
+        firstSeenAt: observed,
+        lastSeenAt: observed,
+        outcome: "dismissed",
+        outcomeAt: observed
+      }
+    ]
+  });
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
+  assert.equal(weekly?.sourceCompleteness.review, "retained-findings");
+  assert.equal(weekly?.report.review.advisoryFindingsAccepted, 1);
+  assert.equal(weekly?.report.review.advisoryFindingsDismissed, 1);
+  assert.equal(weekly?.report.reviewValue?.totals.precision, 0.5);
+  assert.equal(weekly?.report.reviewValue?.totals.sampleSize, 2);
+  assert.equal(weekly?.report.reviewValue?.byCategory.security?.fixed, 1);
+  // Unmeasured review fields stay at zero rather than being inferred.
+  assert.equal(weekly?.report.review.prsReviewed, 0);
+});

@@ -61,6 +61,7 @@ scanners:
   mode: report-only
   semgrep: true
   trivy: true
+  releaseBranches: [release/1.x]
   suppressions:
     - fingerprint: trivy:CVE-2099-0001:package-lock.json
       owner: "@security"
@@ -170,6 +171,11 @@ contract (invalid values fail validation), authorizes promotion only for
 `enforce` or `report-only`+`verified-default-branch`, and still refuses Critical,
 missing-scan, and scanner-error promotion.
 
+Setting `image.deployment` also adds a schedule-only nightly
+`guardianbot/image-rescan` job that rescans the exact deployed digest; see
+[Image security](image-security.md#deployed-digest-rescan). Callers without
+`image.deployment` are unchanged.
+
 ## DAST policy
 
 DAST configuration is staging-only. The primary origin and every additional
@@ -207,6 +213,26 @@ Start from the [validated safe OpenAPI example](examples/openapi.safe.yaml).
 AI findings remain advisory in every mode. A suppression must include a stable
 fingerprint, accountable owner, reviewed reason, ticket, and ISO date-time
 expiry. Expired suppressions fail `guardianctl doctor`.
+
+## Finding ownership and tickets
+
+The optional `findings` section names owners for deterministic scanner findings
+and opts the repository into control-plane GitHub issues. It never carries SLA
+days, ticketing credentials, or notifier endpoints; those are control-plane
+environment only (see [operations](operations.md#findings-lifecycle-and-sla)).
+Owner resolution is: last matching `findings.ownership.rules` entry, then the
+indexed CODEOWNERS file, then `findings.ownership.serviceOwner` for image and
+DAST findings, otherwise an explicit `unowned`.
+
+```yaml
+findings:
+  ownership:
+    serviceOwner: "@acme/platform"
+    rules:
+      - paths: ["services/billing/**"]
+        owner: "@acme/billing"
+  githubIssues: true
+```
 
 ## Field reference
 
@@ -257,6 +283,7 @@ Schema and the inline `GuardianConfig` TypeScript interface.
 | `scanners.mode` | yes | Advisory, report-only, or enforce mode. |
 | `scanners.semgrep` | yes | Whether Semgrep is applicable. |
 | `scanners.trivy` | yes | Whether Trivy is applicable. |
+| `scanners.releaseBranches` | no | Exact release branch names (up to 20 unique names of at most 255 characters using only letters, digits, `.`, `_`, `/`, and `-`; no globs, `refs/` prefix, or `.lock` suffix) whose pull requests and pushes also run the security gate. The default branch is always covered. Omit it to keep default-branch-only triggers. Image promotion, DAST, monitoring, and evidence baselines stay default-branch-only. |
 | `scanners.suppressions` | no | Reviewed, expiring finding suppressions. |
 | `scanners.suppressions.fingerprint` | yes | Stable finding fingerprint. |
 | `scanners.suppressions.owner` | yes | Person or team accountable for the suppression. |
@@ -306,3 +333,10 @@ Schema and the inline `GuardianConfig` TypeScript interface.
 | `dast.profiles.deploySmoke` | yes | Short post-deployment DAST profile. |
 | `dast.profiles.nightly` | yes | Deeper scheduled DAST profile. |
 | `dast.excludedRoutes` | no | Destructive or internal origin-relative routes excluded from DAST. |
+| `findings` | no | Optional finding-lifecycle ownership and ticketing opt-in; see [findings lifecycle](findings-lifecycle.md). |
+| `findings.ownership` | no | Ownership overrides applied before CODEOWNERS. |
+| `findings.ownership.serviceOwner` | no | `@user` or `@org/team` owning image and DAST findings, which have no repository path. |
+| `findings.ownership.rules` | no | Ordered path-glob owner overrides (at most 100); the last matching rule wins over CODEOWNERS. |
+| `findings.ownership.rules.paths` | yes | One to 50 repository-relative globs. |
+| `findings.ownership.rules.owner` | yes | `@user` or `@org/team` handle that owns matching findings. |
+| `findings.githubIssues` | no | When `true` and the control plane enables ticketing, open one GitHub issue per tracked root cause. Defaults to `false`. |

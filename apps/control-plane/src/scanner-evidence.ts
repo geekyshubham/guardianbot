@@ -6,10 +6,15 @@ import { tmpdir } from "node:os";
 import { basename, join, posix } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import {
+  diffCycloneDxSboms,
   normalizeSemgrep,
   normalizeTrivy,
+  SbomDiffError,
+  SEMGREP_NATIVE_SEVERITY,
   stableFingerprint,
-  type NormalizedFinding
+  type NormalizedFinding,
+  type NormalizedSeverity,
+  type SbomDiff
 } from "@guardianbot/core";
 import { createAppJwt } from "./app-auth.js";
 import {
@@ -26,6 +31,13 @@ import {
   DigitalOceanDeploymentError,
   type DigitalOceanDeploymentService
 } from "./digitalocean-deployment.js";
+import { createReleaseGateEvaluator } from "./release-gate.js";
+import {
+  recordAcceptedRunLifecycle,
+  type FindingsLifecycleRuntime,
+  type LifecycleFindingObservation,
+  type LifecycleObservation
+} from "./findings-lifecycle.js";
 import type { GuardianScannerWorkflowRun } from "./service.js";
 import type {
   ScannerArtifactRecord,
@@ -65,6 +77,18 @@ const IMAGE_FILES = new Set([
   ...IMAGE_PROMOTION_REPORT_FILES,
   ...PROVENANCE_FILES
 ]);
+const IMAGE_RESCAN_REPORT_FILES = [
+  "cosign-verification.json",
+  "rescan.json",
+  "sbom-attestation-verification.json",
+  "sbom.cdx.json",
+  "trivy-image.json"
+] as const;
+const IMAGE_RESCAN_FILES = new Set([
+  ...IMAGE_RESCAN_REPORT_FILES,
+  ...PROVENANCE_FILES
+]);
+const IMAGE_RESCAN_PAYLOAD_LIST_LIMIT = 50;
 const LEGACY_DAST_REPORT_FILES = ["scan-status.json", "zap.json"] as const;
 const DAST_REPORT_FILES = ["scan-status.json", "zap.json", "zap.xml"] as const;
 const DAST_FILES = new Set([...DAST_REPORT_FILES, ...PROVENANCE_FILES]);
@@ -82,6 +106,8 @@ interface ScannerEvidenceHandlerOptions {
     fetchImpl: typeof fetch,
     apiBase: string
   ) => Promise<GitHubApiClient>;
+  /** Optional deterministic finding lifecycle; absent or disabled leaves acceptance unchanged. */
+  findingsLifecycle?: FindingsLifecycleRuntime;
 }
 
 interface GitHubWorkflowRun {
@@ -934,6 +960,7 @@ function reportFilesForArtifact(
   if (artifactType === "security") return SECURITY_REPORT_FILES;
   if (artifactType === "dast") return DAST_REPORT_FILES;
   if (artifactType === "image-promotion") return IMAGE_PROMOTION_REPORT_FILES;
+  if (artifactType === "image-rescan") return IMAGE_RESCAN_REPORT_FILES;
   return IMAGE_VALIDATION_REPORT_FILES;
 }
 
@@ -1035,6 +1062,54 @@ function summarizeFindings(findings: readonly NormalizedFinding[]): Record<strin
   return summary;
 }
 
+const SEVERITY_RANK: Readonly<Record<NormalizedSeverity, number>> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4
+};
+
+/**
+ * Release-gate view of one complete scanner report. Every distinct fingerprint is counted (the
+ * evidence bound never truncates it) at the higher of its GuardianBot severity and its native
+ * scanner severity, so the counts are an upper bound on how DefectDojo rates the same report.
+ */
+function releaseSeverityCounts(
+  findings: readonly NormalizedFinding[],
+  nativeSeverities: readonly (NormalizedSeverity | undefined)[] = []
+): Record<NormalizedSeverity, number> {
+  const highest = new Map<string, NormalizedSeverity>();
+  findings.forEach((finding, index) => {
+    let severity = finding.severity;
+    const native = nativeSeverities[index];
+    if (native && SEVERITY_RANK[native] > SEVERITY_RANK[severity]) severity = native;
+    const previous = highest.get(finding.fingerprint);
+    if (!previous || SEVERITY_RANK[severity] > SEVERITY_RANK[previous]) {
+      highest.set(finding.fingerprint, severity);
+    }
+  });
+  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+  for (const severity of highest.values()) counts[severity] += 1;
+  return counts;
+}
+
+/**
+ * Native Semgrep severities in report order, matching normalizeSemgrep's one-to-one mapping.
+ * DefectDojo rates Semgrep INFO as Low, so INFO is raised to low here.
+ */
+function semgrepNativeSeverities(report: unknown): (NormalizedSeverity | undefined)[] {
+  const results = asRecord(report)?.results;
+  if (!Array.isArray(results)) return [];
+  return results.map((entry) => {
+    const native =
+      SEMGREP_NATIVE_SEVERITY[
+        String(asRecord(asRecord(entry)?.extra)?.severity ?? "WARNING").toUpperCase()
+      ];
+    return native === "info" ? "low" : native;
+  });
+}
+
 async function recordEvidence(
   store: Store,
   base: Omit<ScannerEvidenceRecord, "evidenceKey" | "kind" | "source" | "status" | "observedAt">,
@@ -1084,6 +1159,8 @@ async function maybeImportToDefectDojo(
     evidenceKey?: string;
     digest?: string;
     environment?: string;
+    /** Extra test-title segment so per-environment reimports never close each other's findings. */
+    testScope?: string;
   }
 ): Promise<void> {
   if (!settings) return;
@@ -1094,10 +1171,22 @@ async function maybeImportToDefectDojo(
     apiTokenRef: settings.apiTokenRef
   });
   const client = new DefectDojoClient(config);
-  const profile = input.artifactType === "dast" ? "dast" : input.artifactType.startsWith("image") ? "image" : "security";
+  // Deployed-digest rescans get their own engagement so a scheduled rescan never closes or
+  // replaces the build-time image findings the release gate reads from `${branch}/image`.
+  const profile =
+    input.artifactType === "dast"
+      ? "dast"
+      : input.artifactType === "image-rescan"
+        ? "image-rescan"
+        : input.artifactType.startsWith("image")
+          ? "image"
+          : "security";
   const branch = input.headBranch;
   const isDefaultBranch = branch === input.defaultBranch;
   const engagementDates = defectDojoEngagementDates(input.startedAt);
+  const testTitle = input.testScope
+    ? `${branch}/${profile}/${input.testScope}`
+    : `${branch}/${profile}`;
   const tags = buildDefectDojoTags({
     repositoryId: input.repositoryId,
     repositorySlug: input.repositoryFullName,
@@ -1134,7 +1223,7 @@ async function maybeImportToDefectDojo(
       },
       test: {
         scanType: input.scanType,
-        title: `${branch}/${profile}`,
+        title: testTitle,
         branchTag: branch,
         buildId: `${input.runId}/${input.runAttempt}`,
         commitHash: input.headSha,
@@ -1146,7 +1235,7 @@ async function maybeImportToDefectDojo(
     }
     const imported = (await client.importScan({
       scanType: input.scanType,
-      testTitle: `${branch}/${profile}`,
+      testTitle,
       fileName: input.fileName,
       contentType: input.contentType,
       report: input.report,
@@ -1230,7 +1319,7 @@ async function processSecurityArtifact(
   defaultBranch: string,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -1288,7 +1377,17 @@ async function processSecurityArtifact(
     status: semgrepFailed ? "failure" : "success",
     observedAt: new Date().toISOString(),
     details: `semgrep findings: ${semgrepFindings.length}`,
-    payload: summarizeFindings(semgrepFindings)
+    payload: {
+      ...summarizeFindings(semgrepFindings),
+      ...(semgrepFailed
+        ? {}
+        : {
+            releaseSeverities: releaseSeverityCounts(
+              normalizedSemgrepFindings,
+              semgrepNativeSeverities(semgrepJson)
+            )
+          })
+    }
   });
   for (const finding of semgrepFindings) {
     await recordEvidence(store, base, {
@@ -1315,7 +1414,12 @@ async function processSecurityArtifact(
     status: trivyFailed ? "failure" : "success",
     observedAt: new Date().toISOString(),
     details: `trivy findings: ${trivyFindings.length}`,
-    payload: summarizeFindings(trivyFindings)
+    payload: {
+      ...summarizeFindings(trivyFindings),
+      ...(trivyFailed
+        ? {}
+        : { releaseSeverities: releaseSeverityCounts(normalizedTrivyFindings) })
+    }
   });
   for (const finding of trivyFindings) {
     await recordEvidence(store, base, {
@@ -1391,6 +1495,36 @@ async function processSecurityArtifact(
       contentType: "application/json"
     });
   }
+  return [
+    lifecycleObservation("semgrep", !semgrepFailed, normalizedSemgrepFindings, semgrepFindings),
+    lifecycleObservation("trivy-fs", !trivyFailed, normalizedTrivyFindings, trivyFindings)
+  ];
+}
+
+/**
+ * Lifecycle view of one deterministic scan stream. A stream is complete only when
+ * the scanner succeeded and none of its unique findings were dropped by the bound.
+ */
+function lifecycleObservation(
+  stream: string,
+  succeeded: boolean,
+  normalized: readonly NormalizedFinding[],
+  kept: readonly NormalizedFinding[],
+  source?: LifecycleFindingObservation["source"]
+): LifecycleObservation {
+  const unique = new Set(normalized.map((finding) => finding.fingerprint)).size;
+  return {
+    stream,
+    complete: succeeded && unique <= kept.length && unique < MAX_FINDINGS,
+    findings: kept.map((finding) => ({
+      source: source ?? finding.source,
+      fingerprint: finding.fingerprint,
+      ruleId: finding.ruleId,
+      severity: finding.severity,
+      path: finding.path,
+      line: finding.line
+    }))
+  };
 }
 
 function parseBuildDigestReport(report: unknown): Record<string, unknown> {
@@ -1564,7 +1698,7 @@ async function processImageArtifact(
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined,
   deploymentService: DigitalOceanDeploymentService
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -1586,7 +1720,8 @@ async function processImageArtifact(
     throw new Error("Trivy image scanner reported scanner_error");
   }
   validateTrivyScannerReport(trivyJson, "trivy-image.json");
-  const trivyFindings = dedupeFindings(normalizeTrivy(trivyJson));
+  const normalizedImageFindings = normalizeTrivy(trivyJson);
+  const trivyFindings = dedupeFindings(normalizedImageFindings);
   const actualCriticalCount = countCriticalImageFindings(trivyJson);
   const policyCriticalCount = asRecord(policyJson)?.criticalFindings;
   if (
@@ -1664,7 +1799,16 @@ async function processImageArtifact(
         runId: artifact.runId,
         runAttempt: artifact.runAttempt,
         headSha: run.headSha,
-        imageReference: promotion.imageReference
+        imageReference: promotion.imageReference,
+        defaultBranch,
+        // Consulted only by profiles that opt in with requireReleaseGate.
+        releaseEvidence: {
+          defaultBranch,
+          certificateIdentity: promotion.certificateIdentity,
+          criticalFindings: criticalCount,
+          sbomPresent: true,
+          ref: `evidence://${artifact.runId}/${artifact.runAttempt}/${artifact.artifactId}`
+        }
       });
       if (deployment) {
         await recordEvidence(store, base, {
@@ -1729,6 +1873,283 @@ async function processImageArtifact(
       contentType: "application/json"
     });
   }
+  return [
+    lifecycleObservation(
+      "trivy-image",
+      true,
+      normalizedImageFindings,
+      trivyFindings,
+      "trivy-image"
+    )
+  ];
+}
+
+function selectAttestedPreviousSbom(
+  report: unknown,
+  imageDigest: string
+): { document: Record<string, unknown>; attestations: number; distinct: number } {
+  const envelopes = Array.isArray(report) ? report : [report];
+  const digestHex = imageDigest.slice("sha256:".length);
+  const candidates = new Map<string, Record<string, unknown>>();
+  let attestations = 0;
+  for (const envelopeValue of envelopes) {
+    const envelope = asRecord(envelopeValue);
+    if (!envelope || typeof envelope.payload !== "string" || !envelope.payload) continue;
+    let statement: Record<string, unknown> | undefined;
+    try {
+      statement = asRecord(
+        JSON.parse(Buffer.from(envelope.payload, "base64").toString("utf8"))
+      );
+    } catch {
+      statement = undefined;
+    }
+    const subjects = Array.isArray(statement?.subject) ? statement.subject : [];
+    const bound = subjects.some(
+      (subject) => asRecord(asRecord(subject)?.digest)?.sha256 === digestHex
+    );
+    const predicate = asRecord(statement?.predicate);
+    if (
+      !bound ||
+      typeof statement?.predicateType !== "string" ||
+      !statement.predicateType.toLowerCase().includes("cyclonedx") ||
+      predicate?.bomFormat !== "CycloneDX"
+    ) {
+      continue;
+    }
+    attestations += 1;
+    candidates.set(
+      createHash("sha256").update(JSON.stringify(predicate)).digest("hex"),
+      predicate
+    );
+  }
+  if (!candidates.size) {
+    throw new Error("SBOM attestation verification is missing or bound to another digest");
+  }
+  // cosign output order is not defined; pick deterministically when a digest was attested twice.
+  const [selected] = [...candidates.entries()].sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0
+  );
+  return { document: selected![1], attestations, distinct: candidates.size };
+}
+
+function boundedSbomDiffPayload(diff: SbomDiff): Record<string, unknown> {
+  const limit = IMAGE_RESCAN_PAYLOAD_LIST_LIMIT;
+  return {
+    schemaVersion: diff.schemaVersion,
+    previousComponentCount: diff.previousComponentCount,
+    currentComponentCount: diff.currentComponentCount,
+    addedCount: diff.addedCount,
+    removedCount: diff.removedCount,
+    changedCount: diff.changedCount,
+    added: diff.added.slice(0, limit),
+    removed: diff.removed.slice(0, limit),
+    changed: diff.changed.slice(0, limit),
+    signals: diff.signals.slice(0, limit),
+    signalCount: diff.signals.length,
+    truncated:
+      diff.truncated ||
+      diff.added.length > limit ||
+      diff.removed.length > limit ||
+      diff.changed.length > limit ||
+      diff.signals.length > limit
+  };
+}
+
+/**
+ * Nightly rescan of the exact digest already deployed to an environment. The rescan is accepted
+ * only when it targets the digest the control plane itself recorded as deployed, with the same
+ * signing identity, and only from the default-branch schedule. It records coverage and a
+ * promotion-freeze signal; it never calls the deployment service or changes the running app.
+ */
+async function processImageRescanArtifact(
+  store: Store,
+  archive: ParsedArtifactArchive,
+  artifact: ScannerArtifactRecord,
+  repositoryFullName: string,
+  repositoryVisibility: "public" | "private" | "internal",
+  defaultBranch: string,
+  run: Pick<ScannerWorkflowRunRecord, "headBranch" | "workflowRef" | "event" | "startedAt">,
+  trustPolicy: EvidenceTrustPolicy,
+  env: Record<string, string | undefined>,
+  defectDojoSettings: DefectDojoSettings | undefined
+): Promise<LifecycleObservation[]> {
+  if (
+    run.event !== "schedule" ||
+    run.headBranch !== defaultBranch ||
+    (run.workflowRef !== undefined && run.workflowRef !== `refs/heads/${defaultBranch}`)
+  ) {
+    throw new Error("image rescan evidence is not bound to the default-branch schedule");
+  }
+  const rescanBytes = archive.selectedFiles.get("rescan.json");
+  const cosignBytes = archive.selectedFiles.get("cosign-verification.json");
+  const attestationBytes = archive.selectedFiles.get("sbom-attestation-verification.json");
+  const sbomBytes = archive.selectedFiles.get("sbom.cdx.json");
+  const trivyBytes = archive.selectedFiles.get("trivy-image.json");
+  if (!rescanBytes || !cosignBytes || !attestationBytes || !sbomBytes || !trivyBytes) {
+    throw new Error("image rescan evidence is incomplete");
+  }
+  const rescan = asRecord(parseJsonFile(rescanBytes, "rescan.json"));
+  const environment = String(rescan?.environment ?? "");
+  const imageDigest = String(rescan?.imageDigest ?? "");
+  const imageReference = String(rescan?.imageReference ?? "");
+  const certificateIdentity = String(rescan?.certificateIdentity ?? "");
+  if (
+    !rescan ||
+    rescan.schemaVersion !== "1.0.0" ||
+    !/^[a-z][a-z0-9-]{0,62}$/.test(environment) ||
+    !/^sha256:[a-f0-9]{64}$/.test(imageDigest) ||
+    !imageReference.endsWith(`@${imageDigest}`) ||
+    rescan.sbomSha256 !== createHash("sha256").update(sbomBytes).digest("hex")
+  ) {
+    throw new Error("rescan.json is invalid or not bound to the fresh SBOM");
+  }
+  const deployed = await store.getLatestDeployedImageEvidence(
+    artifact.repositoryId,
+    environment,
+    defaultBranch
+  );
+  const trustedIdentityPrefix =
+    `https://github.com/${trustPolicy.repository}/.github/workflows/reusable-image.yml@`;
+  if (
+    !deployed ||
+    deployed.imageDigest !== imageDigest ||
+    deployed.imageReference !== imageReference ||
+    deployed.certificateIdentity !== certificateIdentity ||
+    !certificateIdentity.toLowerCase().startsWith(trustedIdentityPrefix) ||
+    rescan.deploymentRunId !== deployed.runId ||
+    rescan.deploymentRunAttempt !== deployed.runAttempt ||
+    rescan.deploymentHeadSha !== deployed.headSha
+  ) {
+    // The deployment moved, or the artifact names a digest the control plane never deployed.
+    throw new Error("image rescan does not target the accepted deployed digest");
+  }
+  const signatures = verifyCosignSignatureEvidence(
+    parseJsonFile(cosignBytes, "cosign-verification.json"),
+    imageDigest,
+    certificateIdentity
+  );
+  const attestationReport = parseJsonFile(
+    attestationBytes,
+    "sbom-attestation-verification.json"
+  );
+  verifySbomAttestationEvidence(attestationReport, imageDigest);
+  const previous = selectAttestedPreviousSbom(attestationReport, imageDigest);
+  const trivyJson = parseJsonFile(trivyBytes, "trivy-image.json");
+  if (asRecord(trivyJson)?.scanner_error) {
+    throw new Error("Trivy image rescan reported scanner_error");
+  }
+  validateTrivyScannerReport(trivyJson, "trivy-image.json");
+  if (
+    String(asRecord(trivyJson)?.ArtifactName ?? "").toLowerCase() !==
+    imageReference.toLowerCase()
+  ) {
+    throw new Error("Trivy image rescan did not scan the deployed digest");
+  }
+  const criticalCount = countCriticalImageFindings(trivyJson);
+  if (rescan.criticalFindings !== criticalCount) {
+    throw new Error("image rescan critical count does not match the Trivy report");
+  }
+  const sbomJson = parseJsonFile(sbomBytes, "sbom.cdx.json");
+  const sbomSummary = parseCycloneDxSummary(sbomJson);
+  let diff: SbomDiff;
+  try {
+    diff = diffCycloneDxSboms(previous.document, sbomJson);
+  } catch (error) {
+    if (error instanceof SbomDiffError) {
+      throw new Error(`image rescan SBOM diff failed: ${error.message}`);
+    }
+    throw error;
+  }
+  const base = {
+    repositoryId: artifact.repositoryId,
+    runId: artifact.runId,
+    runAttempt: artifact.runAttempt,
+    artifactId: artifact.artifactId
+  };
+  const observedAt = new Date().toISOString();
+  await recordEvidence(store, base, {
+    evidenceKey: `image-rescan:${environment}`,
+    kind: "image-rescan",
+    source: "trivy",
+    status: "success",
+    observedAt,
+    digest: imageDigest,
+    environment,
+    details:
+      `deployed digest rescanned: ${criticalCount} Critical, SBOM +${diff.addedCount} ` +
+      `-${diff.removedCount} ~${diff.changedCount}, ${diff.signals.length} advisory signals`,
+    payload: {
+      imageReference,
+      certificateIdentity,
+      deploymentRunId: deployed.runId,
+      deploymentRunAttempt: deployed.runAttempt,
+      deploymentHeadSha: deployed.headSha,
+      deployedAt: deployed.observedAt,
+      criticalFindings: criticalCount,
+      signatures,
+      previousSbomAttestations: previous.attestations,
+      previousSbomDistinct: previous.distinct,
+      sbom: sbomSummary,
+      sbomDiff: boundedSbomDiffPayload(diff)
+    }
+  });
+  // Promotion required zero Critical findings, so every Critical finding on the deployed digest
+  // is new since promotion. The freeze never changes the running app; the deployment service
+  // refuses to re-promote a frozen digest and the release gate reads it as a blocker.
+  await recordEvidence(store, base, {
+    evidenceKey: `promotion-freeze:${environment}`,
+    kind: "promotion-freeze",
+    source: "guardianbot",
+    status: criticalCount > 0 ? "failure" : "success",
+    observedAt,
+    digest: imageDigest,
+    environment,
+    details:
+      criticalCount > 0
+        ? `promotion freeze: ${criticalCount} new Critical findings on the deployed digest`
+        : "no new Critical findings on the deployed digest",
+    payload: {
+      active: criticalCount > 0,
+      criticalFindings: criticalCount,
+      deploymentRunId: deployed.runId
+    }
+  });
+  // Imported after the freeze is recorded, so a DefectDojo outage retries the artifact without
+  // ever hiding the freeze. The engagement is separate from the build-time `image` profile the
+  // release gate reads, and the test is per environment so reimports never close each other.
+  await maybeImportToDefectDojo(store, env, defectDojoSettings, {
+    repositoryId: artifact.repositoryId,
+    repositoryFullName,
+    visibility: repositoryVisibility,
+    defaultBranch,
+    headBranch: defaultBranch,
+    artifactId: artifact.artifactId,
+    runId: artifact.runId,
+    runAttempt: artifact.runAttempt,
+    headSha: deployed.headSha,
+    startedAt: run.startedAt,
+    artifactType: artifact.artifactType,
+    scanType: "Trivy Scan",
+    fileName: "trivy-image.json",
+    report: trivyBytes,
+    contentType: "application/json",
+    evidenceKey: `defectdojo-import:Trivy Scan:rescan:${environment}`,
+    digest: imageDigest,
+    environment,
+    testScope: environment
+  });
+  // Its own stream per environment: a Critical-only rescan can open or refresh findings and
+  // fix ones it no longer reports, without touching the build-time trivy-image stream.
+  const normalized = normalizeTrivy(trivyJson);
+  return [
+    lifecycleObservation(
+      `trivy-image-rescan:${environment}`,
+      true,
+      normalized,
+      dedupeFindings(normalized),
+      "trivy-image"
+    )
+  ];
 }
 
 async function processDastArtifact(
@@ -1741,7 +2162,7 @@ async function processDastArtifact(
   run: Pick<ScannerWorkflowRunRecord, "headSha" | "headBranch" | "startedAt">,
   env: Record<string, string | undefined>,
   defectDojoSettings: DefectDojoSettings | undefined
-): Promise<void> {
+): Promise<LifecycleObservation[]> {
   const base = {
     repositoryId: artifact.repositoryId,
     runId: artifact.runId,
@@ -1760,6 +2181,22 @@ async function processDastArtifact(
   const findings = normalizeZapFindings(zapJson);
   const isNightly = exit.profile === "authenticated-full";
   const evidencePrefix = isNightly ? "zap-nightly" : "zap-smoke";
+  // The stream is bound to the validated deployment environment; the scan status
+  // already ties it to the deployed digest. Hitting the bound means truncation.
+  const observations: LifecycleObservation[] = [
+    {
+      stream: `zap:${isNightly ? "nightly" : "smoke"}:${exit.deploymentEnvironment}`,
+      complete: exit.zapExitCode < 3 && findings.length < MAX_FINDINGS,
+      findings: findings.map((finding) => ({
+        source: "zap",
+        fingerprint: finding.fingerprint,
+        ruleId: finding.ruleId,
+        severity: finding.severity,
+        path: finding.path,
+        line: finding.line
+      }))
+    }
+  ];
   await recordEvidence(store, base, {
     evidenceKey: `${evidencePrefix}-summary`,
     kind: evidencePrefix,
@@ -1812,9 +2249,9 @@ async function processDastArtifact(
         details:
           "DefectDojo ZAP import requires the XML report emitted by GuardianBot v0.2.28 or newer"
       });
-      return;
+      return observations;
     }
-    if (!zapXmlBytes) return;
+    if (!zapXmlBytes) return observations;
     await maybeImportToDefectDojo(store, env, defectDojoSettings, {
       repositoryId: artifact.repositoryId,
       repositoryFullName,
@@ -1837,11 +2274,13 @@ async function processDastArtifact(
       environment: exit.deploymentEnvironment
     });
   }
+  return observations;
 }
 
 function artifactType(name: string): EvidenceArtifactType | undefined {
   if (name.startsWith("guardianbot-evidence-")) return "security";
   if (name.startsWith("guardianbot-image-promotion-")) return "image-promotion";
+  if (name.startsWith("guardianbot-image-rescan-")) return "image-rescan";
   if (name.startsWith("guardianbot-image-evidence-")) return "image-validation";
   if (name.startsWith("guardianbot-dast-evidence-")) return "dast";
   return undefined;
@@ -1859,7 +2298,9 @@ function expectedArtifactName(
         ? "guardianbot-dast-evidence-"
         : type === "image-promotion"
           ? "guardianbot-image-promotion-"
-          : "guardianbot-image-evidence-";
+          : type === "image-rescan"
+            ? "guardianbot-image-rescan-"
+            : "guardianbot-image-evidence-";
   return `${prefix}${runId}-${runAttempt}`;
 }
 
@@ -1916,6 +2357,18 @@ function expectedArtifactTypes(
     } else {
       if (validationJob.conclusion !== "skipped") types.push("image-validation");
       if (promotionJob.conclusion !== "skipped") types.push("image-promotion");
+    }
+  }
+  if (paths.has(".github/workflows/reusable-image-rescan.yml")) {
+    const rescanJob = workflowJob(jobs, "deployed digest rescan");
+    if (!rescanJob) {
+      if (!workflowCallWasSkipped(jobs, ["guardianbot/image-rescan"])) {
+        throw new RetryableScannerEvidenceError(
+          "trusted image rescan reusable workflow job metadata is unavailable"
+        );
+      }
+    } else if (rescanJob.conclusion !== "skipped") {
+      types.push("image-rescan");
     }
   }
   if (paths.has(".github/workflows/reusable-dast.yml")) {
@@ -2004,7 +2457,15 @@ export function createScannerWorkflowRunHandler(
     store: options.store,
     environment: env,
     fetchImpl: options.fetchImpl,
-    now: options.now
+    now: options.now,
+    // Configuration is read lazily, so profiles without requireReleaseGate
+    // never touch release-gate settings or DefectDojo.
+    releaseGate: createReleaseGateEvaluator({
+      store: options.store,
+      environment: env,
+      fetchImpl: options.fetchImpl,
+      now: options.now
+    })
   });
   const now = options.now ?? (() => new Date());
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -2156,6 +2617,7 @@ export function createScannerWorkflowRunHandler(
       throw new RetryableScannerEvidenceError(validationError);
     }
     let acceptedArtifacts = 0;
+    const lifecycleObservations: LifecycleObservation[] = [];
     const reconciliationErrors: string[] = [];
     for (const type of expectedTypes) {
       const expectedName = expectedArtifactName(type, run.runId, run.runAttempt);
@@ -2207,8 +2669,15 @@ export function createScannerWorkflowRunHandler(
           throw new Error("artifact size or digest mismatch");
         }
         const allowedFiles =
-          type === "security" ? SECURITY_FILES : type === "dast" ? DAST_FILES : IMAGE_FILES;
+          type === "security"
+            ? SECURITY_FILES
+            : type === "dast"
+              ? DAST_FILES
+              : type === "image-rescan"
+                ? IMAGE_RESCAN_FILES
+                : IMAGE_FILES;
         const archive = await parseArtifactArchive(zipPath, allowedFiles);
+        let artifactObservations: LifecycleObservation[];
         validateArtifactProvenance(
           archive,
           type,
@@ -2223,7 +2692,7 @@ export function createScannerWorkflowRunHandler(
           now()
         );
         if (type === "security") {
-          await processSecurityArtifact(
+          artifactObservations = await processSecurityArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2235,7 +2704,7 @@ export function createScannerWorkflowRunHandler(
             defectDojoSettings
           );
         } else if (type === "dast") {
-          await processDastArtifact(
+          artifactObservations = await processDastArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2246,8 +2715,21 @@ export function createScannerWorkflowRunHandler(
             env,
             defectDojoSettings
           );
+        } else if (type === "image-rescan") {
+          artifactObservations = await processImageRescanArtifact(
+            options.store,
+            archive,
+            artifactRecord,
+            repository.fullName,
+            repository.visibility as "public" | "private" | "internal",
+            repository.defaultBranch,
+            workflowRecord,
+            trustPolicy,
+            env,
+            defectDojoSettings
+          );
         } else {
-          await processImageArtifact(
+          artifactObservations = await processImageArtifact(
             options.store,
             archive,
             artifactRecord,
@@ -2266,6 +2748,7 @@ export function createScannerWorkflowRunHandler(
           processedAt: now().toISOString()
         });
         acceptedArtifacts += 1;
+        lifecycleObservations.push(...artifactObservations);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof RetryableScannerEvidenceError) {
@@ -2300,10 +2783,23 @@ export function createScannerWorkflowRunHandler(
       });
       throw new RetryableScannerEvidenceError(validationError);
     }
-    await options.store.upsertScannerWorkflowRun({
+    const acceptedRecord: ScannerWorkflowRunRecord = {
       ...workflowRecord,
       validationStatus: "accepted",
       processedAt: now().toISOString()
-    });
+    };
+    if (options.findingsLifecycle?.options.enabled) {
+      // The lifecycle merge happens before the run is marked processed, so a store
+      // failure leaves the run retryable instead of silently losing observations.
+      await recordAcceptedRunLifecycle({
+        runtime: options.findingsLifecycle,
+        store: options.store,
+        repository,
+        run: acceptedRecord,
+        observations: lifecycleObservations,
+        now: now()
+      });
+    }
+    await options.store.upsertScannerWorkflowRun(acceptedRecord);
   };
 }
