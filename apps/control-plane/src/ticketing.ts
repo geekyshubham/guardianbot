@@ -26,6 +26,8 @@ const DEFAULT_TICKET_TIMEOUT_MS = 30_000;
 const DEFAULT_TICKET_MAX_ATTEMPTS = 3;
 const DEFAULT_TICKET_BACKOFF_MS = 1_000;
 const MAX_ISSUE_SEARCH_PAGES = 10;
+const MAX_JIRA_SEARCH_PAGES = 5;
+const JIRA_SEARCH_PAGE_SIZE = 50;
 const MAX_INLINE_VALUE = 200;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
@@ -54,11 +56,18 @@ export interface FindingTicketSyncResult {
   ref?: string;
 }
 
+export interface FindingTicketMarkerScan {
+  /** Issues that carry a finding marker but were not opened by this GitHub App. */
+  untrusted: number;
+}
+
 export interface FindingTicketSession {
   sync(
     content: FindingTicketContent,
     previous: FindingTicketState | undefined
   ): Promise<FindingTicketSyncResult>;
+  /** The marker scan this session ran, if it ran one. */
+  markerScan?(): FindingTicketMarkerScan | undefined;
 }
 
 export interface FindingTicketProvider {
@@ -208,17 +217,30 @@ function gitHubTicketError(method: string, error: unknown): FindingTicketError {
   );
 }
 
+export interface FindingIssueAppIdentity {
+  id: number;
+  slug: string;
+}
+
 export interface FindingIssueClient {
   request<T>(method: string, path: string, body?: unknown): Promise<T>;
+  /**
+   * The GitHub App this client acts as. Marker recovery trusts only issues this App
+   * opened; without an identity no marker is trusted.
+   */
+  readonly appIdentity?: FindingIssueAppIdentity;
 }
 
 export type FindingIssueClientFactory = (
   repository: RepositoryRecord
 ) => Promise<FindingIssueClient>;
 
+const APP_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/;
+
 /**
  * Mints a repository-scoped installation token with only `issues: write`, so the
- * ticketing path can never read code or touch Actions.
+ * ticketing path can never read code or touch Actions. The App's own identity comes
+ * from `GET /app` with the App JWT (no permission needed) and must match `appId`.
  */
 export function createInstallationIssueClientFactory(input: {
   appId: string;
@@ -228,6 +250,20 @@ export function createInstallationIssueClientFactory(input: {
 }): FindingIssueClientFactory {
   const apiBase = input.apiBase ?? "https://api.github.com";
   const fetchImpl = input.fetchImpl ?? fetch;
+  let identity: Promise<FindingIssueAppIdentity> | undefined;
+  const loadIdentity = async (appClient: GitHubClient): Promise<FindingIssueAppIdentity> => {
+    let app: { id?: unknown; slug?: unknown } | undefined;
+    try {
+      app = await appClient.request<{ id?: unknown; slug?: unknown }>("GET", "/app");
+    } catch (error) {
+      throw gitHubTicketError("app", error);
+    }
+    const slug = typeof app?.slug === "string" ? app.slug : "";
+    if (app?.id !== Number(input.appId) || !APP_SLUG_PATTERN.test(slug)) {
+      throw new FindingTicketError("github-issues app identity does not match GITHUB_APP_ID", false);
+    }
+    return { id: app.id as number, slug };
+  };
   return async (repository) => {
     const appClient = new GitHubClient(
       createAppJwt(input.appId, input.privateKey),
@@ -235,6 +271,11 @@ export function createInstallationIssueClientFactory(input: {
       DEFAULT_TICKET_TIMEOUT_MS,
       fetchImpl
     );
+    identity ??= loadIdentity(appClient).catch((error: unknown) => {
+      identity = undefined;
+      throw error;
+    });
+    const appIdentity = await identity;
     let token: string | undefined;
     try {
       const response = await appClient.request<{ token?: string }>(
@@ -250,7 +291,11 @@ export function createInstallationIssueClientFactory(input: {
       throw gitHubTicketError("token", error);
     }
     if (!token) throw new FindingTicketError("github-issues token response omitted token", false);
-    return new GitHubClient(token, apiBase, DEFAULT_TICKET_TIMEOUT_MS, fetchImpl);
+    const client = new GitHubClient(token, apiBase, DEFAULT_TICKET_TIMEOUT_MS, fetchImpl);
+    return {
+      appIdentity,
+      request: <T>(method: string, path: string, body?: unknown) => client.request<T>(method, path, body)
+    };
   };
 }
 
@@ -259,13 +304,21 @@ interface GitHubIssueSummary {
   body?: string | null;
   pull_request?: unknown;
   user?: { login?: string; type?: string } | null;
+  performed_via_github_app?: { id?: number; slug?: string } | null;
+}
+
+function openedByApp(issue: GitHubIssueSummary, identity: FindingIssueAppIdentity | undefined): boolean {
+  if (!identity) return false;
+  if (issue.performed_via_github_app?.id === identity.id) return true;
+  return issue.user?.type === "Bot" && issue.user.login === `${identity.slug}[bot]`;
 }
 
 /**
  * One GitHub issue per root cause. Idempotency comes from the stored issue number,
- * then from the hidden marker on a bot-authored issue, so a lost database write or a
- * retry never opens a duplicate. Human-authored issues carrying the marker are ignored
- * so a repository user cannot make the control plane overwrite their issue.
+ * then from the hidden marker on an issue this GitHub App opened, so a lost database
+ * write or a retry never opens a duplicate. A marker on any other issue (a human's, or
+ * another App's or bot's) is ignored and counted, so nobody else can make the control
+ * plane overwrite their issue.
  */
 export function createGitHubIssuesProvider(input: {
   clientFactory: FindingIssueClientFactory;
@@ -285,6 +338,7 @@ export function createGitHubIssuesProvider(input: {
       const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`;
       let client: Promise<FindingIssueClient> | undefined;
       let markers: Promise<Map<string, number>> | undefined;
+      let scan: FindingTicketMarkerScan | undefined;
       const call = async <T>(method: string, path: string, body?: unknown): Promise<T> =>
         withRetry(retry, async () => {
           try {
@@ -297,25 +351,41 @@ export function createGitHubIssuesProvider(input: {
         });
       const loadMarkers = async (): Promise<Map<string, number>> => {
         const found = new Map<string, number>();
+        client ??= input.clientFactory(repository);
+        let identity: FindingIssueAppIdentity | undefined;
+        try {
+          identity = (await client).appIdentity;
+        } catch (error) {
+          client = undefined;
+          throw gitHubTicketError("GET", error);
+        }
+        let untrusted = 0;
         for (let page = 1; page <= MAX_ISSUE_SEARCH_PAGES; page += 1) {
           const issues = await call<GitHubIssueSummary[]>(
             "GET",
             `${base}?state=all&sort=created&direction=desc&per_page=100&page=${page}`
           );
           for (const issue of Array.isArray(issues) ? issues : []) {
-            if (issue.pull_request || issue.user?.type !== "Bot") continue;
+            if (issue.pull_request) continue;
             const match = new RegExp(`<!-- ${FINDING_TICKET_MARKER_PREFIX}([a-f0-9]{64}) -->`).exec(
               String(issue.body ?? "")
             );
+            if (!match?.[1]) continue;
+            if (!openedByApp(issue, identity)) {
+              untrusted += 1;
+              continue;
+            }
             if (match?.[1] && Number.isSafeInteger(issue.number) && !found.has(match[1])) {
               found.set(match[1], Number(issue.number));
             }
           }
           if (!Array.isArray(issues) || issues.length < 100) break;
         }
+        scan = { untrusted };
         return found;
       };
       return {
+        markerScan: () => scan,
         async sync(content, previous) {
           if (!FINGERPRINT_PATTERN.test(content.fingerprint)) {
             throw new FindingTicketError("github-issues fingerprint is invalid", false);
@@ -514,6 +584,30 @@ export function createJiraProvider(input: {
     });
     return true;
   };
+  // The enhanced search endpoint; `/rest/api/2/search` is being removed (CHANGE-2046).
+  // The JQL is bounded by project and label, pages follow `nextPageToken`, and the
+  // page count is capped so a misbehaving server cannot keep a pass looping.
+  const findByLabel = async (fingerprint: string): Promise<string | undefined> => {
+    const jql = `project = "${input.projectKey}" AND labels = "${jiraFindingLabel(fingerprint)}" ORDER BY created ASC`;
+    let nextPageToken: string | undefined;
+    for (let page = 0; page < MAX_JIRA_SEARCH_PAGES; page += 1) {
+      const query = new URLSearchParams({ jql, maxResults: String(JIRA_SEARCH_PAGE_SIZE), fields: "key" });
+      if (nextPageToken) query.set("nextPageToken", nextPageToken);
+      const found = await call<{ issues?: Array<{ key?: string }>; nextPageToken?: unknown; isLast?: unknown }>(
+        "GET",
+        `/rest/api/2/search/jql?${query.toString()}`
+      );
+      const candidate = (found?.issues ?? []).find(
+        (issue) => typeof issue?.key === "string" && JIRA_KEY_PATTERN.test(issue.key)
+      )?.key;
+      if (candidate) return candidate;
+      if (found?.isLast !== false || typeof found.nextPageToken !== "string" || !found.nextPageToken) {
+        return undefined;
+      }
+      nextPageToken = found.nextPageToken;
+    }
+    throw new FindingTicketError("jira search exceeded its page limit", true);
+  };
   return {
     name: "jira",
     requiresRepositoryOptIn: false,
@@ -528,13 +622,7 @@ export function createJiraProvider(input: {
           const fields = { summary: ticketTitle(content), description: jiraDescription(content) };
           let key = previous?.ref && JIRA_KEY_PATTERN.test(previous.ref) ? previous.ref : undefined;
           if (!key) {
-            const jql = `project = "${input.projectKey}" AND labels = "${jiraFindingLabel(content.fingerprint)}"`;
-            const found = await call<{ issues?: Array<{ key?: string }> }>(
-              "GET",
-              `/rest/api/2/search?jql=${encodeURIComponent(jql)}&maxResults=1&fields=key`
-            );
-            const candidate = found?.issues?.[0]?.key;
-            key = candidate && JIRA_KEY_PATTERN.test(candidate) ? candidate : undefined;
+            key = await findByLabel(content.fingerprint);
           }
           if (!key) {
             if (content.state === "closed") return {};

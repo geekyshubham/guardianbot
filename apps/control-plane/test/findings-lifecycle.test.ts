@@ -11,8 +11,10 @@ import {
 } from "@guardianbot/core";
 import {
   DEFAULT_FINDINGS_SLA_DAYS,
+  FINDING_TICKET_CLAIM_LEASE_MS,
   UNOWNED_FINDING_OWNER,
   computeSlaDueAt,
+  enforceFindingLifecycleBound,
   findingsLifecycleOptionsFromEnvironment,
   ingestFindingObservations,
   isTrustedLifecycleRun,
@@ -705,4 +707,193 @@ test("recording an accepted run swallows ticket failures but keeps the merge", a
   const stored = await byFingerprint(store, "one");
   assert.equal(stored?.status, "open");
   assert.equal(stored?.tickets.slack?.error, "ticket provider request failed");
+});
+
+function boundRecord(
+  label: string,
+  overrides: Partial<FindingLifecycleRecord> = {}
+): FindingLifecycleRecord {
+  return {
+    repositoryId: 20,
+    fingerprint: fingerprint(label),
+    source: "semgrep",
+    ruleId: `rule.${label}`,
+    severity: "medium",
+    status: "open",
+    owner: "@acme/app",
+    streams: { semgrep: "2026-07-01T00:00:00.000Z" },
+    firstSeenAt: "2026-07-01T00:00:00.000Z",
+    openedAt: "2026-07-01T00:00:00.000Z",
+    lastSeenAt: "2026-07-01T00:00:00.000Z",
+    lastRunId: 1,
+    lastRunAttempt: 1,
+    tickets: {},
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+test("the record bound retires long-fixed records first and keeps open Critical or High findings", () => {
+  const records = [
+    boundRecord("fixed-old", { status: "fixed", fixedAt: "2026-07-02T00:00:00.000Z" }),
+    boundRecord("fixed-ticketed", {
+      status: "fixed",
+      fixedAt: "2026-07-01T00:00:00.000Z",
+      tickets: { jira: { ref: "SEC-1", state: "open", updatedAt: "2026-07-01T00:00:00.000Z" } }
+    }),
+    boundRecord("critical", { severity: "critical" }),
+    boundRecord("high", { severity: "high", firstSeenAt: "2026-07-20T00:00:00.000Z" }),
+    boundRecord("low", { severity: "low" }),
+    boundRecord("medium-new", { firstSeenAt: "2026-07-25T00:00:00.000Z" }),
+    boundRecord("medium-old")
+  ];
+  const map = new Map(records.map((record) => [record.fingerprint, record]));
+  const fits = enforceFindingLifecycleBound(new Map(map), 7);
+  assert.deepEqual(fits, { retired: [], dropped: [] });
+
+  const result = enforceFindingLifecycleBound(map, 3);
+  assert.deepEqual(result.retired, [fingerprint("fixed-old")], "a fixed record with an open ticket is not retired");
+  assert.deepEqual(
+    result.dropped.map((record) => record.ruleId),
+    ["rule.fixed-ticketed", "rule.low", "rule.medium-new"],
+    "non-open, then lowest severity, then newest within a tier"
+  );
+  assert.deepEqual(
+    [...map.values()].map((record) => record.ruleId).sort(),
+    ["rule.critical", "rule.high", "rule.medium-old"]
+  );
+
+  const onlySevere = new Map(
+    ["a", "b", "c"].map((label) => [fingerprint(label), boundRecord(label, { severity: "critical" })])
+  );
+  const forced = enforceFindingLifecycleBound(onlySevere, 2);
+  assert.equal(forced.dropped.length, 1, "Critical or High work is dropped only when nothing else is left");
+});
+
+test("bound drops are recorded on the repository so monitoring can alert on them", async () => {
+  const store = new MemoryStore();
+  const record = await seed(store);
+  await ingest(store, record, [observation("semgrep", [semgrep("one")])]);
+  const clean = await store.getFindingLifecycleState(20);
+  assert.equal(clean?.lastDropped, 0);
+  assert.equal(clean?.droppedTotal, 0);
+
+  await store.saveFindingLifecycle(20, [], [], [], {
+    dropped: 4,
+    droppedCriticalHigh: 1,
+    observedAt: "2026-07-28T00:00:00.000Z"
+  });
+  await store.saveFindingLifecycle(20, [], [], [], {
+    dropped: 0,
+    droppedCriticalHigh: 0,
+    observedAt: "2026-07-29T00:00:00.000Z"
+  });
+  const state = await store.getFindingLifecycleState(20);
+  assert.equal(state?.droppedTotal, 4, "the total is cumulative");
+  assert.equal(state?.lastDropped, 0, "the last merge fit the bound again");
+  assert.equal(state?.lastDroppedAt, "2026-07-28T00:00:00.000Z");
+});
+
+test("ticket providers are called outside the lifecycle lock and only on granted claims", async () => {
+  const store = new MemoryStore();
+  const record = await seed(store);
+  await ingest(store, record, [observation("semgrep", [semgrep("one"), semgrep("two")])]);
+  let lockFreeDuringCall = false;
+  const provider: FindingTicketProvider = {
+    name: "jira",
+    requiresRepositoryOptIn: false,
+    contentSha: (content) => createHash("sha256").update(JSON.stringify(content)).digest("hex"),
+    session: () => ({
+      async sync(_content, previous) {
+        // A merge must be able to take the lock while a provider call is in flight.
+        const lock = await Promise.race([
+          store.acquireFindingLifecycleLock(20),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 50))
+        ]);
+        if (lock) {
+          lockFreeDuringCall = true;
+          await lock.release();
+        }
+        return { ref: previous?.ref ?? "SEC-1" };
+      }
+    })
+  };
+
+  // Another pass holds a live claim on "two": this pass must leave it alone.
+  const held = await store.claimFindingTickets(
+    20,
+    {
+      claimId: "other-pass",
+      claimedAt: NOW.toISOString(),
+      leaseExpiresAt: new Date(NOW.getTime() + FINDING_TICKET_CLAIM_LEASE_MS).toISOString()
+    },
+    [{ fingerprint: fingerprint("two"), provider: "jira" }]
+  );
+  assert.equal(held.length, 1);
+  const result = await syncFindingTickets({
+    store,
+    repository: record,
+    providers: [provider],
+    slaDays: OPTIONS.slaDays,
+    now: NOW
+  });
+  assert.deepEqual(result, { attempted: 1, failed: 0 });
+  assert.equal(lockFreeDuringCall, true);
+  assert.equal((await byFingerprint(store, "one"))?.tickets.jira?.ref, "SEC-1");
+  assert.equal((await byFingerprint(store, "two"))?.tickets.jira, undefined);
+
+  // Once the other pass's lease expires, a later pass takes the work over.
+  const later = new Date(NOW.getTime() + FINDING_TICKET_CLAIM_LEASE_MS + 1);
+  const takeover = await syncFindingTickets({
+    store,
+    repository: record,
+    providers: [provider],
+    slaDays: OPTIONS.slaDays,
+    now: later
+  });
+  assert.equal(takeover.attempted, 1);
+  assert.equal((await byFingerprint(store, "two"))?.tickets.jira?.ref, "SEC-1");
+  // The expired pass finishing late cannot overwrite the newer result.
+  const stale = await store.completeFindingTicketClaim(
+    20,
+    "other-pass",
+    { fingerprint: fingerprint("two"), provider: "jira" },
+    { ref: "SEC-999", state: "open", updatedAt: later.toISOString() }
+  );
+  assert.equal(stale, false);
+  assert.equal((await byFingerprint(store, "two"))?.tickets.jira?.ref, "SEC-1");
+});
+
+test("a merge never overwrites ticket state that a claim recorded", async () => {
+  const store = new MemoryStore();
+  const record = await seed(store);
+  await ingest(store, record, [observation("semgrep", [semgrep("one")])]);
+  const { provider } = recordingProvider("jira");
+  await syncFindingTickets({ store, repository: record, providers: [provider], slaDays: OPTIONS.slaDays, now: NOW });
+  const ticketed = await byFingerprint(store, "one");
+  assert.equal(ticketed?.tickets.jira?.ref, "1");
+  // A merge working from an older read must keep the stored ticket.
+  await store.saveFindingLifecycle(20, [{ ...ticketed!, tickets: {}, lastSeenAt: "2026-07-28T00:00:00.000Z" }]);
+  assert.equal((await byFingerprint(store, "one"))?.tickets.jira?.ref, "1");
+});
+
+test("GitHub marker scans that ignore foreign issues are recorded on the repository", async () => {
+  const store = new MemoryStore();
+  const record = await seed(store, { config: config({ githubIssues: true }) });
+  await ingest(store, record, [observation("semgrep", [semgrep("one")])]);
+  const provider: FindingTicketProvider = {
+    name: "github-issues",
+    requiresRepositoryOptIn: true,
+    contentSha: () => "c".repeat(64),
+    session: () => ({
+      async sync() {
+        return { ref: "5" };
+      },
+      markerScan: () => ({ untrusted: 2 })
+    })
+  };
+  await syncFindingTickets({ store, repository: record, providers: [provider], slaDays: OPTIONS.slaDays, now: NOW });
+  const state = await store.getFindingLifecycleState(20);
+  assert.equal(state?.untrustedMarkers, 2);
+  assert.equal(state?.untrustedMarkersObservedAt, NOW.toISOString());
 });

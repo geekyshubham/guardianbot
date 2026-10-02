@@ -30,6 +30,15 @@ reusable workflow commits remain immutable.
   `GUARDIANBOT_FINDINGS_LIFECYCLE_ENABLED` is set. Adds `findings-sla` and
   `findings-ticketing` monitoring checks and a weekly `findings` section.
   Automated tests only; no live evidence.
+- Findings lifecycle `findings-capacity` monitoring check: failing when the
+  record bound dropped an open Critical or High finding, warning on any other
+  drop or on marker issues this App did not open. Automated tests only.
+
+### Security
+
+- Finding ticket marker recovery trusts only issues opened by this GitHub App
+  (`performed_via_github_app.id` or the App's `<slug>[bot]` login, verified
+  against `GET /app`), not any Bot-authored issue.
 - Review value analytics (`fixed`, `dismissed`, `ignored`, precision) in the
   weekly report, the `@guardianbot dismiss` command, and opt-in Mode C
   `@guardianbot draft-fix` draft pull requests behind
@@ -44,6 +53,13 @@ reusable workflow commits remain immutable.
   source and observation runs, and ruleset pagination is capped at 10 pages.
 - Deployed-digest rescans do not feed the findings lifecycle, so they cannot
   open or fix `trivy-image` records.
+- Finding ticket sync claims work under the lifecycle lock and calls
+  providers after releasing it; results are recorded only while their leased
+  claim holds, and scanner merges no longer write ticket state.
+- The findings record bound retires long-fixed records first and drops open
+  Critical or High findings last; every drop is recorded.
+- Jira label lookup uses `/rest/api/2/search/jql` with bounded
+  `nextPageToken` paging instead of the removed `/rest/api/2/search`.
 
 ## [0.2.41] - 2026-08-02
 

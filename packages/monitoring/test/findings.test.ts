@@ -4,6 +4,7 @@ import {
   MAX_WEEKLY_FINDING_OWNERS,
   buildWeeklyCoverageReport,
   emptyFindingsMetrics,
+  evaluateFindingsCapacity,
   evaluateFindingsLifecycle,
   findingAgeBucket,
   fixedClock,
@@ -124,4 +125,28 @@ test("the weekly report adds a deterministic findings section only when metrics 
   assert.equal(report.findings?.otherOwners, 2);
   // AI review metrics stay separate from deterministic finding metrics.
   assert.equal(report.review.advisoryFindingsOpened, 0);
+});
+
+test("findings-capacity fails on dropped Critical or High findings and warns on other loss", () => {
+  const base = { lastDropped: 0, lastDroppedCriticalHigh: 0, droppedTotal: 0, untrustedMarkers: 0 };
+  assert.equal(evaluateFindingsCapacity(base).status, "passing");
+  assert.equal(evaluateFindingsCapacity({ ...base, droppedTotal: 9 }).status, "passing", "only the latest merge alerts");
+  const lowLoss = evaluateFindingsCapacity({ ...base, lastDropped: 3, droppedTotal: 3 });
+  assert.equal(lowLoss.status, "warning");
+  assert.match(lowLoss.summary, /3 finding record\(s\) were dropped/);
+  const foreign = evaluateFindingsCapacity({ ...base, untrustedMarkers: 2 });
+  assert.equal(foreign.status, "warning");
+  assert.match(foreign.summary, /not opened by this GitHub App/);
+  const severe = evaluateFindingsCapacity({ ...base, lastDropped: 3, lastDroppedCriticalHigh: 1, droppedTotal: 3 });
+  assert.equal(severe.status, "failing");
+  assert.equal(severe.key, "findings-capacity");
+  const evaluation = evaluateFindingsLifecycle([], fixedClock(new Date(NOW)), severe.metadata as typeof base);
+  assert.deepEqual(
+    evaluation.checks.map((check) => [check.key, check.status]),
+    [
+      ["findings-sla", "passing"],
+      ["findings-ticketing", "passing"],
+      ["findings-capacity", "failing"]
+    ]
+  );
 });

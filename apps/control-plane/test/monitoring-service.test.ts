@@ -1549,7 +1549,7 @@ test("an enabled findings lifecycle raises SLA breach and ticketing alerts and a
       tickets: { slack: { error: "slack POST request returned 500", updatedAt: "2026-07-27T11:00:00.000Z" } }
     }),
     lifecycleRecord({ fingerprint: "d".repeat(64), status: "fixed", streams: {} })
-  ]);
+  ], [], [], { dropped: 2, droppedCriticalHigh: 1, observedAt: "2026-07-27T11:00:00.000Z" });
   const syncCalls: number[] = [];
   const monitoring = new MonitoringService(store, {
     enabled: true,
@@ -1570,6 +1570,10 @@ test("an enabled findings lifecycle raises SLA breach and ticketing alerts and a
   const alerts = (await store.listActiveMonitoringAlerts(20)).map((alert) => alert.alertKey);
   assert.ok(alerts.includes("findings-sla"));
   assert.ok(alerts.includes("findings-ticketing"));
+  const capacity = snapshot?.checks.find((check) => check.key === "findings-capacity");
+  assert.equal(capacity?.status, "failing");
+  assert.match(String(capacity?.summary), /^1 open Critical or High finding\(s\) were dropped/);
+  assert.ok(alerts.includes("findings-capacity"));
 
   const weekly = await store.getMonitoringWeeklyReport("v1:2026-07-27");
   assert.deepEqual(weekly?.report.findings, {

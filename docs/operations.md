@@ -382,7 +382,10 @@ GitHub issues use a repository-scoped installation token limited to
 notifier failures are retried with bounded backoff, stored as a sanitized
 error on the lifecycle record, retried on the next ingestion and monitoring
 cycle, and raised as the `findings-ticketing` monitoring alert. Open findings
-past their due date raise `findings-sla`; see the
+past their due date raise `findings-sla`, and records dropped over the
+5000-record bound or ignored foreign marker issues raise `findings-capacity`.
+Marker recovery trusts only issues this App opened; the App identity is read
+from `GET /app` and must match `GITHUB_APP_ID`. See the
 [SLA breach runbook](runbooks/sla-breach.md).
 
 ### Remediation drafts

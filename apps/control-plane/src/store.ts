@@ -838,10 +838,61 @@ export interface FindingLifecycleStreamWatermark {
   updatedAt: string;
 }
 
+/**
+ * Lease on one finding's provider ticket. A ticket pass takes claims under the
+ * lifecycle lock, releases the lock, calls the provider, and then records the
+ * result only while its claim still holds, so no provider call ever runs while the
+ * lock (or any transaction) is held and two passes never sync the same ticket at once.
+ */
+export interface FindingTicketClaim {
+  claimId: string;
+  claimedAt: string;
+  /** After this instant another pass may take the claim over. */
+  leaseExpiresAt: string;
+}
+
+export interface FindingTicketClaimTarget {
+  fingerprint: string;
+  provider: FindingTicketProviderName;
+}
+
+/**
+ * Per-repository lifecycle health that is not a property of any one record: how many
+ * records the bound forced out, and how many marker-bearing GitHub issues the last
+ * marker scan refused to trust.
+ */
+export interface FindingLifecycleState {
+  repositoryId: number;
+  /** Cumulative records dropped because the repository exceeded its record bound. */
+  droppedTotal: number;
+  /** Records dropped by the most recent merge; zero once a merge fits the bound again. */
+  lastDropped: number;
+  /** Open Critical or High records among `lastDropped`. */
+  lastDroppedCriticalHigh: number;
+  lastDroppedAt?: string;
+  /** Marker-bearing issues not created by this GitHub App, from the latest marker scan. */
+  untrustedMarkers: number;
+  untrustedMarkersObservedAt?: string;
+  updatedAt: string;
+}
+
+/** Bound accounting written atomically with the merge that produced it. */
+export interface FindingLifecycleCapacityUpdate {
+  dropped: number;
+  droppedCriticalHigh: number;
+  observedAt: string;
+}
+
 /** Upper bound for one repository's lifecycle page; open records are returned first. */
 export const MAX_FINDING_LIFECYCLE_RECORDS = 5_000;
 const FINDING_LIFECYCLE_UPSERT_CHUNK = 500;
+const FINDING_TICKET_PROVIDER_NAMES: ReadonlySet<string> = new Set(["github-issues", "jira", "slack"]);
+const FINDING_TICKET_CLAIM_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+const FINDING_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
 
+// `tickets` is written on insert only. Ticket state changes solely through
+// completeFindingTicketClaim, so a merge that read the record before a provider call
+// finished can never overwrite the ticket reference that call recorded.
 export const FINDING_LIFECYCLE_UPSERT_SQL = `INSERT INTO finding_lifecycle
   (repository_id, fingerprint, source, rule_id, severity, path, line, status, owner,
    streams, first_seen_at, opened_at, last_seen_at, fixed_at, sla_due_at, last_run_id, last_run_attempt,
@@ -871,7 +922,6 @@ ON CONFLICT (repository_id, fingerprint) DO UPDATE SET
   sla_due_at=excluded.sla_due_at,
   last_run_id=excluded.last_run_id,
   last_run_attempt=excluded.last_run_attempt,
-  tickets=excluded.tickets,
   updated_at=excluded.updated_at`;
 
 export const FINDING_LIFECYCLE_STREAM_UPSERT_SQL = `INSERT INTO finding_lifecycle_streams
@@ -885,6 +935,52 @@ ON CONFLICT (repository_id, stream) DO UPDATE SET
   run_started_at=excluded.run_started_at,
   run_id=excluded.run_id,
   run_attempt=excluded.run_attempt,
+  updated_at=excluded.updated_at`;
+
+export const FINDING_TICKET_CLAIM_SQL = `INSERT INTO finding_ticket_claims
+  (repository_id, fingerprint, provider, claim_id, claimed_at, lease_expires_at)
+SELECT DISTINCT $1::bigint, fingerprint, provider, $2::text, $3::timestamptz, $4::timestamptz
+FROM jsonb_to_recordset($5::jsonb) AS rows(fingerprint TEXT, provider TEXT)
+ON CONFLICT (repository_id, fingerprint, provider) DO UPDATE SET
+  claim_id=excluded.claim_id,
+  claimed_at=excluded.claimed_at,
+  lease_expires_at=excluded.lease_expires_at
+WHERE finding_ticket_claims.lease_expires_at <= excluded.claimed_at
+RETURNING fingerprint, provider`;
+
+/**
+ * Releases the claim and writes only that provider's ticket state in one statement.
+ * A claim that another pass took over after its lease expired no longer matches, so
+ * the late result is discarded rather than overwriting the newer pass.
+ */
+export const FINDING_TICKET_COMPLETE_SQL = `WITH released AS (
+  DELETE FROM finding_ticket_claims
+  WHERE repository_id=$1 AND fingerprint=$2 AND provider=$3 AND claim_id=$4
+  RETURNING repository_id
+), recorded AS (
+  UPDATE finding_lifecycle
+  SET tickets=jsonb_set(tickets, ARRAY[$3::text], $5::jsonb, true), updated_at=$6::timestamptz
+  WHERE repository_id=$1 AND fingerprint=$2 AND EXISTS (SELECT 1 FROM released)
+  RETURNING fingerprint
+)
+SELECT EXISTS (SELECT 1 FROM recorded) AS recorded`;
+
+export const FINDING_LIFECYCLE_CAPACITY_SQL = `INSERT INTO finding_lifecycle_state
+  (repository_id, dropped_total, last_dropped, last_dropped_critical_high, last_dropped_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (repository_id) DO UPDATE SET
+  dropped_total=finding_lifecycle_state.dropped_total + excluded.dropped_total,
+  last_dropped=excluded.last_dropped,
+  last_dropped_critical_high=excluded.last_dropped_critical_high,
+  last_dropped_at=COALESCE(excluded.last_dropped_at, finding_lifecycle_state.last_dropped_at),
+  updated_at=excluded.updated_at`;
+
+export const FINDING_TICKET_MARKER_SCAN_SQL = `INSERT INTO finding_lifecycle_state
+  (repository_id, untrusted_markers, untrusted_markers_observed_at, updated_at)
+VALUES ($1, $2, $3, $3)
+ON CONFLICT (repository_id) DO UPDATE SET
+  untrusted_markers=excluded.untrusted_markers,
+  untrusted_markers_observed_at=excluded.untrusted_markers_observed_at,
   updated_at=excluded.updated_at`;
 
 export const FINDING_LIFECYCLE_LIST_SQL = `SELECT *
@@ -936,6 +1032,31 @@ function assertFindingLifecycleOwnership(
   ) {
     throw new Error("finding lifecycle writes must belong to one repository");
   }
+}
+
+function assertFindingTicketClaim(claim: Pick<FindingTicketClaim, "claimId">): void {
+  if (!FINDING_TICKET_CLAIM_ID_PATTERN.test(claim.claimId)) {
+    throw new Error("finding ticket claim id is invalid");
+  }
+}
+
+function assertFindingTicketTarget(target: FindingTicketClaimTarget): void {
+  if (
+    !FINDING_FINGERPRINT_PATTERN.test(target.fingerprint) ||
+    !FINDING_TICKET_PROVIDER_NAMES.has(target.provider)
+  ) {
+    throw new Error("finding ticket claim target is invalid");
+  }
+}
+
+function assertFindingLifecycleCount(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+}
+
+function findingTicketClaimKey(repositoryId: number, target: FindingTicketClaimTarget): string {
+  return `${repositoryId}:${target.fingerprint}:${target.provider}`;
 }
 
 function compareFindingLifecycle(
@@ -1799,17 +1920,46 @@ export interface Store {
   listFindingLifecycleStreams(repositoryId: number): Promise<FindingLifecycleStreamWatermark[]>;
   /**
    * Atomic upsert keyed by repository and root-cause fingerprint, together with
-   * the stream watermarks the same merge advanced and any long-fixed records the
-   * merge retired to keep the repository within its bound.
+   * the stream watermarks the same merge advanced, any records the merge removed to
+   * keep the repository within its bound, and that bound's drop accounting. An
+   * existing record keeps its stored ticket state; only ticket claims change it.
    */
   saveFindingLifecycle(
     repositoryId: number,
     records: readonly FindingLifecycleRecord[],
     streams?: readonly FindingLifecycleStreamWatermark[],
-    removedFingerprints?: readonly string[]
+    removedFingerprints?: readonly string[],
+    capacity?: FindingLifecycleCapacityUpdate
   ): Promise<void>;
-  /** Serialises lifecycle merges for one repository across instances. */
+  /** Serialises lifecycle merges and ticket claims for one repository across instances. */
   acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock>;
+  /**
+   * Claims each target that has no unexpired claim and returns the targets granted.
+   * Callers hold the lifecycle lock while claiming and release it before any provider call.
+   */
+  claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]>;
+  /**
+   * Records one provider's ticket state and releases its claim, only while `claimId`
+   * still holds the claim. Returns false when the claim was lost or the record is gone.
+   */
+  completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean>;
+  /** Releases every claim still held by `claimId`, so unfinished work is retried promptly. */
+  releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void>;
+  getFindingLifecycleState(repositoryId: number): Promise<FindingLifecycleState | undefined>;
+  recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void>;
 }
 
 export function postgresPoolConfig(
@@ -1894,6 +2044,8 @@ export class MemoryStore implements Store {
   private findingLifecycleStreams = new Map<string, FindingLifecycleStreamWatermark>();
   private findingLifecycleLocks = new Set<number>();
   private findingLifecycleLockWaiters = new Map<number, Array<() => void>>();
+  private findingTicketClaims = new Map<string, FindingTicketClaim>();
+  private findingLifecycleStates = new Map<number, FindingLifecycleState>();
 
   async ping(): Promise<void> {}
   async close(): Promise<void> {}
@@ -3189,17 +3341,31 @@ export class MemoryStore implements Store {
     repositoryId: number,
     records: readonly FindingLifecycleRecord[],
     streams: readonly FindingLifecycleStreamWatermark[] = [],
-    removedFingerprints: readonly string[] = []
+    removedFingerprints: readonly string[] = [],
+    capacity?: FindingLifecycleCapacityUpdate
   ): Promise<void> {
     assertFindingLifecycleOwnership(repositoryId, records, streams);
-    for (const fingerprint of removedFingerprints) {
+    if (capacity) {
+      assertFindingLifecycleCount(capacity.dropped, "dropped");
+      assertFindingLifecycleCount(capacity.droppedCriticalHigh, "droppedCriticalHigh");
+    }
+    const removed = new Set(removedFingerprints);
+    for (const fingerprint of removed) {
       this.findingLifecycle.delete(`${repositoryId}:${fingerprint}`);
     }
+    for (const key of [...this.findingTicketClaims.keys()]) {
+      const [claimRepository, fingerprint] = key.split(":");
+      if (claimRepository === String(repositoryId) && removed.has(fingerprint ?? "")) {
+        this.findingTicketClaims.delete(key);
+      }
+    }
     for (const record of records) {
-      this.findingLifecycle.set(
-        `${record.repositoryId}:${record.fingerprint}`,
-        structuredClone(record)
-      );
+      const key = `${record.repositoryId}:${record.fingerprint}`;
+      const existing = this.findingLifecycle.get(key);
+      const next = structuredClone(record);
+      // Same rule as PostgreSQL: ticket state changes only through claims.
+      if (existing) next.tickets = structuredClone(existing.tickets);
+      this.findingLifecycle.set(key, next);
     }
     for (const watermark of streams) {
       this.findingLifecycleStreams.set(
@@ -3207,6 +3373,91 @@ export class MemoryStore implements Store {
         { ...watermark }
       );
     }
+    if (capacity) {
+      const existing = this.findingLifecycleStates.get(repositoryId);
+      this.findingLifecycleStates.set(repositoryId, {
+        repositoryId,
+        droppedTotal: (existing?.droppedTotal ?? 0) + capacity.dropped,
+        lastDropped: capacity.dropped,
+        lastDroppedCriticalHigh: capacity.droppedCriticalHigh,
+        lastDroppedAt: capacity.dropped > 0 ? capacity.observedAt : existing?.lastDroppedAt,
+        untrustedMarkers: existing?.untrustedMarkers ?? 0,
+        untrustedMarkersObservedAt: existing?.untrustedMarkersObservedAt,
+        updatedAt: capacity.observedAt
+      });
+    }
+  }
+
+  async claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]> {
+    assertFindingTicketClaim(claim);
+    const claimedAt = Date.parse(claim.claimedAt);
+    const granted: FindingTicketClaimTarget[] = [];
+    for (const target of targets) {
+      assertFindingTicketTarget(target);
+      const key = findingTicketClaimKey(repositoryId, target);
+      const existing = this.findingTicketClaims.get(key);
+      if (existing && !(Date.parse(existing.leaseExpiresAt) <= claimedAt)) continue;
+      this.findingTicketClaims.set(key, { ...claim });
+      granted.push({ fingerprint: target.fingerprint, provider: target.provider });
+    }
+    return granted;
+  }
+
+  async completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean> {
+    assertFindingTicketClaim({ claimId });
+    assertFindingTicketTarget(target);
+    const key = findingTicketClaimKey(repositoryId, target);
+    if (this.findingTicketClaims.get(key)?.claimId !== claimId) return false;
+    this.findingTicketClaims.delete(key);
+    const record = this.findingLifecycle.get(`${repositoryId}:${target.fingerprint}`);
+    if (!record) return false;
+    record.tickets[target.provider] = structuredClone(ticket);
+    record.updatedAt = ticket.updatedAt;
+    return true;
+  }
+
+  async releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void> {
+    assertFindingTicketClaim({ claimId });
+    for (const [key, claim] of this.findingTicketClaims) {
+      if (key.startsWith(`${repositoryId}:`) && claim.claimId === claimId) {
+        this.findingTicketClaims.delete(key);
+      }
+    }
+  }
+
+  async getFindingLifecycleState(
+    repositoryId: number
+  ): Promise<FindingLifecycleState | undefined> {
+    const state = this.findingLifecycleStates.get(repositoryId);
+    return state ? { ...state } : undefined;
+  }
+
+  async recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void> {
+    assertFindingLifecycleCount(untrustedMarkers, "untrustedMarkers");
+    const existing = this.findingLifecycleStates.get(repositoryId);
+    this.findingLifecycleStates.set(repositoryId, {
+      repositoryId,
+      droppedTotal: existing?.droppedTotal ?? 0,
+      lastDropped: existing?.lastDropped ?? 0,
+      lastDroppedCriticalHigh: existing?.lastDroppedCriticalHigh ?? 0,
+      lastDroppedAt: existing?.lastDroppedAt,
+      untrustedMarkers,
+      untrustedMarkersObservedAt: observedAt,
+      updatedAt: observedAt
+    });
   }
 
   async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {
@@ -3830,6 +4081,29 @@ export class PostgresStore implements Store {
         run_attempt INTEGER NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (repository_id, stream)
+      );
+
+      CREATE TABLE IF NOT EXISTS finding_ticket_claims (
+        repository_id BIGINT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        claim_id TEXT NOT NULL,
+        claimed_at TIMESTAMPTZ NOT NULL,
+        lease_expires_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (repository_id, fingerprint, provider)
+      );
+      CREATE INDEX IF NOT EXISTS finding_ticket_claims_claim_idx
+        ON finding_ticket_claims (repository_id, claim_id);
+
+      CREATE TABLE IF NOT EXISTS finding_lifecycle_state (
+        repository_id BIGINT PRIMARY KEY REFERENCES repositories(repository_id) ON DELETE CASCADE,
+        dropped_total BIGINT NOT NULL DEFAULT 0,
+        last_dropped INTEGER NOT NULL DEFAULT 0,
+        last_dropped_critical_high INTEGER NOT NULL DEFAULT 0,
+        last_dropped_at TIMESTAMPTZ,
+        untrusted_markers INTEGER NOT NULL DEFAULT 0,
+        untrusted_markers_observed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       `);
       if (this.repositoryIndexStorageMode === "pgvector") {
@@ -5671,16 +5945,26 @@ export class PostgresStore implements Store {
     repositoryId: number,
     records: readonly FindingLifecycleRecord[],
     streams: readonly FindingLifecycleStreamWatermark[] = [],
-    removedFingerprints: readonly string[] = []
+    removedFingerprints: readonly string[] = [],
+    capacity?: FindingLifecycleCapacityUpdate
   ): Promise<void> {
     assertFindingLifecycleOwnership(repositoryId, records, streams);
-    if (!records.length && !streams.length && !removedFingerprints.length) return;
+    if (capacity) {
+      assertFindingLifecycleCount(capacity.dropped, "dropped");
+      assertFindingLifecycleCount(capacity.droppedCriticalHigh, "droppedCriticalHigh");
+    }
+    if (!records.length && !streams.length && !removedFingerprints.length && !capacity) return;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       if (removedFingerprints.length) {
+        // A removed record's claims go with it, so an abandoned claim cannot outlive it.
         await client.query(
-          `DELETE FROM finding_lifecycle
+          `WITH claims AS (
+             DELETE FROM finding_ticket_claims
+             WHERE repository_id=$1 AND fingerprint = ANY($2::text[])
+           )
+           DELETE FROM finding_lifecycle
            WHERE repository_id=$1 AND fingerprint = ANY($2::text[])`,
           [repositoryId, [...removedFingerprints]]
         );
@@ -5705,6 +5989,16 @@ export class PostgresStore implements Store {
           )
         ]);
       }
+      if (capacity) {
+        await client.query(FINDING_LIFECYCLE_CAPACITY_SQL, [
+          repositoryId,
+          capacity.dropped,
+          capacity.dropped,
+          capacity.droppedCriticalHigh,
+          capacity.dropped > 0 ? capacity.observedAt : null,
+          capacity.observedAt
+        ]);
+      }
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -5712,6 +6006,90 @@ export class PostgresStore implements Store {
     } finally {
       client.release();
     }
+  }
+
+  async claimFindingTickets(
+    repositoryId: number,
+    claim: FindingTicketClaim,
+    targets: readonly FindingTicketClaimTarget[]
+  ): Promise<FindingTicketClaimTarget[]> {
+    assertFindingTicketClaim(claim);
+    const unique = new Map<string, FindingTicketClaimTarget>();
+    for (const target of targets) {
+      assertFindingTicketTarget(target);
+      unique.set(findingTicketClaimKey(repositoryId, target), target);
+    }
+    if (!unique.size) return [];
+    const result = await this.pool.query(FINDING_TICKET_CLAIM_SQL, [
+      repositoryId,
+      claim.claimId,
+      claim.claimedAt,
+      claim.leaseExpiresAt,
+      JSON.stringify(
+        [...unique.values()].map((target) => ({ fingerprint: target.fingerprint, provider: target.provider }))
+      )
+    ]);
+    return result.rows.map((row) => ({
+      fingerprint: String(row.fingerprint),
+      provider: row.provider as FindingTicketProviderName
+    }));
+  }
+
+  async completeFindingTicketClaim(
+    repositoryId: number,
+    claimId: string,
+    target: FindingTicketClaimTarget,
+    ticket: FindingTicketState
+  ): Promise<boolean> {
+    assertFindingTicketClaim({ claimId });
+    assertFindingTicketTarget(target);
+    const result = await this.pool.query<{ recorded: boolean }>(FINDING_TICKET_COMPLETE_SQL, [
+      repositoryId,
+      target.fingerprint,
+      target.provider,
+      claimId,
+      JSON.stringify(ticket),
+      ticket.updatedAt
+    ]);
+    return result.rows[0]?.recorded === true;
+  }
+
+  async releaseFindingTicketClaims(repositoryId: number, claimId: string): Promise<void> {
+    assertFindingTicketClaim({ claimId });
+    await this.pool.query(
+      "DELETE FROM finding_ticket_claims WHERE repository_id=$1 AND claim_id=$2",
+      [repositoryId, claimId]
+    );
+  }
+
+  async getFindingLifecycleState(
+    repositoryId: number
+  ): Promise<FindingLifecycleState | undefined> {
+    const result = await this.pool.query(
+      "SELECT * FROM finding_lifecycle_state WHERE repository_id=$1",
+      [repositoryId]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId: Number(row.repository_id),
+      droppedTotal: Number(row.dropped_total ?? 0),
+      lastDropped: Number(row.last_dropped ?? 0),
+      lastDroppedCriticalHigh: Number(row.last_dropped_critical_high ?? 0),
+      lastDroppedAt: fromUnknownDate(row.last_dropped_at),
+      untrustedMarkers: Number(row.untrusted_markers ?? 0),
+      untrustedMarkersObservedAt: fromUnknownDate(row.untrusted_markers_observed_at),
+      updatedAt: fromUnknownDate(row.updated_at) ?? String(row.updated_at)
+    };
+  }
+
+  async recordFindingTicketMarkerScan(
+    repositoryId: number,
+    untrustedMarkers: number,
+    observedAt: string
+  ): Promise<void> {
+    assertFindingLifecycleCount(untrustedMarkers, "untrustedMarkers");
+    await this.pool.query(FINDING_TICKET_MARKER_SCAN_SQL, [repositoryId, untrustedMarkers, observedAt]);
   }
 
   async acquireFindingLifecycleLock(repositoryId: number): Promise<StoreLock> {

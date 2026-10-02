@@ -73,11 +73,18 @@ their own section.
 All providers are optional and configured only in the control plane:
 
 - **GitHub issues**: one issue per root cause, recovered idempotently through a
-  hidden `guardianbot-finding:<fingerprint>` marker on bot-authored issues.
-  Requires `findings.githubIssues: true` in the repository and is never used on
-  public repositories.
+  hidden `guardianbot-finding:<fingerprint>` marker. Only issues this GitHub App
+  opened are trusted: `performed_via_github_app.id` equals `GITHUB_APP_ID`, or
+  the author is the App's own `<slug>[bot]` account. The App id and slug come
+  from `GET /app` with the App JWT and must match `GITHUB_APP_ID`, or ticketing
+  fails closed. A marker on any other issue (a human's, or another App's or
+  bot's) is ignored and counted. Requires `findings.githubIssues: true` in the
+  repository and is never used on public repositories.
 - **Jira**: one issue per root cause, found again through a per-fingerprint
-  label and moved into the done category on close.
+  label with the enhanced `/rest/api/2/search/jql` endpoint (the legacy
+  `/rest/api/2/search` is being removed by Atlassian). Searches are bounded by
+  project and label, follow `nextPageToken`, and stop after a fixed page cap.
+  Issues move into the done category on close.
 - **Slack-compatible webhook**: a notification when a finding opens, breaches,
   or closes.
 
@@ -86,3 +93,21 @@ location, owner, status, and lifecycle dates. Scanner titles and descriptions
 are never copied. Failures are retried, stored as a sanitized error kind, and
 raised as `findings-ticketing`; they never fail scanner acceptance. See the
 [SLA breach runbook](runbooks/sla-breach.md).
+
+Ticket work is chosen and claimed under the per-repository lifecycle lock, the
+lock is released, and only then are providers called, so a slow provider never
+stalls scanner merges. Each claim is a lease (10 minutes). A result is recorded
+only while its claim still holds, and recording the ticket and clearing the
+claim is one atomic write, so a pass whose lease expired and was taken over can
+never overwrite the newer result. Scanner merges never write ticket state.
+
+## Record bound
+
+Each repository keeps at most 5000 lifecycle records. When a merge exceeds the
+bound, long-fixed records without an open ticket are retired first; that is
+routine and not alerted. Anything still over the bound is dropped, spending
+non-open and low-severity records first and open Critical or High findings only
+when nothing else is left. Drops are recorded on the repository and raise the
+`findings-capacity` monitoring check: failing when an open Critical or High
+finding was dropped, warning for any other drop. The same check warns when a
+GitHub marker scan ignored issues this App did not open.
