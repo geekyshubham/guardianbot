@@ -9,6 +9,7 @@ import {
   createDastSessionService,
   DastSessionError
 } from "./dast-session.js";
+import { createReleaseGateService, ReleaseGateError } from "./release-gate.js";
 import { GuardianMetrics } from "./metrics.js";
 import { metricsRequestAuthorized } from "./http-security.js";
 import { startImageSmokeServer } from "./image-smoke.js";
@@ -107,6 +108,23 @@ async function start() {
     }
   });
   const dastSession = createDastSessionService({
+    store,
+    environment: process.env,
+    authorizeRepository: async (repositoryName, repositoryId) => {
+      const repository = await store.getRepository(repositoryId);
+      if (
+        repository?.repositoryState !== "active" ||
+        repository.fullName.toLowerCase() !== repositoryName.toLowerCase()
+      ) {
+        return undefined;
+      }
+      return {
+        fullName: repository.fullName,
+        defaultBranch: repository.defaultBranch
+      };
+    }
+  });
+  const releaseGate = createReleaseGateService({
     store,
     environment: process.env,
     authorizeRepository: async (repositoryName, repositoryId) => {
@@ -354,6 +372,69 @@ async function start() {
                   : "invalid attestation request"
             })
           );
+      }
+      return;
+    }
+    if (request.method === "POST" && request.url === "/release/gate") {
+      const mediaType = String(request.headers["content-type"] ?? "")
+        .split(";", 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (mediaType !== "application/json") {
+        response.writeHead(415).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let received = 0;
+      try {
+        for await (const chunk of request) {
+          const buffer = Buffer.from(chunk);
+          received += buffer.length;
+          if (received > 16 * 1024) {
+            response.writeHead(413).end();
+            request.destroy();
+            return;
+          }
+          chunks.push(buffer);
+        }
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        // A failing decision is still a 200: the caller workflow fails its job
+        // on decision "fail". Non-200 means no decision was made.
+        const decision = await releaseGate.check(request.headers.authorization, payload);
+        console.info(
+          JSON.stringify({
+            event: "guardianbot.release_gate_decision",
+            repositoryId: decision.candidate.repositoryId,
+            environment: decision.candidate.environment,
+            decision: decision.decision,
+            blockers: decision.blockers.map((blocker) => blocker.code)
+          })
+        );
+        response
+          .writeHead(200, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(JSON.stringify(decision));
+      } catch (error) {
+        const status = error instanceof ReleaseGateError ? error.statusCode : 400;
+        const failure =
+          error instanceof ReleaseGateError ? error.message : "invalid release gate request";
+        console.warn(
+          JSON.stringify({
+            event: "guardianbot.release_gate_rejected",
+            status,
+            failure
+          })
+        );
+        response
+          .writeHead(status, {
+            "cache-control": "no-store, max-age=0",
+            "content-type": "application/json",
+            pragma: "no-cache"
+          })
+          .end(JSON.stringify({ error: failure }));
       }
       return;
     }

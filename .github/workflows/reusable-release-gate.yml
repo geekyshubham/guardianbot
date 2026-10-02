@@ -1,0 +1,319 @@
+name: GuardianBot reusable release gate
+
+on:
+  workflow_call:
+    inputs:
+      image-name: { required: true, type: string }
+      image-digest: { required: true, type: string }
+      environment: { required: true, type: string }
+      # Defaults to this workflow's own release SHA. Set it only when the
+      # caller pins reusable-image.yml to a different GuardianBot release.
+      image-workflow-sha: { required: false, type: string, default: "" }
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: digest-scoped release gate
+    # Image-promotion evidence is accepted only after its default-branch push
+    # run completes, so the gate is an explicit operator dispatch.
+    if: github.event_name == 'workflow_dispatch'
+    environment: guardianbot-release-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    steps:
+      - name: Check out immutable GuardianBot deployment manifest
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: guardianbot-engine
+          persist-credentials: false
+
+      - name: Resolve exact release candidate
+        id: candidate
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_IMAGE_DIGEST: ${{ inputs.image-digest }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_IMAGE_WORKFLOW_SHA: ${{ inputs.image-workflow-sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const imageName = process.env.INPUT_IMAGE_NAME;
+          const digest = process.env.INPUT_IMAGE_DIGEST;
+          const environment = process.env.INPUT_ENVIRONMENT;
+          const imageWorkflowSha =
+            (process.env.INPUT_IMAGE_WORKFLOW_SHA || process.env.JOB_WORKFLOW_SHA).toLowerCase();
+          if (!/^ghcr\.io\/[a-z0-9._-]+(?:\/[a-z0-9._-]+)+$/.test(imageName) ||
+              imageName.split("/").includes("..")) {
+            throw new Error("image-name must be a lowercase ghcr.io repository without a tag");
+          }
+          if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
+            throw new Error("image-digest must be an exact sha256 digest");
+          }
+          if (!/^[a-z][a-z0-9-]{0,62}$/.test(environment)) {
+            throw new Error("environment is invalid");
+          }
+          if (!/^[a-f0-9]{40}$/.test(imageWorkflowSha)) {
+            throw new Error("image-workflow-sha must be a full commit SHA");
+          }
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(process.env.JOB_WORKFLOW_REPOSITORY)) {
+            throw new Error("Reusable workflow repository is invalid");
+          }
+          const candidatePath = path.join(process.env.RUNNER_TEMP, "guardianbot-release-candidate.json");
+          fs.writeFileSync(candidatePath, JSON.stringify({
+            imageReference: `${imageName}@${digest}`,
+            imageDigest: digest,
+            environment,
+            certificateIdentity:
+              `https://github.com/${process.env.JOB_WORKFLOW_REPOSITORY}` +
+              `/.github/workflows/reusable-image.yml@${imageWorkflowSha}`
+          }), { mode: 0o600, flag: "wx" });
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `candidate-path=${candidatePath}\n`);
+          NODE
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+
+      - name: Independently verify the candidate signature
+        env:
+          CANDIDATE_PATH: ${{ steps.candidate.outputs.candidate-path }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$(jq -r '.imageReference' "$CANDIDATE_PATH")"
+          image_digest="$(jq -r '.imageDigest' "$CANDIDATE_PATH")"
+          certificate_identity="$(jq -r '.certificateIdentity' "$CANDIDATE_PATH")"
+          printf '%s' "$REGISTRY_TOKEN" |
+            docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          verification="${RUNNER_TEMP}/guardianbot-cosign-verification.json"
+          cosign verify --output json "$image_ref" \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            > "$verification"
+          jq -e --arg digest "$image_digest" \
+            'type == "array" and length > 0 and
+             all(.[]; .critical.image["docker-manifest-digest"] == $digest)' \
+            "$verification" >/dev/null
+          docker logout ghcr.io >/dev/null 2>&1 || true
+
+      - name: Request control-plane release decision
+        env:
+          CANDIDATE_PATH: ${{ steps.candidate.outputs.candidate-path }}
+          GUARDIANBOT_WORKFLOW_CHECKOUT: guardianbot-engine
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          (async () => {
+            const childProcess = require("node:child_process");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const readJsonLimited = async (response, maximum) => {
+              const declared = response.headers.get("content-length");
+              if (declared !== null &&
+                  (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+                throw new Error("JSON response exceeded its size limit");
+              }
+              if (!response.body) throw new Error("JSON response body is missing");
+              const reader = response.body.getReader();
+              const chunks = [];
+              let received = 0;
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                received += value.byteLength;
+                if (received > maximum) {
+                  await reader.cancel();
+                  throw new Error("JSON response exceeded its size limit");
+                }
+                chunks.push(Buffer.from(value));
+              }
+              return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            };
+            const candidate = JSON.parse(fs.readFileSync(process.env.CANDIDATE_PATH, "utf8"));
+            const workflowMatch = process.env.JOB_WORKFLOW_REF.match(
+              /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml)@([a-f0-9]{40})$/i
+            );
+            if (!workflowMatch || workflowMatch[3].toLowerCase() !==
+                process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+              throw new Error("Reusable workflow identity is not pinned to its exact SHA");
+            }
+            const checkout = fs.realpathSync(process.env.GUARDIANBOT_WORKFLOW_CHECKOUT);
+            const checkedOutSha = childProcess.execFileSync(
+              "git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }
+            ).trim().toLowerCase();
+            if (checkedOutSha !== process.env.JOB_WORKFLOW_SHA.toLowerCase()) {
+              throw new Error("Deployment manifest checkout does not match the reusable workflow SHA");
+            }
+            const deploymentPath = path.join(checkout, "deployments", "production.json");
+            const deploymentStat = fs.lstatSync(deploymentPath);
+            if (!deploymentStat.isFile() || deploymentStat.isSymbolicLink() ||
+                path.dirname(path.dirname(fs.realpathSync(deploymentPath))) !== checkout) {
+              throw new Error("GuardianBot deployment manifest is unsafe");
+            }
+            const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+            if (!deployment || deployment.schemaVersion !== "1.0.0" ||
+                deployment.environment !== "production" ||
+                typeof deployment.evidenceAttestationUrl !== "string") {
+              throw new Error("GuardianBot deployment manifest is invalid");
+            }
+            const evidenceEndpoint = new URL(deployment.evidenceAttestationUrl);
+            if (evidenceEndpoint.protocol !== "https:" ||
+                evidenceEndpoint.pathname !== "/evidence/attest" ||
+                evidenceEndpoint.username || evidenceEndpoint.password ||
+                evidenceEndpoint.search || evidenceEndpoint.hash) {
+              throw new Error("GuardianBot evidence endpoint is invalid");
+            }
+            const gateEndpoint = new URL("/release/gate", evidenceEndpoint);
+            const fetchGithubOidc = async (url, init) => {
+              let lastFailure = "unknown failure";
+              for (let attempt = 1; attempt <= 4; attempt += 1) {
+                try {
+                  const response = await fetch(url, init);
+                  if (
+                    response.ok ||
+                    (response.status !== 429 && response.status < 500) ||
+                    attempt === 4
+                  ) {
+                    return response;
+                  }
+                  lastFailure = `HTTP ${response.status}`;
+                  await response.arrayBuffer().catch(() => undefined);
+                } catch (error) {
+                  lastFailure = error instanceof Error ? error.message : String(error);
+                  if (attempt === 4) {
+                    throw new Error(
+                      `GitHub OIDC request failed after ${attempt} attempts: ${lastFailure}`
+                    );
+                  }
+                }
+                await new Promise((resolve) =>
+                  setTimeout(resolve, 500 * (2 ** (attempt - 1)))
+                );
+              }
+              throw new Error(`GitHub OIDC request failed: ${lastFailure}`);
+            };
+            const oidcUrl = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
+            oidcUrl.searchParams.set("audience", "guardianbot-release-gate");
+            const oidcResponse = await fetchGithubOidc(oidcUrl, {
+              headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+              redirect: "error"
+            });
+            if (!oidcResponse.ok) {
+              throw new Error(`GitHub OIDC request failed: ${oidcResponse.status}`);
+            }
+            const oidcToken = String((await readJsonLimited(oidcResponse, 64 * 1024)).value || "");
+            if (!oidcToken) throw new Error("GitHub OIDC response omitted its token");
+            const request = {
+              schemaVersion: "1.0.0",
+              repository: process.env.GITHUB_REPOSITORY.toLowerCase(),
+              repositoryId: Number(process.env.GITHUB_REPOSITORY_ID),
+              runId: Number(process.env.GITHUB_RUN_ID),
+              runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+              headSha: process.env.GITHUB_SHA.toLowerCase(),
+              imageDigest: candidate.imageDigest,
+              environment: candidate.environment
+            };
+            const gateResponse = await fetch(gateEndpoint, {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${oidcToken}`,
+                "content-type": "application/json"
+              },
+              body: JSON.stringify(request),
+              redirect: "error"
+            });
+            // Pass and fail are both 200 decisions. Anything else means the
+            // gate could not decide, which is never a pass.
+            if (gateResponse.status !== 200) {
+              throw new Error(`Release gate unavailable: HTTP ${gateResponse.status}`);
+            }
+            const decision = await readJsonLimited(gateResponse, 512 * 1024);
+            if (!decision || typeof decision !== "object" ||
+                decision.schemaVersion !== "1.0.0" ||
+                !["pass", "fail"].includes(decision.decision) ||
+                !Array.isArray(decision.blockers) ||
+                !Array.isArray(decision.exceptions) ||
+                !decision.candidate ||
+                decision.candidate.repositoryId !== request.repositoryId ||
+                decision.candidate.commit !== request.headSha ||
+                decision.candidate.digest !== request.imageDigest ||
+                decision.candidate.environment !== request.environment) {
+              throw new Error("Release gate response is invalid or not bound to this candidate");
+            }
+            if (decision.decision === "pass" &&
+                (decision.blockers.length !== 0 ||
+                 typeof decision.expectedCertificateIdentity !== "string" ||
+                 decision.expectedCertificateIdentity.toLowerCase() !==
+                   candidate.certificateIdentity.toLowerCase())) {
+              throw new Error("Release gate pass disagrees with the independently verified signer");
+            }
+            fs.mkdirSync("guardianbot-release-gate", { mode: 0o700 });
+            fs.writeFileSync(
+              path.join("guardianbot-release-gate", "decision.json"),
+              `${JSON.stringify(decision, null, 2)}\n`,
+              { mode: 0o600, flag: "wx" }
+            );
+            // DefectDojo-sourced names are untrusted text: strip Markdown and
+            // control characters before they reach the job summary.
+            const cell = (value) => String(value ?? "")
+              .replace(/[\u0000-\u001f\u007f]/g, " ")
+              .replace(/[\\`*_{}\[\]()<>#+!|~-]/g, (match) => `\\${match}`)
+              .slice(0, 200);
+            const lines = [
+              `## GuardianBot release gate: ${decision.decision === "pass" ? "PASS" : "FAIL"}`,
+              "",
+              `Digest: ${cell(request.imageDigest)}`,
+              `Commit: ${cell(request.headSha)}`,
+              `Environment: ${cell(request.environment)}`,
+              ""
+            ];
+            if (decision.blockers.length) {
+              lines.push("| Blocker | Detail | Reference |", "| --- | --- | --- |");
+              for (const blocker of decision.blockers.slice(0, 100)) {
+                lines.push(`| ${cell(blocker.code)} | ${cell(blocker.message)} | ${cell(blocker.ref)} |`);
+              }
+              lines.push("");
+            }
+            if (decision.exceptions.length) {
+              lines.push("| Accepted finding | Risk acceptance | Expires |", "| --- | --- | --- |");
+              for (const exception of decision.exceptions.slice(0, 100)) {
+                lines.push(
+                  `| ${cell(exception.ref)} | ${cell(exception.riskAcceptanceName)} | ${cell(exception.expiresAt)} |`
+                );
+              }
+              lines.push("");
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
+            if (decision.decision !== "pass") {
+              throw new Error(
+                `Release gate failed: ${decision.blockers.map((blocker) =>
+                  /^[a-z-]{1,64}$/.test(String(blocker.code)) ? blocker.code : "unknown").join(", ")}`
+              );
+            }
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Upload release decision
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: guardianbot-release-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: guardianbot-release-gate/
+          if-no-files-found: warn

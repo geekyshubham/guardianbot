@@ -5,6 +5,8 @@ const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_BACKOFF_MS = 250;
 const MAX_PAGINATION_PAGES = 1_000;
+const DEFAULT_RELEASE_MAX_PAGES = 20;
+const MAX_RELEASE_ENGAGEMENTS = 10;
 const MAX_RESPONSE_BODY_PREVIEW = 1_024;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const ENVIRONMENT_REFERENCE_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
@@ -75,6 +77,52 @@ export interface DefectDojoTest {
   tags?: string[];
   updated?: string | null;
   created?: string | null;
+}
+
+export interface DefectDojoRiskAcceptance {
+  id: number;
+  name?: string | null;
+  expiration_date?: string | null;
+  decision?: string | null;
+  owner?: number | null;
+  accepted_findings?: number[] | null;
+}
+
+export interface DefectDojoFinding {
+  id: number;
+  test: number;
+  title?: string | null;
+  severity?: string | null;
+  active?: boolean | null;
+  verified?: boolean | null;
+  false_p?: boolean | null;
+  duplicate?: boolean | null;
+  out_of_scope?: boolean | null;
+  is_mitigated?: boolean | null;
+  risk_accepted?: boolean | null;
+  tags?: string[] | null;
+  accepted_risks?: DefectDojoRiskAcceptance[] | null;
+}
+
+export interface DefectDojoReleaseFindingsInput {
+  /** Exact DefectDojo product name; GuardianBot uses the repository full name. */
+  productName: string;
+  /** Exact engagement names to read, such as `main/security` and `main/image`. */
+  engagementNames: string[];
+  /** Restrict active findings to DefectDojo-verified findings. Defaults to true. */
+  verifiedOnly?: boolean;
+  /** Per-listing page cap. Exceeding it fails instead of truncating. Defaults to 20. */
+  maxPages?: number;
+}
+
+export interface DefectDojoReleaseFindings {
+  product: DefectDojoProduct | null;
+  engagements: DefectDojoEngagement[];
+  tests: DefectDojoTest[];
+  /** Open findings: active, not false positive/duplicate/out of scope/mitigated. */
+  findings: DefectDojoFinding[];
+  /** Risk-accepted findings with their `accepted_risks`, for exception checks. */
+  acceptedFindings: DefectDojoFinding[];
 }
 
 export interface DefectDojoImportMetadata {
@@ -346,7 +394,7 @@ function stableArrayEqual(left: string[] | undefined, right: string[] | undefine
     leftSorted.every((value, index) => value === rightSorted[index]);
 }
 
-function normalizeDefectDojoTag(value: string): string | undefined {
+export function normalizeDefectDojoTag(value: string): string | undefined {
   const normalized = value
     .trim()
     .replace(/[\s,'"]+/gu, "-")
@@ -780,9 +828,113 @@ export class DefectDojoClient {
     return results.find((item) => item.name === name) ?? null;
   }
 
+  /**
+   * Read-only release-gate query. Lists the exact product and named
+   * engagements, every Test inside them (Tests carry GuardianBot's scope tags
+   * because GuardianBot does not apply import tags to findings), and two finding
+   * sets: open findings (active, not false positive, not duplicate, not out of
+   * scope, not mitigated, and verified unless disabled) and risk-accepted
+   * findings with their `accepted_risks`. Every listing is page-bounded and
+   * fails instead of truncating, so callers can fail closed.
+   */
+  async listReleaseFindings(
+    input: DefectDojoReleaseFindingsInput
+  ): Promise<DefectDojoReleaseFindings> {
+    const maxPages = input.maxPages ?? DEFAULT_RELEASE_MAX_PAGES;
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > MAX_PAGINATION_PAGES) {
+      throw new DefectDojoError({
+        kind: "validation",
+        path: "maxPages",
+        message: `DefectDojo release query maxPages must be an integer between 1 and ${MAX_PAGINATION_PAGES}`
+      });
+    }
+    const engagementNames = sortStrings(input.engagementNames) ?? [];
+    if (
+      !input.productName.trim() ||
+      !engagementNames.length ||
+      engagementNames.length > MAX_RELEASE_ENGAGEMENTS
+    ) {
+      throw new DefectDojoError({
+        kind: "validation",
+        path: "release",
+        message: `DefectDojo release query requires a product name and 1-${MAX_RELEASE_ENGAGEMENTS} engagement names`
+      });
+    }
+    const verifiedOnly = input.verifiedOnly ?? true;
+    const products = await this.listPaginated<DefectDojoProduct>(
+      "/api/v2/products/",
+      { name: input.productName },
+      maxPages
+    );
+    const product = products.find((candidate) => candidate.name === input.productName) ?? null;
+    if (!product) {
+      return { product: null, engagements: [], tests: [], findings: [], acceptedFindings: [] };
+    }
+    const wanted = new Set(engagementNames);
+    const engagements = (
+      await this.listPaginated<DefectDojoEngagement>(
+        "/api/v2/engagements/",
+        { product: product.id },
+        maxPages
+      )
+    ).filter((engagement) => engagement.product === product.id && wanted.has(engagement.name));
+    const tests: DefectDojoTest[] = [];
+    const findings: DefectDojoFinding[] = [];
+    const acceptedFindings: DefectDojoFinding[] = [];
+    for (const engagement of engagements) {
+      tests.push(
+        ...(
+          await this.listPaginated<DefectDojoTest>(
+            "/api/v2/tests/",
+            { engagement: engagement.id },
+            maxPages
+          )
+        ).filter((test) => test.engagement === engagement.id)
+      );
+      const base = {
+        test__engagement: engagement.id,
+        false_p: false,
+        duplicate: false,
+        out_of_scope: false
+      };
+      findings.push(
+        ...(await this.listPaginated<DefectDojoFinding>(
+          "/api/v2/findings/",
+          {
+            ...base,
+            active: true,
+            is_mitigated: false,
+            verified: verifiedOnly ? true : undefined
+          },
+          maxPages
+        ))
+      );
+      acceptedFindings.push(
+        ...(await this.listPaginated<DefectDojoFinding>(
+          "/api/v2/findings/",
+          { ...base, risk_accepted: true },
+          maxPages
+        ))
+      );
+    }
+    const testIds = new Set(tests.map((test) => test.id));
+    const inEngagement = (finding: DefectDojoFinding) =>
+      Number.isSafeInteger(finding.id) && testIds.has(finding.test);
+    return {
+      product,
+      engagements,
+      tests,
+      // Server-side filters are re-checked by the evaluator; anything whose Test
+      // is outside the listed engagements is dropped here rather than trusted.
+      findings: findings.filter(inEngagement),
+      acceptedFindings: acceptedFindings.filter(inEngagement)
+    };
+  }
+
   private async listPaginated<T>(
     path: string,
-    query: Record<string, string | number | boolean | undefined> = {}
+    query: Record<string, string | number | boolean | undefined> = {},
+    maxPages = MAX_PAGINATION_PAGES
   ): Promise<T[]> {
     const results: T[] = [];
     let nextPath: string | null = path;
@@ -794,7 +946,7 @@ export class DefectDojoClient {
     let pages = 0;
     while (nextPath) {
       const nextUrl = new URL(nextPath, this.config.baseUrl).toString();
-      if (visited.has(nextUrl) || pages >= MAX_PAGINATION_PAGES) {
+      if (visited.has(nextUrl) || pages >= maxPages) {
         throw new DefectDojoError({
           kind: "validation",
           path,

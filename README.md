@@ -56,7 +56,8 @@ node packages/guardianctl/dist/cli.js onboard OWNER/REPOSITORY --dry-run
 
 Production-like setup starts with [getting started](docs/getting-started.md).
 See [what is verified](docs/status.md), [how it works](docs/how-it-works.md),
-[configuration](docs/repository-configuration.md), and the
+[configuration](docs/repository-configuration.md), the
+[release gate](docs/release-gate.md), and the
 [security model](docs/security-model.md). GitHub App creation and least-
 privilege settings are documented in [docs/github-app.md](docs/github-app.md).
 
@@ -68,7 +69,7 @@ privilege settings are documented in [docs/github-app.md](docs/github-app.md).
 - `packages/protocol`: canonical provider-neutral request/result schemas and client.
 - `packages/core`: detection, configuration, indexing, policy, and GitHub primitives.
 - `packages/guardianctl`: reusable repository onboarding and administration.
-- `.github/workflows`: centrally maintained security, image, and DAST workflows.
+- `.github/workflows`: centrally maintained security, image, DAST, and release-gate workflows.
 - `infra`: DigitalOcean-only deployment definitions.
 - `docs`: user, protocol, security, operations, runbooks, ADRs, and roadmap.
 

@@ -4,6 +4,7 @@ import {
   createDigitalOceanDeploymentService,
   DigitalOceanDeploymentError
 } from "../src/digitalocean-deployment.js";
+import type { ReleaseGateEvaluator } from "../src/release-gate.js";
 import { MemoryStore } from "../src/store.js";
 
 const NOW = new Date("2026-07-27T12:00:00.000Z");
@@ -497,4 +498,125 @@ test("repositories without an administrative profile are not deployed", async ()
     }) as typeof fetch
   });
   assert.equal(await service.promote(input()), undefined);
+});
+
+function gatedEnvironment(requireReleaseGate: unknown): Record<string, string> {
+  const base = environment();
+  const profiles = JSON.parse(base.GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON!) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  profiles["service-staging"]!.requireReleaseGate = requireReleaseGate;
+  return { ...base, GUARDIANBOT_DIGITALOCEAN_DEPLOYMENTS_JSON: JSON.stringify(profiles) };
+}
+
+function idempotentFetch(counter: { calls: number }): typeof fetch {
+  return (async (request: string | URL | Request) => {
+    counter.calls += 1;
+    const url =
+      request instanceof URL
+        ? request
+        : new URL(typeof request === "string" ? request : request.url);
+    if (url.origin === "https://api.digitalocean.com") {
+      return Response.json(appDocument(NEW_DIGEST));
+    }
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+}
+
+function releaseDecision(decision: "pass" | "fail") {
+  return {
+    decision,
+    blockers: decision === "pass" ? [] : [{ code: "release-blocking-finding" }]
+  } as unknown as Awaited<ReturnType<ReleaseGateEvaluator["evaluate"]>>;
+}
+
+const RELEASE_EVIDENCE = {
+  defaultBranch: "main",
+  certificateIdentity: "https://github.com/geekyshubham/guardianbot/.github/workflows/reusable-image.yml@" + "f".repeat(40),
+  criticalFindings: 0,
+  sbomPresent: true,
+  ref: "evidence://500/2/9"
+};
+
+test("requireReleaseGate rejects non-boolean values and defaults off", async () => {
+  assert.throws(
+    () =>
+      createDigitalOceanDeploymentService({
+        store: new MemoryStore(),
+        environment: gatedEnvironment("yes")
+      }),
+    /requireReleaseGate must be a boolean/
+  );
+  // Default-off profiles never consult the gate, even when one is wired.
+  let evaluations = 0;
+  const service = createDigitalOceanDeploymentService({
+    store: new MemoryStore(),
+    environment: environment(),
+    fetchImpl: idempotentFetch({ calls: 0 }),
+    now: () => NOW,
+    releaseGate: {
+      evaluate: async () => {
+        evaluations += 1;
+        return releaseDecision("fail");
+      }
+    }
+  });
+  assert.equal((await service.promote(input()))?.updated, false);
+  assert.equal(evaluations, 0);
+});
+
+test("requireReleaseGate refuses promotion before any DigitalOcean call unless the gate passes", async () => {
+  const counter = { calls: 0 };
+  const evaluated: unknown[] = [];
+  const build = (gate?: ReleaseGateEvaluator) =>
+    createDigitalOceanDeploymentService({
+      store: new MemoryStore(),
+      environment: gatedEnvironment(true),
+      fetchImpl: idempotentFetch(counter),
+      now: () => NOW,
+      releaseGate: gate
+    });
+  const failing: ReleaseGateEvaluator = {
+    evaluate: async (value) => {
+      evaluated.push(value);
+      return releaseDecision("fail");
+    }
+  };
+  await assert.rejects(
+    () => build(failing).promote({ ...input(), releaseEvidence: RELEASE_EVIDENCE }),
+    (error: unknown) =>
+      error instanceof DigitalOceanDeploymentError &&
+      /release-blocking-finding/.test(error.message)
+  );
+  await assert.rejects(
+    () => build(undefined).promote({ ...input(), releaseEvidence: RELEASE_EVIDENCE }),
+    DigitalOceanDeploymentError
+  );
+  await assert.rejects(() => build(failing).promote(input()), DigitalOceanDeploymentError);
+  await assert.rejects(
+    () =>
+      build({
+        evaluate: async () => {
+          throw new Error("DefectDojo down");
+        }
+      }).promote({ ...input(), releaseEvidence: RELEASE_EVIDENCE }),
+    (error: unknown) =>
+      error instanceof DigitalOceanDeploymentError && /unavailable/.test(error.message)
+  );
+  assert.equal(counter.calls, 0);
+  assert.deepEqual((evaluated[0] as { candidate: unknown }).candidate, {
+    repository: "geekyshubham/service",
+    repositoryId: 99,
+    commit: "a".repeat(40),
+    digest: NEW_DIGEST,
+    environment: "staging"
+  });
+
+  const passing = await build({ evaluate: async () => releaseDecision("pass") }).promote({
+    ...input(),
+    releaseEvidence: RELEASE_EVIDENCE
+  });
+  assert.equal(passing?.imageDigest, NEW_DIGEST);
+  assert.ok(counter.calls > 0);
 });

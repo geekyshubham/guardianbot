@@ -564,3 +564,201 @@ test("builds stable immutable scan identities and sorted tags", () => {
     "1|geekyshubham/guardianbot|private|main|nightly|Trivy Scan|88|2|abc123|staging|sha256:deadbeef"
   );
 });
+
+function releaseClient(
+  handler: (url: URL) => Response,
+  calls: URL[] = []
+): DefectDojoClient {
+  return new DefectDojoClient(
+    resolveDefectDojoConfig(
+      {
+        DEFECTDOJO_URL: "https://dojo.example.com",
+        DEFECTDOJO_API_TOKEN: "token"
+      },
+      { baseUrlRef: "DEFECTDOJO_URL", apiTokenRef: "DEFECTDOJO_API_TOKEN", pageSize: 2 }
+    ),
+    {
+      fetch: async (input, init) => {
+        assert.equal(init?.method ?? "GET", "GET");
+        const url = new URL(input instanceof URL ? input.toString() : String(input));
+        calls.push(url);
+        return handler(url);
+      }
+    }
+  );
+}
+
+test("release finding query is read-only, scoped to named engagements, and paginated", async () => {
+  const calls: URL[] = [];
+  const client = releaseClient((url) => {
+    if (url.pathname === "/api/v2/products/") {
+      return createJsonResponse({
+        next: null,
+        results: [
+          { id: 7, name: "Geekyshubham/service-old" },
+          { id: 8, name: "Geekyshubham/service" }
+        ]
+      });
+    }
+    if (url.pathname === "/api/v2/engagements/") {
+      return createJsonResponse({
+        next: null,
+        results: [
+          { id: 30, name: "main/security", product: 8 },
+          { id: 31, name: "main/image", product: 8 },
+          { id: 32, name: "feature/security", product: 8 },
+          { id: 33, name: "main/dast", product: 9 }
+        ]
+      });
+    }
+    if (url.pathname === "/api/v2/tests/") {
+      const engagement = Number(url.searchParams.get("engagement"));
+      return createJsonResponse({
+        next: null,
+        results: [
+          { id: engagement * 10, engagement, tags: ["guardianbot:repo-id:99"] },
+          { id: 999, engagement: 77 }
+        ]
+      });
+    }
+    if (url.pathname === "/api/v2/findings/") {
+      const engagement = Number(url.searchParams.get("test__engagement"));
+      if (url.searchParams.get("risk_accepted") === "true") {
+        return createJsonResponse({ next: null, results: [] });
+      }
+      if (!url.searchParams.has("offset")) {
+        return createJsonResponse({
+          next: `https://dojo.example.com/api/v2/findings/?test__engagement=${engagement}&offset=2`,
+          results: [{ id: engagement * 100, test: engagement * 10, severity: "Critical" }]
+        });
+      }
+      return createJsonResponse({
+        next: null,
+        results: [
+          { id: engagement * 100 + 1, test: engagement * 10, severity: "High" },
+          { id: engagement * 100 + 2, test: 999, severity: "Critical" }
+        ]
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  }, calls);
+
+  const result = await client.listReleaseFindings({
+    productName: "Geekyshubham/service",
+    engagementNames: ["main/security", "main/image"]
+  });
+  assert.equal(result.product?.id, 8);
+  assert.deepEqual(
+    result.engagements.map((engagement) => engagement.id),
+    [30, 31]
+  );
+  assert.deepEqual(
+    result.tests.map((entry) => entry.id),
+    [300, 310]
+  );
+  // Findings whose Test is outside the listed engagements are dropped.
+  assert.deepEqual(
+    result.findings.map((finding) => finding.id),
+    [3000, 3001, 3100, 3101]
+  );
+  const openQuery = calls.find(
+    (url) =>
+      url.pathname === "/api/v2/findings/" &&
+      url.searchParams.get("active") === "true"
+  );
+  assert.ok(openQuery);
+  assert.equal(openQuery.searchParams.get("verified"), "true");
+  assert.equal(openQuery.searchParams.get("false_p"), "false");
+  assert.equal(openQuery.searchParams.get("duplicate"), "false");
+  assert.equal(openQuery.searchParams.get("out_of_scope"), "false");
+  assert.equal(openQuery.searchParams.get("is_mitigated"), "false");
+  assert.ok(
+    calls.some(
+      (url) =>
+        url.pathname === "/api/v2/findings/" &&
+        url.searchParams.get("risk_accepted") === "true"
+    )
+  );
+});
+
+test("release finding query can include unverified findings", async () => {
+  const calls: URL[] = [];
+  const client = releaseClient((url) => {
+    if (url.pathname === "/api/v2/products/") {
+      return createJsonResponse({ next: null, results: [{ id: 8, name: "acme/app" }] });
+    }
+    if (url.pathname === "/api/v2/engagements/") {
+      return createJsonResponse({ next: null, results: [{ id: 1, name: "main/image", product: 8 }] });
+    }
+    return createJsonResponse({ next: null, results: [] });
+  }, calls);
+  await client.listReleaseFindings({
+    productName: "acme/app",
+    engagementNames: ["main/image"],
+    verifiedOnly: false
+  });
+  const openQuery = calls.find(
+    (url) => url.pathname === "/api/v2/findings/" && url.searchParams.get("active") === "true"
+  );
+  assert.equal(openQuery?.searchParams.has("verified"), false);
+});
+
+test("release finding query reports a missing product without guessing", async () => {
+  const client = releaseClient(() => createJsonResponse({ next: null, results: [{ id: 1, name: "acme/other" }] }));
+  const result = await client.listReleaseFindings({
+    productName: "acme/app",
+    engagementNames: ["main/image"]
+  });
+  assert.equal(result.product, null);
+  assert.deepEqual(result.findings, []);
+});
+
+test("release finding query fails instead of truncating past its page cap", async () => {
+  let page = 0;
+  const client = releaseClient((url) => {
+    if (url.pathname === "/api/v2/products/") {
+      return createJsonResponse({ next: null, results: [{ id: 8, name: "acme/app" }] });
+    }
+    if (url.pathname === "/api/v2/engagements/") {
+      return createJsonResponse({ next: null, results: [{ id: 1, name: "main/image", product: 8 }] });
+    }
+    if (url.pathname === "/api/v2/tests/") {
+      return createJsonResponse({ next: null, results: [{ id: 10, engagement: 1 }] });
+    }
+    page += 1;
+    return createJsonResponse({
+      next: `https://dojo.example.com/api/v2/findings/?offset=${page * 2}`,
+      results: [{ id: page, test: 10, severity: "Critical" }]
+    });
+  });
+  await assert.rejects(
+    () =>
+      client.listReleaseFindings({
+        productName: "acme/app",
+        engagementNames: ["main/image"],
+        maxPages: 3
+      }),
+    (error: unknown) =>
+      error instanceof DefectDojoError &&
+      error.kind === "validation" &&
+      /maximum page count/.test(error.message)
+  );
+  await assert.rejects(
+    () =>
+      client.listReleaseFindings({
+        productName: "acme/app",
+        engagementNames: [],
+        maxPages: 3
+      }),
+    /engagement names/
+  );
+  await assert.rejects(
+    () =>
+      client.listReleaseFindings({
+        productName: "acme/app",
+        engagementNames: ["main/image"],
+        maxPages: 0
+      }),
+    /maxPages/
+  );
+});

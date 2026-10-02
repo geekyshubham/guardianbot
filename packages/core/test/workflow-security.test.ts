@@ -13,7 +13,8 @@ test("reusable workflows resolve attestation only from the exact workflow releas
   const workflows = [
     ".github/workflows/reusable-security.yml",
     ".github/workflows/reusable-image.yml",
-    ".github/workflows/reusable-dast.yml"
+    ".github/workflows/reusable-dast.yml",
+    ".github/workflows/reusable-release-gate.yml"
   ].map(repositoryFile);
 
   for (const workflow of workflows) {
@@ -47,7 +48,8 @@ test("reusable workflows retry only transient GitHub OIDC failures", () => {
   const workflows = new Map([
     [".github/workflows/reusable-security.yml", 1],
     [".github/workflows/reusable-image.yml", 2],
-    [".github/workflows/reusable-dast.yml", 2]
+    [".github/workflows/reusable-dast.yml", 2],
+    [".github/workflows/reusable-release-gate.yml", 1]
   ]);
 
   for (const [path, expectedRequests] of workflows) {
@@ -64,6 +66,54 @@ test("reusable workflows retry only transient GitHub OIDC failures", () => {
     assert.match(workflow, /response\.status !== 429 && response\.status < 500/);
     assert.match(workflow, /attempt <= 4/);
     assert.match(workflow, /500 \* \(2 \*\* \(attempt - 1\)\)/);
+  }
+});
+
+test("release gate workflow verifies the exact signer and fails closed on any non-pass", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-release-gate.yml");
+  assert.match(workflow, /^permissions:\n  contents: read\n/m);
+  assert.match(workflow, /if: github\.event_name == 'workflow_dispatch'\n/);
+  assert.match(workflow, /environment: guardianbot-release-gate\n/);
+  assert.match(workflow, /id-token: write/);
+  assert.doesNotMatch(workflow, /secrets\./);
+  assert.doesNotMatch(workflow, /pull_request_target/);
+  assert.doesNotMatch(workflow, /contents: write|packages: write|id-token: read/);
+  assert.match(workflow, /sigstore\/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac/);
+  assert.match(workflow, /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02/);
+  for (const line of workflow.split("\n").filter((entry) => /uses: /.test(entry))) {
+    assert.match(line, /@[a-f0-9]{40}$/, `action must be pinned to a full SHA: ${line}`);
+  }
+  assert.match(
+    workflow,
+    /`\/\.github\/workflows\/reusable-image\.yml@\$\{imageWorkflowSha\}`/
+  );
+  assert.match(
+    workflow,
+    /cosign verify --output json "\$image_ref" \\\n\s+--certificate-identity "\$certificate_identity" \\\n\s+--certificate-oidc-issuer "https:\/\/token\.actions\.githubusercontent\.com"/
+  );
+  assert.doesNotMatch(workflow, /--certificate-identity-regexp/);
+  assert.match(workflow, /\.critical\.image\["docker-manifest-digest"\] == \$digest/);
+  assert.match(workflow, /set -euo pipefail/);
+  assert.match(workflow, /oidcUrl\.searchParams\.set\("audience", "guardianbot-release-gate"\)/);
+  assert.match(workflow, /new URL\("\/release\/gate", evidenceEndpoint\)/);
+  assert.match(workflow, /if \(gateResponse\.status !== 200\)/);
+  assert.match(workflow, /decision\.candidate\.digest !== request\.imageDigest/);
+  assert.match(workflow, /if \(decision\.decision !== "pass"\) \{\n\s+throw new Error/);
+  assert.match(workflow, /GITHUB_STEP_SUMMARY/);
+  assert.match(workflow, /path: guardianbot-release-gate\//);
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{ inputs."))) {
+    assert.match(
+      line,
+      /^\s+INPUT_[A-Z0-9_]+:\s+\$\{\{ inputs\.[A-Za-z0-9-]+ \}\}$/,
+      `workflow input must enter a shell step only through an environment assignment: ${line}`
+    );
+  }
+  for (const line of workflow.split("\n").filter((entry) => entry.includes("${{"))) {
+    assert.doesNotMatch(
+      line,
+      /^\s+(?:run:|node|cosign|jq|printf|docker)/,
+      `expressions must not be interpolated into scripts: ${line}`
+    );
   }
 });
 
