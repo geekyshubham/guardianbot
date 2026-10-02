@@ -611,6 +611,16 @@ export interface SuccessfulDeploymentEvidence {
   origin: string;
 }
 
+/**
+ * The digest currently deployed to an environment, joined with the signature evidence that the
+ * same trusted promotion recorded. The rescan target is derived only from these server-side rows,
+ * never from a tag or from workflow input.
+ */
+export interface DeployedImageEvidence extends SuccessfulDeploymentEvidence {
+  imageReference: string;
+  certificateIdentity: string;
+}
+
 export interface StoreLock {
   release(): Promise<void>;
 }
@@ -1366,6 +1376,15 @@ export interface Store {
     headSha: string,
     defaultBranch: string
   ): Promise<SuccessfulDeploymentEvidence | undefined>;
+  /**
+   * Latest accepted default-branch deployment for an environment regardless of head SHA, used to
+   * pin the nightly rescan to the exact digest that is running.
+   */
+  getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined>;
   claimDeploymentPromotion(
     claim: DeploymentPromotionClaim
   ): Promise<boolean>;
@@ -2384,6 +2403,89 @@ export class MemoryStore implements Store {
       };
     }
     return undefined;
+  }
+
+  async getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined> {
+    const candidates = [...this.scannerEvidence.values()]
+      .filter(
+        (evidence) =>
+          evidence.repositoryId === repositoryId &&
+          evidence.evidenceKey === `deployment:${environment}` &&
+          evidence.kind === "deployment" &&
+          evidence.source === "digitalocean" &&
+          evidence.status === "success" &&
+          evidence.environment === environment &&
+          evidence.fingerprint === undefined &&
+          typeof evidence.digest === "string" &&
+          /^sha256:[a-f0-9]{64}$/.test(evidence.digest)
+      )
+      .sort(compareScannerEvidenceNewestFirst);
+    const latest = candidates.find((evidence) => {
+      const run = this.scannerRuns.get(
+        scannerRunKey(repositoryId, evidence.runId, evidence.runAttempt)
+      );
+      const artifact = this.scannerArtifacts.get(
+        scannerArtifactKey(
+          repositoryId,
+          evidence.runId,
+          evidence.runAttempt,
+          evidence.artifactId
+        )
+      );
+      return (
+        run !== undefined &&
+        run.headBranch === defaultBranch &&
+        run.event === "push" &&
+        run.conclusion === "success" &&
+        run.validationStatus === "accepted" &&
+        artifact?.artifactType === "image-promotion" &&
+        artifact.validationStatus === "accepted" &&
+        typeof evidence.payload?.origin === "string"
+      );
+    });
+    // Only the newest accepted deployment is the running digest. An older healthy row must never
+    // stand in for it when the newest one cannot be bound to its signature evidence.
+    if (!latest) return undefined;
+    const run = this.scannerRuns.get(
+      scannerRunKey(repositoryId, latest.runId, latest.runAttempt)
+    )!;
+    const signature = this.scannerEvidence.get(
+      scannerEvidenceKey(
+        repositoryId,
+        latest.runId,
+        latest.runAttempt,
+        latest.artifactId,
+        "signature"
+      )
+    );
+    const imageReference = signature?.payload?.imageReference;
+    const certificateIdentity = signature?.payload?.certificateIdentity;
+    if (
+      !signature ||
+      signature.kind !== "signature" ||
+      signature.status !== "success" ||
+      signature.digest !== latest.digest ||
+      typeof imageReference !== "string" ||
+      typeof certificateIdentity !== "string"
+    ) {
+      return undefined;
+    }
+    return {
+      repositoryId,
+      runId: latest.runId,
+      runAttempt: latest.runAttempt,
+      headSha: run.headSha,
+      environment,
+      imageDigest: latest.digest!,
+      observedAt: latest.observedAt,
+      origin: String(latest.payload!.origin),
+      imageReference,
+      certificateIdentity
+    };
   }
 
   async claimDeploymentPromotion(
@@ -4299,6 +4401,93 @@ export class PostgresStore implements Store {
       imageDigest: String(row.digest),
       observedAt: new Date(row.observed_at).toISOString(),
       origin: String(row.origin)
+    };
+  }
+
+  async getLatestDeployedImageEvidence(
+    repositoryId: number,
+    environment: string,
+    defaultBranch: string
+  ): Promise<DeployedImageEvidence | undefined> {
+    // The newest accepted deployment row is selected first and only then joined to its signature
+    // row, so an unbindable newest deployment yields nothing instead of an older digest.
+    const result = await this.pool.query(
+      `WITH latest AS (
+         SELECT evidence.repository_id,
+                evidence.run_id,
+                evidence.run_attempt,
+                evidence.artifact_id,
+                evidence.digest,
+                evidence.observed_at,
+                evidence.payload->>'origin' AS origin,
+                runs.head_sha
+         FROM scanner_evidence AS evidence
+         JOIN scanner_workflow_runs AS runs
+           ON runs.repository_id=evidence.repository_id
+          AND runs.run_id=evidence.run_id
+          AND runs.run_attempt=evidence.run_attempt
+         JOIN scanner_artifacts AS artifacts
+           ON artifacts.repository_id=evidence.repository_id
+          AND artifacts.run_id=evidence.run_id
+          AND artifacts.run_attempt=evidence.run_attempt
+          AND artifacts.artifact_id=evidence.artifact_id
+         WHERE evidence.repository_id=$1
+           AND evidence.evidence_key=$2
+           AND evidence.kind='deployment'
+           AND evidence.source='digitalocean'
+           AND evidence.status='success'
+           AND evidence.environment=$3
+           AND evidence.fingerprint IS NULL
+           AND evidence.digest ~ '^sha256:[a-f0-9]{64}$'
+           AND runs.head_branch=$4
+           AND runs.event='push'
+           AND runs.conclusion='success'
+           AND runs.validation_status='accepted'
+           AND artifacts.artifact_type='image-promotion'
+           AND artifacts.validation_status='accepted'
+           AND jsonb_typeof(evidence.payload)='object'
+           AND jsonb_typeof(evidence.payload->'origin')='string'
+         ORDER BY evidence.observed_at DESC,
+                  evidence.updated_at DESC,
+                  evidence.run_id DESC,
+                  evidence.run_attempt DESC
+         LIMIT 1
+       )
+       SELECT latest.run_id,
+              latest.run_attempt,
+              latest.digest,
+              latest.observed_at,
+              latest.origin,
+              latest.head_sha,
+              signature.payload->>'imageReference' AS image_reference,
+              signature.payload->>'certificateIdentity' AS certificate_identity
+       FROM latest
+       JOIN scanner_evidence AS signature
+         ON signature.repository_id=latest.repository_id
+        AND signature.run_id=latest.run_id
+        AND signature.run_attempt=latest.run_attempt
+        AND signature.artifact_id=latest.artifact_id
+        AND signature.evidence_key='signature'
+       WHERE signature.kind='signature'
+         AND signature.status='success'
+         AND signature.digest=latest.digest
+         AND jsonb_typeof(signature.payload->'imageReference')='string'
+         AND jsonb_typeof(signature.payload->'certificateIdentity')='string'`,
+      [repositoryId, `deployment:${environment}`, environment, defaultBranch]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      repositoryId,
+      runId: Number(row.run_id),
+      runAttempt: Number(row.run_attempt),
+      headSha: String(row.head_sha),
+      environment,
+      imageDigest: String(row.digest),
+      observedAt: new Date(row.observed_at).toISOString(),
+      origin: String(row.origin),
+      imageReference: String(row.image_reference),
+      certificateIdentity: String(row.certificate_identity)
     };
   }
 

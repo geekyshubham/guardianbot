@@ -3408,3 +3408,165 @@ test("PostgresStore monitoring inventory reads runs and evidence from the defaul
   assert.match(runsQuery, /runs\.head_branch=repositories\.default_branch/);
   assert.match(evidenceQuery, /runs\.head_branch=repositories\.default_branch/);
 });
+
+async function seedDeployment(
+  store: MemoryStore,
+  options: {
+    runId: number;
+    headSha: string;
+    digest: string;
+    observedAt: string;
+    signatureDigest?: string | null;
+    event?: "push" | "schedule";
+  }
+): Promise<void> {
+  await store.upsertScannerWorkflowRun({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    headSha: options.headSha,
+    headBranch: "main",
+    event: options.event ?? "push",
+    workflowPath: ".github/workflows/guardianbot.yml",
+    conclusion: "success",
+    status: "completed",
+    validationStatus: "accepted",
+    referencedWorkflows: []
+  });
+  await store.upsertScannerArtifact({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    artifactId: options.runId + 1,
+    artifactName: `guardianbot-image-promotion-${options.runId}-1`,
+    artifactType: "image-promotion",
+    sizeBytes: 1,
+    expired: false,
+    validationStatus: "accepted"
+  });
+  if (options.signatureDigest !== null) {
+    await store.upsertScannerEvidence({
+      repositoryId: 77,
+      runId: options.runId,
+      runAttempt: 1,
+      artifactId: options.runId + 1,
+      evidenceKey: "signature",
+      kind: "signature",
+      source: "cosign",
+      status: "success",
+      observedAt: options.observedAt,
+      digest: options.signatureDigest ?? options.digest,
+      payload: {
+        imageReference: `ghcr.io/example/service@${options.digest}`,
+        certificateIdentity:
+          "https://github.com/geekyshubham/guardianbot/.github/workflows/reusable-image.yml@" +
+          "c".repeat(40)
+      }
+    });
+  }
+  await store.upsertScannerEvidence({
+    repositoryId: 77,
+    runId: options.runId,
+    runAttempt: 1,
+    artifactId: options.runId + 1,
+    evidenceKey: "deployment:staging",
+    kind: "deployment",
+    source: "digitalocean",
+    status: "success",
+    observedAt: options.observedAt,
+    digest: options.digest,
+    environment: "staging",
+    payload: { origin: "https://staging.example.com" }
+  });
+}
+
+test("MemoryStore returns the newest accepted deployed digest with its signature identity", async () => {
+  const store = new MemoryStore();
+  const older = `sha256:${"1".repeat(64)}`;
+  const newer = `sha256:${"2".repeat(64)}`;
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: older,
+    observedAt: "2026-07-26T10:00:00.000Z"
+  });
+  await seedDeployment(store, {
+    runId: 200,
+    headSha: "b".repeat(40),
+    digest: newer,
+    observedAt: "2026-07-27T10:00:00.000Z"
+  });
+  const deployed = await store.getLatestDeployedImageEvidence(77, "staging", "main");
+  assert.equal(deployed?.imageDigest, newer);
+  assert.equal(deployed?.headSha, "b".repeat(40));
+  assert.equal(deployed?.runId, 200);
+  assert.equal(deployed?.imageReference, `ghcr.io/example/service@${newer}`);
+  assert.match(deployed?.certificateIdentity ?? "", /reusable-image\.yml@c{40}$/);
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "production", "main"), undefined);
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "release"), undefined);
+});
+
+test("MemoryStore never falls back to an older digest when the newest deployment is unbound", async () => {
+  const store = new MemoryStore();
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: `sha256:${"1".repeat(64)}`,
+    observedAt: "2026-07-26T10:00:00.000Z"
+  });
+  await seedDeployment(store, {
+    runId: 200,
+    headSha: "b".repeat(40),
+    digest: `sha256:${"2".repeat(64)}`,
+    observedAt: "2026-07-27T10:00:00.000Z",
+    signatureDigest: `sha256:${"3".repeat(64)}`
+  });
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "main"), undefined);
+});
+
+test("MemoryStore ignores deployment rows from runs that are not default-branch pushes", async () => {
+  const store = new MemoryStore();
+  await seedDeployment(store, {
+    runId: 100,
+    headSha: "a".repeat(40),
+    digest: `sha256:${"1".repeat(64)}`,
+    observedAt: "2026-07-26T10:00:00.000Z",
+    event: "schedule"
+  });
+  assert.equal(await store.getLatestDeployedImageEvidence(77, "staging", "main"), undefined);
+});
+
+test("PostgresStore selects the newest deployment before binding its signature row", async () => {
+  const digest = `sha256:${"2".repeat(64)}`;
+  const { store, poolQueries } = stubbedPostgresStore(undefined, (text, values) =>
+    text.includes("WITH latest AS")
+      ? {
+          rows: [
+            {
+              run_id: "200",
+              run_attempt: "1",
+              digest,
+              observed_at: "2026-07-27T10:00:00.000Z",
+              origin: "https://staging.example.com",
+              head_sha: "b".repeat(40),
+              image_reference: `ghcr.io/example/service@${digest}`,
+              certificate_identity: "https://github.com/x/y/.github/workflows/reusable-image.yml@" + "c".repeat(40),
+              values
+            }
+          ]
+        }
+      : undefined
+  );
+  const deployed = await store.getLatestDeployedImageEvidence(77, "staging", "main");
+  assert.equal(deployed?.imageDigest, digest);
+  assert.equal(deployed?.runId, 200);
+  assert.equal(deployed?.headSha, "b".repeat(40));
+  const query = poolQueries.find((text) => text.includes("WITH latest AS"));
+  assert.ok(query);
+  // LIMIT 1 must apply inside the CTE, before the signature join, so an unbindable newest row
+  // cannot let an older deployed digest through.
+  assert.ok(query.indexOf("LIMIT 1") < query.indexOf("JOIN scanner_evidence AS signature"));
+  assert.doesNotMatch(query, /head_sha=\$/);
+  assert.match(query, /runs\.event='push'/);
+  assert.match(query, /signature\.digest=latest\.digest/);
+});

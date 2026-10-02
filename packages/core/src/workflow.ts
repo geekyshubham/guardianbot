@@ -27,9 +27,11 @@ export function generateCallerWorkflow(options: CallerWorkflowOptions): string {
   const securitySchedule = "23 2 * * *";
   const dastSmokeSchedule = "*/15 * * * *";
   const dastNightlySchedule = "47 2 * * *";
+  const imageRescanSchedule = "13 3 * * *";
   const reference = `${options.guardianRepository}/.github/workflows/reusable-security.yml@${options.workflowSha}`;
   const imageReference = `${options.guardianRepository}/.github/workflows/reusable-image.yml@${options.workflowSha}`;
   const dastReference = `${options.guardianRepository}/.github/workflows/reusable-dast.yml@${options.workflowSha}`;
+  const imageRescanReference = `${options.guardianRepository}/.github/workflows/reusable-image-rescan.yml@${options.workflowSha}`;
   const image = options.image;
   const dast = options.dast;
   const runtimeEnvironment = image?.runtimeEnvironment
@@ -65,7 +67,21 @@ ${runtimeEnvironment || "          # No runtime environment values configured."}
           ? `\${{ github.event_name == 'push' && github.ref == 'refs/heads/${options.defaultBranch}' }}`
           : "false"
       }
-` : "";
+${image.deployment ? `
+  guardianbot-image-rescan:
+    name: guardianbot/image-rescan
+    # Nightly rescan of the exact digest already deployed to this environment. The digest is
+    # resolved from accepted control-plane deployment evidence, never from a tag.
+    if: github.event_name == 'schedule' && github.event.schedule == '${imageRescanSchedule}'
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    uses: ${imageRescanReference}
+    with:
+      image-name: ${JSON.stringify(image.registry)}
+      deployment-environment: ${JSON.stringify(image.deployment.environment)}
+` : ""}` : "";
   const dastJobs = dast ? `
   guardianbot-dast-smoke:
     name: guardianbot/dast-smoke
@@ -105,7 +121,10 @@ ${runtimeEnvironment || "          # No runtime environment values configured."}
 ` : "";
   const schedules = [
     securitySchedule,
-    ...(dast ? [dastSmokeSchedule, dastNightlySchedule] : [])
+    ...(dast ? [dastSmokeSchedule, dastNightlySchedule] : []),
+    // Only configurations that opted into image.deployment gain the rescan schedule, so every
+    // other caller workflow stays byte-identical.
+    ...(image?.deployment ? [imageRescanSchedule] : [])
   ];
   const releaseCoverage = (options.releaseBranches?.length ?? 0) > 0;
   const coveredBranches = callerCoveredBranches(options.defaultBranch, options.releaseBranches)

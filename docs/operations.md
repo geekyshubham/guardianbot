@@ -59,6 +59,9 @@ App-level environment configuration must include:
 - GitHub App ID, private key, and webhook secret;
 - `GUARDIANBOT_EVIDENCE_SIGNING_SECRET`;
 - exact trusted security, image, and DAST reusable-workflow SHAs;
+- optionally `GUARDIANBOT_TRUSTED_IMAGE_RESCAN_WORKFLOW_SHA`, the exact trusted
+  `reusable-image-rescan.yml` SHA. It defaults to the trusted image workflow
+  SHA because both workflows ship in the same release;
 - `DATABASE_URL` and
   `GUARDIANBOT_DATABASE_CA_CERT=${guardianbot-db.CA_CERT}` for the managed
   DigitalOcean database binding;
@@ -75,6 +78,13 @@ configuration.
 The DAST broker reads accepted deployment evidence from the durable store and
 will not issue a session until the scheduled/manual run SHA matches the
 healthy deployed digest and origin.
+
+Repositories with `image.deployment` also run a nightly deployed-digest
+rescan. Each such consumer repository needs a GitHub environment named
+`guardianbot-image-rescan`; the rescan job requests an OIDC token with that
+audience and calls `POST /image/rescan-target`, which returns only the latest
+accepted deployment's exact digest and signing identity and fails closed when
+no deployment exists. Callers gain the job only after they are regenerated.
 
 To roll back App Platform, run the same verified script with the retained asset
 directory for the previous release. Database rollback is a separate,
@@ -220,6 +230,8 @@ Monitor at minimum:
 - expected workflow runs, repository-index freshness, and scanner evidence;
 - distinct DAST smoke/nightly freshness and DefectDojo imports;
 - exact scan/SBOM/signature/deployment digest agreement; and
+- deployed-digest rescan freshness (`image-rescan-coverage`) and the
+  `image-promotion-freeze` signal; and
 - suppression expiry and weekly coverage snapshots.
 
 ### Private metrics and operator monitoring status

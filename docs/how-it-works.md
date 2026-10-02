@@ -110,3 +110,27 @@ The 15-minute smoke and nightly authenticated scans use distinct evidence and
 DefectDojo import identities. Expected-run reconciliation, index freshness,
 evidence freshness, suppression expiry, exact signed/deployed digest matching,
 and weekly aggregate coverage are persisted by the monitoring scheduler.
+
+```mermaid
+sequenceDiagram
+  participant W as "Nightly rescan workflow"
+  participant O as "GitHub OIDC"
+  participant C as "GuardianBot rescan target"
+  participant E as "Accepted deployment evidence"
+  participant R as "GHCR"
+  participant T as "Trivy"
+  W->>O: "OIDC token for guardianbot-image-rescan"
+  W->>C: "POST /image/rescan-target"
+  C->>C: "Verify repo, run, commit, workflow SHA, runner, environment"
+  C->>E: "Latest accepted deployment for the environment"
+  E-->>C: "Exact digest, reference, signing identity, deployment run"
+  C-->>W: "Digest-bound rescan target"
+  W->>R: "cosign verify and verify-attestation, pull by digest"
+  W->>T: "Pinned image scan and fresh CycloneDX SBOM"
+  W->>C: "Provenance-bound image-rescan evidence"
+  C->>C: "Re-verify, diff SBOM, record rescan and promotion-freeze signal"
+```
+
+When `image.deployment` is set, the nightly rescan re-examines the exact
+deployed digest, never a tag. New Critical findings record a promotion freeze
+signal in evidence and monitoring without changing the running deployment.
