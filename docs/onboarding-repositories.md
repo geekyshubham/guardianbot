@@ -74,6 +74,11 @@ eligibility remains enforced inside the reusable image workflow.
   seven-day clock), and the elapsed observation period;
 - active rulesets or classic branch protection requiring the exact observed gate
   check when scanner mode is `enforce`.
+- when `scanners.releaseBranches` is set, a report-only `release-branch-rules`
+  check that each release branch has an active ruleset (an explicit
+  `refs/heads/` pattern, not `~DEFAULT_BRANCH`) or classic branch protection
+  strictly requiring the gate check. It never blocks readiness and never
+  creates or changes rulesets; operators configure release-branch protection.
 
 App installation endpoints are not visible to every GitHub token. In that case
 `doctor` reports the App check as `unobservable` without treating it as proof of

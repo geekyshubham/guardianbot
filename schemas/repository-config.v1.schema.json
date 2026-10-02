@@ -223,6 +223,18 @@
         "trivy": {
           "type": "boolean"
         },
+        "releaseBranches": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^(?!/)(?!refs/)(?!.*(?:\\.\\.|//))(?!.*\\.lock$)[A-Za-z0-9._/-]+(?<![/.])$"
+          }
+        },
         "suppressions": {
           "type": "array",
           "items": {

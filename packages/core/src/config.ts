@@ -72,6 +72,12 @@ export interface GuardianConfig {
     mode: ScannerMode;
     semgrep: boolean;
     trivy: boolean;
+    /**
+     * Exact release branch names that also receive pull_request and push
+     * coverage from the generated caller. The default branch is always
+     * covered. Omit to keep the default-branch-only trigger set.
+     */
+    releaseBranches?: string[];
     suppressions?: Array<{
       fingerprint: string;
       owner: string;
@@ -163,6 +169,15 @@ const IMAGE_PROMOTION_MODES = new Set<ImagePromotionMode>([
   "verified-default-branch"
 ]);
 const BRANCH_PATTERN = /^(?!\/)(?!.*(?:\/\/|\.\.|@\{))[^\s~^:?*[\\]+(?<![/.])$/;
+/** Upper bound on scanners.releaseBranches so caller triggers stay reviewable. */
+export const MAX_SCANNER_RELEASE_BRANCHES = 20;
+const MAX_BRANCH_NAME_LENGTH = 255;
+/**
+ * Conservative character set for scanners.releaseBranches. GitHub Actions
+ * branch filters treat * ** ? + [ ] ! and backslash as pattern syntax, so only
+ * characters that are literal in both trigger filters and refs are accepted.
+ */
+const RELEASE_BRANCH_CHARACTERS = /^[A-Za-z0-9._/-]+$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -511,12 +526,45 @@ export function validateGuardianConfig(config: unknown): string[] {
   if (!isRecord(config.scanners)) {
     errors.push("scanners is required");
   } else {
-    unknownFields(config.scanners, ["mode", "semgrep", "trivy", "suppressions"], "scanners", errors);
+    unknownFields(
+      config.scanners,
+      ["mode", "semgrep", "trivy", "releaseBranches", "suppressions"],
+      "scanners",
+      errors
+    );
     if (!["advisory", "report-only", "enforce"].includes(String(config.scanners.mode))) {
       errors.push("scanners.mode is invalid");
     }
     if (typeof config.scanners.semgrep !== "boolean") errors.push("scanners.semgrep must be boolean");
     if (typeof config.scanners.trivy !== "boolean") errors.push("scanners.trivy must be boolean");
+    if (config.scanners.releaseBranches !== undefined) {
+      // Exact branch names only: the character set excludes every GitHub Actions
+      // filter metacharacter (* ? + [ ] ! backslash) and expression syntax, BRANCH_PATTERN
+      // enforces git ref rules, and refs/ prefixes are rejected so triggers and
+      // ruleset checks agree.
+      stringArray(config.scanners.releaseBranches, "scanners.releaseBranches", errors, {
+        validate: (entry) =>
+          entry.length <= MAX_BRANCH_NAME_LENGTH &&
+          RELEASE_BRANCH_CHARACTERS.test(entry) &&
+          BRANCH_PATTERN.test(entry) &&
+          !entry.startsWith("refs/") &&
+          !entry.endsWith(".lock")
+      });
+      if (
+        Array.isArray(config.scanners.releaseBranches) &&
+        config.scanners.releaseBranches.length > MAX_SCANNER_RELEASE_BRANCHES
+      ) {
+        errors.push(
+          `scanners.releaseBranches must contain at most ${MAX_SCANNER_RELEASE_BRANCHES} branches`
+        );
+      }
+      if (
+        Array.isArray(config.scanners.releaseBranches) &&
+        config.scanners.releaseBranches.length === 0
+      ) {
+        errors.push("scanners.releaseBranches must not be empty when set");
+      }
+    }
     if (config.scanners.suppressions !== undefined) {
       if (!Array.isArray(config.scanners.suppressions)) {
         errors.push("scanners.suppressions must be an array");

@@ -1653,3 +1653,56 @@ test("persists DefectDojo reconciliation failure without mutating the completed 
     false
   );
 });
+
+test("accepts gate policy findings that carry severitySource without changing fingerprints", async () => {
+  const store = new MemoryStore();
+  await seedRepository(store);
+  const semgrepFinding = {
+    check_id: "auth.rule",
+    path: "src/auth.ts",
+    start: { line: 4 },
+    extra: {
+      severity: "WARNING",
+      message: "Authorization is bypassed",
+      metadata: { "guardianbot-severity": "high" }
+    }
+  };
+  // Severity and its source are not fingerprint inputs, so a policy mapping
+  // never invalidates existing baselines or suppressions.
+  const fingerprint = scannerFingerprint([
+    "semgrep",
+    semgrepFinding.check_id,
+    semgrepFinding.path,
+    semgrepFinding.start.line,
+    semgrepFinding.extra.message
+  ]);
+  const zip = buildSecurityZip({
+    semgrep: { results: [semgrepFinding] },
+    gate: actualGateFixture({
+      passed: false,
+      failures: ["Semgrep auth.rule at src/auth.ts:4"],
+      policyFindings: [
+        {
+          source: "semgrep",
+          ruleId: "auth.rule",
+          severity: "high",
+          severitySource: "policy",
+          fingerprint
+        }
+      ]
+    })
+  });
+  const artifact = artifactRecord(501, "guardianbot-evidence-500-2", zip);
+  const { fetchStub } = createFetchStub({
+    workflowRun: trustedWorkflowRun(),
+    jobs: defaultSecurityJobs(),
+    artifactPages: [[artifact]],
+    zipByArtifactId: { 501: zip }
+  });
+  await createHandler(store, fetchStub)(handlerInput());
+  const gate = scannerEvidence(store).find((entry) => entry.evidenceKey === "gate");
+  assert.equal(gate?.status, "failure");
+  assert.equal(gate?.payload?.policyFindings, 1);
+  assert.equal((await store.getScannerWorkflowRun(99, 500, 2))?.validationStatus, "accepted");
+  assert.ok(scannerEvidence(store).some((entry) => entry.fingerprint === fingerprint));
+});

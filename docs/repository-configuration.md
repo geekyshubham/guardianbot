@@ -61,6 +61,7 @@ scanners:
   mode: report-only
   semgrep: true
   trivy: true
+  releaseBranches: [release/1.x]
   suppressions:
     - fingerprint: trivy:CVE-2099-0001:package-lock.json
       owner: "@security"
@@ -257,6 +258,7 @@ Schema and the inline `GuardianConfig` TypeScript interface.
 | `scanners.mode` | yes | Advisory, report-only, or enforce mode. |
 | `scanners.semgrep` | yes | Whether Semgrep is applicable. |
 | `scanners.trivy` | yes | Whether Trivy is applicable. |
+| `scanners.releaseBranches` | no | Exact release branch names (up to 20 unique names of at most 255 characters using only letters, digits, `.`, `_`, `/`, and `-`; no globs, `refs/` prefix, or `.lock` suffix) whose pull requests and pushes also run the security gate. The default branch is always covered. Omit it to keep default-branch-only triggers. Image promotion, DAST, monitoring, and evidence baselines stay default-branch-only. |
 | `scanners.suppressions` | no | Reviewed, expiring finding suppressions. |
 | `scanners.suppressions.fingerprint` | yes | Stable finding fingerprint. |
 | `scanners.suppressions.owner` | yes | Person or team accountable for the suppression. |

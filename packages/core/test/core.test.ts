@@ -208,7 +208,11 @@ test("normalizes and gates deterministic findings", () => {
         check_id: "auth.rule",
         path: "src/auth.ts",
         start: { line: 4 },
-        extra: { severity: "ERROR", message: "Missing check" }
+        extra: {
+          severity: "ERROR",
+          message: "Missing check",
+          metadata: { "guardianbot-severity": "high" }
+        }
       }
     ]
   });

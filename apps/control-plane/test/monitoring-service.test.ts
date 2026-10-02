@@ -1223,3 +1223,84 @@ function maxPlaceholder(query: string): number {
     ...[...query.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
   );
 }
+
+test("release-branch push runs neither shadow nor satisfy default-branch monitoring evidence", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store, { releaseBranches: ["release/1.x"] });
+  await store.upsertScannerWorkflowRun(scannerRun());
+  for (const record of [
+    evidence("semgrep-summary", "semgrep"),
+    evidence("trivy-summary", "trivy"),
+    evidence("defectdojo-import:Semgrep JSON Report", "defectdojo-import"),
+    evidence("defectdojo-import:Trivy Scan", "defectdojo-import")
+  ]) {
+    await store.upsertScannerEvidence(record);
+  }
+  // A newer schedule-shaped run on a release branch at the same commit, with
+  // newer failing evidence, must not replace the default-branch evidence.
+  await store.upsertScannerWorkflowRun(
+    scannerRun({
+      runId: 900,
+      headBranch: "release/1.x",
+      startedAt: "2026-07-27T11:50:00.000Z",
+      completedAt: "2026-07-27T11:55:00.000Z",
+      processedAt: "2026-07-27T11:55:00.000Z"
+    })
+  );
+  for (const key of ["semgrep-summary", "trivy-summary"]) {
+    await store.upsertScannerEvidence(
+      evidence(key, key.split("-")[0] as string, "failure", {
+        runId: 900,
+        artifactId: 901,
+        observedAt: "2026-07-27T11:56:00.000Z"
+      })
+    );
+  }
+
+  const inventory = await store.listMonitoringRepositoryInventory();
+  assert.equal(inventory.length, 1);
+  assert.equal(
+    inventory[0]?.latestScannerRuns.some((run) => run.headBranch !== "main"),
+    false
+  );
+  assert.equal(
+    inventory[0]?.latestScannerEvidence.some((item) => item.runId === 900),
+    false
+  );
+
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.equal(snapshot?.overallStatus, "passing");
+});
+
+test("a release-branch-only run cannot satisfy the default-branch scheduled-run expectation", async () => {
+  const store = new MemoryStore();
+  await store.upsertRepository(repository());
+  await seedImmutableConfigIndex(store, { releaseBranches: ["release/1.x"] });
+  await store.upsertScannerWorkflowRun(
+    scannerRun({ runId: 910, headBranch: "release/1.x", event: "push" })
+  );
+  for (const key of ["semgrep-summary", "trivy-summary"]) {
+    await store.upsertScannerEvidence(
+      evidence(key, key.split("-")[0] as string, "success", { runId: 910 })
+    );
+  }
+  const monitoring = new MonitoringService(store, {
+    enabled: true,
+    intervalMs: 15 * 60_000,
+    clock: { now: () => new Date(INITIAL_NOW) }
+  });
+  await monitoring.reconcileOnce();
+  const snapshot = await store.getLatestMonitoringSnapshot(20);
+  assert.notEqual(snapshot?.overallStatus, "passing");
+  assert.equal(
+    snapshot?.checks.find((check) => check.key === "scanner-run")?.status,
+    "failing"
+  );
+});

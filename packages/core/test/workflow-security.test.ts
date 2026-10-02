@@ -880,3 +880,198 @@ test("pull request policy resolution binds onboarding state to the base commit",
     /The pull request base commit is not available for policy resolution\./
   );
 });
+
+test("Semgrep policy severity comes only from verified rule metadata, never workflow interpolation", () => {
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptEnd = workflow.indexOf("\n          NODE\n", stepStart);
+  assert.ok(stepStart >= 0 && scriptEnd > stepStart);
+  const step = workflow.slice(stepStart, scriptEnd);
+  // The step env is unchanged: no new expression-fed inputs reach the gate.
+  const env = step.slice(step.indexOf("        env:"), step.indexOf("        shell: bash"));
+  assert.deepEqual(
+    env.split("\n").filter((line) => /^ {10}[A-Z_]+:/.test(line)).map((line) => line.trim().split(":")[0]),
+    ["SCANNER_MODE", "BASELINE_PATH"]
+  );
+  const script = step.slice(step.indexOf("node <<'NODE'"));
+  assert.doesNotMatch(script, /\$\{\{/);
+  assert.match(script, /metadata\[SEMGREP_POLICY_SEVERITY_KEY\]/);
+  // Only critical/high Semgrep findings can block, regardless of severity source.
+  assert.match(script, /severitySource: policyMapped \? "policy" : "native"/);
+
+  // Execute the extracted normalizer so mapped and unmapped behaviour is proven.
+  const normalizerStart = script.indexOf("          const SEMGREP_POLICY_SEVERITY_KEY");
+  const semgrepTableEnd = script.indexOf("          const trivySeverity", normalizerStart);
+  const normalizeStart = script.indexOf("          const normalizeSemgrep = (report) =>");
+  const normalizeEnd = script.indexOf("          const normalizeTrivy", normalizeStart);
+  assert.ok(normalizerStart >= 0 && semgrepTableEnd > normalizerStart);
+  assert.ok(normalizeStart >= 0 && normalizeEnd > normalizeStart);
+  const source = [
+    script.slice(normalizerStart, semgrepTableEnd),
+    script.slice(normalizeStart, normalizeEnd),
+    "return normalizeSemgrep;"
+  ].join("\n");
+  const normalizeSemgrep = new Function(
+    "asRecord",
+    "fingerprintFields",
+    source
+  )(
+    (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? value : undefined,
+    (parts: unknown[]) => ({ fingerprint: parts.join("|") })
+  ) as (report: unknown) => Array<Record<string, unknown>>;
+  const [mapped, unmapped, invalid] = normalizeSemgrep({
+    results: [
+      {
+        check_id: "mapped",
+        path: "a.ts",
+        start: { line: 1 },
+        extra: { severity: "WARNING", message: "m", metadata: { "guardianbot-severity": "high" } }
+      },
+      { check_id: "unmapped", path: "b.ts", start: { line: 2 }, extra: { severity: "ERROR", message: "u" } },
+      {
+        check_id: "invalid",
+        path: "c.ts",
+        start: { line: 3 },
+        extra: { severity: "INFO", message: "i", metadata: { "guardianbot-severity": "blocker" } }
+      }
+    ]
+  });
+  assert.equal(mapped?.severity, "high");
+  assert.equal(mapped?.severitySource, "policy");
+  assert.equal(unmapped?.severity, "high");
+  assert.equal(unmapped?.severitySource, "native");
+  assert.equal(invalid?.severity, "info");
+  assert.equal(invalid?.severitySource, "native");
+  // Severity is not a fingerprint input.
+  assert.equal(mapped?.fingerprint, "semgrep|mapped|a.ts|1|m");
+});
+
+test("release-branch callers keep image promotion and DAST on the default branch", async () => {
+  const { generateCallerWorkflow } = await import("../src/workflow.js");
+  const caller = generateCallerWorkflow({
+    guardianRepository: "Geekyshubham/guardianbot",
+    workflowSha: "b".repeat(40),
+    defaultBranch: "main",
+    scannerMode: "report-only",
+    releaseBranches: ["release/1.x"],
+    image: {
+      dockerfile: "Dockerfile",
+      context: ".",
+      platform: "linux/amd64",
+      registry: "ghcr.io/example/service",
+      healthPath: "/health",
+      sbomFormat: "cyclonedx-json",
+      deployment: {
+        environment: "staging",
+        requireImmutableDigest: true,
+        requireSignature: true,
+        requireSbom: true,
+        promotionMode: "verified-default-branch"
+      }
+    },
+    dast: {
+      allowedOrigin: "https://staging.example.com",
+      openapi: "openapi.json",
+      openapiSource: "repository-file",
+      authenticationProfile: "control-plane://profiles/service-staging",
+      sessionAssertionPath: "/session"
+    } as never
+  });
+  assert.match(caller, /pull_request:\n {4}types: \[[^\]]+\]\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(caller, /push:\n {4}branches: \["main", "release\/1\.x"\]/);
+  assert.match(
+    caller,
+    /push: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' \}\}/
+  );
+  assert.doesNotMatch(caller, /refs\/heads\/release/);
+  // DAST jobs run only on schedule or manual dispatch, never on push.
+  const dastJobs = caller.slice(caller.indexOf("  guardianbot-dast-smoke:"));
+  assert.doesNotMatch(dastJobs.split("\n    uses:")[0] ?? "", /'push'/);
+  assert.match(caller, /guardianbot-dast-nightly:\n {4}name: guardianbot\/dast-nightly\n {4}if: github\.event_name == 'schedule'/);
+  // No untrusted ref or PR data is interpolated into the generated caller.
+  assert.doesNotMatch(caller, /github\.head_ref|github\.event\.pull_request/);
+});
+
+test("enforce gate blocks only policy-mapped Semgrep severity when the workflow script runs", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, mkdtempSync, readFileSync: read, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const workflow = repositoryFile(".github/workflows/reusable-security.yml");
+  const stepStart = workflow.indexOf("      - name: Evaluate new-finding policy");
+  const scriptStart = workflow.indexOf("node <<'NODE'\n", stepStart) + "node <<'NODE'\n".length;
+  const scriptEnd = workflow.indexOf("\n          NODE\n", scriptStart);
+  assert.ok(stepStart >= 0 && scriptEnd > scriptStart);
+  const script = workflow
+    .slice(scriptStart, scriptEnd)
+    .split("\n")
+    .map((line) => line.replace(/^ {10}/, ""))
+    .join("\n");
+
+  const run = (metadata: Record<string, unknown> | undefined) => {
+    const directory = mkdtempSync(join(tmpdir(), "guardianbot-gate-"));
+    try {
+      mkdirSync(join(directory, "guardianbot-evidence"));
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "semgrep.json"),
+        JSON.stringify({
+          results: [
+            {
+              check_id: "rule",
+              path: "a.py",
+              start: { line: 1 },
+              extra: { severity: "ERROR", message: "m", ...(metadata ? { metadata } : {}) }
+            }
+          ]
+        })
+      );
+      writeFileSync(
+        join(directory, "guardianbot-evidence", "trivy.json"),
+        JSON.stringify({ SchemaVersion: 2, ArtifactName: ".", ArtifactType: "filesystem", Results: [] })
+      );
+      writeFileSync(join(directory, "guardianbot-evidence", "suppressions.json"), "[]");
+      writeFileSync(join(directory, "baseline.json"), JSON.stringify(["f".repeat(64)]));
+      writeFileSync(join(directory, "gate.js"), script);
+      const result = spawnSync(process.execPath, ["gate.js"], {
+        cwd: directory,
+        encoding: "utf8",
+        env: {
+          PATH: process.env.PATH ?? "",
+          SCANNER_MODE: "enforce",
+          BASELINE_PATH: "baseline.json",
+          GITHUB_REPOSITORY: "acme/service",
+          GITHUB_SHA: "a".repeat(40),
+          GITHUB_RUN_ID: "1",
+          GITHUB_RUN_ATTEMPT: "1",
+          GITHUB_STEP_SUMMARY: join(directory, "summary.md")
+        }
+      });
+      const gate = JSON.parse(read(join(directory, "guardianbot-evidence", "gate.json"), "utf8")) as {
+        passed: boolean;
+        policyFindings: Array<{ severity: string; severitySource: string }>;
+      };
+      return { status: result.status, gate, summary: read(join(directory, "summary.md"), "utf8") };
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  const mapped = run({ "guardianbot-severity": "high" });
+  assert.equal(mapped.status, 1);
+  assert.equal(mapped.gate.passed, false);
+  assert.equal(mapped.gate.policyFindings[0]?.severitySource, "policy");
+
+  const unmapped = run(undefined);
+  assert.equal(unmapped.status, 0);
+  assert.equal(unmapped.gate.passed, true);
+  // Unmapped native ERROR stays visible as a High policy finding and is flagged.
+  assert.equal(unmapped.gate.policyFindings[0]?.severity, "high");
+  assert.equal(unmapped.gate.policyFindings[0]?.severitySource, "native");
+  assert.match(unmapped.summary, /Semgrep rule `rule` has no policy severity mapping/);
+  assert.match(unmapped.summary, /- ⚠️ Semgrep rule at a\.py:1 \(no policy severity mapping\)|⚠️ Semgrep rule/);
+
+  const mappedDown = run({ "guardianbot-severity": "medium" });
+  assert.equal(mappedDown.status, 0);
+  assert.deepEqual(mappedDown.gate.policyFindings, []);
+});
